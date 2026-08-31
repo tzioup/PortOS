@@ -1,13 +1,14 @@
-// PROTOTYPE — issue #9. Smoke check only: proves every variant x scenario mounts,
-// so the principal never opens a blank page. Deleted with the rest of the folder.
+// PROTOTYPE — issue #9. Smoke check only: proves the surface mounts in every
+// scenario and holds the two rules that are requirements rather than styling,
+// so the principal never opens a blank or a lying page. Deleted with the folder.
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 import BeeperPrototypeTab from './BeeperPrototypeTab';
 import { SCENARIOS } from './beeperFixtures';
 
-const mount = (search) => render(
-  <MemoryRouter initialEntries={[`/messages/beeper-proto${search}`]}>
+const at = (path) => render(
+  <MemoryRouter initialEntries={[path]}>
     <Routes>
       <Route path="/messages/:tab/:chatKey" element={<BeeperPrototypeTab />} />
       <Route path="/messages/:tab" element={<BeeperPrototypeTab />} />
@@ -16,32 +17,33 @@ const mount = (search) => render(
 );
 
 describe('beeper prototype smoke', () => {
-  for (const v of ['A', 'B', 'C']) {
-    for (const s of SCENARIOS) {
-      it(`renders ${v} / ${s.id}`, () => {
-        const { unmount } = mount(`?variant=${v}&scenario=${s.id}`);
-        expect(screen.getByText('Prototype')).toBeTruthy();
-        unmount();
-      });
-    }
+  for (const s of SCENARIOS) {
+    it(`renders the ${s.id} install`, () => {
+      const { unmount } = at(`/messages/beeper-proto?scenario=${s.id}`);
+      expect(screen.getByText('Prototype')).toBeTruthy();
+      unmount();
+    });
   }
 
-  it('opens a thread from the URL and names the network in the composer', () => {
-    render(
-      <MemoryRouter initialEntries={['/messages/beeper-proto/c1?variant=A&scenario=nine']}>
-        <Routes><Route path="/messages/:tab/:chatKey" element={<BeeperPrototypeTab />} /></Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByPlaceholderText(/on WhatsApp/)).toBeTruthy();
-    expect(screen.getAllByText('ok that works — 3pm your time?').length).toBe(2); // list preview + last bubble
+  it('badges rows with their network in the unified inbox', () => {
+    at('/messages/beeper-proto?scenario=nine&scope=all');
+    expect(screen.getAllByTestId('network-badge').length).toBeGreaterThan(0);
+  });
+
+  it('drops every row badge inside a single-network scope', () => {
+    at('/messages/beeper-proto?scenario=nine&scope=whatsapp');
+    // The rail already states the network, so a per-row badge is pure noise.
+    expect(screen.queryAllByTestId('network-badge')).toHaveLength(0);
+    expect(screen.getByText('WhatsApp')).toBeTruthy(); // the scope header still names it
+  });
+
+  it('names the network and its transport in the composer', () => {
+    at('/messages/beeper-proto/c7?scenario=nine');
+    expect(screen.getByPlaceholderText(/on Google Messages \(RCS\)$/)).toBeTruthy();
   });
 
   it('disables send when the conversation’s bridge is disconnected', () => {
-    render(
-      <MemoryRouter initialEntries={['/messages/beeper-proto/c4?variant=B&scenario=degraded']}>
-        <Routes><Route path="/messages/:tab/:chatKey" element={<BeeperPrototypeTab />} /></Routes>
-      </MemoryRouter>,
-    );
+    at('/messages/beeper-proto/c1?scenario=degraded');
     expect(screen.getByPlaceholderText(/can’t send/)).toBeDisabled();
   });
 });
