@@ -168,24 +168,27 @@ function Rail({ accounts, conversations, scope, onScope, totalUnread }) {
 function PinnedGrid({ conversations, unified, onSelect }) {
   if (conversations.length === 0) return null;
   return (
-    <div className="grid shrink-0 grid-cols-3 gap-x-2 gap-y-1 border-b border-port-border px-3 pb-3 pt-4">
+    <div className="grid shrink-0 grid-cols-3 gap-x-2 gap-y-2 border-b border-port-border px-3 pb-3 pt-2">
+      {/* Each cell reserves its own band for the bubble (pt-5). In the reference
+          a bubble may overhang its neighbour, but only because few chats carry
+          one at once; with every pinned chat unread they collide, so here the
+          bubble is clipped to its own column. */}
       {conversations.map((c) => (
         <button
           key={c.id}
           type="button"
           onClick={() => onSelect(c.id)}
-          className="flex flex-col items-center gap-1"
+          className="relative flex flex-col items-center gap-1 pt-5"
         >
+          {c.unread > 0 && (
+            <span className="pointer-events-none absolute inset-x-0 top-0 z-20 mx-auto w-fit max-w-full truncate rounded-full bg-port-accent px-2 py-0.5 text-[9px] leading-4 text-port-on-accent">
+              {c.preview}
+            </span>
+          )}
           <span className="relative">
-            {/* floating preview bubble, as in the reference */}
-            {c.unread > 0 && (
-              <span className="absolute -top-3 left-6 z-10 max-w-[92px] truncate rounded-full bg-port-accent px-2 py-0.5 text-[9px] text-port-on-accent">
-                {c.preview}
-              </span>
-            )}
             <Avatar conv={c} size={54} />
             {c.unread > 0 && (
-              <span className="absolute -right-1 top-0 min-w-4 rounded-full bg-neutral-900 px-1 text-center text-[10px] font-semibold text-white ring-2 ring-port-bg">
+              <span className="absolute -right-1 -top-1 z-30 min-w-4 rounded-full bg-neutral-900 px-1 text-center text-[10px] font-semibold text-white ring-2 ring-port-bg">
                 {c.unread}
               </span>
             )}
