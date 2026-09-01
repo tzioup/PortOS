@@ -1,0 +1,76 @@
+$schema: https://api.gitbook.com/gitbook-docs.yaml
+version: 1
+site:
+  title: PortOS
+  structure:
+    - type: section
+      key: section-documentation
+      title: Documentation
+      description: Living guides, feature deep dives, themes, and examples.
+      path: documentation
+      default: true
+      children:
+        - type: space
+          key: space-guides
+          title: Guides
+          path: guides
+          default: true
+          content:
+            directory: ./docs
+            language: en
+        - type: space
+          key: space-features
+          title: Feature Deep Dives
+          path: features
+          content:
+            directory: ./docs/features
+            language: en
+        - type: space
+          key: space-themes
+          title: Themes
+          path: themes
+          content:
+            directory: ./docs/themes
+            language: en
+        - type: space
+          key: space-examples
+          title: Examples
+          path: examples
+          content:
+            directory: ./docs/examples
+            language: en
+    - type: section
+      key: section-records
+      title: Records
+      description: Point-in-time records — decisions, design plans, and research write-ups.
+      path: records
+      children:
+        - type: space
+          key: space-decisions
+          title: Decisions
+          path: decisions
+          default: true
+          content:
+            directory: ./docs/decisions
+            language: en
+        - type: space
+          key: space-plans
+          title: Design Plans
+          path: plans
+          content:
+            directory: ./docs/plans
+            language: en
+        - type: space
+          key: space-research
+          title: Research
+          path: research
+          content:
+            directory: ./docs/research
+            language: en
+        - type: space
+          key: space-superpowers
+          title: Superpowers
+          path: superpowers
+          content:
+            directory: ./docs/superpowers
+            language: en
