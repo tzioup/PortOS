@@ -1,13 +1,12 @@
 $schema: https://api.gitbook.com/gitbook-docs.yaml
-version: 1
 site:
   title: PortOS
   structure:
     - type: section
       key: section-documentation
       title: Documentation
-      description: Living guides, feature deep dives, themes, and examples.
       path: documentation
+      description: Living guides, feature deep dives, themes, and examples.
       default: true
       children:
         - type: space
@@ -42,8 +41,8 @@ site:
     - type: section
       key: section-records
       title: Records
-      description: Point-in-time records — decisions, design plans, and research write-ups.
       path: records
+      description: Point-in-time records — decisions, design plans, and research write-ups.
       children:
         - type: space
           key: space-decisions
