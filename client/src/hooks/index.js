@@ -13,7 +13,6 @@ export { default as useAudioSessionClaim } from './useAudioSessionClaim.js';
 export { default as useAsyncCaptureGuard } from './useAsyncCaptureGuard.js';
 export { default as useAssignableInstances } from './useAssignableInstances.js';
 export { default as useAutoscroll } from './useAutoscroll.js';
-export { default as useOpenWorldAudio } from './useOpenWorldAudio.js';
 export { default as useClonedGltf } from './useClonedGltf.jsx';
 export * from './useClonedGltf.jsx';
 export { default as useAutoSizeTextarea } from './useAutoSizeTextarea.js';
@@ -45,7 +44,6 @@ export { default as useRoundRows } from './useRoundRows.js';
 export { default as useRoundViewParams } from './useRoundViewParams.js';
 export { default as useSongTraining } from './useSongTraining.js';
 export { default as useMediaPreviewActions } from './useMediaPreviewActions.js';
-export { default as useKeyboardControls } from './useKeyboardControls.js';
 export { default as useKeyCapture } from './useKeyCapture.js';
 export { default as useKeyboardShortcuts } from './useKeyboardShortcuts.js';
 export * from './useKeyboardShortcuts.js';
@@ -102,8 +100,6 @@ export { default as useTokenPopover } from './useTokenPopover.js';
 // === Mixed (both default and named) — surface both ===
 export { default as useAsyncAction } from './useAsyncAction.js';
 export * from './useAsyncAction.js';
-export { default as useOpenWorldSettings } from './useOpenWorldSettings.js';
-export * from './useOpenWorldSettings.js';
 
 // === Notifications & toasts ===
 export * from './useAIStatusNotifications.js';
@@ -144,6 +140,7 @@ export { default as useCatalogTypes } from './useCatalogTypes.jsx';
 export * from './useCatalogTypes.jsx';
 
 // === Sockets & lifecycle ===
+export * from './useCosTaskUpdates.js';
 export * from './usePrevious.js';
 export * from './useShellSession.js';
 export * from './useSocket.js';
@@ -157,6 +154,7 @@ export * from './useAutoRefetch.js';
 export * from './useCmdKSearch.js';
 export * from './useCooldownTick.js';
 export { default as useDrawerTab } from './useDrawerTab.js';
+export { default as useDownloadPreflightConfirm } from './useDownloadPreflightConfirm.js';
 export { default as useChordPlayer } from './useChordPlayer.js';
 export { default as useDrumPlayer } from './useDrumPlayer.js';
 export * from './useHfTokenStatus.js';
@@ -184,16 +182,12 @@ export * from './useSidebarApps.js';
 export * from './useSidebarSeries.js';
 export * from './useSidebarUniverses.js';
 
-// === Domain: OpenWorld / Voice / Mortality / Universe / Apps / Sessions ===
+// === Domain: Voice / Mortality / Universe / Apps / Sessions ===
 export * from './useAppDeploy.js';
 export * from './useAppOperation.js';
 export * from './useAppOverrideActions.js';
 export * from './useTaskModelPins.js';
 export * from './useCanonPatch.js';
-export * from './useOpenWorldData.js';
-export * from './useOpenWorldPlayback.js';
-export { default as useOpenWorldViewport } from './useOpenWorldViewport.js';
-export * from './useOpenWorldViewport.js';
 export * from './useDeathClock.js';
 export * from './useFederatedMediaTarget.js';
 export * from './useGoalDetail.js';
@@ -201,6 +195,7 @@ export * from './usePostSession.js';
 export * from './useRecordMerge.js';
 export * from './useRenderJobQueue.js';
 export * from './useRepoIntake.js';
+export * from './useRepoStudyConfig.js';
 export * from './useSyncIntegrity.js';
 export * from './useSystemResourceReport.js';
 export * from './useTwinEvaluationSuite.js';
@@ -208,7 +203,6 @@ export * from './useUniverseNav.js';
 export * from './useVideoFileSrc.js';
 export * from './useVideoGenFieldState.js';
 export * from './useVideoGenForm.js';
-export * from './useVideoGenQueue.js';
 export * from './useVideoGenSubmitFlow.js';
 export * from './useVideoGenValidation.js';
 export * from './useVoiceUiSync.js';

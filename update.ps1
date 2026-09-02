@@ -106,18 +106,15 @@ function Test-WorkspaceDepsChanged {
 }
 
 # Wipe a workspace's installed deps so the next `npm install` resolves the tree
-# from scratch. node_modules is always removed; the lockfile is removed ONLY
-# when it's gitignored (the per-install client/server locks) — a tracked root
-# or autofixer lock was just pulled and is already consistent with the new
-# package.json, so keep it for reproducible resolution.
+# from scratch. node_modules ONLY — every workspace lockfile this script touches
+# (root, client, server, autofixer) is tracked, so the pull just brought one that
+# is already consistent with the new package.json. Keep it: reinstalling from the
+# committed lock is reproducible, while deleting it would let transitive versions
+# float past the `overrides` pins.
 function Clear-WorkspaceDeps {
     param([string]$Dir)
     if (Test-Path "$Dir/node_modules") {
         Remove-Item -Recurse -Force "$Dir/node_modules" -ErrorAction SilentlyContinue
-    }
-    git check-ignore -q "$Dir/package-lock.json" 2>$null
-    if ($LASTEXITCODE -eq 0 -and (Test-Path "$Dir/package-lock.json")) {
-        Remove-Item -Force "$Dir/package-lock.json" -ErrorAction SilentlyContinue
     }
 }
 
@@ -140,7 +137,7 @@ function Safe-Install {
     Invoke-Logged npm install --no-save
     if ($LASTEXITCODE -eq 0) { Pop-Location; return }
 
-    Write-SafeHost "⚠️  npm install failed for $Label — cleaning node_modules + package-lock.json and retrying..." -ForegroundColor Yellow
+    Write-SafeHost "⚠️  npm install failed for $Label — cleaning node_modules and retrying..." -ForegroundColor Yellow
     Pop-Location
     Clear-WorkspaceDeps -Dir $Dir
     Push-Location $Dir
@@ -286,8 +283,8 @@ if (-not (Test-Path "client/node_modules/vite/bin/vite.js")) {
 Step "npm-install" "done" "Dependencies installed"
 
 # Run data/db/browser setup. Don't call `npm run setup` — that re-runs the
-# installs we just did above. The three scripts here are the data-side half
-# of `npm run setup` and are idempotent.
+# installs we just did above. These scripts are the data-side half of
+# `npm run setup` and are idempotent.
 Step "setup" "running" "Running setup..."
 Invoke-Logged node scripts/setup-data.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -297,6 +294,23 @@ Invoke-Logged node scripts/setup-browser.js
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Invoke-Logged node scripts/setup-ghostty.js
 Step "setup" "done" "Setup complete"
+Write-SafeHost ""
+
+# Retry the safe Tailscale certificate path on every update. Missing sign-in,
+# MagicDNS, or the admin HTTPS toggle is reported as guidance rather than a
+# failed update; setup-guide owns the shared human-readable next step.
+Step "network-setup" "running" "Checking Tailscale, MagicDNS, and HTTPS..."
+Invoke-Logged node scripts/setup-cert.js
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$networkSummary = & {
+    $ErrorActionPreference = 'Continue'
+    & node scripts/setup-guide.js --summary 2>> $UpdateLog
+}
+if ($LASTEXITCODE -ne 0 -or -not $networkSummary) {
+    $networkSummary = "Network setup checked"
+    $global:LASTEXITCODE = 0
+}
+Step "network-setup" "done" ($networkSummary -join " ")
 Write-SafeHost ""
 
 # Run data migrations
@@ -402,6 +416,16 @@ $accessUrl = & node scripts/print-access-url.js 2>$null
 $global:LASTEXITCODE = 0
 if ($accessUrl) {
     $accessUrl | ForEach-Object { Write-SafeHost $_ -ForegroundColor Cyan }
+    Write-SafeHost ""
+}
+
+$setupGuide = & {
+    $ErrorActionPreference = 'Continue'
+    & node scripts/setup-guide.js --assume-active 2>$null
+}
+$global:LASTEXITCODE = 0
+if ($setupGuide) {
+    $setupGuide | ForEach-Object { Write-SafeHost $_ -ForegroundColor Cyan }
     Write-SafeHost ""
 }
 

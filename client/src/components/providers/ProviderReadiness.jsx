@@ -10,7 +10,7 @@
  * transcript.
  *
  * `readiness` is one entry of the map from `GET /api/providers/readiness`
- * (`{ kind, label, endpoint, ready, checks, manageUrl, setup }`).
+ * (`{ kind, label, endpoint, ready, standby, checks, manageUrl, setup }`).
  * Renders nothing without one, so providers with no local dependency — and
  * cards drawn before the fetch resolves — show no checklist at all.
  *
@@ -36,7 +36,7 @@
  */
 
 import { Link } from 'react-router';
-import { CheckCircle2, Download, HelpCircle, RefreshCw, Wand2, Wrench, XCircle } from 'lucide-react';
+import { CheckCircle2, Download, HelpCircle, PauseCircle, RefreshCw, Wand2, Wrench, XCircle } from 'lucide-react';
 import Banner from '../ui/Banner';
 import Pill from '../ui/Pill';
 
@@ -70,9 +70,14 @@ function CodeText({ text }) {
   );
 }
 
-export default function ProviderReadiness({ readiness, onAutoSetup, onUseServedModel, onServeWantedModel, serving = false, className = '' }) {
+/**
+ * `optional` — the provider is switched off, so these checks are what enabling
+ * it would take rather than an outstanding task (see `providerCardState`). Same
+ * checks and same fix buttons, in an informational tone under a title saying so.
+ */
+export default function ProviderReadiness({ readiness, onAutoSetup, onUseServedModel, onServeWantedModel, serving = false, optional = false, className = '' }) {
   if (!readiness || !Array.isArray(readiness.checks) || readiness.checks.length === 0) return null;
-  const { label, endpoint, ready, checks, manageUrl, setup } = readiness;
+  const { label, endpoint, ready, standby, standbyDetail, checks, manageUrl, setup } = readiness;
 
   if (ready) {
     return (
@@ -82,15 +87,35 @@ export default function ProviderReadiness({ readiness, onAutoSetup, onUseServedM
     );
   }
 
+  if (standby) {
+    return (
+      <Banner
+        tone="info"
+        size="sm"
+        icon={PauseCircle}
+        className={className}
+        title={`${label} installed · standby`}
+      >
+        {standbyDetail && <p className="mt-1 text-gray-400"><CodeText text={standbyDetail} /></p>}
+        {manageUrl && (
+          <Link to={manageUrl} className={`${ACTION_CLASS} mt-2`}>Open the LLMs page</Link>
+        )}
+      </Banner>
+    );
+  }
+
   const blocked = checks.filter((check) => check.ok !== true).length;
+  const requirements = `${blocked} requirement${blocked === 1 ? '' : 's'}`;
 
   return (
     <Banner
-      tone="warning"
+      tone={optional ? 'info' : 'warning'}
       size="sm"
       icon={Wrench}
       className={className}
-      title={`${label} setup incomplete — ${blocked} requirement${blocked === 1 ? '' : 's'} unmet`}
+      title={optional
+        ? `${label} setup — ${requirements} to meet if you enable this provider`
+        : `${label} setup incomplete — ${requirements} unmet`}
     >
       <ul className="space-y-1 mt-1">
         {checks.map((check) => {
@@ -102,7 +127,7 @@ export default function ProviderReadiness({ readiness, onAutoSetup, onUseServedM
                 <CodeText text={check.label} />
                 {check.detail && <span className="text-gray-500"> — <CodeText text={check.detail} /></span>}
                 {check.fixHint && (
-                  <span className="block text-port-warning/90"><CodeText text={check.fixHint} /></span>
+                  <span className={`block ${optional ? 'text-port-accent/90' : 'text-port-warning/90'}`}><CodeText text={check.fixHint} /></span>
                 )}
                 {check.id === 'model' && check.ok === false
                   && Array.isArray(check.servedModels) && check.servedModels.length > 0 && (

@@ -217,38 +217,45 @@ if (import.meta.hot) {
 // date-scoped features (daily log, schedulers) land on the wrong day. Push
 // the browser's IANA zone once so remote/VPN clients don't need to visit
 // Settings before their first entry is correct.
-function useTimezoneBootstrap() {
+function useTimezoneBootstrap(enabled = true) {
   useEffect(() => {
+    if (!enabled) return;
     getSettings().then((s) => {
       if (s?.timezone) return;
       const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
       if (!tz || tz === 'UTC') return;
       return updateSettings({ timezone: tz });
     }).catch(() => null);
-  }, []);
+  }, [enabled]);
 }
 
 // Stamp the machine's instance name into the browser tab so multiple federated
 // installs are distinguishable at a glance — "PortOS: {name}". Falls back to the
 // static "PortOS" title (set in index.html) when the name is missing/unfetchable.
-function useDocumentTitle() {
+function useDocumentTitle(enabled = true) {
   useEffect(() => {
+    if (!enabled) return;
     getSelfInstance({ silent: true }).then((self) => {
       const name = self?.name?.trim();
       if (name) document.title = `PortOS: ${name}`;
     }).catch(() => null);
-  }, []);
+  }, [enabled]);
 }
 
 export default function App() {
-  useTimezoneBootstrap();
-  useDocumentTitle();
-  return (
-    <CatalogTypesProvider>
+  const { pathname } = useLocation();
+  const isHostedAudienceRoute = pathname.replace(/\/+$/, '') === '/fableloom/join';
+  useTimezoneBootstrap(!isHostedAudienceRoute);
+  useDocumentTitle(!isHostedAudienceRoute);
+
+  const routeContent = (
     <Suspense fallback={<PageLoader />}>
       <Routes>
         <Route path="/login" element={<Login />} />
         <Route path="/ambient" element={<Ambient />} />
+        {/* Hosted audience devices need the full dynamic viewport, without the
+            app chrome consuming part of the height or clipping the controls. */}
+        <Route path="/fableloom/join" element={<FableLoomHostedJoin />} />
         <Route path="/" element={<Layout />}>
           <Route index element={<Dashboard />} />
           <Route path="apps" element={<Apps />} />
@@ -273,13 +280,15 @@ export default function App() {
           <Route path="devtools/agents" element={<AgentsPage />} />
           <Route path="eidoverse" element={<Eidoverse />} />
           <Route path="ai" element={<AIProviders />} />
-          {/* The provider editor is a deep-linkable slide-in over the same page:
-              /ai/new creates, /ai/edit/:providerId edits. The id sits under its
-              own `edit` segment rather than directly under /ai so the create
-              route can't be shadowed by a real provider: ids are slugified from
-              the display name, so a provider named "New" gets the id `new` and
-              /ai/new would otherwise match the static create route instead. */}
+          {/* Provider overlays are deep-linkable over the same page: /ai/new
+              creates, /ai/fleet walks through a remote GPU host, and
+              /ai/edit/:providerId edits. The id sits under its own `edit`
+              segment rather than directly under /ai so the create route can't
+              be shadowed by a real provider: ids are slugified from the display
+              name, so a provider named "New" gets the id `new` and /ai/new
+              would otherwise match the static create route instead. */}
           <Route path="ai/new" element={<AIProviders />} />
+          <Route path="ai/fleet" element={<AIProviders />} />
           <Route path="ai/edit/:providerId" element={<AIProviders />} />
           <Route path="prompts" element={<PromptManager />} />
           <Route path="cos" element={<Navigate to="/cos/tasks" replace />} />
@@ -319,6 +328,9 @@ export default function App() {
           {/* Embeddings moved into Models with the rest of the model management
               (#4728) — it picks a model, not a preference. */}
           <Route path="settings/embeddings" element={<Navigate to="/models/embeddings" replace />} />
+          {/* Code Reviewer configuration moved into Models with the reviewer
+              runtimes it configures; keep the old URL working for bookmarks. */}
+          <Route path="settings/code-reviewers" element={<Navigate to="/models/code-reviewers" replace />} />
           {/* Spotify/YouTube sync feed the activity Timeline, which lives in
               Brain — moved alongside it so they show up in the same sidebar
               section as the data they populate. */}
@@ -331,7 +343,7 @@ export default function App() {
           <Route path="voice/call-host" element={<VoiceCallHost />} />
           <Route path="api-reference" element={<Navigate to="/api-reference/catalog" replace />} />
           <Route path="api-reference/:tab" element={<ApiExplorer />} />
-          <Route path="models" element={<Navigate to="/models/performance" replace />} />
+          <Route path="models" element={<Navigate to="/models/llms" replace />} />
           {/* A tab's drill-down (today: the LoRA dataset workbench) renders through
               Models itself, so it keeps the section header and tab bar — see
               TAB_DETAIL there. */}
@@ -520,7 +532,6 @@ export default function App() {
           <Route path="sharing/:section" element={<Sharing />} />
           <Route path="sharing/:section/:bucketId" element={<Sharing />} />
           <Route path="importer" element={<Importer />} />
-          <Route path="fableloom/join" element={<FableLoomHostedJoin />} />
           <Route path="fableloom" element={<FableLoom />} />
           <Route path="fableloom/:loomId" element={<FableLoomStory />} />
           <Route path="fableloom/:loomId/:episodeId/outline" element={<FableLoomStory view="outline" />} />
@@ -564,6 +575,8 @@ export default function App() {
         </Route>
       </Routes>
     </Suspense>
-    </CatalogTypesProvider>
   );
+  return isHostedAudienceRoute
+    ? routeContent
+    : <CatalogTypesProvider>{routeContent}</CatalogTypesProvider>;
 }

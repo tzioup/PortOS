@@ -24,6 +24,17 @@
  *      which passes no `label`. Such a toast collapses to a pill after
  *      COLLAPSE_AFTER_MS (so it stops covering the page), and the pill has no
  *      text of its own to name itself with.
+ *   5. A non-interactive element (`<div>`, `<li>`, `<tr>`, …) carrying an
+ *      `onClick` and nothing else. It takes no focus and Enter/Space do
+ *      nothing, so the affordance does not exist at all for a keyboard or
+ *      screen-reader user. `lib/a11yKeyboard.js`'s `clickableProps(handler)`
+ *      supplies the missing role, tab stop and Enter/Space handler.
+ *   6. An `<img>` with no `alt`, which is announced by its `src` — a hashed
+ *      filename or a blob URL. `alt=""` is the correct spelling for a
+ *      decorative image and passes; only the omission is the bug.
+ *   7. An icon-only `<button>` in the MeatSpace health-logging tree sized to
+ *      its bare icon (`p-1` around a 12-14px glyph = a 22px target) instead of
+ *      the 44px floor the rest of the app enforces.
  *
  * Scoped to git-tracked `.jsx` under `client/src` so an untracked scratch file
  * can't fail the suite.
@@ -734,17 +745,24 @@ function findButtonBody(src, openEnd) {
   return closeIdx === -1 ? null : src.slice(openEnd, closeIdx);
 }
 
-// Is this <button> node an icon-only button with nothing to name it? Named
-// rather than inlined in the rule so the `selfClosing` it reads is testable:
-// this rule scans UNMASKED source, where a comment survives to the end of the
-// tag — `<button /* pause */>` ends in `*/>`, which the old `endsWith('/>')`
-// re-derivation called self-closing, skipping a button that has a body and
-// needs a name.
-function isUnnamedIconOnlyButton(src, { tag, contentStart, selfClosing }) {
+// Is this <button> node one whose entire body is an icon? Named rather than
+// inlined in the rule so the `selfClosing` it reads is testable: these rules
+// scan UNMASKED source, where a comment survives to the end of the tag —
+// `<button /* pause */>` ends in `*/>`, which the old `endsWith('/>')`
+// re-derivation called self-closing, skipping a button that has a body.
+//
+// Two rules ask about the same shape for different reasons: the naming rule
+// wants the ones with nothing to announce, the touch-target rule wants all of
+// them (an aria-label makes a 22px button announceable, not tappable).
+function isIconOnlyButton(src, { contentStart, selfClosing }) {
   if (selfClosing) return false; // no body to judge
-  if (/\baria-label\s*=/.test(tag) || /\baria-labelledby\s*=/.test(tag)) return false;
   const body = findButtonBody(src, contentStart);
   return body !== null && isIconOnlyBody(body);
+}
+
+function isUnnamedIconOnlyButton(src, node) {
+  if (/\baria-label\s*=/.test(node.tag) || /\baria-labelledby\s*=/.test(node.tag)) return false;
+  return isIconOnlyButton(src, node);
 }
 
 // Tailwind `h-`/`w-`/`min-h-`/`min-w-` token → px, for both an arbitrary
@@ -1619,15 +1637,101 @@ function hasUsableAriaLabelledByReference(src, tag) {
   });
 }
 
+// The element's BODY, prepared the way `hasUsableElementText` prepares it:
+// comments masked, `aria-hidden` subtrees removed — so the two content-name
+// checks cannot drift on what "hidden" means.
+function accessibleBodyOf(src, { contentStart, matchingClose }) {
+  if (!matchingClose) return null;
+  return stripHiddenElementContent(
+    maskComments(src.slice(contentStart, matchingClose.index), { startMode: 'jsx-text' }),
+  );
+}
+
+// `alt` names an element only where HTML says it does. A `<div alt="…">` or a
+// `<Thumb alt={caption} />` is inert markup as far as the accessibility tree is
+// concerned — reading it as a name would exempt an unnamed link on the strength
+// of an attribute no browser looks at. `<input type="image">` is left out
+// deliberately: it is not phrasing content inside a link, and `<input>` has its
+// own name rule two branches down.
+const ALT_NAMED_TAGS = new Set(['img', 'area']);
+
+// Which components declared in THIS file render text of their own? An anchor
+// wrapping one is named by whatever that component renders — KanbanBoard's
+// `<a><TicketCard ticket={ticket} /></a>` announces the ticket's key, summary,
+// priority and type — and an `aria-label` on such a link would REPLACE that
+// whole subtree with a terser name rather than add to it.
+//
+// Only a LOCAL declaration is credited, and only one that actually renders
+// text. Every link this rule exists to catch wraps an IMPORTED icon
+// (`<Download />`, `<ExternalLink />`), and a file-local icon wrapper renders no
+// text either — so neither is exempted. Crediting any component child, or
+// following imports, would hand the rule the one bypass that makes it vacuous.
+const textRenderingLocalComponentsBySource = new Map();
+
+function textRenderingLocalComponents(src) {
+  const cached = textRenderingLocalComponentsBySource.get(src);
+  if (cached) return cached;
+  const names = new Set();
+  forEachLocalComponent(src, (name, body) => {
+    if (names.has(name)) return;
+    for (const node of forEachOpeningTag(body)) {
+      if (isHiddenFromAccessibility(node.tag)) continue;
+      if (!hasUsableElementText(body, node)) continue;
+      names.add(name);
+      return;
+    }
+  });
+  textRenderingLocalComponentsBySource.set(src, names);
+  return names;
+}
+
+// Everything an <a> can be named by that is NOT its own plain text: a
+// descendant image's `alt` (a thumbnail link — an `aria-label` bolted onto one
+// would OVERRIDE that alt rather than add to it, a regression dressed up as a
+// fix), and a same-file component that renders text.
+//
+// One walk of the prepared body answers both. It is the expensive half of the
+// rule, so it runs only after `hasUsableElementText` has already cleared the
+// ordinary text links, and the local-component set is resolved lazily — a body
+// with no component child at all never builds one.
+function hasAccessibleLinkContent(src, node) {
+  const body = accessibleBodyOf(src, node);
+  if (body === null) return false;
+  const componentChildren = new Set();
+  for (const child of forEachOpeningTag(body, undefined, { startMode: 'jsx-text' })) {
+    if (ALT_NAMED_TAGS.has(child.name) && hasUsableAccessibleNameAttribute(child.tag, 'alt')) return true;
+    if (child.name && COMPONENT_TAG_NAME.test(child.name)) componentChildren.add(child.name);
+  }
+  if (componentChildren.size === 0) return false;
+  const local = textRenderingLocalComponents(src);
+  return [...componentChildren].some((name) => local.has(name));
+}
+
 // `type`-derived names are an <input>-only affordance: a submit button names
 // itself from `value`, an image button from `alt`, and a hidden input is not in
 // the a11y tree at all. <select> and <textarea> have no such escape hatch, so
 // the caller passes the tag name rather than this reading `type` off anything
 // that happens to carry one.
-function hasAccessibleControlName(src, tag, index, tagName, file) {
+//
+// Takes the tag-index NODE, not a `(tag, index)` pair: the <a> branch needs the
+// element's BODY, and `matchingClose` is the lexer's answer to where that ends.
+// Re-deriving it from an index inside here would be a second answer to a
+// question the scan already settled — the same trap `controlSourceAnchor`
+// documents.
+function hasAccessibleControlName(src, node, tagName, file) {
+  const { tag, index } = node;
   if (hasUsableAccessibleNameAttribute(tag, 'aria-label')) return true;
   if (hasUsableAccessibleNameAttribute(tag, 'aria-labelledby') && hasUsableAriaLabelledByReference(src, tag)) return true;
   if (tagName === 'input' && hasUsableNativeInputName(tag)) return true;
+  // Unlike a form control, a link names itself from its own CONTENT — its text,
+  // a descendant image's `alt`, or a same-file component that renders either.
+  // The overwhelming majority of anchors in the tree are ordinary text links,
+  // and without these branches the rule would report every one of them. All
+  // three read the body through the one `accessibleBodyOf` preparation, so an
+  // `aria-hidden` subtree contributes to none of them: an anchor whose only
+  // child is `<Icon aria-hidden="true" />` computes an EMPTY name in the browser
+  // and is correctly reported as unnamed here.
+  if (tagName === 'a' && (hasUsableElementText(src, node) || hasAccessibleLinkContent(src, node))) return true;
   if (isNestedInLabel(src, index)) return true;
 
   const id = normalizedAttributeValue(attributeValue(tag, 'id'));
@@ -1641,8 +1745,12 @@ function hasAccessibleControlName(src, tag, index, tagName, file) {
 // control; remove each entry as its control receives a real name. The tag name
 // is part of the anchor so a <select> and a <textarea> that happen to share a
 // file and an attribute set can't exempt each other.
+// `href` is what distinguishes one <a> from another — without it a page's links
+// all share the empty semantic anchor and the offender list reads as
+// `file|a||occurrence=7`, which names nothing a reader can find. No <input>,
+// <select> or <textarea> carries one, so adding it cannot move an existing row.
 const CONTROL_ANCHOR_ATTRIBUTES = [
-  'id', 'name', 'type', 'placeholder', 'value', 'ref', 'title', 'role',
+  'id', 'name', 'type', 'placeholder', 'value', 'ref', 'title', 'role', 'href',
   'aria-label', 'aria-labelledby', 'autoFocus', 'min', 'max', 'step', 'rows',
 ];
 
@@ -1710,6 +1818,148 @@ const PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST = new Set([
   "src/components/ui/AutoSizeTextarea.jsx|textarea|value=value|ref=ref",
   "src/components/ui/ProseEditor.jsx|textarea|placeholder=placeholder|value=value|ref=ref",
 ]);
+
+// The <a> half, added by #5674. "Anchor" here means the ELEMENT, not the
+// `controlSourceAnchor` string the other two lists are keyed by — the rows are
+// still those strings.
+//
+// It is EMPTY and stays empty: the eight unnamed links the rule exposed (the
+// media lightbox / media card download links, the brain link-row and mood-board
+// "open in new tab" links, the file browser and uploads download links, and the
+// two LoRA source links) were named in the same change rather than seeded here.
+//
+// A link with no accessible name is announced as bare "link" — the destination
+// is exactly what a screen-reader user is choosing between. `title` alone does
+// not fill that gap, for the reasons the icon-only-button rule spells out, so
+// the fix for a new offender is an `aria-label` alongside whatever `title` it
+// already carries — never a row here.
+const PREEXISTING_ANCHOR_NAME_ALLOWLIST = new Set([]);
+
+// --- keyboard activation on non-interactive elements ----------------------
+// A `<button>`/`<a>`/`<input>` activates from the keyboard on its own; a
+// `<div onClick>` does not — it takes no focus and Enter/Space do nothing, so
+// the affordance simply does not exist for a keyboard or screen-reader user.
+// `lib/a11yKeyboard.js`'s `clickableProps(handler)` is the repair (role +
+// tabIndex + an Enter/Space `onKeyDown`), and the tree already follows it
+// everywhere — which is exactly why the convention is worth pinning now, while
+// the rule lands green with no allowlist to erode.
+const CLICKABLE_HOST_TAGS = ['div', 'span', 'li', 'tr', 'td', 'section', 'article'];
+
+// An `onClick` whose entire body is `e.stopPropagation()` is a propagation
+// shim, not an activation target: it exists so a click on a drag handle nested
+// inside a clickable row never reaches the row (goals/GoalsListView.jsx's grip,
+// fableloom/LoomSceneMedia.jsx's `stopNodeActivation`). There is nothing for a
+// keyboard user to activate, and handing it a role plus a tab stop would ADD a
+// dead stop to the tab order.
+const PROPAGATION_SHIM_HANDLER = /^\(?\s*\w*\s*\)?\s*=>\s*\{?\s*\w+\s*\.\s*stopPropagation\(\)\s*;?\s*\}?$/;
+const BARE_IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
+
+// Roles whose keyboard contract does NOT live on the element itself, so a tab
+// stop here would be the defect rather than the fix:
+//   - `presentation`/`none` take the element out of the a11y tree, exactly like
+//     `aria-hidden` — that is how the dismiss scrim under every Modal, Drawer
+//     and command palette is spelled, and the keyboard route out is the owning
+//     component's Esc handler, not a focusable backdrop.
+//   - `option` is focus-managed BY its composite parent (ARIA APG roving focus /
+//     aria-activedescendant): CmdKSearch.jsx's result rows are the worked
+//     example — the input owns the arrow keys and Enter, and making each row
+//     individually tabbable would break that.
+//   - `dialog`/`alertdialog` on a click-to-dismiss surface (media/MediaLightbox)
+//     is closed with Esc.
+// Deliberately only the roles the tree actually renders. The sibling
+// composite-child roles (`tab`, `menuitem`, `treeitem`, `row`, `gridcell`) are
+// the same argument and belong here the day one lands — but seeding them now
+// would exempt a `<div role="tab" onClick>` that has no parent managing focus
+// at all, which is the false negative this list is one bad guess away from.
+// `button` and `link` are excluded permanently: those promise activation ON the
+// element, which is the promise this rule exists to keep.
+const SELF_MANAGED_CLICK_ROLES = new Set([
+  'presentation', 'none', 'dialog', 'alertdialog', 'option',
+]);
+
+// Attribute NAMES written on an opening tag, reading quoted values and brace
+// expressions as opaque. `attributeValue`'s bare regex is right for the paired
+// -id lookups it serves, but a rule whose entire answer is "was this attribute
+// written at all" must not accept `title=" alt="` as an alt — the one shape
+// that would silently exempt the images this guard exists for.
+function tagAttributes(tag) {
+  const names = new Set();
+  // Every SPREAD expression on the tag, concatenated. `clickableProps` only
+  // does anything when its result is spread onto the element, so both narrowings
+  // matter: reading the raw tag would let a `title="clickableProps(x)"` stand in
+  // for spreading it, and reading every brace expression would accept an
+  // `onClick={() => clickableProps(select)}` that builds the props and drops
+  // them on the floor.
+  let spreads = '';
+  for (let i = 0; i < tag.length; i++) {
+    const char = tag[i];
+    if (char === '"' || char === "'" || char === '`') { i = skipString(tag, i); continue; }
+    if (char === '{') {
+      const end = matchingBraceEnd(tag, i);
+      if (end === -1) break;
+      const body = tag.slice(i + 1, end);
+      if (body.trimStart().startsWith('...')) spreads += `${body}\n`;
+      i = end;
+      continue;
+    }
+    const name = /^[A-Za-z_$][\w$:.-]*/.exec(tag.slice(i))?.[0];
+    if (!name) continue;
+    let after = i + name.length;
+    while (/\s/.test(tag[after])) after++;
+    if (tag[after] === '=') names.add(name);
+    i = after - 1;
+  }
+  return { names, spreads };
+}
+
+// The shim written inline, or hoisted to a named `const`/`let`/`var` arrow in
+// the same file. Resolution is by name across the whole file, which is only
+// sound while that name is declared once — two component scopes sharing a
+// `stop` would let one's shim exempt the other's real handler — so a name
+// declared more than once resolves to nothing and the element is reported.
+function isPropagationShim(src, handler) {
+  if (PROPAGATION_SHIM_HANDLER.test(handler)) return true;
+  if (!BARE_IDENTIFIER.test(handler)) return false;
+  const declarations = [...src.matchAll(new RegExp(`\\b(?:const|let|var)\\s+${handler}\\s*=\\s*([^;\\n]+)`, 'g'))];
+  return declarations.length === 1 && PROPAGATION_SHIM_HANDLER.test(declarations[0][1].trim());
+}
+
+function isKeyboardActivatable(src, tag) {
+  const { names, spreads } = tagAttributes(tag);
+  if (!names.has('onClick')) return true;
+  if (isPropagationShim(src, normalizedAttributeValue(attributeValue(tag, 'onClick')) ?? '')) return true;
+  // `clickableProps(` is the canonical spelling.
+  if (/\bclickableProps\s*\(/.test(spreads)) return true;
+  if (normalizedAttributeValue(attributeValue(tag, 'aria-hidden')) === 'true') return true;
+  const role = normalizedAttributeValue(attributeValue(tag, 'role'));
+  if (role !== null && SELF_MANAGED_CLICK_ROLES.has(role)) return true;
+  // The explicit triple is the escape hatch, so a surface with its own ARIA
+  // role is never forced through the helper. A PARTIAL triple is not one — a
+  // `role="button"` with no tab stop is announced as a button the keyboard can
+  // never reach, which is worse than the plain <div> it started as — and
+  // neither is `tabIndex={-1}`, which is programmatic focus only.
+  if (!names.has('role') || !names.has('tabIndex') || !names.has('onKeyDown')) return false;
+  return !(normalizedAttributeValue(attributeValue(tag, 'tabIndex')) ?? '').startsWith('-');
+}
+
+// Every non-interactive element in `src` carrying a mouse-only `onClick`. The
+// rule and its fixture probes both walk this, so a probe asks the rule's own
+// question instead of a copy that can drift green.
+function* mouseOnlyClickables(src) {
+  for (const name of CLICKABLE_HOST_TAGS) {
+    for (const node of forEachOpeningTag(src, name)) {
+      if (!isKeyboardActivatable(src, node.tag)) yield node;
+    }
+  }
+}
+
+// `alt=""` is the correct spelling for a decorative image and must pass, so the
+// rule asks only whether the attribute is written at all — never what it holds.
+function* imagesWithoutAlt(src) {
+  for (const node of forEachOpeningTag(src, 'img')) {
+    if (!tagAttributes(node.tag).names.has('alt')) yield node;
+  }
+}
 
 describe('a11y conventions', () => {
   // Modal.jsx IS the shared implementation; Drawer and Layout use the same
@@ -1887,6 +2137,95 @@ describe('a11y conventions', () => {
     expect(offenders, `Icon-only <button> with no aria-label/aria-labelledby — title alone isn't touch-discoverable and isn't reliably read as the accessible name; see media/MediaCard.jsx's Annotate button for the convention:\n${offenders.join('\n')}`).toEqual([]);
   });
 
+  it('keyboard-activates every clickable non-interactive element', () => {
+    // A mouse-only `onClick` on a <div>/<li>/<tr> is the most common way an
+    // otherwise-accessible view loses its keyboard users: the element never
+    // enters the tab order, so there is no keystroke that reaches the handler
+    // at all. Spread `clickableProps(handler)` from lib/a11yKeyboard.js
+    // alongside the existing onClick (components/IngredientPicker.jsx is the
+    // worked example) — or, for a surface with its own ARIA role, write
+    // role + tabIndex + onKeyDown out in full.
+    const offenders = [];
+    for (const file of trackedJsxFiles()) {
+      const src = maskedSourceOf(file);
+      for (const { name, index } of mouseOnlyClickables(src)) {
+        offenders.push(`${file}:${lineOf(src, index)} <${name}>`);
+      }
+    }
+    expect(offenders, `Non-interactive element with a mouse-only onClick — spread {...clickableProps(handler)} from lib/a11yKeyboard.js (see IngredientPicker.jsx), or write role + tabIndex + onKeyDown in full:\n${offenders.join('\n')}`).toEqual([]);
+  });
+
+  it('gives every <img> an alt attribute', () => {
+    // An <img> with no `alt` is announced by its src — a hashed filename or a
+    // blob URL — where an empty `alt=""` correctly removes a decorative image
+    // from the a11y tree entirely. Both are one keystroke apart, and only the
+    // omission is a bug, so the rule requires the attribute and says nothing
+    // about its value.
+    const offenders = [];
+    for (const file of trackedJsxFiles()) {
+      const src = maskedSourceOf(file);
+      for (const { index } of imagesWithoutAlt(src)) offenders.push(`${file}:${lineOf(src, index)}`);
+    }
+    expect(offenders, `<img> without an alt attribute — describe the image, or write alt="" if it is decorative:\n${offenders.join('\n')}`).toEqual([]);
+  });
+
+  it('reads activation and alt off the tag itself, and not out of a comment', () => {
+    // Both rules above are green against the whole tree, so nothing in the tree
+    // pins what they actually reject. These fixtures do: one probe per branch,
+    // so neither rule can go vacuously green.
+    const clickables = (src) => [...mouseOnlyClickables(src)].map(({ name }) => name);
+
+    expect(clickables('<div onClick={select}>Pick</div>')).toEqual(['div']);
+    expect(clickables('<div onClick={select} {...clickableProps(select)}>Pick</div>')).toEqual([]);
+    expect(clickables('<li onClick={select} role="option" tabIndex={0} onKeyDown={onKey}>Pick</li>')).toEqual([]);
+    expect(clickables('<div onClick={e => e.stopPropagation()}><GripVertical /></div>')).toEqual([]);
+    // The same shim hoisted to a named const — resolved out of the source, not
+    // pattern-matched off the tag, so `onClick={stopNodeActivation}` is not read
+    // as a real clickable.
+    expect(clickables('const stop = (event) => event.stopPropagation();\n<div onClick={stop}><Grip /></div>')).toEqual([]);
+    // …but a named handler that is NOT a shim stays reported, or the branch
+    // above would exempt every clickable that hoists its handler.
+    expect(clickables('const stop = (event) => onSelect(event);\n<div onClick={stop}>Pick</div>')).toEqual(['div']);
+    // A scrim is outside the a11y tree and dismissed with Esc by its owner;
+    // giving it a tab stop would put focus on an element AT is told to ignore.
+    expect(clickables('<div className="fixed inset-0" onClick={close} aria-hidden="true" />')).toEqual([]);
+    // A composite-widget row is focus-managed by its parent (ARIA APG), and a
+    // click-to-dismiss dialog surface closes on Esc.
+    expect(clickables('<div onClick={dispatch} role="option" aria-selected={focused}>Go</div>')).toEqual([]);
+    expect(clickables('<div role="dialog" aria-modal="true" onClick={onClose}>…</div>')).toEqual([]);
+    // A partial triple is not the escape hatch — a role with no tab stop is
+    // announced as a button the keyboard can never reach.
+    expect(clickables('<div onClick={select} role="button">Pick</div>')).toEqual(['div']);
+    // …and neither is a full triple whose tab stop is programmatic-focus-only.
+    expect(clickables('<div onClick={select} role="button" tabIndex={-1} onKeyDown={onKey}>Pick</div>')).toEqual(['div']);
+    // A <button> activates itself; reporting one would make the rule noise.
+    expect(clickables('<button onClick={select}>Pick</button>')).toEqual([]);
+
+    // Every exemption is read off attribute NAMES and SPREAD expressions, never
+    // off the raw tag text, so nothing quoted can forge one. Without this the
+    // rules are one stray string away from exempting the elements they exist
+    // for — and the string would be invisible in review.
+    expect(clickables('<div onClick={select} title="clickableProps(select)">Pick</div>')).toEqual(['div']);
+    // Nor can building the props without spreading them onto the element.
+    expect(clickables('<div onClick={() => clickableProps(select)}>Pick</div>')).toEqual(['div']);
+    expect(clickables('<div onClick={select} title=" role= tabIndex= onKeyDown=">Pick</div>')).toEqual(['div']);
+    // A name declared twice resolves to no shim: one component's
+    // `e.stopPropagation()` must not exempt another's real handler.
+    expect(clickables('const stop = (e) => e.stopPropagation();\nconst stop = (e) => onSelect(e);\n<div onClick={stop}>Pick</div>')).toEqual(['div']);
+
+    const unaltered = (src) => [...imagesWithoutAlt(src)].length;
+    expect(unaltered('<img src={url} className="w-8" />')).toBe(1);
+    expect(unaltered('<img src={url} alt="" />')).toBe(0);
+    expect(unaltered('<img src={url} alt={caption} />')).toBe(0);
+    expect(unaltered('<img src={url} title=" alt=" />')).toBe(1);
+
+    // Both rules read MASKED source, so a JSX example written in a comment —
+    // the shape lib/a11yKeyboard.js's own usage docblock is written in — cannot
+    // fail the suite.
+    expect(unaltered(maskComments('// <img src={url} />'))).toBe(0);
+    expect(clickables(maskComments('// <div onClick={select}>Pick</div>'))).toEqual([]);
+  });
+
   // Every rule below asks the same question of every tracked file and differs
   // only in which tag it asks about and which direction it compares the answer
   // against the allowlist, so they share one scan per tag. Two copies would each
@@ -1900,7 +2239,7 @@ describe('a11y conventions', () => {
     for (const file of trackedJsxFiles()) {
       const scanSrc = maskedSourceOf(file);
       for (const node of forEachOpeningTag(scanSrc, tagName)) {
-        if (hasAccessibleControlName(scanSrc, node.tag, node.index, tagName, file)) continue;
+        if (hasAccessibleControlName(scanSrc, node, tagName, file)) continue;
         anchors.add(controlSourceAnchor(file, scanSrc, node, tagName));
       }
     }
@@ -1911,19 +2250,27 @@ describe('a11y conventions', () => {
   // One rule per tag rather than one merged rule, so a failure names the tag
   // and each backlog burns down on its own schedule. `<select>` and `<textarea>`
   // share an allowlist because they were seeded together by the same widening.
+  //
+  // `remedy` rides on the rule rather than being spelled inline, because the fix
+  // is not the same for every tag: a form control wants a `<label>`, and a link
+  // wants its own text — an `aria-label` is the fallback for both, and telling
+  // someone to put a `<label>` on an anchor is advice that does not work.
   const CONTROL_NAME_RULES = [
-    { tag: 'input', listName: 'PREEXISTING_INPUT_NAME_ALLOWLIST', allowlist: PREEXISTING_INPUT_NAME_ALLOWLIST, issue: '#4297' },
-    { tag: 'select', listName: 'PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST', allowlist: PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST, issue: '#4309' },
-    { tag: 'textarea', listName: 'PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST', allowlist: PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST, issue: '#4309' },
+    { tag: 'input', listName: 'PREEXISTING_INPUT_NAME_ALLOWLIST', allowlist: PREEXISTING_INPUT_NAME_ALLOWLIST, issue: '#4297', remedy: 'add aria-label/aria-labelledby or an explicit/implicit <label>, or exclude type="hidden"' },
+    { tag: 'select', listName: 'PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST', allowlist: PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST, issue: '#4309', remedy: 'add aria-label/aria-labelledby or an explicit/implicit <label>' },
+    { tag: 'textarea', listName: 'PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST', allowlist: PREEXISTING_SELECT_TEXTAREA_NAME_ALLOWLIST, issue: '#4309', remedy: 'add aria-label/aria-labelledby or an explicit/implicit <label>' },
+    { tag: 'a', listName: 'PREEXISTING_ANCHOR_NAME_ALLOWLIST', allowlist: PREEXISTING_ANCHOR_NAME_ALLOWLIST, issue: '#5674', remedy: 'an icon-only link is announced as bare "link" — give it visible text or an aria-label naming the destination; a title alone is not read as the accessible name, and an aria-hidden icon leaves the name empty' },
   ];
 
-  for (const { tag, listName, allowlist, issue } of CONTROL_NAME_RULES) {
+  for (const { tag, listName, allowlist, issue, remedy } of CONTROL_NAME_RULES) {
     it(`gives every <${tag}> an accessible name`, () => {
-      // A control with no name is announced as bare "edit text" / "combo box".
-      // Prefer a paired `<label htmlFor>`; aria-label is for the compact rows
-      // (peer management, inline filters) where a visible label breaks layout.
+      // A control with no name is announced as bare "edit text" / "combo box",
+      // and a link with no name as bare "link". Prefer the name the element
+      // already renders — a paired `<label htmlFor>`, or the anchor's own text;
+      // aria-label is for the compact rows (peer management, inline filters,
+      // icon-only action links) where visible text breaks the layout.
       const offenders = [...unnamedControlAnchors(tag)].filter((anchor) => !allowlist.has(anchor));
-      expect(offenders, `<${tag}> without an accessible name — add aria-label/aria-labelledby or an explicit/implicit <label>${tag === 'input' ? ', or exclude type="hidden"' : ''}:\n${offenders.join('\n')}`).toEqual([]);
+      expect(offenders, `<${tag}> without an accessible name — ${remedy}:\n${offenders.join('\n')}`).toEqual([]);
     });
 
     it(`keeps no stale <${tag}> entries in ${listName} (${issue})`, () => {
@@ -1944,9 +2291,12 @@ describe('a11y conventions', () => {
   // way a call site's would. Only the directory matters — the file itself need
   // not exist.
   const FIXTURE_HOST = 'src/components/settings/FixtureHost.jsx';
+  // Reads the control off the same tag index the real scan walks, so a fixture
+  // asks the recognizer exactly the question a tracked file would — and the
+  // node carries the `matchingClose` the <a> branch reads its body from.
   const isNamed = (src, tagName = 'input', file = FIXTURE_HOST) => {
-    const index = src.indexOf(`<${tagName}`);
-    return hasAccessibleControlName(src, openingTagAt(src, index), index, tagName, file);
+    const [node] = forEachOpeningTag(src, tagName);
+    return node !== undefined && hasAccessibleControlName(src, node, tagName, file);
   };
   // The id-keyed half of the same question: is a control carrying this `id`
   // named by one of the wrappers the source renders? These fixtures declare
@@ -1976,6 +2326,59 @@ describe('a11y conventions', () => {
     expect(isNamed('<input type="hidden" value={token} />', 'input')).toBe(true);
     expect(isNamed('<select type="hidden" value={sort} />', 'select')).toBe(false);
     expect(isNamed('<textarea type="submit" value="Send" />', 'textarea')).toBe(false);
+  });
+
+  it('reads a name for <a> from its own content, and from nothing else', () => {
+    // The <a> rule (#5674) rests on a recognizer no other tag uses: a link
+    // names itself from what it renders. Both directions have to be pinned or
+    // the rule goes vacuous in whichever one drifts — credit everything and it
+    // never reports the icon-only links it exists for; credit nothing and it
+    // floods with every ordinary text link in the tree, which is the failure
+    // that would get it deleted.
+    expect(isNamed('<a href={url}>Open in Jira</a>', 'a')).toBe(true);
+    expect(isNamed('<a href={url}>{label}</a>', 'a')).toBe(true);
+    expect(isNamed('<a href={url} aria-label="Download"><Download size={14} /></a>', 'a')).toBe(true);
+    expect(isNamed('<a href={url} title="Download"><Download size={14} /></a>', 'a')).toBe(false);
+    expect(isNamed('<a href={url}><Download size={14} /></a>', 'a')).toBe(false);
+
+    // `title` is a hover affordance, not the accessible name — the same reason
+    // the icon-only-button rule refuses it. Asserted rather than assumed,
+    // because seven of the eight anchors #5674 named already carried one, and a
+    // recognizer that credited `title` would have reported none of them.
+    expect(isNamed('<a href={url} title="Open on Civitai"><ExternalLink /></a>', 'a')).toBe(false);
+
+    // A thumbnail link is named by its image's alt — bolting an aria-label onto
+    // one would OVERRIDE that alt, so crediting it is what keeps the rule from
+    // driving a regression. An empty/absent alt names nothing.
+    expect(isNamed('<a href={url}><img src={src} alt={caption} /></a>', 'a')).toBe(true);
+    expect(isNamed('<a href={url}><img src={src} alt="Cover art" /></a>', 'a')).toBe(true);
+    expect(isNamed('<a href={url}><img src={src} alt="" /></a>', 'a')).toBe(false);
+    expect(isNamed('<a href={url}><img src={src} /></a>', 'a')).toBe(false);
+
+    // …but only where HTML says `alt` names anything. On a <div> the browser
+    // ignores it outright, and on a component nothing proves it is forwarded to
+    // an image — crediting either would exempt an unnamed link on the strength
+    // of inert markup.
+    expect(isNamed('<a href={url}><div alt="Cover art" /></a>', 'a')).toBe(false);
+    expect(isNamed('<a href={url}><Thumb alt="Cover art" /></a>', 'a')).toBe(false);
+
+    // An anchor wrapping a component THIS FILE declares is named by what that
+    // component renders, so an aria-label here would replace a whole card's
+    // text with a terser name. The discriminator is text, not componentness:
+    // every link this rule exists to catch wraps an imported icon, and a
+    // file-local icon wrapper is credited no more than an imported one.
+    const localCard = 'function Card({ t }) {\n  return (<div><span>{t.key}</span></div>);\n}\n';
+    const localIcon = 'function IconOnly() {\n  return (<Download size={14} />);\n}\n';
+    expect(isNamed(`${localCard}<a href={url}><Card t={t} /></a>`, 'a')).toBe(true);
+    expect(isNamed(`${localIcon}<a href={url}><IconOnly /></a>`, 'a')).toBe(false);
+
+    // An aria-hidden child is removed from the name computation, so an anchor
+    // whose ONLY content is hidden computes an empty name — worse than the
+    // title-only shape, and invisible to a check that merely asked "does this
+    // anchor have children".
+    expect(isNamed('<a href={url} title="Open board"><ExternalLink aria-hidden="true" /></a>', 'a')).toBe(false);
+    expect(isNamed('<a href={url}><img src={src} alt="Cover" aria-hidden="true" /></a>', 'a')).toBe(false);
+    expect(isNamed('<a href={url}><span aria-hidden="true">→</span>Next page</a>', 'a')).toBe(true);
   });
 
   it('masks JSX examples written in comments after an expression-rendered list', () => {
@@ -2861,5 +3264,59 @@ describe('a11y conventions', () => {
       }
     }
     expect(offenders, `Close button under the 44px touch-target minimum — add min-h-[44px] min-w-[44px] + flex items-center justify-center (see Drawer.jsx:106):\n${offenders.join('\n')}`).toEqual([]);
+  });
+
+  it("meets the 44px touch-target minimum on the MeatSpace log-row icon buttons (#5703)", () => {
+    // The MeatSpace tabs are the app's most phone-centric surface — a drink or
+    // a nicotine entry is logged one-handed — and their inline row controls
+    // kept shipping as a bare `p-1`/`p-1.5` around a 12-14px icon: a 22-26px
+    // target, half the floor everywhere else. Save and Cancel sit adjacent in
+    // the edit rows, so a mis-tap commits or discards the wrong edit.
+    //
+    // The fix grows the invisible box (`min-h-[44px] min-w-[44px]` +
+    // `inline-flex items-center justify-center`), never the icon: icon size is
+    // what sets the log row's density, and growing it would reflow the tables.
+    //
+    // Two scopings, both deliberate. `components/meatspace/` rather than the
+    // whole tree: the same shape survives in a handful of desktop-first views,
+    // and widening here would turn one regression guard into a tree-wide sweep.
+    // And only the `p-0.5`/`p-1`/`p-1.5` shape, rather than every icon button
+    // missing an explicit min: one that reaches 44px through generous padding
+    // (`p-3` around a 20px glyph), or that carries no padding class at all, is a
+    // different question, and folding it in would make the guard report dozens
+    // of controls this change never looked at.
+    const TIGHT_PADDING = /(?:^|\s)p-(?:0\.5|1|1\.5)(?:\s|$)/;
+    const offendersIn = (file, src) => {
+      const out = [];
+      for (const node of forEachOpeningTag(src, "button")) {
+        if (!isIconOnlyButton(src, node)) continue;
+        const cls = node.tag.match(/className\s*=\s*"([^"]*)"/);
+        if (!cls) continue; // dynamic className — reviewed by hand, not scanned here
+        if (!TIGHT_PADDING.test(cls[1])) continue;
+        if (hasFortyFourMinTouchTarget(cls[1])) continue;
+        out.push(`${file}:${lineOf(src, node.index)}`);
+      }
+      return out;
+    };
+
+    // Probe first: a green run has to mean "no offenders", not "the matcher
+    // stopped recognizing the shape it was written for".
+    const probe = (cls) => offendersIn("probe.jsx", `<button aria-label="Save" className="${cls}"><Check size={14} /></button>`);
+    expect(probe("p-1 text-port-success")).toEqual(["probe.jsx:1"]);
+    expect(probe("min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1")).toEqual([]);
+    // …and that the padding scoping is a scoping, not an accident: a roomier
+    // button is out of this rule's remit even though it declares no min either.
+    expect(probe("p-2 text-port-success")).toEqual([]);
+
+    // The prefix is `trackedJsxFiles()`'s path shape (`git ls-files src` run
+    // from client/), not this file's location — assert the filter really
+    // selected the tree, so a change to the walker's path shape fails loudly
+    // here instead of turning the rule into a vacuous pass over zero files.
+    const scanned = trackedJsxFiles().filter((file) => file.startsWith("src/components/meatspace/"));
+    expect(scanned.length, "no MeatSpace sources matched — has trackedJsxFiles() changed its path shape?").toBeGreaterThan(20);
+
+    const offenders = [];
+    for (const file of scanned) offenders.push(...offendersIn(file, rawSourceOf(file)));
+    expect(offenders, `MeatSpace icon-only <button> under the 44px touch-target minimum — add min-h-[44px] min-w-[44px] inline-flex items-center justify-center and leave the icon size alone:\n${offenders.join("\n")}`).toEqual([]);
   });
 });

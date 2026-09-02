@@ -15,6 +15,7 @@
 import { join } from 'node:path';
 import { z } from 'zod';
 import { PATHS, atomicWrite } from '../../lib/fileUtils.js';
+import { renderTimingFields } from '../../lib/renderTiming.js';
 import { FEDERATED_MEDIA_WIRE_VERSION } from '../../lib/federatedMediaWire.js';
 import {
   federatedMediaImageJobSubmissionBaseSchema,
@@ -62,7 +63,7 @@ const executor = createRemoteMediaExecutor({
   // filename is the same shape imageGen/local.js uses, which is what lets the
   // gallery, the media index, and the provider-side result guard all agree.
   resolveDestination: ({ jobId }) => ({ dir: PATHS.images, filename: `${jobId}.png` }),
-  async finalize({ jobId, dir, filename, request, remoteJob, peerId }) {
+  async finalize({ jobId, dir, filename, request, remoteJob, peerId, renderStartedAtMs }) {
     // Honest sidecar: only fields this render actually had. Seed is the
     // requested one (wire-v1 results carry no rendered seed), so a render that
     // did not pin one records null rather than inventing a number the peer
@@ -83,6 +84,7 @@ const executor = createRemoteMediaExecutor({
       federatedPeerId: peerId,
       federatedJobId: remoteJob.id,
       createdAt: new Date().toISOString(),
+      ...renderTimingFields(renderStartedAtMs),
     };
     await atomicWrite(join(dir, `${jobId}.metadata.json`), meta);
     return {

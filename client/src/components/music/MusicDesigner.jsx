@@ -34,6 +34,7 @@ import TabPills from '../ui/TabPills';
 import toast from '../ui/Toast';
 import useMounted from '../../hooks/useMounted';
 import useProviderModels from '../../hooks/useProviderModels';
+import { safeReadStorage, safeRemoveStorage, safeWriteStorage } from '../../lib/safeStorage.js';
 import {
   createTrack, describeMusic, generateLyrics, getSettings, getTrack, updateSettings, updateTrack,
 } from '../../services/api';
@@ -66,7 +67,7 @@ export default function MusicDesigner() {
   const [searchParams] = useSearchParams();
   const mountedRef = useMounted();
   const requestedTrackId = searchParams.get('trackId') || '';
-  const storedDraftId = requestedTrackId || window.localStorage.getItem(ACTIVE_DRAFT_KEY) || '';
+  const storedDraftId = requestedTrackId || safeReadStorage(ACTIVE_DRAFT_KEY) || '';
 
   // Wizard text — lifted here so MusicGenPanel (which never writes back to
   // prompt/lyrics) can be re-hosted under step 4 unchanged, and so edits
@@ -100,8 +101,8 @@ export default function MusicDesigner() {
 
   const hydrateDraft = (track) => {
     setTrackId(track.id);
-    if (track.title === DRAFT_TITLE) window.localStorage.setItem(ACTIVE_DRAFT_KEY, track.id);
-    else if (window.localStorage.getItem(ACTIVE_DRAFT_KEY) === track.id) window.localStorage.removeItem(ACTIVE_DRAFT_KEY);
+    if (track.title === DRAFT_TITLE) safeWriteStorage(ACTIVE_DRAFT_KEY, track.id);
+    else if (safeReadStorage(ACTIVE_DRAFT_KEY) === track.id) safeRemoveStorage(ACTIVE_DRAFT_KEY);
     setConcept(track.concept || '');
     setDescription(track.prompt || '');
     setLyrics(track.lyrics || '');
@@ -495,17 +496,6 @@ export default function MusicDesigner() {
               </button>
             )}
           </div>
-          <div className="rounded border border-port-border bg-port-bg/60 p-3 text-xs text-gray-400">
-            <p className="mb-2 font-medium text-gray-300">Manual composition structure</p>
-            <p className="mb-2">Put one section tag on its own line, then begin its singable words on the next line. A useful arc is: intro → verse → pre-chorus → chorus → verse 2 → chorus → bridge → final chorus → outro.</p>
-            <ul className="mb-3 list-disc space-y-1 pl-4">
-              <li>Use 4–8 short lines for a verse and 2–4 lines for a pre-chorus or bridge.</li>
-              <li>Give the chorus a repeated hook; repeat the tag when the chorus returns.</li>
-              <li>Use tags such as <code className="text-gray-300">[instrumental]</code> and <code className="text-gray-300">[solo]</code> for wordless sections; keep tempo, meter, and production direction in the description.</li>
-              <li>Include enough sections for the intended duration—MiniMax can end early when the lyric structure runs out.</li>
-            </ul>
-            <pre className="overflow-x-auto rounded bg-port-bg p-2 font-mono text-[11px] text-gray-300">{`[verse]\nShort image, short line\nA second line to sing\n\n[pre-chorus]\nBuild the thought\nTurn toward the hook\n\n[chorus]\nA repeatable hook\nA repeatable hook`}</pre>
-          </div>
           <label htmlFor="music-designer-lyrics" className="block">
             <span className={LABEL_CLASS}>Lyrics</span>
             <textarea
@@ -528,11 +518,42 @@ export default function MusicDesigner() {
               On the render step, enable Instrumental only to prohibit wordless or background vocals too.
             </p>
           )}
+          <details className="rounded border border-port-border bg-port-bg/60 p-3 text-xs text-gray-400">
+            <summary className="cursor-pointer font-medium text-gray-300">Manual composition structure</summary>
+            <div className="pt-2">
+              <p className="mb-2">Put one section tag on its own line, then begin its singable words on the next line. A useful arc is: intro → verse → pre-chorus → chorus → verse 2 → chorus → bridge → final chorus → outro.</p>
+              <ul className="mb-3 list-disc space-y-1 pl-4">
+                <li>Use 4–8 short lines for a verse and 2–4 lines for a pre-chorus or bridge.</li>
+                <li>Give the chorus a repeated hook; repeat the tag when the chorus returns.</li>
+                <li>Use tags such as <code className="text-gray-300">[instrumental]</code> and <code className="text-gray-300">[solo]</code> for wordless sections; keep tempo, meter, and production direction in the description.</li>
+                <li>Include enough sections for the intended duration—MiniMax can end early when the lyric structure runs out.</li>
+              </ul>
+              <pre className="overflow-x-auto rounded bg-port-bg p-2 font-mono text-[11px] text-gray-300">{`[verse]\nShort image, short line\nA second line to sing\n\n[pre-chorus]\nBuild the thought\nTurn toward the hook\n\n[chorus]\nA repeatable hook\nA repeatable hook`}</pre>
+            </div>
+          </details>
         </div>
       )}
 
       {step === 'render' && (
         <div className="space-y-4">
+          <label htmlFor="music-designer-render-prompt" className="block">
+            <span className={LABEL_CLASS}>Prompt for this render</span>
+            <textarea
+              id="music-designer-render-prompt"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              onBlur={() => saveDraft({ prompt: description.trim() })}
+              disabled={draftLoading}
+              rows={6}
+              maxLength={8000}
+              placeholder={'Describe the sound, arrangement, vocals, instruments, mood, and production direction…'}
+              aria-describedby="music-designer-render-prompt-hint"
+              className={FIELD_CLASS}
+            />
+            <span id="music-designer-render-prompt-hint" className="mt-1 block text-xs text-gray-500">
+              Required. This editable description is the prompt sent to the selected audio engine.
+            </span>
+          </label>
           <label htmlFor="music-designer-title" className="block">
             <span className={LABEL_CLASS}>Title (optional)</span>
             <input
@@ -541,8 +562,8 @@ export default function MusicDesigner() {
               onChange={(event) => setTitle(event.target.value)}
               onBlur={() => {
                 const nextTitle = title.trim() || DRAFT_TITLE;
-                if (title.trim()) window.localStorage.removeItem(ACTIVE_DRAFT_KEY);
-                else window.localStorage.setItem(ACTIVE_DRAFT_KEY, trackId);
+                if (title.trim()) safeRemoveStorage(ACTIVE_DRAFT_KEY);
+                else safeWriteStorage(ACTIVE_DRAFT_KEY, trackId);
                 saveDraft({ title: nextTitle });
               }}
               disabled={!draftReady}

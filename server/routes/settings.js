@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { getSettings, updateSettingsWith } from '../services/settings.js';
 import { getAiAssignments, updateAiAssignment } from '../services/aiAssignments.js';
 import { saveSubscriptionCosts } from '../services/subscriptionCosts.js';
+import { saveApiBilledInstanceIds } from '../services/usageFleetBilling.js';
 import {
   setCodexParallelLimit,
   CODEX_PARALLEL_MIN,
@@ -11,14 +12,15 @@ import {
 } from '../services/mediaJobQueue/index.js';
 import { assertMediaRoutingConfig } from '../services/federatedMedia/routingPolicy.js';
 import { assertConfiguredEidoverseInstalled, getInstanceFeatures, updateEidoverseWorldsRepo, updateEidoverseWorldsSource, updateInstanceFeature } from '../services/instanceFeatures.js';
+import { getCredentialInventory } from '../services/credentialInventory.js';
 import { installEidoverse } from '../services/eidoverse.js';
 import { ensureEidoverseHost } from '../services/eidoverseHost.js';
-import { isGitHubRepoUrl } from '../lib/githubRepoUrl.js';
+import { isGitHubRepoUrl } from '../lib/repoUrl.js';
 import { asyncHandler } from '../lib/errorHandler.js';
 import { isPlainObject } from '../lib/objects.js';
 import { agentContextSettingsSchema } from '../lib/agentContextValidation.js';
 import { EFFORT_LEVELS } from '../lib/providerModels.js';
-import { backupConfigSchema, sharingSettingsPatchSchema, featureProviderConfigSchema, autofixerSettingsSchema, codeReviewSettingsSchema, locationSettingsSchema, settingsEmbeddingsSchema, localLlmSettingsSchema, openWorldSnapshotConfigSchema, imessageConfigSchema, signalConfigSchema, spotifyConfigSchema, youtubeConfigSchema, apiAccessSettingsSchema, instanceFeatureSettingsSchema, instanceFeatureIdSchema, instanceFeatureUpdateSchema, loraTrainingConfigSchema, pipelineEditorialChecksSettingsSchema, creativeDirectorSettingsSchema, musicSettingsSchema, federationSettingsSchema, privacySettingsSchema, seriesAutopilotSettingsSchema, layeredIntelligenceSettingsSchema, imageGenGrokSettingsSchema, imageGenAgySettingsSchema, renderDefaultsSettingsSchema, videoGenSettingsSchema, subscriptionCostsMapSchema, validateRequest } from '../lib/validation.js';
+import { backupConfigSchema, sharingSettingsPatchSchema, featureProviderConfigSchema, autofixerSettingsSchema, codeReviewSettingsSchema, locationSettingsSchema, settingsEmbeddingsSchema, localLlmSettingsSchema, imessageConfigSchema, signalConfigSchema, spotifyConfigSchema, youtubeConfigSchema, apiAccessSettingsSchema, instanceFeatureSettingsSchema, instanceFeatureIdSchema, instanceFeatureUpdateSchema, loraTrainingConfigSchema, pipelineEditorialChecksSettingsSchema, creativeDirectorSettingsSchema, musicSettingsSchema, federationSettingsSchema, privacySettingsSchema, seriesAutopilotSettingsSchema, layeredIntelligenceSettingsSchema, imageGenGrokSettingsSchema, imageGenAgySettingsSchema, renderDefaultsSettingsSchema, videoGenSettingsSchema, subscriptionCostsMapSchema, usageApiBilledInstanceIdsSchema, validateRequest } from '../lib/validation.js';
 
 const router = Router();
 
@@ -168,6 +170,13 @@ router.get('/features', asyncHandler(async (_req, res) => {
   res.json(await getInstanceFeatures());
 }));
 
+// GET /api/settings/credentials
+// Presence + source only. Never a value or masked prefix — the page links out
+// to the existing per-integration tab to enter a secret.
+router.get('/credentials', asyncHandler(async (_req, res) => {
+  res.json(await getCredentialInventory());
+}));
+
 // POST /api/settings/features/eidoverse/install
 // Explicit consent boundary: no Eidoverse checkout or dependency install occurs
 // until the user presses Install in Settings > Features.
@@ -269,17 +278,6 @@ router.put('/', asyncHandler(async (req, res) => {
   if (req.body?.localLlm !== undefined) {
     validateRequest(localLlmSettingsSchema, req.body.localLlm);
   }
-  // OpenWorld snapshot capture config — validate the slice when present so a
-  // malformed interval/cap can't reach disk and break the scheduler.
-  if (req.body?.openWorldSnapshots !== undefined) {
-    validateRequest(openWorldSnapshotConfigSchema.partial(), req.body.openWorldSnapshots);
-  }
-  // The settings slice predates the OpenWorld rename. Keep accepting the old
-  // property so an older client can still update capture settings safely.
-  const legacySnapshotSettingsKey = ['city', 'Snapshots'].join('');
-  if (req.body?.[legacySnapshotSettingsKey] !== undefined) {
-    validateRequest(openWorldSnapshotConfigSchema.partial(), req.body[legacySnapshotSettingsKey]);
-  }
   // iMessage ingestion config (#2151) — validate the slice when present so a
   // malformed enabled/interval can't reach disk and break the sync scheduler.
   if (req.body?.imessage !== undefined) {
@@ -375,6 +373,11 @@ router.put('/', asyncHandler(async (req, res) => {
   if (req.body?.subscriptionCosts !== undefined) {
     validateRequest(subscriptionCostsMapSchema, req.body.subscriptionCosts);
   }
+  // Same schema PUT /api/usage/fleet-billing's store uses, so a restore dump
+  // can't write an unbounded or non-string list through the generic endpoint.
+  if (req.body?.usageApiBilledInstanceIds !== undefined) {
+    validateRequest(usageApiBilledInstanceIdsSchema, req.body.usageApiBilledInstanceIds);
+  }
   // User-defined catalog types moved out of settings.json into PostgreSQL
   // (`catalog_user_types`, #1001). The `/api/catalog/types` routes are the only
   // write path; a `catalogUserTypes` key in a PUT /api/settings body (legacy
@@ -387,24 +390,38 @@ router.put('/', asyncHandler(async (req, res) => {
   // would bypass the current-password proof the /api/auth/password routes
   // require. Secrets are write-only through their dedicated routes
   // (/api/auth/password, /api/github/secrets, etc.).
-  // subscriptionCosts is excluded from the generic shallow spread below and
-  // routed through the same per-family merge PUT /api/usage/subscriptions
-  // uses (saveSubscriptionCosts) — a shallow `{ ...current, ...settingsPatch }`
-  // would replace the whole map, silently dropping any family the incoming
-  // patch didn't mention.
-  const { secrets: _ignoredSecrets, catalogUserTypes: _ignoredTypes, subscriptionCosts: subscriptionCostsPatch, ...settingsPatch } = req.body || {};
+  // subscriptionCosts and usageApiBilledInstanceIds are excluded from the
+  // generic shallow spread below and routed through their dedicated savers —
+  // the same merge PUT /api/usage/subscriptions and PUT /api/usage/fleet-billing
+  // use — so a restore dump can't persist an unvalidated slice, and a shallow
+  // `{ ...current, ...settingsPatch }` can't replace a map by dropping keys
+  // the incoming patch didn't mention.
+  const {
+    secrets: _ignoredSecrets,
+    catalogUserTypes: _ignoredTypes,
+    subscriptionCosts: subscriptionCostsPatch,
+    usageApiBilledInstanceIds: apiBilledPatch,
+    ...settingsPatch
+  } = req.body || {};
   // updateSettingsWith (not updateSettings) so the multi-owner `federation`
   // slice merges per sub-key and persisted write-only tokens the incoming patch
   // omits get re-injected — both against the freshest snapshot inside the write
   // queue (see mergeFederationSlice / preserveExternallyOwnedKeys).
+  // `actor: 'user'` is what separates a save made HERE — a human on the Settings
+  // page — from every other `save()` caller (schedulers, sync hooks, feature
+  // writes), which keep the `'system'` default in the operator-action ledger (#5594).
   let merged = await updateSettingsWith((current) =>
     preserveExternallyOwnedKeys(
       mergeFederationSlice({ ...current, ...settingsPatch }, current),
       current,
-    ));
+    ), { actor: 'user' });
   if (subscriptionCostsPatch !== undefined) {
-    const costs = await saveSubscriptionCosts(subscriptionCostsPatch);
+    const costs = await saveSubscriptionCosts(subscriptionCostsPatch, { actor: 'user' });
     merged = { ...merged, subscriptionCosts: costs };
+  }
+  if (apiBilledPatch !== undefined) {
+    const ids = await saveApiBilledInstanceIds(apiBilledPatch, { actor: 'user' });
+    merged = { ...merged, usageApiBilledInstanceIds: ids };
   }
   // The queue caches codex.parallelLimit in-process; sync it from the
   // merged value so a save takes effect without a restart and without

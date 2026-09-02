@@ -6,6 +6,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { EventEmitter } from 'events';
+import { ChildProcess } from '../../lib/childProcess.js';
 
 // Spawn mock — capture every spawn call so tests can assert args, drive
 // stdout/stderr, capture the stdin-delivered prompt, and trigger the close
@@ -15,6 +16,10 @@ import { EventEmitter } from 'events';
 const spawnCalls = [];
 const makeFakeChild = () => {
   const child = new EventEmitter();
+  // killProcessTree tells a spawned child from a node-pty session by
+  // `instanceof ChildProcess` (a pty takes a different kill shape), so the fake
+  // has to carry the prototype the way a real spawn() result does.
+  Object.setPrototypeOf(child, ChildProcess.prototype);
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.stdin = { written: '', on: vi.fn(), write: vi.fn(function (s) { child.stdin.written += s; }), end: vi.fn() };
@@ -278,6 +283,14 @@ describe('grok provider — directed-path harvest', () => {
     // Sidecar metadata exists too.
     const sidecar = join(FAKE_IMAGES_DIR, `${job.generationId}.metadata.json`);
     expect(existsSync(sidecar)).toBe(true);
+    // …and carries this render's own wall-clock cost (#5878), which is what the
+    // gallery card humanizes. The span is bounded by `createdAt`→`now` rather
+    // than asserted against a literal, so this stays a contract test and not a
+    // timing flake.
+    const meta = JSON.parse(await readFile(sidecar, 'utf8'));
+    expect(meta.renderMs).toBeGreaterThanOrEqual(0);
+    expect(Date.parse(meta.renderStartedAt)).toBeLessThanOrEqual(Date.parse(meta.renderCompletedAt));
+    expect(Date.parse(meta.renderCompletedAt) - Date.parse(meta.renderStartedAt)).toBe(meta.renderMs);
   });
 
   it('transcodes a staged JPEG to PNG instead of shipping mislabeled bytes', async () => {

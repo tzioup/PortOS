@@ -20,6 +20,7 @@ import {
   isFederatedMediaAudioPrompt,
 } from './federatedMediaWire.js';
 import { isPlainObject } from './objects.js';
+import { USER_ACTION_ACTORS, USER_ACTION_TYPES } from './userActionTypes.js';
 
 // gpt-image-2 (codex backend) caps at 3840px per edge and 8,294,400 total
 // pixels. Mirror the ceiling for every image-gen route. Local mflux can
@@ -531,7 +532,7 @@ export const providerSchema = z.object({
   orcarouterBacked: z.boolean().optional(),
   // Explicit opt-in to attach the API key to an arbitrary (non-local,
   // non-allowlisted) endpoint — mirrors the aiToolkit providerSchema. Guards
-  // SSRF / key exfiltration (server/lib/aiToolkit/internal/endpointGuard.js).
+  // SSRF / key exfiltration (server/lib/aiToolkit/endpointGuard.js).
   allowCustomEndpoint: z.boolean().optional(),
   envVars: z.record(z.string()).optional(),
   headlessArgs: z.array(z.string()).optional(),
@@ -548,6 +549,19 @@ export const providerVisionTestSchema = z.object({
     z.array(z.string().trim().min(1).max(128)).max(50),
   ]).optional()),
   model: z.preprocess(emptyToUndefined, z.string().trim().min(1).max(256).optional()),
+});
+
+// POST /api/providers/codex/account/login/cancel. The id is minted by the Codex
+// app-server and only ever echoed back, so this bounds the shape and nothing
+// more — the service still refuses an id that isn't the pending login's.
+export const codexLoginCancelSchema = z.object({
+  loginId: z.string().trim().min(1).max(200),
+});
+
+// POST /api/providers/codex/account/login. `deviceCode` picks the device-code
+// flow (a URL plus a short code) over opening a browser URL directly.
+export const codexLoginStartSchema = z.object({
+  deviceCode: z.boolean().optional().default(false),
 });
 
 // POST /api/providers/:id/vision-suite.
@@ -1504,6 +1518,22 @@ export const subscriptionCostsMapSchema = z.partialRecord(
 /** Body for PUT /api/usage/subscriptions. */
 export const subscriptionCostsSchema = z.object({ costs: subscriptionCostsMapSchema });
 
+/**
+ * Instances that pay API rates rather than the viewer's subscriptions, so the
+ * Across Instances combined total can leave them out. Used by BOTH write
+ * paths — `PUT /api/usage/fleet-billing` (the per-row toggle) and the
+ * `usageApiBilledInstanceIds` slice of `PUT /api/settings` — so a restore
+ * dump can't write an unbounded or non-string list through the generic
+ * settings endpoint. Cap matches the stored peer-digest cap (64).
+ */
+export const usageApiBilledInstanceIdsSchema = z.array(z.string().min(1).max(200)).max(64);
+
+/** Body for PUT /api/usage/fleet-billing. */
+export const usageFleetBillingSchema = z.object({
+  instanceId: z.string().min(1).max(200),
+  usesSubscriptions: z.boolean(),
+});
+
 
 // =============================================================================
 // PORTS
@@ -1610,6 +1640,33 @@ export const shellImageDropSchema = z.object({
   data: z.string().min(1, 'data is required (base64)').max(64 * 1024 * 1024),
   filename: z.string().min(1, 'filename is required').max(255),
   message: z.string().max(5000).optional()
+});
+
+// =============================================================================
+// USER ACTION LEDGER
+// =============================================================================
+
+// GET /api/user-actions — read the machine-local operator-action ledger (#5594).
+// Every value arrives as a query string, so numbers are coerced and `success` is
+// the string form of the boolean. Range checking is deliberately loose here and
+// the CLAMP lives in `userActions.normalizeListOptions`: a caller asking for 5000
+// rows wants "as many as you will give me", not a 400.
+const isParseableDate = (value) => !Number.isNaN(new Date(value).getTime());
+const userActionDateFilter = z.string().trim().min(1).max(64)
+  .refine(isParseableDate, 'must be a parseable date');
+const userActionType = z.enum([...USER_ACTION_TYPES]);
+
+export const userActionsListQuerySchema = z.object({
+  type: userActionType.optional(),
+  // Repeated `?types=a&types=b` arrives as an array; a single one as a string.
+  types: z.union([userActionType, z.array(userActionType)]).optional(),
+  actor: z.enum([...USER_ACTION_ACTORS]).optional(),
+  target: z.string().trim().min(1).max(200).optional(),
+  success: z.enum(['true', 'false']).optional(),
+  from: userActionDateFilter.optional(),
+  to: userActionDateFilter.optional(),
+  limit: z.coerce.number().int().optional(),
+  offset: z.coerce.number().int().optional(),
 });
 
 // =============================================================================
@@ -1813,6 +1870,9 @@ export const renderDefaultsSettingsSchema = z.object(
 export const videoGenSettingsSchema = z.object({
   mode: videoModePinSchema,
   defaultModelId: z.preprocess(emptyToNull, z.string().trim().max(64).nullable().optional()),
+  // Default-on macOS GPU-watchdog mitigation for sustained MLX video renders.
+  // Set false for a headless display workflow that manages display power itself.
+  displaySleep: z.boolean().optional(),
   // Install-wide acknowledgement of restricted-model license gates, stored as
   // the exact reviewed-license ids (`termsGate.id`). Written through
   // POST /api/video-gen/model-terms; typed here so a Settings save can't put
@@ -1866,6 +1926,14 @@ export const localLlmSettingsSchema = z.object({
     launch: z.object({
       model: z.string().trim().max(300).nullable().optional(),
       port: z.number().int().min(1).max(65535).optional(),
+    }).strict().optional(),
+  }).strict().optional(),
+  slotstream: z.object({
+    idleMinutes: z.number().int().min(0).max(1440).optional(),
+    launch: z.object({
+      model: z.string().trim().max(300).nullable().optional(),
+      port: z.number().int().min(1).max(65535).optional(),
+      memoryGb: z.number().min(6).max(512).nullable().optional(),
     }).strict().optional(),
   }).strict().optional(),
 }).strict();
@@ -1938,7 +2006,7 @@ export const llmSchema = z.object({
 // =============================================================================
 
 /**
- * Body schema for PUT /api/apps/:id/documents/:filename and
+ * Body schema for PUT /api/apps/:id/documents/*docPath and
  * PUT /api/cos/gsd/projects/:appId/documents/:docName.
  * Both routes accept a content string plus an optional commit message.
  */

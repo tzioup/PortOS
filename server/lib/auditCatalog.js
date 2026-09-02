@@ -249,6 +249,20 @@ export const AUDIT_DEFINITIONS = Object.freeze({
       noun: 'simplify finding(s)',
     }),
   },
+  'module-hygiene': {
+    quotaBurnId: null,
+    label: 'Module hygiene',
+    description: 'Module-hygiene audit — configurable: file issues (default) or implement one isolated refactor',
+    defaultFileIssues: true,
+    doWorkRequiresWorktree: true,
+    filing: filing({
+      slugPrefix: 'module-hygiene-',
+      label: 'module-hygiene-audit',
+      issueLabel: 'code-quality',
+      labelDescription: 'Proposed from a module-hygiene audit',
+      noun: 'module-hygiene finding(s)',
+    }),
+  },
   'api-contract': {
     quotaBurnId: 'api-contract-audit',
     label: 'API & route contracts',
@@ -309,12 +323,35 @@ export const AUDIT_DEFINITIONS = Object.freeze({
 
 export const AUDIT_TASK_TYPES = new Set(Object.keys(AUDIT_DEFINITIONS));
 
+/**
+ * Check if a task type is an audit task registered in the catalog.
+ *
+ * @param {string} taskType - Task type identifier (e.g. 'security', 'code-quality')
+ * @returns {boolean} True if registered in AUDIT_DEFINITIONS
+ */
 export function isAuditTaskType(taskType) {
   return AUDIT_TASK_TYPES.has(taskType);
 }
 
+/**
+ * Get the default file-issues setting for an audit task type.
+ *
+ * @param {string} taskType - Task type identifier
+ * @returns {boolean} True if the audit defaults to filing issues rather than fixing
+ */
 export function defaultFileIssuesFor(taskType) {
   return AUDIT_DEFINITIONS[taskType]?.defaultFileIssues === true;
+}
+
+/**
+ * Whether do-work mode for this audit must use an isolated managed worktree.
+ * The flag is catalog-owned so dispatch and schedule UI cannot drift.
+ *
+ * @param {string} taskType - Task type identifier
+ * @returns {boolean} True when live-checkout remediation is forbidden
+ */
+export function auditDoWorkRequiresWorktree(taskType) {
+  return AUDIT_DEFINITIONS[taskType]?.doWorkRequiresWorktree === true;
 }
 
 /**
@@ -322,6 +359,10 @@ export function defaultFileIssuesFor(taskType) {
  * on the merged task metadata wins; otherwise the catalog default applies.
  * Accepts the `'true'`/`'false'` string forms for parity with other metadata
  * gates that round-trip through TASKS.md as text.
+ *
+ * @param {string} taskType - Task type identifier
+ * @param {Record<string, unknown>} [metadata] - Task metadata object
+ * @returns {boolean} True if this dispatch should file issues instead of making code changes
  */
 export function isFileIssuesMode(taskType, metadata) {
   if (!isAuditTaskType(taskType)) return false;
@@ -331,10 +372,22 @@ export function isFileIssuesMode(taskType, metadata) {
   return defaultFileIssuesFor(taskType);
 }
 
+/**
+ * Retrieve filing preset configuration for an audit task type.
+ *
+ * @param {string} taskType - Task type identifier
+ * @returns {object|null} Filing preset metadata (slugPrefix, label, issueLabel, planItemBody, etc.) or null
+ */
 export function getAuditFilingPreset(taskType) {
   return AUDIT_DEFINITIONS[taskType]?.filing || null;
 }
 
+/**
+ * Return the appropriate mode banner contract string for the given execution mode.
+ *
+ * @param {boolean} fileIssues - Whether the dispatch is in file-issues mode
+ * @returns {string} The contract text defining the operating constraints for the agent
+ */
 export function modeContractFor(fileIssues) {
   return fileIssues ? FILE_ISSUES_MODE_CONTRACT : DO_WORK_MODE_CONTRACT;
 }
@@ -343,6 +396,10 @@ export function modeContractFor(fileIssues) {
  * Ensure a prompt carries the mode banner. If the template already has a
  * `{modeInstructions}` placeholder the generator will substitute it; otherwise
  * the banner is prepended so a customized stored prompt still honors the mode.
+ *
+ * @param {string} promptTemplate - The raw prompt template or prompt string
+ * @param {string} modeInstructions - The mode contract banner to wrap or inject
+ * @returns {string} Wrapped prompt string
  */
 export function applyAuditModeWrapper(promptTemplate, modeInstructions) {
   const prompt = typeof promptTemplate === 'string' ? promptTemplate : '';

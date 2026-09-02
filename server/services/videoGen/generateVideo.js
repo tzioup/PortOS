@@ -51,7 +51,9 @@ import {
   routesToWindowsHelper,
   byovRuntimeExpectedRevision,
   isByovRuntimeCurrent,
+  runtimeUsesMlx,
 } from './runtimes.js';
+import { getSettings } from '../settings.js';
 import { loadHistory, saveHistory, mutateVideoHistory, getHistoryItem } from './history.js';
 import { VIDEO_MODE_GATED_RUNTIMES } from './modeContract.js';
 import { videoJobState } from './jobState.js';
@@ -131,6 +133,16 @@ const decorateVideoModel = (m) => (m ? {
   // (lib/videoDraftDecoders.js). Empty for every model that declares no draft
   // decoder, so the client renders no control instead of a one-entry select.
   draftDecodeOptions: publicVideoDraftDecodeOptions(m),
+  // Does a render on this model put the display to sleep? An MLX render must
+  // (spawnWatch.js sleeps it so WindowServer stops contending with Metal and
+  // tripping the Apple GPU watchdog), and a user who is not told that reads the
+  // dark screen as a crash and wakes it — which is the failure the sleep exists
+  // to prevent. Decorated here rather than derived client-side so the warning
+  // and the behaviour can never disagree about which runtimes do it. Whether it
+  // will ACTUALLY happen also depends on the platform and the user's opt-out,
+  // which are per-install facts reported once on /status as
+  // `displaySleepOnRender`.
+  sleepsDisplayDuringRender: runtimeUsesMlx(m.runtime),
 } : m);
 
 export const resolveVideoModel = (modelId) =>
@@ -895,6 +907,7 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
     height: h,
     numFrames: parsedNumFrames,
     steps: actualSteps,
+    videoGenSettings: (await getSettings())?.videoGen,
   });
 
   return { jobId, generationId: jobId, filename, mode: 'local', model: modelId };

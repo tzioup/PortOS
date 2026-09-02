@@ -29,6 +29,7 @@ import { resolveFlux2Python, FLUX2_VENV_DEFAULT } from '../../lib/pythonSetup.js
 import { hfChildEnv } from '../hfToken.js';
 import { extractGatedRepo, isGatedRepoError } from '../../lib/hfErrors.js';
 import { killWithEscalation } from '../../lib/killWithEscalation.js';
+import { renderTimingFields } from '../../lib/renderTiming.js';
 import { createLineReader } from '../../lib/streamLines.js';
 import { claimHeavyLocalJob } from '../../lib/heavyJobClaim.js';
 import { prepareLocalMemory, gpuBlockersMessage } from '../localMemory.js';
@@ -532,6 +533,9 @@ export function parseImageExecutionMarker(line) {
 }
 
 export async function generateImage({ pythonPath, prompt = '', negativePrompt = '', modelId = LOCAL_IMAGEGEN_DEFAULT_MODEL, width = 1024, height = 1024, steps, guidance, seed, quantize = '8', loraFilenames = [], loraPaths = [], loraScales = [], initImagePath = null, initImageStrength = null, referenceImagePaths = [], referenceImageStrengths = [], visualConditioning = null, jobId: providedJobId = null, cleanC2PA = false, denoise = false, regenOf = null, upscaleTo = null, outputTarget = null }) {
+  // The ingestion instant `renderTimingFields` measures from — the queue calls
+  // generateImage the moment it picks this job up. See lib/renderTiming.js.
+  const renderStartedAtMs = Date.now();
   // Empty prompt is allowed: img2img / edit / unconditional renders are driven
   // by the init image (or run unconditionally), so text isn't required. The
   // mflux/diffusers runners accept an empty `--prompt` — the regen pass (#912)
@@ -628,7 +632,7 @@ export async function generateImage({ pythonPath, prompt = '', negativePrompt = 
   if (addedTriggerWords.length) {
     console.log(`🔤 LoRA trigger words woven [${jobId.slice(0, 8)}]: ${addedTriggerWords.join(', ')}`);
   }
-  const job = { ...meta, clients: [], status: 'running' };
+  const job = { ...meta, clients: [], status: 'running', renderStartedAtMs };
   jobs.set(jobId, job);
 
   // Per-job stepwise output dir under the OS temp dir. mflux writes one PNG
@@ -1010,6 +1014,9 @@ export async function generateImage({ pythonPath, prompt = '', negativePrompt = 
       // result-fetch, so there's no gallery record to hydrate.
       const sidecar = join(outputDir, `${jobId}.metadata.json`);
       if (!skipSidecar) {
+        // Render timing is stamped onto `meta` (not spread at the write) so the
+        // sidecar and the `autoCleanGeneratedImage` rewrite below agree on it.
+        Object.assign(meta, renderTimingFields(job.renderStartedAtMs));
         await atomicWrite(sidecar, meta).catch(() => {});
         // Cleaners run BEFORE the SSE complete + completed events so subscribers
         // see the cleaned bytes. Local FLUX renders never carry C2PA chunks so

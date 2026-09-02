@@ -40,6 +40,18 @@ describe('ProviderReadiness', () => {
     expect(screen.queryByText(/setup incomplete/)).toBeNull();
   });
 
+  it('shows installed, stopped llama.cpp as standby instead of incomplete setup', () => {
+    renderWithRouter(<ProviderReadiness readiness={readiness({
+      standby: true,
+      standbyDetail: 'No model server is running, which is a valid idle state. Choose a GGUF preset when needed.',
+    })} />);
+
+    expect(screen.getByText('llama.cpp installed · standby')).toBeTruthy();
+    expect(screen.getByText(/valid idle state/)).toBeTruthy();
+    expect(screen.getByText('Open the LLMs page').closest('a').getAttribute('href')).toBe('/models/llms');
+    expect(screen.queryByText(/setup incomplete/)).toBeNull();
+  });
+
   it('counts only the unmet requirements, and shows each fix', () => {
     renderWithRouter(<ProviderReadiness readiness={readiness()} />);
     // The `server` failure plus the `model` check that could not be evaluated —
@@ -50,6 +62,18 @@ describe('ProviderReadiness', () => {
     // …and reads correctly when only one is outstanding.
     renderWithRouter(<ProviderReadiness readiness={readiness({ checks: readiness().checks.slice(0, 2) })} />);
     expect(screen.getByText(/1 requirement unmet/)).toBeTruthy();
+  });
+
+  // A switched-off provider is optional, not an unfinished step: the same
+  // checks and the same fix buttons, worded and toned as "if you enable this".
+  it('reframes the unmet requirements as optional for a switched-off provider', () => {
+    const { container } = renderWithRouter(<ProviderReadiness readiness={readiness()} optional />);
+    expect(screen.getByText(/2 requirements to meet if you enable this provider/)).toBeTruthy();
+    expect(screen.queryByText(/setup incomplete/)).toBeNull();
+    expect(screen.getByText(/Start llama\.cpp/)).toBeTruthy();
+    // The product claim: an optional provider never paints the amber that means
+    // "this install is behind". Which non-amber tone is Banner's business.
+    expect(container.querySelector('[class*="port-warning"]')).toBeNull();
   });
 
   it('links to the Models → LLMs page as an in-app action — never to vendor setup docs', () => {

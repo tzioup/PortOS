@@ -3,13 +3,15 @@
  *
  * Several suites assert structural properties of the module graph rather than
  * runtime behavior: `agentImportCycles.test.js` proves the agent-lifecycle
- * cluster is acyclic, and `sprites/animationTracks.test.js` proves the
+ * cluster is acyclic, and `spriteAnimationTracks.test.js` proves the
  * request-validation graph never reaches the native image dependencies
  * (sharp/ffmpeg). Both need the same thing — "which modules does this file
  * statically import?" — and both had their own copy of the regex pair and the
  * `exec` drain loop, which is exactly how a guard rots: a fix to one parser
  * (multi-line import lists, `export * from`, a new specifier shape) lands in
- * one copy while the other keeps silently under-reporting.
+ * one copy while the other keeps silently under-reporting. `buildStaticImportGraph`
+ * and `findImportCycles` live here for the same reason — `agentImportCycles` and
+ * `twinImportCycles` both walk `server/services` for rings.
  *
  * **Static imports only.** `await import('./x.js')` is deferred to call time,
  * so it can neither produce a load-time cycle nor drag a native dependency into
@@ -19,8 +21,8 @@
  * `import`/`export`.
  */
 
-import { readFileSync, existsSync } from 'fs';
-import { dirname, resolve } from 'path';
+import { readdirSync, readFileSync, existsSync } from 'fs';
+import { dirname, join, relative, resolve, sep } from 'path';
 
 // `import … from 'x'` / `export … from 'x'` (line-anchored, non-greedy up to
 // the `from`), and bare `import 'x'` side-effect imports.
@@ -82,4 +84,72 @@ export function staticImportClosure(entry) {
  */
 export function specifierMatchesPackage(specifier, pkg) {
   return specifier === pkg || specifier.startsWith(`${pkg}/`);
+}
+
+/**
+ * Every non-test `.js` file under `rootDir`, keyed by its path relative to that
+ * directory (`identity.js`, `identity/goals.js`). The walk recurses: scanning
+ * only top-level files leaves a hole big enough to drive a cycle back through,
+ * because a subdirectory module can import back up.
+ */
+function listModuleFiles(rootDir, dir = rootDir, prefix = '') {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...listModuleFiles(rootDir, join(dir, entry.name), rel));
+    else if (entry.name.endsWith('.js') && !entry.name.includes('.test.')) out.push(rel);
+  }
+  return out;
+}
+
+/**
+ * The STATIC import graph of every non-test module under `rootDir`, as
+ * `Map<relPath, relPath[]>`. Specifiers are resolved relative to the importing
+ * file and re-keyed against `rootDir`, so `./x.js` from a subdirectory and
+ * `../x.js` from a sibling land on the same node; anything resolving outside
+ * `rootDir` is dropped, because these guards ask about one directory's internal
+ * shape. Static edges only — see the module header for why `import()` is out.
+ */
+export function buildStaticImportGraph(rootDir) {
+  const files = listModuleFiles(rootDir);
+  const known = new Set(files);
+  const graph = new Map();
+  for (const file of files) {
+    const abs = join(rootDir, file);
+    const deps = new Set();
+    for (const spec of staticImportSpecifiers(abs)) {
+      if (!spec.startsWith('.')) continue;
+      const rel = relative(rootDir, resolve(dirname(abs), spec)).split(sep).join('/');
+      if (known.has(rel)) deps.add(rel);
+    }
+    graph.set(file, [...deps]);
+  }
+  return graph;
+}
+
+/**
+ * Every static import cycle in `graph`, each rendered as `a.js -> b.js -> a.js`
+ * so a failure message names the whole ring rather than one edge. Depth-first
+ * with an on-stack marker: a dep already on the stack closes a cycle, and the
+ * slice from its first appearance is that cycle.
+ */
+export function findImportCycles(graph) {
+  const cycles = new Set();
+  const stack = [];
+  const state = new Map(); // 1 = on stack, 2 = done
+  const visit = (node) => {
+    state.set(node, 1);
+    stack.push(node);
+    for (const dep of graph.get(node) || []) {
+      if (state.get(dep) === 1) {
+        cycles.add(stack.slice(stack.indexOf(dep)).concat(dep).join(' -> '));
+      } else if (!state.has(dep)) {
+        visit(dep);
+      }
+    }
+    stack.pop();
+    state.set(node, 2);
+  };
+  for (const node of graph.keys()) if (!state.has(node)) visit(node);
+  return [...cycles];
 }

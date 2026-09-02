@@ -414,7 +414,7 @@
       "type": "cli",
       "command": "codex",
       "args": [],
-      "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.3-codex-spark"],
       "defaultModel": "gpt-5.6-terra",
       "lightModel": "gpt-5.6-luna",
       "mediumModel": "gpt-5.6-terra",
@@ -422,6 +422,7 @@
       "contextWindow": 1000000,
       "timeout": 300000,
       "enabled": true,
+      "textTransport": "codex-app-server",
       "envVars": {},
       "secretEnvVars": []
     },
@@ -431,7 +432,7 @@
       "type": "tui",
       "command": "codex",
       "args": ["--dangerously-bypass-approvals-and-sandbox"],
-      "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"],
+      "models": ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.3-codex-spark"],
       "defaultModel": "gpt-5.6-terra",
       "lightModel": "gpt-5.6-luna",
       "mediumModel": "gpt-5.6-terra",
@@ -439,6 +440,7 @@
       "contextWindow": 1000000,
       "timeout": 600000,
       "enabled": false,
+      "textTransport": "codex-app-server",
       "envVars": {},
       "secretEnvVars": [],
       "tuiPromptDelayMs": 2500

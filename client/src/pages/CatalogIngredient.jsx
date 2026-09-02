@@ -13,6 +13,8 @@ import FilePickerButton from '../components/ui/FilePickerButton';
 import Modal from '../components/ui/Modal.jsx';
 import ConfirmButtonPair from '../components/ui/ConfirmButtonPair.jsx';
 import UnsavedChangesConfirm from '../components/ui/UnsavedChangesConfirm.jsx';
+import AutoSizeTextarea from '../components/ui/AutoSizeTextarea';
+import PageSkeleton from '../components/ui/PageSkeleton';
 import {
   getCatalogIngredientDetails,
   updateCatalogIngredient,
@@ -419,9 +421,14 @@ export default function CatalogIngredient() {
 
   if (loading || !record) {
     return (
-      <section className="h-full overflow-y-auto p-4 md:p-6">
-        <div className="max-w-4xl mx-auto text-sm text-gray-400">Loading ingredient…</div>
-      </section>
+      <PageSkeleton
+        header="none"
+        label="Loading ingredient"
+        padded
+        fullHeight
+        cards={3}
+        sidebar={false}
+      />
     );
   }
 
@@ -1126,23 +1133,25 @@ function GenerateImageControl({ ingredientId, name, description, universeId, onC
             <span className="text-xs font-semibold text-white">Generate image</span>
             {prefilling && <Loader2 size={12} className="animate-spin text-gray-400" aria-hidden="true" />}
           </div>
-          <label className="block">
+          <label htmlFor="ci-image-prompt" className="block">
             <span className="text-[11px] text-gray-400">Prompt</span>
-            <textarea
+            <AutoSizeTextarea
+              id="ci-image-prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              rows={4}
+              rows={3}
               placeholder="Describe the image to render…"
-              className="mt-1 w-full text-xs bg-port-bg border border-port-border rounded px-2 py-1 text-gray-200 resize-y"
+              className="mt-1 w-full text-xs bg-port-bg border border-port-border rounded px-2 py-1 text-gray-200 min-h-[60px]"
             />
           </label>
-          <label className="block">
+          <label htmlFor="ci-image-negative-prompt" className="block">
             <span className="text-[11px] text-gray-400">Negative prompt (optional)</span>
-            <textarea
+            <AutoSizeTextarea
+              id="ci-image-negative-prompt"
               value={negativePrompt}
               onChange={(e) => setNegativePrompt(e.target.value)}
               rows={2}
-              className="mt-1 w-full text-xs bg-port-bg border border-port-border rounded px-2 py-1 text-gray-200 resize-y"
+              className="mt-1 w-full text-xs bg-port-bg border border-port-border rounded px-2 py-1 text-gray-200 min-h-[44px]"
             />
           </label>
           <div className="flex items-center justify-end gap-2 pt-1">
@@ -1381,9 +1390,9 @@ function GalleryPickerModal({ onClose, onPick }) {
 
   return (
     <Modal open onClose={onClose} size="lg" ariaLabelledBy="gallery-picker-title"
-      panelClassName="bg-port-card border border-port-border rounded-lg max-h-[80vh] overflow-hidden flex flex-col">
+      panelClassName="bg-port-card border border-port-border rounded-lg overflow-hidden flex flex-col">
       {/* Header + scroll area must be DIRECT flex children of the panel (a
-          fragment, not a wrapping <div>) so the panel's max-h-[80vh] flex
+          fragment, not a wrapping <div>) so the panel's clamped flex
           column constrains the scroll region's height — an intervening
           content-sized <div> would leave `overflow-y-auto` unbounded and clip
           long galleries. */}

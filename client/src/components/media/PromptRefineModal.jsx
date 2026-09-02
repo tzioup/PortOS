@@ -4,6 +4,7 @@ import ProviderModelSelector from '../ProviderModelSelector';
 import toast from '../ui/Toast';
 import Modal from '../ui/Modal';
 import { FormField } from '../ui/FormField';
+import AutoSizeTextarea from '../ui/AutoSizeTextarea';
 import useProviderModels from '../../hooks/useProviderModels';
 import { generateImage, generateVideo, refineMediaPrompt } from '../../services/api';
 import { getRenderConfigForItem } from './normalize';
@@ -120,7 +121,7 @@ export default function PromptRefineModal({ item, open, onClose }) {
       zIndexClassName="z-[70]"
       backdropClassName="bg-black/80"
       ariaLabelledBy="prompt-refine-title"
-      panelClassName="max-h-[90vh] overflow-hidden bg-port-card border border-port-border rounded-xl shadow-2xl flex flex-col"
+      panelClassName="overflow-hidden bg-port-card border border-port-border rounded-xl shadow-2xl flex flex-col"
     >
       <header className="flex items-center justify-between gap-3 px-4 py-3 border-b border-port-border">
         <div className="flex items-center gap-2 min-w-0">
@@ -186,20 +187,20 @@ export default function PromptRefineModal({ item, open, onClose }) {
               )}
 
               <FormField label="New prompt" labelClassName="block text-[11px] uppercase tracking-wide text-gray-500 mb-1">
-                <textarea
+                <AutoSizeTextarea
                   value={refinedPrompt}
                   onChange={(e) => setRefinedPrompt(e.target.value)}
-                  rows={6}
-                  className="w-full bg-port-bg border border-port-border rounded-lg p-3 text-sm text-white focus:outline-none focus:border-port-accent resize-y"
+                  rows={4}
+                  className="w-full bg-port-bg border border-port-border rounded-lg p-3 text-sm text-white focus:outline-none focus:border-port-accent min-h-[100px]"
                 />
               </FormField>
 
               <FormField label="New negative prompt" labelClassName="block text-[11px] uppercase tracking-wide text-gray-500 mb-1">
-                <textarea
+                <AutoSizeTextarea
                   value={refinedNegative}
                   onChange={(e) => setRefinedNegative(e.target.value)}
-                  rows={3}
-                  className="w-full bg-port-bg border border-port-border rounded-lg p-3 text-sm text-white focus:outline-none focus:border-port-accent resize-y"
+                  rows={2}
+                  className="w-full bg-port-bg border border-port-border rounded-lg p-3 text-sm text-white focus:outline-none focus:border-port-accent min-h-[60px]"
                 />
               </FormField>
             </div>

@@ -60,9 +60,10 @@ export * from './slashdoCatalog.js';
 export * from './videoFinish.js';
 export * from './videoGenParams.js';
 export * from './videoGenResolutions.js';
+export * from './videoGenStatusCache.js';
 export * from './videoGenSubmission.js';
 export * from './videoReferenceModes.js';
-export * from './videoStagePreview.js';
+export * from './videoRenderPhase.js';
 export * from './videoTilingOptions.js';
 export * from './wrImageDefaults.js';
 
@@ -95,7 +96,7 @@ export * from './dndTransform.js';
 export * from './downloadBlob.js';
 export * from './extensionErrors.js';
 export * from './genUtils.js';
-export * from './githubRepoUrl.js';
+export * from './repoUrl.js';
 export * from './healthProvenance.js';
 export * from './joinInfluenceList.js';
 export * from './kanbanColumns.js';
@@ -121,7 +122,6 @@ export * from './youtubeUrl.js';
 
 // === Page-scoped pure helpers ===
 export * from './audioContext.js';
-export * from './openWorldPlaybackFrame.js';
 export * from './canvasRoll.js';
 export * from './chiptunePlayback.js';
 export * from './chordPlayback.js';

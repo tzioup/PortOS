@@ -21,23 +21,24 @@
     "test:db:ci": "vitest run --config vitest.config.db.js --bail=1 --reporter=default --reporter=github-actions"
   },
   "dependencies": {
-    "@googleapis/calendar": "^16.0.0",
-    "@googleapis/gmail": "^18.0.0",
+    "@cantoo/pdf-lib": "2.9.1",
+    "@googleapis/calendar": "16.0.0",
+    "@googleapis/gmail": "18.0.0",
     "@novnc/novnc": "1.7.0",
     "chokidar": "5.0.0",
     "express": "5.2.1",
-    "google-auth-library": "^11.0.2",
+    "google-auth-library": "11.0.2",
     "kokoro-js": "1.2.1",
     "node-pty": "1.2.0-beta.15",
-    "pdf-lib": "^1.17.1",
     "pg": "8.23.0",
+    "playwright-core": "1.62.1",
     "pm2": "7.0.4",
     "sharp": "0.35.4",
     "socket.io": "4.8.3",
     "socket.io-client": "4.8.3",
-    "undici": "^8.10.0",
+    "undici": "8.10.0",
     "ws": "8.21.3",
-    "zod": "^4.5.2"
+    "zod": "4.5.4"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "4.1.11",

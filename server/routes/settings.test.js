@@ -58,8 +58,12 @@ vi.mock('../services/eidoverse.js', () => ({
 vi.mock('../services/eidoverseHost.js', () => ({
   ensureEidoverseHost: vi.fn(async () => ({ running: true, protocol: 'https', port: 5563 })),
 }));
+vi.mock('../services/credentialInventory.js', () => ({
+  getCredentialInventory: vi.fn(async () => ({ headline: 'Most of PortOS works with no key at all.', credentials: [] })),
+}));
 
 import settingsRoutes from './settings.js';
+import { updateSettingsWith } from '../services/settings.js';
 import { hasConfiguredInstances as hasConfiguredDatadogInstances } from '../services/datadog.js';
 import { hasConfiguredInstances as hasConfiguredJiraInstances } from '../services/jira.js';
 import { assertEidoverseInstalled, installEidoverse, setEidoverseWorldsOrigin } from '../services/eidoverse.js';
@@ -71,6 +75,18 @@ const buildApp = () => {
   app.use('/api/settings', settingsRoutes);
   return app;
 };
+
+// The operator-action ledger (#5594) distinguishes a human on the Settings page
+// from every other settings writer purely by this argument, so the route has to
+// keep passing it. The row it produces is asserted end-to-end in
+// services/settings.userActions.test.js.
+describe('Settings routes — operator-action actor (#5594)', () => {
+  it('marks a settings PUT as a user action', async () => {
+    const res = await request(buildApp()).put('/api/settings').send({ timezone: 'America/Los_Angeles' });
+    expect(res.status).toBe(200);
+    expect(updateSettingsWith).toHaveBeenCalledWith(expect.any(Function), { actor: 'user' });
+  });
+});
 
 describe('Settings routes — apiAccess slice', () => {
   beforeEach(() => {
@@ -635,5 +651,31 @@ describe('Settings routes — videoGen slice (#3231 Phase 4)', () => {
       .send({ videoGen: { mode: 'local', acceptedModelTerms: ['smuggled-license'] } });
     expect(res.status).toBe(200);
     expect(res.body.videoGen).toEqual({ mode: 'local' });
+  });
+});
+
+describe('Settings routes — credential inventory', () => {
+  it('returns presence and source without secret values', async () => {
+    const { getCredentialInventory } = await import('../services/credentialInventory.js');
+    getCredentialInventory.mockResolvedValueOnce({
+      headline: 'Most of PortOS works with no key at all.',
+      credentials: [{
+        id: 'huggingface',
+        label: 'Hugging Face',
+        unlocks: 'Downloads',
+        tier: 'free',
+        getUrl: 'https://huggingface.co/settings/tokens',
+        configurePath: '/media/image?settings=1',
+        feature: null,
+        configured: true,
+        source: 'settings',
+        unavailableFeatures: [],
+      }],
+    });
+    const res = await request(buildApp()).get('/api/settings/credentials');
+    expect(res.status).toBe(200);
+    expect(res.body.headline).toMatch(/no key at all/i);
+    expect(res.body.credentials[0]).toMatchObject({ id: 'huggingface', configured: true, source: 'settings' });
+    expect(JSON.stringify(res.body)).not.toMatch(/hf_|sk-|ghp_/);
   });
 });

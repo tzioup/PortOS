@@ -76,6 +76,10 @@ vi.mock('../services/videoGen/runtimes.js', async (importOriginal) => ({
   resolveByovRuntimeLoraCapable: vi.fn(async (runtime) => runtime === 'minimax_h3' && loraCapability.capable),
 }));
 
+vi.mock('../services/displayPower.js', () => ({
+  isDisplaySleepEnabled: vi.fn(() => false),
+}));
+
 vi.mock('../services/settings.js', () => ({
   getSettings: vi.fn(async () => ({ imageGen: { local: { pythonPath: '/usr/bin/python3' } } })),
   updateSettingsWith: vi.fn(async (mutate) => mutate({ imageGen: { local: { pythonPath: '/usr/bin/python3' } } })),
@@ -404,6 +408,31 @@ describe('videoGen routes', () => {
         expect([backend.summary, ...backend.facts].join(' '))
           .not.toMatch(/uncensored|unrestricted|less restrictive/i);
       }
+    });
+
+    // #5872 — the page warns the user BEFORE the screen goes dark, which it can
+    // only do if the server says whether THIS install will actually sleep it.
+    // The predicate is stubbed rather than exercised for real: it is
+    // macOS-only, so a live call returns false on every other runner and the
+    // assertions would pass against a hardcoded false — pinning nothing.
+    it('reports whether a render will sleep the display, and passes the videoGen slice', async () => {
+      const { isDisplaySleepEnabled } = await import('../services/displayPower.js');
+      const { getSettings } = await import('../services/settings.js');
+
+      isDisplaySleepEnabled.mockReturnValueOnce(true);
+      getSettings.mockResolvedValueOnce({
+        imageGen: { local: { pythonPath: '/usr/bin/python3' } },
+        videoGen: { displaySleep: true },
+      });
+      const on = await request(app).get('/api/video-gen/status');
+      expect(on.body.displaySleepOnRender).toBe(true);
+      // The videoGen slice, not the whole settings object — the predicate reads
+      // `.displaySleep` off what it is handed.
+      expect(isDisplaySleepEnabled).toHaveBeenCalledWith({ displaySleep: true });
+
+      isDisplaySleepEnabled.mockReturnValueOnce(false);
+      const off = await request(app).get('/api/video-gen/status');
+      expect(off.body.displaySleepOnRender).toBe(false);
     });
 
     it('passes each model entry through with its registry disclosure block', async () => {

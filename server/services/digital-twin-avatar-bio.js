@@ -18,10 +18,11 @@ import { join } from 'path';
 import { DIGITAL_TWIN_DIR, callProviderAI } from './digital-twin-helpers.js';
 import { loadMeta } from './digital-twin-meta.js';
 import { getTraits } from './digital-twin-analysis.js';
-import { getGoals } from './identity.js';
+import { getGoals } from './identity/goals.js';
 import { getProviderById } from './providers.js';
 import { estimateTokens, trimContextToBudget } from '../lib/contextBudget.js';
 import { tryReadFile } from '../lib/fileUtils.js';
+import { escapeRegExp } from '../lib/textUtils.js';
 
 // Bio length presets. `blurb` is a single paragraph per section (avatar persona
 // fields are often short); `persona` is the balanced default; `knowledge` keeps
@@ -112,7 +113,7 @@ function pullLabeledLine(md, label) {
  */
 function extractSection(md, heading) {
   if (!md) return null;
-  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escaped = escapeRegExp(heading);
   const headingRe = new RegExp(`^(#{2,3})\\s+${escaped}\\s*$`, 'i');
   const lines = md.split('\n');
   let start = -1;

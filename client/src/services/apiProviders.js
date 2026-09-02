@@ -9,14 +9,14 @@ export const setActiveProvider = (id) => request('/providers/active', {
   method: 'PUT',
   body: JSON.stringify({ id })
 });
-export const getProvider = (id) => request(`/providers/${id}`);
 export const createProvider = (data) => request('/providers', {
   method: 'POST',
   body: JSON.stringify(data)
 });
-export const updateProvider = (id, data) => request(`/providers/${id}`, {
+export const updateProvider = (id, data, options = {}) => request(`/providers/${id}`, {
   method: 'PUT',
-  body: JSON.stringify(data)
+  body: JSON.stringify(data),
+  ...options,
 });
 export const deleteProvider = (id) => request(`/providers/${id}`, { method: 'DELETE' });
 export const getSampleProviders = () => request('/providers/samples');
@@ -44,5 +44,41 @@ export const serveProviderModel = (id, options) => request(
 
 // Provider status (usage limits, availability)
 export const getProviderStatuses = () => request('/providers/status');
-export const getProviderStatus = (id) => request(`/providers/${id}/status`);
 export const recoverProvider = (id, options) => request(`/providers/${id}/status/recover`, { method: 'POST', ...options });
+
+// Codex / ChatGPT subscription account (#5589). The Codex app-server owns the
+// credentials: these calls report and change SIGN-IN STATE only, and no
+// response ever carries a token, an account id, or a credential path.
+//
+// `fresh` skips the server's short readiness TTL — use it for the poll that
+// follows a sign-in, not for the page's idle refresh.
+export const getCodexAccount = (options = {}) => {
+  const { fresh = false, ...rest } = options;
+  return request(`/providers/codex/account${fresh ? '?fresh=1' : ''}`, rest);
+};
+// Starts the ChatGPT OAuth flow and resolves to { login: { loginId, authUrl,
+// verificationUrl, userCode, expiresAt } }. Only ever call this from an
+// explicit user action — it opens a real sign-in.
+export const startCodexLogin = (deviceCode = false, options) => request('/providers/codex/account/login', {
+  method: 'POST',
+  body: JSON.stringify({ deviceCode }),
+  ...options,
+});
+// Abandons a sign-in this browser started. The id must be the one
+// `startCodexLogin` returned; a stale tab's id is refused with a 409.
+export const cancelCodexLogin = (loginId, options) => request('/providers/codex/account/login/cancel', {
+  method: 'POST',
+  body: JSON.stringify({ loginId }),
+  ...options,
+});
+export const codexLogout = (options) => request('/providers/codex/account/logout', { method: 'POST', ...options });
+// The models this subscription may run, from the app-server catalog (#5590).
+// Not yet called from a component: the Providers-page picker that consumes it is
+// #5591 (phase 3), which also ships the toggle that sets `textTransportEnabled`.
+// Resolves to { models, fetchedAt, error }. `models: null` means NEVER FETCHED
+// and `[]` means fetched-and-empty; when `error` is set the list is the
+// last-known-good one, so render that rather than emptying the picker.
+export const getCodexModels = (options = {}) => {
+  const { fresh = false, ...rest } = options;
+  return request(`/providers/codex/models${fresh ? '?fresh=1' : ''}`, rest);
+};

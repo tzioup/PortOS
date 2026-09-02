@@ -53,6 +53,7 @@ vi.mock('../../services/appIconDetect.js', () => ({
 import * as appsService from '../../services/apps.js';
 import * as pm2Service from '../../services/pm2.js';
 import * as history from '../../services/history.js';
+import * as appUpdater from '../../services/appUpdater.js';
 
 describe('Apps Lifecycle Routes', () => {
   let app;

@@ -18,7 +18,7 @@ import { useNavigate, useParams } from 'react-router';
 import { AlertTriangle, Flame, RefreshCw } from 'lucide-react';
 import toast from '../components/ui/Toast';
 import Banner from '../components/ui/Banner';
-import BrailleSpinner from '../components/BrailleSpinner';
+import PageSkeleton from '../components/ui/PageSkeleton';
 import FamilyCard from '../components/quotaBurn/FamilyCard';
 import { NumberField } from '../components/quotaBurn/fields';
 import * as api from '../services/api';
@@ -35,7 +35,7 @@ export const SAVE_DEBOUNCE_MS = 500;
 
 // How often to re-ask while a family's quota scrape is still running. A scrape
 // is a 10-20s PTY spawn, so this is a handful of polls, not a busy loop.
-const PENDING_POLL_MS = 4000;
+export const PENDING_POLL_MS = 4000;
 
 const EMPTY_CATALOG = { jobTypes: [], apps: [], universes: [], imageModes: [], providers: [] };
 
@@ -376,7 +376,18 @@ export default function QuotaBurn() {
     // fades while a poll that keeps failing deserves a standing indicator.
   };
 
-  if (loading) return <div className="p-6 text-gray-400"><BrailleSpinner /> Loading burn plan…</div>;
+  if (loading) {
+    return (
+      <PageSkeleton
+        label="Loading burn plan"
+        headerRowClass="flex flex-wrap items-center gap-3"
+        titleWidthClass="w-40"
+        showAction={false}
+        cards={3}
+        sidebar={false}
+      />
+    );
+  }
   // A failed first read used to land here with no cause and no way out but a
   // browser reload — the header (and its "Refresh quota") returns above.
   if (!config) {

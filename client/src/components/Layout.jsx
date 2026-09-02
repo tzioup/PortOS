@@ -68,6 +68,7 @@ import {
   Database,
   Shield,
   ShieldCheck,
+  KeyRound,
   Lock,
   Wand2,
   Rocket,
@@ -123,6 +124,7 @@ import { useOnDemandTaskToast } from '../hooks/useOnDemandTaskToast';
 import { useEngagementReminderToast } from '../hooks/useEngagementReminderToast';
 import { useSharingNotifications } from '../hooks/useSharingNotifications';
 import UpdateBanners from './UpdateBanners';
+import SetupBanner from './SetupBanner';
 import { useAIStatusNotifications } from '../hooks/useAIStatusNotifications';
 import { useNavWorkingSet } from '../hooks/useNavWorkingSet.js';
 import { migrateLegacyNavPath } from '../utils/navWorkingSet.js';
@@ -294,7 +296,8 @@ export const NAV_PRESENTATION = {
   '/api-reference/catalog': { icon: Braces },
   '/settings/autofixer': { icon: Wrench },
   '/settings/backup': { icon: Download },
-  '/settings/code-reviewers': { icon: ShieldCheck },
+  '/settings/credentials': { icon: KeyRound },
+  '/models/code-reviewers': { icon: ShieldCheck },
   '/settings/database': { icon: Database },
   '/settings/features': { icon: ListChecks },
   '/settings/general': { icon: Settings },
@@ -349,16 +352,25 @@ const SECTION_PRESENTATION = {
   Create: { icon: Sparkles, defaultTo: '/media' },
   'Dev Tools': { icon: Terminal },
   Health: { icon: Heart, defaultTo: '/meatspace/overview' },
-  Models: { icon: Cpu, defaultTo: '/models/performance' },
+  Models: { icon: Cpu, defaultTo: '/models/llms' },
   Settings: { icon: Settings, defaultTo: '/settings/general' },
   Identity: { icon: Fingerprint, defaultTo: '/digital-twin/overview' },
   POST: { icon: Zap, defaultTo: '/post/launcher' },
 };
 
-const SECTION_ORDER = [
+// Sidebar grouping is declared, never derived from array positions. The first
+// two lists are the alphabetical run of sections, split around the Goals row;
+// the third is the intentionally-last bucket that renders below the "More"
+// divider, so it is NOT alphabetical relative to the other two and can only be
+// declared. Adding a section means putting its name in the list it belongs to —
+// there are no indices to keep in sync.
+export const SECTIONS_BEFORE_GOALS = [
   'Brain', 'Calendar', 'Chief of Staff', 'Comms', 'Create', 'Dev Tools',
-  'Health', 'Models', 'Settings', 'Identity', 'POST',
 ];
+export const SECTIONS_AFTER_GOALS = ['Health', 'Models', 'Settings'];
+export const SECTIONS_BELOW_MORE = ['Identity', 'POST'];
+
+const SECTION_ORDER = [...SECTIONS_BEFORE_GOALS, ...SECTIONS_AFTER_GOALS, ...SECTIONS_BELOW_MORE];
 
 // These rows have no PortOS route, so a NAV_COMMANDS entry would be dishonest.
 // Keep them visibly marked as local-only instead of smuggling structural route
@@ -409,11 +421,11 @@ const navItems = [
   ...mainRows,
   { separator: true, localOnly: true },
   { ...appsCommand, dynamic: 'apps', defaultTo: appsCommand.to, children: [] },
-  ...SECTION_ORDER.slice(0, 6).map((section) => sectionRows[section]),
+  ...SECTIONS_BEFORE_GOALS.map((section) => sectionRows[section]),
   goalsRow,
-  ...SECTION_ORDER.slice(6, 9).map((section) => sectionRows[section]),
+  ...SECTIONS_AFTER_GOALS.map((section) => sectionRows[section]),
   { moreLabel: true, localOnly: true },
-  ...SECTION_ORDER.slice(9).map((section) => sectionRows[section]),
+  ...SECTIONS_BELOW_MORE.map((section) => sectionRows[section]),
 ];
 
 const SIDEBAR_KEY = 'portos-sidebar-collapsed';
@@ -1425,9 +1437,10 @@ export default function Layout() {
           </div>
         </header>
 
-        {/* Update / out-of-sync advisories — inline (document flow) so they
+        {/* Update, out-of-sync, and essential-setup advisories — inline (document flow) so they
             push the page instead of covering a bottom-anchored composer (#3786) */}
         <UpdateBanners />
+        <SetupBanner />
 
         {/* Main content */}
         {(() => {

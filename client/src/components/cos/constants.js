@@ -280,14 +280,14 @@ export function pinnedPrCompletion(metadata) {
 // review via the native reviewer API; CLI reviewers (claude/antigravity/codex/grok/cursor)
 // instruct the follow-up agent to invoke the named CLI; local-LLM reviewers
 // (lmstudio/ollama) route the diff through PortOS's `POST /api/code-review/local`
-// endpoint, which runs the model configured on the Settings → Code Reviewers
+// endpoint, which runs the model configured on the Models → Code Reviewers
 // page. Keep in sync with the `REVIEWER_VALUES` enum in
 // `server/lib/validation.js`.
 export const REVIEWER_OPTIONS = [
   { value: 'copilot', label: 'Copilot', description: 'GitHub Copilot (GitHub-only)' },
-  { value: 'claude', label: 'Claude', description: 'Claude CLI reviews the PR diff (optional model on Settings → Code Reviewers; supports an Ollama-backed Claude for local-only setups)' },
+  { value: 'claude', label: 'Claude', description: 'Claude CLI reviews the PR diff (optional model on Models → Code Reviewers; supports an Ollama-backed Claude for local-only setups)' },
   { value: 'antigravity', label: 'Antigravity', description: 'Antigravity CLI (agy) reviews the PR diff' },
-  { value: 'codex', label: 'Codex', description: 'Codex CLI reviews the PR diff (optional model tier on Settings → Code Reviewers)' },
+  { value: 'codex', label: 'Codex', description: 'Codex CLI reviews the PR diff (optional model tier on Models → Code Reviewers)' },
   { value: 'grok', label: 'Grok', description: 'Grok Build CLI (grok) reviews the PR diff' },
   { value: 'cursor', label: 'Cursor Agent', description: 'Cursor Agent CLI (cursor-agent) reviews the PR diff' },
   { value: 'lmstudio', label: 'LM Studio', description: 'Local LM Studio model reviews the diff (set model on AI Providers)' },

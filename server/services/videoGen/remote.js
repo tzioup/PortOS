@@ -25,6 +25,7 @@ import { createRemoteMediaExecutor } from '../federatedMedia/remoteExecutor.js';
 import { applyRemoteInputAssets, remoteInputAssetsSchema } from '../federatedMedia/inputAssets.js';
 import { videoGenEvents } from './events.js';
 import { mutateVideoHistory } from './history.js';
+import { renderTimingFields } from '../../lib/renderTiming.js';
 
 const remoteVideoMarkerSchema = z.object({
   wireVersion: z.literal(FEDERATED_MEDIA_WIRE_VERSION),
@@ -62,7 +63,7 @@ const executor = createRemoteMediaExecutor({
   // `<jobId>.mp4` is videoGen/local.js's own filename shape, which is what the
   // provider-side result guard and the local history row both key on.
   resolveDestination: ({ jobId }) => ({ dir: PATHS.videos, filename: `${jobId}.mp4` }),
-  async finalize({ jobId, path, filename, request, remoteJob, peerId }) {
+  async finalize({ jobId, path, filename, request, remoteJob, peerId, renderStartedAtMs }) {
     // Both ffmpeg passes are best-effort by construction (they no-op when
     // ffmpeg is absent), exactly as the local finalize path treats them — a
     // missing thumbnail must not fail a render that already landed verified.
@@ -88,6 +89,7 @@ const executor = createRemoteMediaExecutor({
         federatedPeerId: peerId,
         federatedJobId: remoteJob.id,
         createdAt: new Date().toISOString(),
+        ...renderTimingFields(renderStartedAtMs),
       });
       return history;
     });

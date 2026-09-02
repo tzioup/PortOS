@@ -180,6 +180,57 @@ describe('IssuesTab', () => {
     expect(await screen.findByRole('link', { name: /Completed/ })).toBeInTheDocument();
   });
 
+  it('does not treat a failed agent completion as a completed task', async () => {
+    await renderTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Claim/ }));
+    expect(await screen.findByRole('link', { name: /Queued/ })).toBeInTheDocument();
+
+    act(() => socketHandlers.get('cos:agent:completed')({
+      taskId: 'task-1', result: { success: false },
+    }));
+
+    expect(screen.getByRole('link', { name: /Queued/ })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Completed/ })).not.toBeInTheDocument();
+  });
+
+  it('applies every task from a user task-list update', async () => {
+    const SECOND_ISSUE = {
+      ...ISSUE,
+      number: 43,
+      title: 'Sync conflict',
+      url: 'https://github.com/acme/widget/issues/43',
+    };
+    api.getAppIssues.mockResolvedValue(okPayload([ISSUE, SECOND_ISSUE]));
+    api.createSlashdoTask
+      .mockResolvedValueOnce({ id: 'task-1' })
+      .mockResolvedValueOnce({ id: 'task-2' });
+    await renderTab();
+
+    const claimButtons = await screen.findAllByRole('button', { name: /Claim/ });
+    fireEvent.click(claimButtons[0]);
+    fireEvent.click(claimButtons[1]);
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenCalledTimes(2));
+
+    act(() => socketHandlers.get('cos:tasks:user:changed')({
+      tasks: [
+        { id: 'task-1', status: 'completed' },
+        { id: 'task-2', status: 'completed' },
+      ],
+    }));
+
+    await waitFor(() => expect(screen.getAllByRole('link', { name: /Completed/ })).toHaveLength(2));
+  });
+
+  it('removes every CoS socket listener when unmounted', async () => {
+    const listenerCountBeforeMount = socketHandlers.size;
+    const { unmount } = await renderTab();
+
+    expect(socketHandlers.size).toBe(listenerCountBeforeMount + 6);
+    unmount();
+    expect(socketHandlers.size).toBe(listenerCountBeforeMount);
+  });
+
   it('does not lose an active socket update that arrives before the POST response', async () => {
     let resolveClaim;
     api.createSlashdoTask.mockImplementation(() => new Promise(resolve => { resolveClaim = resolve; }));
@@ -368,6 +419,67 @@ describe('IssuesTab', () => {
     expect(await screen.findByText('Crash on save')).toBeInTheDocument();
   });
 
+  it('hides every issue from Hide all labels and restores them from Show all labels', async () => {
+    api.getAppIssues.mockResolvedValue(okPayload([
+      ISSUE,
+      { ...ISSUE, number: 43, title: 'Add CSV export', labels: [{ name: 'feature', color: null, description: '' }] },
+      { ...ISSUE, number: 44, title: 'Untagged cleanup', labels: [] },
+    ]));
+    await renderTab();
+
+    await screen.findByText('Crash on save');
+    expect(screen.getByText('Add CSV export')).toBeInTheDocument();
+    expect(screen.getByText('Untagged cleanup')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide all labels' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Show all labels' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hide all labels' }));
+    await waitFor(() => expect(screen.queryByText('Crash on save')).not.toBeInTheDocument());
+    expect(screen.queryByText('Add CSV export')).not.toBeInTheDocument();
+    expect(screen.queryByText('Untagged cleanup')).not.toBeInTheDocument();
+    expect(screen.getByText('No open issues match the current label filters.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show all labels' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Hide all labels' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show all labels' }));
+    expect(await screen.findByText('Crash on save')).toBeInTheDocument();
+    expect(screen.getByText('Add CSV export')).toBeInTheDocument();
+    expect(screen.getByText('Untagged cleanup')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Hide all labels' })).toBeInTheDocument();
+  });
+
+  it('after Hide all, turning one label back on lists every issue that carries it', async () => {
+    // Exclude-all (the naive Hide-all) would still drop a `critical`+`bug`
+    // issue when `bug` stayed hidden. Include mode is what "show only critical"
+    // has to mean.
+    api.getAppIssues.mockResolvedValue(okPayload([
+      {
+        ...ISSUE,
+        title: 'Crash on save',
+        labels: [
+          { name: 'bug', color: '#d73a4a', description: '' },
+          { name: 'critical', color: '#b60205', description: '' },
+        ],
+      },
+      { ...ISSUE, number: 43, title: 'Add CSV export', labels: [{ name: 'feature', color: null, description: '' }] },
+      { ...ISSUE, number: 44, title: 'Page is down', labels: [{ name: 'critical', color: '#b60205', description: '' }] },
+      { ...ISSUE, number: 45, title: 'Untagged cleanup', labels: [] },
+    ]));
+    await renderTab();
+
+    await screen.findByText('Crash on save');
+    fireEvent.click(screen.getByRole('button', { name: 'Hide all labels' }));
+    await waitFor(() => expect(screen.queryByText('Crash on save')).not.toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'critical (2)' }));
+    expect(await screen.findByText('Crash on save')).toBeInTheDocument();
+    expect(screen.getByText('Page is down')).toBeInTheDocument();
+    expect(screen.queryByText('Add CSV export')).not.toBeInTheDocument();
+    expect(screen.queryByText('Untagged cleanup')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'critical (2)' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'bug (1)' })).toHaveAttribute('aria-pressed', 'false');
+  });
+
   it('never ships a filter chip with both a graded color and the theme utilities that override it', async () => {
     // `.bg-port-bg` / `.border-port-border` / day-mode `.text-gray-300` are all
     // `!important` in index.css, and author `!important` beats an inline style —
@@ -508,5 +620,70 @@ describe('IssuesTab', () => {
     expect(await screen.findByText(/Work Tracker isn't a forge issue tracker/)).toBeInTheDocument();
     // No issues ⇒ no Claim button that would queue a mis-routed run.
     expect(screen.queryByRole('button', { name: /Claim/ })).not.toBeInTheDocument();
+  });
+});
+
+// Replan is a SECOND opinion on an already-planned issue, launched from the same
+// row as Claim. The failure modes worth pinning are the ones where the two runs
+// bleed into each other: the wrong slashdo command, or one run's lifecycle events
+// swapping out the other's button.
+describe('IssuesTab replan', () => {
+  it('queues the replan command with the same pin and prefetched content a claim gets', async () => {
+    await renderTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Replan/ }));
+
+    await waitFor(() => expect(api.createSlashdoTask).toHaveBeenCalledWith(
+      'replan', 'app-1', {
+        target: '42',
+        issueContext: {
+          number: 42,
+          title: 'Crash on save',
+          body: 'Repro: open the editor and hit save.',
+          url: 'https://github.com/acme/widget/issues/42'
+        }
+      }, { silent: true }
+    ));
+    expect(await screen.findByRole('link', { name: /Replan #42: Queued/ })).toBeInTheDocument();
+  });
+
+  it('leaves the Claim button live while a replan of the same issue is running', async () => {
+    await renderTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Replan/ }));
+    expect(await screen.findByRole('link', { name: /Replan #42: Queued/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Claim/ })).toBeEnabled();
+  });
+
+  // Before the POST resolves there is no task id to match on, so the socket path
+  // falls back to the target the server stamped. Reading `claimTarget` there
+  // would light up the Claim row from a replan's events (and vice versa).
+  it('matches a pre-response socket update on replanTarget, never on claimTarget', async () => {
+    let resolveReplan;
+    api.createSlashdoTask.mockImplementation(() => new Promise(resolve => { resolveReplan = resolve; }));
+    await renderTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Replan/ }));
+    act(() => socketHandlers.get('cos:tasks:changed')({
+      task: { id: 'task-9', status: 'in_progress', metadata: { app: 'app-1', claimTarget: '42' } }
+    }));
+    // A claim's event must not advance the replan row.
+    expect(screen.getByRole('button', { name: /Claim/ })).toBeInTheDocument();
+
+    act(() => socketHandlers.get('cos:tasks:changed')({
+      task: { id: 'task-9', status: 'in_progress', metadata: { app: 'app-1', replanTarget: '42' } }
+    }));
+    expect(await screen.findByRole('link', { name: /Replan #42: Active/ })).toBeInTheDocument();
+
+    await act(async () => { resolveReplan({ id: 'task-9', status: 'pending' }); });
+    expect(screen.getByRole('link', { name: /Replan #42: Active/ })).toBeInTheDocument();
+  });
+
+  it('re-enables the Replan button when queuing fails, instead of stranding it', async () => {
+    api.createSlashdoTask.mockRejectedValue(new Error('tracker is not a forge'));
+    await renderTab();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Replan/ }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Replan/ })).toBeEnabled());
   });
 });

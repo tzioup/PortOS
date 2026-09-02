@@ -24,6 +24,11 @@ describe('FableLoomHostedJoin', () => {
     render(<FableLoomHostedJoin />);
     expect(screen.getByText('Hosted Play Error')).toBeInTheDocument();
     expect(screen.getByText(/Invalid or missing join credentials/i)).toBeInTheDocument();
+
+    const shell = screen.getByRole('main');
+    expect(shell).toContainElement(screen.getByRole('heading', { name: 'Hosted Play Error' }));
+    expect(shell).toHaveClass('h-dvh-screen');
+    expect(shell).not.toHaveClass('min-h-screen');
   });
 
   it('connects to /fableloom-hosted when hash credentials are provided', async () => {
@@ -40,6 +45,24 @@ describe('FableLoomHostedJoin', () => {
     expect(screen.getByText('Audience Microphone UI')).toBeInTheDocument();
   });
 
+  it('keeps the transcript as the only inner scroll region of the dynamic shell', () => {
+    window.location.hash = '#session=sess-123&token=tok-abc';
+    render(<FableLoomHostedJoin />);
+
+    const shell = screen.getByRole('main');
+    expect(shell).toHaveClass('h-dvh-screen', 'overflow-y-auto');
+    expect(shell).not.toHaveClass('overflow-hidden');
+    expect(shell).not.toHaveClass('min-h-screen');
+
+    const scrollRegions = shell.querySelectorAll('.overflow-y-auto');
+    expect(scrollRegions).toHaveLength(1);
+    expect(scrollRegions[0]).toHaveClass('flex-1', 'min-h-[8rem]');
+    const header = shell.querySelector('header');
+    expect(header).toHaveClass('shrink-0');
+    expect(header.nextElementSibling).toHaveClass('shrink-0');
+    expect(screen.getByPlaceholderText('Or type a message…').closest('form').parentElement).toHaveClass('shrink-0');
+  });
+
   it('sends text input fallback when submitted', async () => {
     window.location.hash = '#session=sess-123&token=tok-abc';
     render(<FableLoomHostedJoin />);
@@ -47,7 +70,15 @@ describe('FableLoomHostedJoin', () => {
     const input = screen.getByPlaceholderText('Or type a message…');
     fireEvent.change(input, { target: { value: 'Look around the room' } });
 
-    expect(screen.getByRole('button', { name: 'Send message' })).toBeInTheDocument();
+    const sendButton = screen.getByRole('button', { name: 'Send message' });
+    expect(sendButton).toBeInTheDocument();
+    expect(sendButton).toHaveClass(
+      'min-w-[44px]',
+      'min-h-[44px]',
+      'flex',
+      'items-center',
+      'justify-center',
+    );
     fireEvent.submit(input.closest('form'));
 
     expect(mockSocket.emit).toHaveBeenCalledWith('hosted:turn:text', { text: 'Look around the room' });

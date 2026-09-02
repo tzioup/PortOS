@@ -145,6 +145,34 @@ describe('<MusicDesigner>', () => {
       await screen.findByLabelText(/what do you want to hear/i);
       expect(window.localStorage.getItem('portos.musicDesigner.activeDraft')).toBe('track-draft');
     });
+
+    it('keeps the render prompt visible and editable for a saved draft', async () => {
+      api.getTrack.mockResolvedValue({
+        id: 'track-saved', title: 'Named Track', concept: 'A dusk-time pulse',
+        prompt: 'Warm synths and a patient beat.', lyrics: '',
+      });
+      renderAt('/music/generate/render?trackId=track-saved');
+
+      const prompt = await screen.findByLabelText(/prompt for this render/i);
+      expect(prompt).toHaveValue('Warm synths and a patient beat.');
+      fireEvent.change(prompt, { target: { value: 'A brighter pulse with hand percussion.' } });
+      expect(screen.getByTestId('gen-panel')).toHaveAttribute('data-prompt', 'A brighter pulse with hand percussion.');
+      fireEvent.blur(prompt);
+
+      await waitFor(() => expect(api.updateTrack).toHaveBeenCalledWith(
+        'track-saved', { prompt: 'A brighter pulse with hand percussion.' }, { silent: true },
+      ));
+    });
+
+    it('lets a direct render visit supply the prompt before generating', async () => {
+      renderAt('/music/generate/render?trackId=track-draft');
+
+      const prompt = await screen.findByLabelText(/prompt for this render/i);
+      expect(prompt).toHaveValue('');
+      fireEvent.change(prompt, { target: { value: 'A quiet piano loop with tape hiss.' } });
+
+      expect(screen.getByTestId('gen-panel')).toHaveAttribute('data-prompt', 'A quiet piano loop with tape hiss.');
+    });
   });
 
   describe('the describe step', () => {
@@ -224,7 +252,13 @@ describe('<MusicDesigner>', () => {
       fireEvent.click(screen.getByRole('button', { name: /generate lyrics/i }));
 
       await waitFor(() => expect(screen.getByLabelText('Lyrics')).toHaveValue('[verse]\nrain on the window'));
-      expect(screen.getByText(/manual composition structure/i)).toBeInTheDocument();
+      const lyricsField = screen.getByLabelText('Lyrics');
+      const guide = screen.getByText(/manual composition structure/i);
+      expect(guide).toBeInTheDocument();
+      expect(guide.closest('details')).not.toHaveAttribute('open');
+      expect(lyricsField.compareDocumentPosition(guide)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      fireEvent.click(guide);
+      expect(guide.closest('details')).toHaveAttribute('open');
       expect(api.generateLyrics).toHaveBeenCalledWith({
         description: 'Lush pads over a broken beat.',
         guidance: 'about leaving at dawn',
@@ -284,6 +318,31 @@ describe('<MusicDesigner>', () => {
 
       await waitFor(() => expect(hook.setSelectedProviderId).toHaveBeenCalledWith('provider-a'));
       expect(hook.setSelectedModel).not.toHaveBeenCalled();
+    });
+  });
+
+  // A blocked localStorage (Safari private mode, disabled cookies) throws from
+  // the accessor. The draft-id read happens in the component RENDER BODY, so
+  // before #5689 that throw was a render-phase exception and the whole Music
+  // Designer route unmounted — the user lost the page, not a preference.
+  describe('blocked storage', () => {
+    // `vi.stubGlobal`, not `vi.spyOn`: a method assigned onto jsdom's Storage
+    // proxy is swallowed as a stored key, so a spy never installs and the test
+    // would pass against the unguarded component it is meant to fail.
+    afterEach(() => { vi.unstubAllGlobals(); });
+
+    it('still renders the designer when every storage access throws', async () => {
+      const boom = () => { throw new DOMException('The operation is insecure.', 'SecurityError'); };
+      vi.stubGlobal('localStorage', {
+        getItem: boom, setItem: boom, removeItem: boom, clear: () => {},
+      });
+
+      renderAt('/music/generate');
+
+      // The route renders, and the draft is still created — storage only ever
+      // held the resume hint, so losing it costs the hint and nothing else.
+      expect(await screen.findByLabelText(/what do you want to hear/i)).toBeInTheDocument();
+      await waitFor(() => expect(api.createTrack).toHaveBeenCalled());
     });
   });
 

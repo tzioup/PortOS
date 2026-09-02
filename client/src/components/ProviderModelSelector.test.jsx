@@ -8,6 +8,7 @@ vi.mock('../services/apiLocalLlm', () => ({ getToolUseModels: (...a) => getToolU
 
 import ProviderModelSelector from './ProviderModelSelector';
 import { __resetToolUseModelIdsCache } from '../hooks/useToolUseModelIds.js';
+import SHIPPED_PROVIDERS from '../../../data.reference/providers.json';
 
 const PROVIDERS = [
   { id: 'p1', name: 'Provider One' },
@@ -33,6 +34,20 @@ describe('ProviderModelSelector', () => {
     renderSelector();
     const options = screen.getAllByRole('option').map((o) => o.textContent);
     expect(options).toEqual(['Provider One', 'Provider Two', 'm1', 'm2']);
+  });
+
+  it('renders every current Codex fallback choice, including Codex Spark', () => {
+    const codexModels = SHIPPED_PROVIDERS.providers.codex.models;
+    expect(codexModels).toContain('gpt-5.3-codex-spark');
+    renderSelector({
+      providers: [{ id: 'codex', name: 'Codex CLI', type: 'cli', models: codexModels }],
+      selectedProviderId: 'codex',
+      selectedModel: 'gpt-5.3-codex-spark',
+      availableModels: codexModels,
+    });
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    expect([...modelSelect.querySelectorAll('option')].map((option) => option.value)).toEqual(codexModels);
+    expect(modelSelect.value).toBe('gpt-5.3-codex-spark');
   });
 
   it('prepends empty options with value "" when emptyProviderOption/emptyModelOption are set', () => {
@@ -117,6 +132,42 @@ describe('ProviderModelSelector', () => {
     const providerSelect = screen.getAllByRole('combobox')[0];
     const labels = [...providerSelect.querySelectorAll('option')].map((o) => o.textContent);
     expect(labels).toEqual(['Provider One', 'Provider Two']);
+  });
+
+  it('applies one selection policy to providers, models, and effort options', () => {
+    const policy = {
+      provider: (provider) => provider.id === 'local',
+      model: (model) => (typeof model === 'string' ? model : model.id) === 'safe-model',
+      effort: (level) => level === 'low',
+    };
+    renderSelector({
+      providers: [{ id: 'local', name: 'Local', type: 'cli', command: 'codex', models: ['gpt-5'] }, { id: 'cloud', name: 'Cloud' }],
+      selectedProviderId: 'local',
+      selectedModel: 'safe-model',
+      availableModels: [{ id: 'safe-model', capabilities: ['chat'] }, { id: 'tool-model', capabilities: ['tools'] }],
+      effort: 'low',
+      onEffortChange: () => {},
+      selectionPolicy: policy,
+    });
+
+    const [providerSelect, modelSelect, effortSelect] = screen.getAllByRole('combobox');
+    expect([...providerSelect.options].map((option) => option.value)).toEqual(['local']);
+    expect([...modelSelect.options].map((option) => option.value)).toEqual(['safe-model']);
+    expect([...effortSelect.options].map((option) => option.value)).toEqual(['', 'low']);
+  });
+
+  it('keeps a disallowed saved model visible only as a disabled stale option', () => {
+    renderSelector({
+      providers: [{ id: 'local', name: 'Local' }],
+      selectedProviderId: 'local',
+      selectedModel: 'tool-model',
+      availableModels: ['safe-model', 'tool-model'],
+      selectionPolicy: { model: (model) => model !== 'tool-model' },
+    });
+    const modelSelect = screen.getAllByRole('combobox')[1];
+    expect([...modelSelect.options].map((option) => option.value)).toEqual(['tool-model', 'safe-model']);
+    expect(modelSelect.querySelector('option[value="tool-model"]').disabled).toBe(true);
+    expect(modelSelect.querySelector('option[value="tool-model"]').textContent).toMatch(/not permitted/i);
   });
 
   it('hides incompatible providers and models while preserving selected pins', () => {

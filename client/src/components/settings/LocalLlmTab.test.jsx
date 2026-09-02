@@ -4,6 +4,7 @@ import { MemoryRouter, useLocation } from 'react-router';
 
 vi.mock('../../services/api', () => ({
   getLocalLlmStatus: vi.fn(),
+  getSystemCapabilities: vi.fn(),
   getLocalLlmCatalog: vi.fn(),
   getLocalLlmHuggingFaceSearch: vi.fn(),
   installLocalLlmModel: vi.fn(),
@@ -18,6 +19,10 @@ vi.mock('../../services/api', () => ({
   startMtplxServer: vi.fn(),
   stopMtplxServer: vi.fn(),
   installMtplx: vi.fn(),
+  getSlotstreamServerStatus: vi.fn().mockResolvedValue({ installed: false, running: false, supported: true, cachedModels: [], memoryPlan: { targetGb: 22, expectedPeakGb: 22, expectedWarmDecodeToks: 8, auto: true } }),
+  startSlotstreamServer: vi.fn(),
+  stopSlotstreamServer: vi.fn(),
+  installSlotstream: vi.fn(),
   // The MTPLX card's checkpoint panel loads upstream's default listing on mount.
   searchMtplxModels: vi.fn().mockResolvedValue({ models: [], error: null }),
   pullMtplxModel: vi.fn(),
@@ -32,6 +37,15 @@ vi.mock('../../services/api', () => ({
   installLlamaServer: vi.fn().mockResolvedValue({ success: true }),
   upgradeLlamaServer: vi.fn().mockResolvedValue({ success: true, note: 'updated' }),
   downloadSpecDecodeModel: vi.fn(),
+  previewLocalLlmDownload: vi.fn(async () => ({
+    kind: 'spec-decode',
+    destPath: 'models/example.gguf',
+    expectedBytes: 6,
+    freeBytes: 1e12,
+    requiredBytes: 6,
+    headroomBytes: 0,
+    verdict: 'ok',
+  })),
   cancelSpecDecodeModelDownload: vi.fn(),
 }));
 vi.mock('../../services/socket', () => ({
@@ -40,10 +54,14 @@ vi.mock('../../services/socket', () => ({
 vi.mock('../ui/Toast', () => ({
   default: Object.assign(vi.fn(), { success: vi.fn(), error: vi.fn(), warning: vi.fn(), info: vi.fn() }),
 }));
+vi.mock('../models/ModelAbuseGuardPanel.jsx', () => ({
+  default: () => <section id="llm-management-panel-abuse" role="tabpanel" aria-labelledby="tab-abuse" data-testid="model-abuse-guard-card">abuse panel</section>,
+}));
 
 import {
   deleteLocalLlmModel,
   getLocalLlmStatus,
+  getSystemCapabilities,
   getLocalLlmCatalog,
   installLocalLlmBackend,
   patchSettingsSlice,
@@ -51,6 +69,7 @@ import {
 } from '../../services/api';
 import socket from '../../services/socket';
 import { LocalLlmTab } from './LocalLlmTab';
+import { hardwareLlmRecommendation } from './HardwareLlmRecommendation.jsx';
 
 // A realistically long HF model id — the shape that got ellipsised to
 // "hf.co/sja…" on a phone before the row was allowed to wrap.
@@ -61,14 +80,21 @@ const LocationProbe = () => {
   return <output data-testid="location">{location.pathname}{location.search}</output>;
 };
 
-const renderTab = async () => {
+const renderTab = async (view = 'runtimes') => {
   render(
     <MemoryRouter>
-      <LocalLlmTab />
+      <LocalLlmTab view={view} />
       <LocationProbe />
     </MemoryRouter>,
   );
-  await waitFor(() => expect(screen.getByText(/Installed on Ollama/)).toBeTruthy());
+  await waitFor(() => expect(screen.getByRole('tabpanel')).toHaveAttribute('id', `llm-management-panel-${view}`));
+  if (view === 'library') {
+    await waitFor(() => expect(screen.getByText(/Installed on (Ollama|LM Studio)/)).toBeTruthy());
+  } else if (view === 'abuse') {
+    await waitFor(() => expect(screen.getByTestId('model-abuse-guard-card')).toBeInTheDocument());
+  } else {
+    await waitFor(() => expect(screen.getByTitle(/PortOS routes local-LLM runs here by default/)).toBeInTheDocument());
+  }
   // The MTPLX checkpoint panel only mounts once the MTPLX status resolves, and
   // it then fetches its default listing — two chained awaits, so flush twice so
   // both state updates land inside act().
@@ -97,9 +123,84 @@ beforeEach(() => {
     lmstudio: { installed: false, available: false, modelCount: 0, models: [] },
   });
   getLocalLlmCatalog.mockResolvedValue({ models: [] });
+  getSystemCapabilities.mockResolvedValue({
+    platform: 'darwin',
+    appleSilicon: true,
+    totalMemoryGb: 64,
+    cuda: { status: 'absent', gpus: [], maxVramGb: null },
+  });
   installLocalLlmBackend.mockResolvedValue({ success: true });
   patchSettingsSlice.mockResolvedValue({});
   deleteLocalLlmModel.mockResolvedValue({ success: true });
+});
+
+describe('LocalLlmTab information architecture', () => {
+  it('defaults the legacy LLM URL to runtime controls without loading the model catalog', async () => {
+    await renderTab();
+
+    expect(screen.getByRole('heading', { name: 'Local Runtime Servers' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Models' })).not.toBeInTheDocument();
+    expect(getLocalLlmCatalog).not.toHaveBeenCalled();
+    expect(await screen.findByRole('heading', { name: 'Recommended coding-agent setup' })).toBeInTheDocument();
+    expect(screen.getByText('OpenCode MTPLX TUI')).toBeInTheDocument();
+  });
+
+  it('gives the model-abuse guard its own panel without mounting the catalog', async () => {
+    await renderTab('abuse');
+
+    expect(screen.getByTestId('model-abuse-guard-card')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Models' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Local Runtime Servers' })).not.toBeInTheDocument();
+    expect(getLocalLlmCatalog).not.toHaveBeenCalled();
+  });
+
+  it('gives model installation its own panel without mounting runtime management', async () => {
+    const { getLlamaServerStatus, getMtplxServerStatus, getSlotstreamServerStatus } = await import('../../services/api');
+
+    await renderTab('library');
+
+    expect(screen.getByRole('heading', { name: 'Models' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Local Runtime Servers' })).not.toBeInTheDocument();
+    expect(getLlamaServerStatus).not.toHaveBeenCalled();
+    expect(getMtplxServerStatus).not.toHaveBeenCalled();
+    expect(getSlotstreamServerStatus).not.toHaveBeenCalled();
+    await waitFor(() => expect(getLocalLlmCatalog).toHaveBeenCalled());
+  });
+
+  it('navigates between the focused panels with a shareable URL', async () => {
+    await renderTab();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Model Library' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('/models/llms/library');
+    fireEvent.click(screen.getByRole('tab', { name: 'Abuse Guard' }));
+    expect(screen.getByTestId('location')).toHaveTextContent('/models/llms/abuse');
+  });
+
+  it('keeps the model-abuse guard off the catalog panel', async () => {
+    await renderTab('library');
+
+    expect(screen.queryByRole('heading', { name: 'Model-abuse guard' })).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Models' })).toBeInTheDocument();
+  });
+});
+
+describe('hardware coding-agent profiles', () => {
+  it('selects the benchmarked Apple profile by unified-memory tier', () => {
+    expect(hardwareLlmRecommendation({ platform: 'darwin', appleSilicon: true, totalMemoryGb: 48 })).toMatchObject({
+      id: 'apple-48', runtime: 'MTPLX', harness: 'OpenCode MTPLX TUI', context: '64K context',
+    });
+    expect(hardwareLlmRecommendation({ platform: 'darwin', appleSilicon: true, totalMemoryGb: 128 })).toMatchObject({
+      id: 'apple-128', model: expect.stringMatching(/Quality/),
+    });
+  });
+
+  it('selects the llama.cpp path only for the configured RTX 3090 machine', () => {
+    expect(hardwareLlmRecommendation({
+      platform: 'win32',
+      cuda: { maxVramGb: 24, gpus: [{ name: 'NVIDIA GeForce RTX 3090' }] },
+    })).toMatchObject({ id: 'rtx-3090', runtime: 'llama.cpp', harness: 'OpenCode llama TUI' });
+    expect(hardwareLlmRecommendation({ platform: 'win32', cuda: { maxVramGb: 16, gpus: [{ name: 'NVIDIA GeForce RTX 3090' }] } })).toBeNull();
+  });
 });
 
 describe('LocalLlmTab backend disable state', () => {
@@ -119,11 +220,9 @@ describe('LocalLlmTab backend disable state', () => {
       lmstudio: { installed: true, available: false, disabled: true, modelCount: 0, models: [] },
     });
     await renderTab();
-    expect(screen.getByText(/LM Studio isn't running/)).toBeInTheDocument();
     fireEvent.click(screen.getByTitle('Mark LM Studio as intentionally disabled'));
     await waitFor(() => expect(patchSettingsSlice).toHaveBeenCalledWith('localLlm.lmstudio', { disabled: true }));
-    await waitFor(() => expect(screen.queryByText(/LM Studio isn't running/)).toBeNull());
-    expect(screen.getByText('Disabled')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Disabled')).toBeInTheDocument());
   });
 });
 
@@ -141,7 +240,7 @@ describe('LocalLlmTab runtime servers', () => {
       lmstudio: { installed: true, available: true, modelCount: 0, models: [] },
     });
 
-    await renderTab();
+    await renderTab('library');
 
     const blocker = screen.getByText("Ollama isn't installed yet.").closest('div');
     expect(within(blocker).queryByText(/npm run setup:llm/)).toBeNull();
@@ -165,7 +264,7 @@ describe('LocalLlmTab runtime servers', () => {
       },
     });
 
-    await renderTab();
+    await renderTab('library');
 
     const blocker = screen.getByText("LM Studio isn't installed yet.").closest('div');
     expect(within(blocker).queryByRole('button', { name: 'Install LM Studio' })).toBeNull();
@@ -225,6 +324,7 @@ describe('LocalLlmTab runtime servers', () => {
 
     await renderTab();
     fireEvent.click(screen.getByRole('button', { name: /Download default checkpoint/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
 
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/no space left on device/)));
     expect(toast.success).not.toHaveBeenCalled();
@@ -239,6 +339,7 @@ describe('LocalLlmTab runtime servers', () => {
 
     await renderTab();
     fireEvent.click(screen.getByRole('button', { name: /Download default checkpoint/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
 
     // `null` (not a repo id the card invented) = MTPLX's own verified default.
     await waitFor(() => expect(pullMtplxModel).toHaveBeenCalledWith(null));
@@ -262,14 +363,14 @@ describe('LocalLlmTab installed models', () => {
   });
 
   it('lets a long model id wrap instead of truncating it', async () => {
-    await renderTab();
+    await renderTab('library');
     const name = screen.getByText(LONG_ID);
     expect(name.className).toMatch(/\bbreak-all\b/);
     expect(name.className).not.toMatch(/\btruncate\b/);
   });
 
   it('stacks the row on mobile and keeps it inline from sm up', async () => {
-    await renderTab();
+    await renderTab('library');
     // The row is the flex container holding the name; on mobile it stacks so the
     // id gets the full width, and the action row drops beneath it.
     const row = screen.getByText(LONG_ID).closest('.rounded-lg');
@@ -278,7 +379,7 @@ describe('LocalLlmTab installed models', () => {
   });
 
   it('folds the model size into the wrapping metadata line', async () => {
-    await renderTab();
+    await renderTab('library');
     // Size used to be its own fixed-width column competing with the name; it now
     // rides along with params/quant/family so nothing is squeezed out.
     expect(screen.getByText(/^34\.7B · Q6_K · qwen2 · [\d.]+ GB$/)).toBeTruthy();
@@ -286,8 +387,9 @@ describe('LocalLlmTab installed models', () => {
 
   it('redownloads an installed model instead of requiring delete-then-install', async () => {
     installLocalLlmModel.mockResolvedValue({ success: true });
-    await renderTab();
+    await renderTab('library');
     fireEvent.click(screen.getByRole('button', { name: `Redownload ${LONG_ID}` }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
     await waitFor(() => expect(installLocalLlmModel).toHaveBeenCalledWith(
       'ollama',
       LONG_ID,
@@ -307,7 +409,7 @@ describe('LocalLlmTab installed models', () => {
     });
     const toast = (await import('../ui/Toast')).default;
 
-    await renderTab();
+    await renderTab('library');
     for (const model of models.slice(0, 6)) {
       fireEvent.click(screen.getByRole('checkbox', { name: `Select ${model.name} for comparison` }));
     }
@@ -322,7 +424,7 @@ describe('LocalLlmTab installed models', () => {
   }, 10_000);
 
   it('requires inline confirmation before deleting an installed model', async () => {
-    await renderTab();
+    await renderTab('library');
     fireEvent.click(screen.getByRole('button', { name: `Delete ${LONG_ID}` }));
     expect(screen.getByText('Delete?')).toBeInTheDocument();
     expect(deleteLocalLlmModel).not.toHaveBeenCalled();
@@ -349,11 +451,12 @@ describe('LocalLlmTab installed models', () => {
     });
     render(
       <MemoryRouter>
-        <LocalLlmTab />
+        <LocalLlmTab view="library" />
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText(/Installed on LM Studio/)).toBeTruthy());
     fireEvent.click(screen.getByRole('button', { name: 'Redownload Qwen3.8 27B' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
     await waitFor(() => expect(installLocalLlmModel).toHaveBeenCalledWith(
       'lmstudio',
       'unsloth/Qwen3.8-27B-GGUF@UD-Q4_K_M',
@@ -374,7 +477,7 @@ describe('LocalLlmTab installed models', () => {
     });
     render(
       <MemoryRouter>
-        <LocalLlmTab />
+        <LocalLlmTab view="library" />
       </MemoryRouter>,
     );
     await waitFor(() => expect(screen.getByText(/Installed on LM Studio/)).toBeTruthy());
@@ -400,7 +503,7 @@ describe('LocalLlmTab recommendations', () => {
       }],
     });
 
-    await renderTab();
+    await renderTab('library');
 
     const termsLink = await screen.findByRole('link', { name: 'Accept terms' });
     expect(termsLink).toHaveAttribute('href', 'https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-MLX');
@@ -428,7 +531,7 @@ describe('LocalLlmTab recommendations', () => {
       }],
     });
 
-    await renderTab();
+    await renderTab('library');
 
     expect(await screen.findByText('Best Qwen3.8 path')).toBeTruthy();
     expect(screen.getAllByText('General purpose').length).toBeGreaterThan(0);
@@ -453,9 +556,10 @@ describe('LocalLlmTab recommendations', () => {
         capabilities: ['chat'],
       }],
     });
-    await renderTab();
+    await renderTab('library');
     expect(await screen.findByText('Qwen3.8 27B')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /^Redownload$/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
     await waitFor(() => expect(installLocalLlmModel).toHaveBeenCalledWith(
       'ollama',
       'hf.co/unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M',
@@ -522,7 +626,7 @@ describe('LocalLlmTab measured fit badge', () => {
         assessedAt: '2026-01-02T00:00:00.000Z',
       })],
     });
-    await renderTab();
+    await renderTab('library');
 
     const badge = await screen.findByText(/exceeds RAM \(measured\)/);
     expect(badge).toBeInTheDocument();
@@ -533,7 +637,7 @@ describe('LocalLlmTab measured fit badge', () => {
 
   it('labels an unmeasured verdict as the estimate it is', async () => {
     getLocalLlmCatalog.mockResolvedValue({ models: [catalogEntry({ fit: 'comfortable', fitSource: 'estimated', estimatedFit: 'comfortable', measuredFit: null })] });
-    await renderTab();
+    await renderTab('library');
 
     const badge = await screen.findByText('fits comfortably');
     expect(badge.getAttribute('title')).toMatch(/Estimated fit/);
@@ -544,7 +648,7 @@ describe('LocalLlmTab measured fit badge', () => {
     // No amount of free RAM fixes a backend refusing a model, so `incompatible`
     // only ever comes from a real run.
     getLocalLlmCatalog.mockResolvedValue({ models: [catalogEntry({ fit: 'incompatible', fitSource: 'measured', estimatedFit: 'comfortable', measuredFit: 'incompatible', disagrees: true })] });
-    await renderTab();
+    await renderTab('library');
 
     expect(await screen.findByText(/backend refused it \(measured\)/)).toBeInTheDocument();
   });
@@ -846,6 +950,7 @@ describe('LocalLlmTab llama-server management', () => {
     expect(screen.getByText(/Downloaded \(1\.1 GB\)/)).toBeInTheDocument();
     const downloadBtn = screen.getByRole('button', { name: /^Download$/ });
     fireEvent.click(downloadBtn);
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
 
     await waitFor(() => {
       expect(downloadSpecDecodeModel).toHaveBeenCalledWith('qwen3.8-27b-dspark', 'model', { silent: true });
@@ -872,6 +977,7 @@ describe('LocalLlmTab llama-server management', () => {
     await renderTab();
 
     fireEvent.click(await screen.findByRole('button', { name: /^Download$/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start download' }));
 
     await waitFor(() => {
       expect(toast.warning).toHaveBeenCalledWith(expect.stringMatching(/still running in the background/));
@@ -938,6 +1044,28 @@ describe('LocalLlmTab llama-server management', () => {
     await waitFor(() => {
       expect(installLlamaServer).toHaveBeenCalled();
     });
+  });
+
+  it('names the install command the SERVER reports, not a hardcoded Homebrew one', async () => {
+    // The browser cannot know what OS the install runs on, so this copy has to
+    // come off the status payload — a Windows user was previously told to run
+    // `brew install llama.cpp`, which does not exist there.
+    const { getLlamaServerStatus } = await import('../../services/api');
+    getLlamaServerStatus.mockResolvedValue({
+      installed: false,
+      running: false,
+      managed: false,
+      packageManager: 'winget',
+      packageManagerLabel: 'winget',
+      installCommand: 'winget install ggml.llamacpp',
+      presets: specPresets(),
+    });
+
+    await renderTab();
+
+    await screen.findByRole('button', { name: /Install llama\.cpp/ });
+    expect(screen.getAllByText('winget install ggml.llamacpp').length).toBeGreaterThan(0);
+    expect(screen.queryByText('brew install llama.cpp')).not.toBeInTheDocument();
   });
 
   it('updates llama.cpp from the unified runtime row', async () => {

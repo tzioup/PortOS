@@ -14,16 +14,6 @@ import { ASSESSABLE_RUNTIMES } from './localProviderRuntime.js';
 import { SWEEP_SCOPES } from './localModelAssessment.js';
 import { CAPABILITY_TEST_IDS } from './modelCapabilityTests.js';
 
-// OpenWorld snapshot pipeline (issue #877): how often to capture a city-state
-// frame and how many to retain. Validated as a settings slice on PUT /api/settings;
-// service-side defaults (DEFAULT_SNAPSHOT_CONFIG) fill any absent field so an
-// install with no `openWorldSnapshots` key still captures.
-export const openWorldSnapshotConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  intervalMinutes: z.number().int().min(1).max(1440).optional(),
-  maxSnapshots: z.number().int().min(10).max(100000).optional()
-});
-
 // iMessage ingestion config (#2151) — the `settings.imessage` slice. Sync is OFF
 // by default and only reads chat.db when enabled (needs macOS Full Disk Access).
 // Validated as a settings slice on PUT /api/settings; service-side DEFAULT_CONFIG
@@ -128,13 +118,6 @@ export const startTrainingRunSchema = z.object({
   acknowledgeCaptionLeak: z.boolean().optional(),
 });
 
-// Query for GET /api/openworld/snapshots — `since` (ISO timestamp) and `limit`
-// (most-recent N) both arrive as strings on the query string.
-export const openWorldSnapshotsQuerySchema = z.object({
-  since: z.string().datetime().optional(),
-  limit: z.coerce.number().int().min(1).max(100000).optional()
-});
-
 // === Local LLM backends (Ollama / LM Studio) ===
 export const localLlmBackendSchema = z.enum(['ollama', 'lmstudio']);
 // modelId is passed positionally to the `lms` CLI (execFile, no shell) — reject
@@ -180,6 +163,14 @@ export const localLlmMtplxStartSchema = z.object({
     /^$|^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/,
     'model must be a Hugging Face repo id',
   ).optional().nullable(),
+});
+// Slotstream launch. Every field is optional: with none of them PortOS serves
+// the first cached checkpoint on the dedicated loopback port. `memoryGb` is the
+// explicit cache-size cap persisted on the saved launch line; absent = auto.
+export const localLlmSlotstreamStartSchema = z.object({
+  port: z.coerce.number().int().min(1).max(65535).optional(),
+  model: z.string().trim().max(300).optional().nullable(),
+  memoryGb: z.coerce.number().min(6).max(512).optional().nullable(),
 });
 // MTPLX model catalog. `mtplx forge discover` is upstream's own index of
 // MTPLX-branded MTP checkpoints; an empty query means its default listing.
@@ -239,6 +230,27 @@ export const localLlmSpecModelDownloadSchema = z.object({
   presetId: z.string().trim().min(1).max(100),
   role: z.enum(['model', 'draftModel']),
 });
+// Confirm-step disk preflight for a weight download. Discriminated on `kind`
+// so the server resolves dest + expected size — the client never supplies a
+// path. `insufficient` is returned as a verdict, not thrown, so the confirm
+// UI can disable the button instead of toasting a failure the user hasn't
+// committed to yet. The download endpoints still throw DISK_INSUFFICIENT.
+export const localLlmDownloadPreflightSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('spec-decode'),
+    presetId: z.string().trim().min(1).max(100),
+    role: z.enum(['model', 'draftModel']),
+  }),
+  z.object({
+    kind: z.literal('mtplx'),
+    model: mtplxRepoIdSchema.optional().nullable(),
+  }),
+  z.object({
+    kind: z.literal('install'),
+    backend: localLlmBackendSchema,
+    modelId: localLlmModelIdSchema,
+  }),
+]);
 export const localLlmHuggingFaceSearchSchema = z.object({
   backend: localLlmBackendSchema,
   q: z.string().max(160).optional().default(''),

@@ -38,16 +38,14 @@ log "==================================="
 log ""
 
 # Wipe a workspace's installed deps so the next `npm install` resolves the tree
-# from scratch. node_modules is always removed; the lockfile is removed ONLY
-# when it's gitignored (the per-install client/server locks) — a tracked root
-# or autofixer lock was just pulled and is already consistent with the new
-# package.json, so keep it for reproducible resolution.
+# from scratch. node_modules ONLY — every workspace lockfile this script touches
+# (root, client, server, autofixer) is tracked, so the pull just brought one that
+# is already consistent with the new package.json. Keep it: reinstalling from the
+# committed lock is reproducible, while deleting it would let transitive versions
+# float past the `overrides` pins.
 clean_workspace_deps() {
   local dir="$1"
   rm -rf "$dir/node_modules"
-  if git check-ignore -q "$dir/package-lock.json" 2>/dev/null; then
-    rm -f "$dir/package-lock.json"
-  fi
 }
 
 # Whether the pulled update changed this workspace's package.json. When it did,
@@ -99,7 +97,7 @@ safe_install() {
     return 0
   fi
 
-  log "⚠️  npm install failed for $label — cleaning node_modules + package-lock.json and retrying..."
+  log "⚠️  npm install failed for $label — cleaning node_modules and retrying..."
   clean_workspace_deps "$dir"
   if (cd "$dir" && run npm install --no-save); then
     return 0
@@ -211,14 +209,23 @@ fi
 step "npm-install" "done" "Dependencies installed"
 
 # Run data/db/browser setup. Don't call `npm run setup` — that re-runs the
-# installs we just did above. The three scripts here are the data-side half
-# of `npm run setup` and are idempotent.
+# installs we just did above. These scripts are the data-side half of
+# `npm run setup` and are idempotent.
 step "setup" "running" "Running setup..."
 run node scripts/setup-data.js
 run node scripts/setup-db.js
 run node scripts/setup-browser.js
 run node scripts/setup-ghostty.js || true
 step "setup" "done" "Setup complete"
+log ""
+
+# Retry the safe Tailscale certificate path on every update. setup-cert exits 0
+# with an actionable explanation when a human-only prerequisite (sign-in,
+# MagicDNS, HTTPS Certificates) is missing, so updates never hang or fail on it.
+step "network-setup" "running" "Checking Tailscale, MagicDNS, and HTTPS..."
+run node scripts/setup-cert.js
+network_summary=$(node scripts/setup-guide.js --summary 2>> "$UPDATE_LOG" || true)
+step "network-setup" "done" "${network_summary:-Network setup checked}"
 log ""
 
 # Ensure ffmpeg is present — it's a runtime dependency for the media/video
@@ -368,6 +375,12 @@ log ""
 access_url=$(node scripts/print-access-url.js 2>/dev/null || true)
 if [ -n "$access_url" ]; then
   log "$access_url"
+  log ""
+fi
+
+setup_guide=$(node scripts/setup-guide.js --assume-active 2>/dev/null || true)
+if [ -n "$setup_guide" ]; then
+  log "$setup_guide"
   log ""
 fi
 

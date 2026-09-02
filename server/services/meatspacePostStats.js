@@ -1,8 +1,9 @@
 /**
  * POST aggregate statistics.
  *
- * The persistence service keeps the public API stable by re-exporting this
- * module. Shared session and legacy-task helpers intentionally stay there.
+ * Reads raw sessions and the legacy-task helpers from the persistence service;
+ * callers name THIS module for the derived aggregates rather than reaching for
+ * a re-export off the persistence service (issue #5690).
  */
 import { getPostSessions, deriveTaskAccuracy, deriveTaskCompletion } from './meatspacePost.js';
 import { getAllTrainingEntries } from './postTrainingLogStore.js';

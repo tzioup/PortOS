@@ -13,6 +13,7 @@
     "ux": "e03d03fc7c16faa5b5db93be2896b9ad",
     "data-safety": "86b07f51abdbcbe7016f840b5bb0cd9b",
     "simplify": "2a048214d1dd3b75bee9ae1a38fa1589",
+    "module-hygiene": "3b7671cd44f719d4b2116b96a279e6d0",
     "api-contract": "cf02b10a5993baf473e0d320771f26b6",
     "react-lifecycle": "14b3816d1bcc10f0d7d6357e55cc5e69",
     "observability": "fdb4d77df5891cfb653a5da2553ecf8a",
@@ -20,25 +21,27 @@
     "feature-ideas": "804f62f1dadadbfa8a0bcd4aff16b2e8",
     "plan-feature": "87f71a894757f89354da4e2119e07118",
     "plan-task": "b85fe92999aa4ee4a8910320457c4242",
-    "claim-issue": "9bf278ab141120625cd6faf854622f91",
-    "claim-issue-gitlab": "745672581d766edff0ec585dd5b1ef5d",
-    "claim-issue-jira": "1407b5095c18524f02e6bf1ff45ad967",
+    "claim-issue": "78325cbcfb0e5698018fcd16b3aa8b49",
+    "claim-issue-gitlab": "bb83608738b6517f3f05df116994a6fd",
+    "claim-issue-jira": "b14a5dde5519fda59c2ba1ae7a3d8989",
     "code-reviewer-review": "27ded42013f28e7d327d8f1cc624aac1",
     "code-reviewer-implement": "2e10cac7c1e1cd021d06bfddb5c1eaf2",
     "error-handling": "9afba2e99b90a8d5771c75e7f0615d96",
     "typing": "1f2758ce0bb62d789a21aec241549531",
-    "release-check": "644e5f2f6df1daf06f3792a81ba7a51a",
+    "release-check": "5a82eec9f86ad05185ed77a42dbfd9d4",
     "stash-cleanup": "1c12bac5aac6bb27008c40981e7db08c",
     "repo-sync": "0a648d35d43b023b758226b9c709c8ea",
+    "user-action-review": "945a716d446d26a03e2805d28bd1ae16",
     "jira-sprint-manager": "3e63c8a3bdf0d5a05a30faaa2dc07980",
     "do-replan": "35660eb7b43e4259a6a9253ed288a1db",
     "jira-status-report": "9d374a9d8ccb92c5c8fd0aa9899e79a5",
     "branch-cleanup": "8fdeb4acc2749816a47ca318b6602721",
     "branch-reconcile": "16479f4b64395103fd222dc9608830b1",
     "issue-reconcile": "6f33db6ad0b57c36909229694b78891a",
-    "pr-reviewer": "add27b67daa6aa2c75717ac96a6bd625",
-    "pr-reviewer-security": "4df29e2bf7b05dbec67e1b6198b8b9c9",
-    "pr-reviewer-review": "ec67b91468cead9c16cfcffff06f8993",
+    "pr-reviewer": "679680b3b382aeb6786df01c4d1a90c6",
+    "pr-reviewer-security": "a993798467b8d773b0e44b3e3d303bd0",
+    "pr-reviewer-eligibility": "7e35acefd33f05145544e2702d065bfd",
+    "pr-reviewer-review": "76d1d8265d4d56ae6a4c00d64e8787a8",
     "reference-watch": "e0e20754700fb08d5159b8437d9c260b",
     "pr-watcher": "53ead8e26d396849bfa78f28550bd691",
     "refresh-local-llm-catalog": "9741ca6a8419fcdea2743e3b64781a8b"
@@ -47,10 +50,10 @@
     "do-replan": 2,
     "feature-ideas": 11,
     "plan-task": 18,
-    "claim-issue": 22,
-    "claim-issue-gitlab": 20,
-    "claim-issue-jira": 15,
-    "pr-reviewer": 3,
+    "claim-issue": 24,
+    "claim-issue-gitlab": 22,
+    "claim-issue-jira": 16,
+    "pr-reviewer": 4,
     "code-reviewer-a": 1,
     "code-reviewer-b": 1,
     "reference-watch": 3,
@@ -58,6 +61,7 @@
     "branch-reconcile": 3,
     "issue-reconcile": 4,
     "refresh-local-llm-catalog": 4,
+    "user-action-review": 1,
     "plan-feature": 5,
     "security": 2,
     "code-quality": 3,
@@ -74,13 +78,14 @@
     "ux": 1,
     "data-safety": 1,
     "simplify": 1,
+    "module-hygiene": 1,
     "api-contract": 1,
     "react-lifecycle": 1,
     "observability": 1,
     "copy": 1,
     "stash-cleanup": 2,
     "repo-sync": 1,
-    "release-check": 12,
+    "release-check": 13,
     "jira-sprint-manager": 1,
     "jira-status-report": 1
   },
@@ -120,7 +125,8 @@
     ],
     "pr-reviewer": [
       "9ceeed08f238b3787fc1201a0ce8e023",
-      "f64e5d8176a871304fa691df812cda61"
+      "f64e5d8176a871304fa691df812cda61",
+      "add27b67daa6aa2c75717ac96a6bd625"
     ],
     "reference-watch": [
       "f9322140bff7d3f603799c09ce468da9",
@@ -141,7 +147,8 @@
       "52fd3506aad0b283be7234b608cf31ca",
       "9d782972b20d6b721eb44d0673315cad",
       "c66170bfcdee911f03e60261c4f503db",
-      "d5e2b6cf39c2acfebef9ee8e826a7e42"
+      "d5e2b6cf39c2acfebef9ee8e826a7e42",
+      "1407b5095c18524f02e6bf1ff45ad967"
     ],
     "claim-issue-gitlab": [
       "fae92c45c89c65455930b4b06a1b88c4",
@@ -162,7 +169,9 @@
       "ed2c2c9c8cd6297340b3a92666cb2c5a",
       "348ed6348b90dcc6eead03e06df049e9",
       "1f9ec476dce71d04e588d17e72cd46c9",
-      "b5e24d2caefba4acc6fb09f6c09f2afd"
+      "b5e24d2caefba4acc6fb09f6c09f2afd",
+      "745672581d766edff0ec585dd5b1ef5d",
+      "42fcfae41076d73b49050015fac0ae0e"
     ],
     "claim-issue": [
       "37949d1b1fa8d461a15658f8f4192d97",
@@ -185,7 +194,9 @@
       "a91b3df45864cf1aeaea7b326a7717ae",
       "a6f069d7276c9f31fdca3b50666324e2",
       "6a9bebb3f31b7c1b0a0728def0fe5b3c",
-      "af99e76b4881d1a18234eff0d58d49a4"
+      "af99e76b4881d1a18234eff0d58d49a4",
+      "9bf278ab141120625cd6faf854622f91",
+      "688661e7e7b0b4b5af95288dd86a23e8"
     ],
     "security": [
       "b199739b21a8c45ed3778b2339ebf55f",
@@ -238,7 +249,8 @@
       "08c928e6f79f83535e40b6988ff6eae3",
       "afa9039cfbff21d77d601dc74eb5b81f",
       "2d2a6700c23b73bf738c2aa915e37277",
-      "64be10f6ac7bcf74d4fc257089fc179b"
+      "64be10f6ac7bcf74d4fc257089fc179b",
+      "644e5f2f6df1daf06f3792a81ba7a51a"
     ],
     "branch-reconcile": [
       "7ef2b5f7d8f05937d4912b26ad45f42e",

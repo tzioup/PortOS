@@ -175,22 +175,22 @@ export default function FableLoomHostedJoin() {
 
   if (authError) {
     return (
-      <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-6 text-center">
+      <main className="h-dvh-screen bg-slate-950 text-white flex flex-col items-center justify-center p-6 text-center">
         <div className="w-16 h-16 rounded-full bg-red-500/10 border border-red-500/20 flex items-center justify-center mb-4">
           <AlertCircle className="w-8 h-8 text-red-400" />
         </div>
         <h1 className="text-xl font-bold mb-2">Hosted Play Error</h1>
         <p className="text-slate-400 text-sm max-w-xs">{authError}</p>
-      </div>
+      </main>
     );
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-white flex flex-col justify-between max-w-md mx-auto relative overflow-hidden shadow-2xl">
+    <main className="h-dvh-screen bg-slate-950 text-white flex flex-col justify-between max-w-md mx-auto relative overflow-y-auto shadow-2xl">
       <audio ref={audioPlayerRef} className="hidden" />
 
       {/* Header */}
-      <header className="px-5 py-4 border-b border-slate-800/80 bg-slate-900/50 backdrop-blur flex items-center justify-between">
+      <header className="shrink-0 px-5 py-4 border-b border-slate-800/80 bg-slate-900/50 backdrop-blur flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <Smartphone className="w-5 h-5 text-indigo-400" />
           <div>
@@ -205,7 +205,7 @@ export default function FableLoomHostedJoin() {
       </header>
 
       {/* Live Turn Phase Banner */}
-      <div className="px-4 py-2.5 border-b border-slate-800 bg-slate-900/30 flex items-center justify-center">
+      <div className="shrink-0 px-4 py-2.5 border-b border-slate-800 bg-slate-900/30 flex items-center justify-center">
         {turnPhase === 'listening' ? (
           <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold animate-pulse">
             <Mic className="w-4 h-4" />
@@ -231,7 +231,7 @@ export default function FableLoomHostedJoin() {
       {/* Transcript Stream */}
       <div
         ref={transcriptScrollRef}
-        className="flex-1 p-4 overflow-y-auto space-y-3 font-sans text-sm"
+        className="flex-1 min-h-[8rem] p-4 overflow-y-auto space-y-3 font-sans text-sm"
       >
         {transcript.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center text-center text-slate-500 text-xs py-12">
@@ -267,7 +267,7 @@ export default function FableLoomHostedJoin() {
       </div>
 
       {/* Mobile Push-To-Talk / Interaction Control */}
-      <div className="p-4 bg-slate-900/80 border-t border-slate-800 space-y-3">
+      <div className="shrink-0 p-4 bg-slate-900/80 border-t border-slate-800 space-y-3">
         <div className="flex flex-col items-center justify-center py-2">
           <button
             type="button"
@@ -308,12 +308,12 @@ export default function FableLoomHostedJoin() {
             type="submit"
             aria-label="Send message"
             disabled={!textInput.trim() || turnPhase === 'thinking' || turnPhase === 'speaking'}
-            className="p-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-white transition-colors"
+            className="min-w-[44px] min-h-[44px] p-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg text-white transition-colors flex items-center justify-center"
           >
             <Send className="w-4 h-4" />
           </button>
         </form>
       </div>
-    </div>
+    </main>
   );
 }

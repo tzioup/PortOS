@@ -35,6 +35,25 @@
  *   usePortal               LayoutEditor / KeyboardHelp — escape any
  *                           stacking-context ancestors.
  *
+ * Height: the panel is clamped to the *visible* viewport by Modal itself —
+ * `max-h-dvh-cap` (index.css) minus a per-align `--dvh-inset`. Call sites must
+ * NOT pass their own `max-h-[NNvh]` in `panelClassName`: the overlay is
+ * `fixed inset-0` (the small viewport on iOS Safari) and centres with
+ * `items-center`, so a panel taller than the overlay has its overflow split
+ * top and bottom — the dialog's title AND its Save/Cancel footer end up
+ * off-screen, which is unrecoverable on a modal that also opts out of Esc and
+ * backdrop dismissal. The clamp lives in the primitive for the same reason
+ * portaling does (`client/src/AGENTS.md`): so no call site has to remember it.
+ * `client/src/components/ui/modalPanelHeights.test.js` fails the build if the
+ * per-caller idiom comes back. The inset accounts for the align padding,
+ * including align='top' (`pt-[10dvh]`), so a top-aligned panel still ends
+ * above the bottom edge. A caller that wants a *shorter* panel sets the cap
+ * rather than a raw vh: `panelClassName="… [--dvh-cap:60dvh]"`. Modal also
+ * supplies `overflow-auto` unless `panelClassName` already declares an
+ * overflow utility, so a clamped panel is always scrollable — a panel that
+ * needs an un-portaled popover to escape its bounds declares
+ * `overflow-visible` and keeps the clamp.
+ *
  * Stacking: Modal uses a single module-scope bubble-phase `keydown`
  * listener that dispatches Esc only to the top-most open Modal — and only
  * the top-most. Every open Modal registers on the stack (regardless of its
@@ -67,12 +86,27 @@ const SIZE_CLASSES = {
 // order — see the note next to the overlay <div> below.
 const ALIGN_CLASSES = {
   center: 'items-center justify-center p-4',
-  top: 'items-start justify-center pt-[10vh] px-4 pb-4',
+  top: 'items-start justify-center pt-[10dvh] px-4 pb-4',
   // No padding — for callers that historically had a bare overlay (no `p-*`)
   // and provide their own panel-internal padding instead. Used by
   // ResumeAgentModal where the pre-refactor overlay was
   // `fixed inset-0 ... flex items-center justify-center` with no padding.
   none: 'items-center justify-center',
+};
+
+// Per-align `--dvh-inset` for the panel's unconditional `max-h-dvh-cap` clamp
+// (see the "Height" section of the docblock). The inset is the vertical space
+// the overlay's own padding already consumes, so the clamped panel never
+// exceeds the *visible* dynamic viewport:
+//   center  p-4                → 1rem top + 1rem bottom
+//   top     pt-[10dvh] + pb-4  → 10dvh top + 1rem bottom
+//   none    no padding         → 0
+// These must be written as literal class strings so Tailwind's source scanner
+// emits the arbitrary-property utilities.
+const ALIGN_DVH_INSET = {
+  center: '[--dvh-inset:2rem]',
+  top: '[--dvh-inset:calc(10dvh_+_1rem)]',
+  none: '[--dvh-inset:0px]',
 };
 
 // Module-scope stack of open Modal ids. A single bubble-phase keydown
@@ -99,11 +133,26 @@ const ALIGN_CLASSES = {
 // always-mounted shells that the order is consistent. If a future component
 // adds a window keydown handler at module load and runs first, this Modal
 // will still dispatch (because its handler exists), but won't block that
-// earlier listener. The HMR-safe install pattern below (`__portos_modal_esc`
-// globalThis flag + import.meta.hot.dispose) prevents duplicate installs on
-// dev hot-reload.
-const modalStack = [];
-const escHandlers = new Map();
+// earlier listener.
+//
+// Keep the listener guard AND its dispatch state in one global record. Vite
+// HMR and Vitest isolation can both re-evaluate this module while retaining
+// the same DOM globals. A boolean-only install guard leaves the old listener
+// pointing at its module-local stack while the new Modal instances push onto
+// a fresh one, orphaning Escape dispatch. Sharing the stack and handler map
+// makes every module instance register with the one installed listener.
+const MODAL_ESC_STATE_KEY = '__portos_modal_esc_state';
+const modalEscState = globalThis[MODAL_ESC_STATE_KEY] ?? {
+  stack: [],
+  handlers: new Map(),
+  listener: null,
+  windowTarget: null,
+  documentTarget: null,
+};
+globalThis[MODAL_ESC_STATE_KEY] = modalEscState;
+
+const modalStack = modalEscState.stack;
+const escHandlers = modalEscState.handlers;
 
 function handleGlobalEsc(e) {
   if (e.key !== 'Escape' || modalStack.length === 0) return;
@@ -120,7 +169,7 @@ function handleGlobalEsc(e) {
   if (handler) handler();
 }
 
-if (typeof window !== 'undefined') {
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   // Install both window AND document keydown listeners. Bubble-phase event
   // order on the same keystroke is: target → ... → document → window. A
   // document-level handler installed by another component (e.g.
@@ -131,22 +180,36 @@ if (typeof window !== 'undefined') {
   // at both — gives the top-most modal full ownership of the keystroke
   // regardless of where competing listeners are bound.
   //
-  // Guarded against double-install on Vite HMR. The module can re-evaluate
-  // when it (or one of its importers) is edited; without the globalThis
-  // flag the handlers would stack up, with each copy referencing the stale
-  // modalStack from its own module instance.
-  if (!globalThis.__portos_modal_esc_installed) {
+  // Reuse the listener when this module is re-evaluated against the same DOM.
+  // If the DOM targets themselves changed (possible in an isolated test
+  // environment), detach from the old targets and reset their obsolete stack
+  // before installing against the current window/document pair.
+  const sameTargets = modalEscState.windowTarget === window
+    && modalEscState.documentTarget === document;
+  if (!sameTargets && modalEscState.listener) {
+    modalEscState.windowTarget?.removeEventListener('keydown', modalEscState.listener);
+    modalEscState.documentTarget?.removeEventListener('keydown', modalEscState.listener);
+    modalStack.length = 0;
+    escHandlers.clear();
+    modalEscState.listener = null;
+  }
+  if (!modalEscState.listener) {
     window.addEventListener('keydown', handleGlobalEsc);
     document.addEventListener('keydown', handleGlobalEsc);
-    globalThis.__portos_modal_esc_installed = true;
+    modalEscState.listener = handleGlobalEsc;
+    modalEscState.windowTarget = window;
+    modalEscState.documentTarget = document;
   }
   // On HMR dispose, tear down both listeners so the next module instance
-  // can re-install them cleanly against its own modalStack/escHandlers.
+  // can install its current handler while retaining the shared modal state.
   if (import.meta.hot) {
     import.meta.hot.dispose(() => {
-      window.removeEventListener('keydown', handleGlobalEsc);
-      document.removeEventListener('keydown', handleGlobalEsc);
-      delete globalThis.__portos_modal_esc_installed;
+      if (modalEscState.listener !== handleGlobalEsc) return;
+      modalEscState.windowTarget?.removeEventListener('keydown', handleGlobalEsc);
+      modalEscState.documentTarget?.removeEventListener('keydown', handleGlobalEsc);
+      modalEscState.listener = null;
+      modalEscState.windowTarget = null;
+      modalEscState.documentTarget = null;
     });
   }
 }
@@ -242,6 +305,18 @@ export default function Modal({
   const alignClass = ALIGN_CLASSES[align] || ALIGN_CLASSES.center;
   const sizeClass = SIZE_CLASSES[size] ?? SIZE_CLASSES.md;
   const widthClass = size === 'none' ? '' : `w-full ${sizeClass}`;
+  const insetClass = ALIGN_DVH_INSET[align] || ALIGN_DVH_INSET.center;
+  // Only supply the scroll behaviour when the caller declares an UNPREFIXED
+  // overflow of its own. Tailwind precedence follows CSS source order, not
+  // class-string order (see the overlay note below), so emitting
+  // `overflow-auto` alongside a caller's base `overflow-hidden` would be a
+  // coin flip rather than an override. A variant-prefixed utility
+  // (`sm:overflow-hidden`) is deliberately NOT a match: it only applies inside
+  // its media query — which does outrank the base utility — so suppressing the
+  // default would leave the panel clamped but unscrollable below that
+  // breakpoint.
+  const overflowClass = /(^|\s)!?overflow-/.test(panelClassName) ? '' : 'overflow-auto';
+  const heightClass = `max-h-dvh-cap ${insetClass} ${overflowClass}`;
 
   const overlay = (
     <div
@@ -266,7 +341,7 @@ export default function Modal({
         aria-modal="true"
         aria-labelledby={ariaLabelledBy}
         aria-label={!ariaLabelledBy ? ariaLabel : undefined}
-        className={`relative ${widthClass} ${panelClassName}`}
+        className={`relative ${widthClass} ${heightClass} ${panelClassName}`}
         // Swallow click bubbling at the panel boundary. Two reasons: (1)
         // target-check on the backdrop already prevents panel clicks from
         // firing our own backdrop dismiss, but if this Modal is rendered as

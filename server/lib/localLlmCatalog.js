@@ -172,6 +172,20 @@ export const LOCAL_LLM_CATALOG = [
     ollama: 'qwen3.5:4b',
     lmstudio: 'lmstudio-community/Qwen3.5-4B-GGUF'
   },
+  {
+    key: 'phi-4-mini',
+    name: 'Phi-4 Mini 3.8B',
+    category: 'lightweight',
+    recommendedFor: ['lightweight', 'reasoning', 'chat'],
+    params: '3.8B',
+    size: '2.4 GB',
+    family: 'phi',
+    description: "Microsoft's lightweight 3.8B model with 128K context, strong reasoning, multilingual support, and function calling.",
+    capabilities: ['chat', 'reasoning', 'tools', 'multilingual'],
+    context: 131072,
+    ollama: 'phi4-mini',
+    lmstudio: 'lmstudio-community/Phi-4-mini-instruct-GGUF'
+  },
   // ── General-purpose laptop tier (16–32GB) ──
   {
     key: 'lfm2.5-8b-a1b',
@@ -278,9 +292,26 @@ export const LOCAL_LLM_CATALOG = [
     size: '12 GB',
     family: 'gpt-oss',
     description: 'Open-weights 20B model — the default local thinking model.',
-    capabilities: ['chat', 'reasoning'],
+    capabilities: ['chat', 'reasoning', 'tools'],
     ollama: 'gpt-oss:20b',
     lmstudio: 'lmstudio-community/gpt-oss-20b-GGUF'
+  },
+  {
+    key: 'gemma3-27b-it',
+    name: 'Gemma 3 27B IT',
+    category: 'general',
+    recommendedFor: ['general', 'reasoning'],
+    params: '27B',
+    size: '17 GB',
+    family: 'gemma',
+    description: "Google's Gemma 3 27B instruction model — long-context local analysis for code-review findings without native tool calling.",
+    note: 'Long-context local analysis option; Hugging Face’s official Gemma repository requires accepting its terms.',
+    repository: 'google/gemma-3-27b-it',
+    gated: true,
+    capabilities: ['chat', 'vision'],
+    context: 131072,
+    ollama: 'gemma3:27b',
+    lmstudio: 'lmstudio-community/gemma-3-27b-it-GGUF'
   },
   // ── Large general-purpose / long-context tier (32–128GB unified memory) ──
   // Best suited for whole-manuscript editorial review, where prose quality and a
@@ -422,6 +453,20 @@ export const LOCAL_LLM_CATALOG = [
     lmstudio: 'lmstudio-community/DeepSeek-R1-Distill-Llama-8B-GGUF'
   },
   {
+    key: 'deepseek-r1-14b',
+    name: 'DeepSeek-R1 14B',
+    category: 'reasoning',
+    recommendedFor: ['reasoning'],
+    params: '14B',
+    size: '9.0 GB',
+    family: 'deepseek',
+    description: "DeepSeek's open reasoning model distilled into a 14B Qwen architecture — deeper chain-of-thought thinking for math, logic, and complex problem-solving.",
+    capabilities: ['chat', 'reasoning'],
+    context: 131072,
+    ollama: 'deepseek-r1:14b',
+    lmstudio: 'lmstudio-community/DeepSeek-R1-Distill-Qwen-14B-GGUF'
+  },
+  {
     key: 'phi-4-14b',
     name: 'Phi-4 14B',
     category: 'reasoning',
@@ -509,6 +554,20 @@ export const LOCAL_LLM_CATALOG = [
     context: 131072,
     ollama: 'qwen2.5-coder:7b',
     lmstudio: 'lmstudio-community/Qwen2.5-Coder-7B-Instruct-GGUF'
+  },
+  {
+    key: 'codestral-22b',
+    name: 'Codestral 22B',
+    category: 'coding',
+    recommendedFor: ['coding'],
+    params: '22B',
+    size: '13 GB',
+    family: 'codestral',
+    description: "Mistral AI's 22B code model supporting over 80 programming languages, tuned for code completion and generation.",
+    capabilities: ['chat', 'code', 'tools'],
+    context: 32768,
+    ollama: 'codestral',
+    lmstudio: 'lmstudio-community/Codestral-22B-v0.1-GGUF'
   },
   {
     key: 'ornith-9b',
@@ -679,6 +738,20 @@ export const LOCAL_LLM_CATALOG = [
     ollama: 'qwen3-vl:30b',
     lmstudio: 'lmstudio-community/Qwen3-VL-30B-A3B-Instruct-GGUF'
   },
+  {
+    key: 'llama3.2-vision-11b',
+    name: 'Llama 3.2 Vision 11B',
+    category: 'vision',
+    recommendedFor: ['vision', 'general'],
+    params: '11B',
+    size: '7.9 GB',
+    family: 'llama',
+    description: "Meta's instruction-tuned multimodal model with vision capabilities for image reasoning and captioning.",
+    capabilities: ['chat', 'tools', 'vision'],
+    context: 128000,
+    ollama: 'llama3.2-vision:11b',
+    lmstudio: 'lmstudio-community/Llama-3.2-11B-Vision-Instruct-GGUF'
+  },
   // ── Multilingual tier ──
   {
     key: 'aya-expanse-8b',
@@ -692,6 +765,20 @@ export const LOCAL_LLM_CATALOG = [
     capabilities: ['chat', 'multilingual'],
     ollama: 'aya-expanse:8b',
     lmstudio: 'lmstudio-community/Aya-Expanse-8B-GGUF'
+  },
+  {
+    key: 'aya-expanse-32b',
+    name: 'Aya Expanse 32B',
+    category: 'multilingual',
+    recommendedFor: ['multilingual', 'chat', 'general'],
+    params: '32B',
+    size: '19.5 GB',
+    family: 'aya',
+    description: "Cohere For AI's high-capacity 32B multilingual model covering 23 languages with advanced translation and localized dialogue.",
+    capabilities: ['chat', 'multilingual'],
+    context: 128000,
+    ollama: 'aya-expanse:32b',
+    lmstudio: 'lmstudio-community/Aya-Expanse-32B-GGUF'
   },
   // ── Text embeddings ──
   // PortOS's memory/recall pipeline expects 768-dimension vectors
@@ -805,6 +892,32 @@ const entryIdsForBackend = (entry, backend) => [
 
 const entryMatchesBackendId = (entry, backend, normalizedId) =>
   entryIdsForBackend(entry, backend).some((id) => normalizeFor(backend, id) === normalizedId);
+
+const SIZE_UNIT_BYTES = { KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 };
+
+/** Parse a catalog `size` string ('4.9 GB', '301 MB') to bytes; 0 if unparseable. */
+const parseCatalogSizeBytes = (size) => {
+  const match = /^([\d.]+)\s*(KB|MB|GB|TB)$/i.exec(String(size || '').trim());
+  if (!match) return 0;
+  return Math.round(Number(match[1]) * SIZE_UNIT_BYTES[match[2].toUpperCase()]);
+};
+
+/**
+ * Bytes for a curated catalog entry's advertised download size, resolved by
+ * the backend-specific install id (matched the same alias-aware way
+ * `getOllamaImportSpec`/`getCatalog` match ids). 0 for an unrecognized id or
+ * an entry whose `size` string doesn't parse — the disk preflight already
+ * treats 0 as "unknown, never refuse," so a miss here fails open rather than
+ * blocking an install PortOS just can't size.
+ */
+export function catalogSizeBytes(backend, modelId) {
+  if (!isBackend(backend)) return 0;
+  const normalizedId = normalizeFor(backend, modelId);
+  const entry = LOCAL_LLM_CATALOG.find((candidate) => (
+    candidate[backend] && entryMatchesBackendId(candidate, backend, normalizedId)
+  ));
+  return entry ? parseCatalogSizeBytes(entry.size) : 0;
+}
 
 /**
  * Return the trusted local-Safetensors import recipe for a curated Ollama id.

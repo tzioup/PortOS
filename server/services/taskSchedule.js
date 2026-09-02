@@ -28,7 +28,7 @@ import { loadState, isImprovementEnabled } from './cosState.js';
 import { getLocalParts } from '../lib/timezone.js';
 import { getUserTimezone } from './userTimezone.js';
 import { parseCronToNextRun, parseCronToPrevRun } from './eventScheduler.js';
-import { isAuditTaskType, defaultFileIssuesFor } from '../lib/auditCatalog.js';
+import { isAuditTaskType, defaultFileIssuesFor, auditDoWorkRequiresWorktree } from '../lib/auditCatalog.js';
 import { DEFAULT_TASK_PROMPTS } from './taskPromptDefaults.js';
 import {
   DEFAULT_PERPETUAL_RECHECK_MS,
@@ -40,13 +40,18 @@ import {
 import {
   DEFAULT_TASK_INTERVALS,
   INSTALL_WIDE_TASK_TYPES,
+  MANAGED_APP_TARGET_TASK_TYPES,
   MANAGED_AGENT_OPTIONS,
   getTaskTypeDescription,
+  getTaskTypeInvocation,
+  getTaskTypePromptInfo,
+  requiresManagedAppTarget,
   enforceBranchReconcileBatch,
   enforceManagedAgentOptions
 } from './taskScheduleRegistry.js';
 import { loadSchedule, updateSchedule } from './taskScheduleStore.js';
 import { isInstanceFeatureEnabled } from './instanceFeatures.js';
+import { recordUserAction } from './userActions.js';
 import { getTaskDataInputCatalog } from '../lib/taskDataInputCatalog.js';
 import {
   clearFailureLedgerFields,
@@ -61,8 +66,11 @@ export {
 } from './taskScheduleConstants.js';
 export {
   DEFAULT_BRANCHES_PER_AGENT, DEFAULT_TASK_INTERVALS, INSTALL_WIDE_TASK_TYPES,
+  MANAGED_APP_TARGET_TASK_TYPES,
   MANAGED_AGENT_OPTIONS, PERPETUAL_DRAIN_DISPATCH_CAP, SELF_IMPROVEMENT_TASK_TYPES,
-  TASK_TYPE_DESCRIPTIONS, stripManagedAgentOptionsFromOverride
+  TASK_TYPE_DESCRIPTIONS, TASK_TYPE_INVOCATION, TASK_TYPE_PROMPT_INFO,
+  getTaskTypeInvocation, getTaskTypePromptInfo, requiresManagedAppTarget,
+  stripManagedAgentOptionsFromOverride
 } from './taskScheduleRegistry.js';
 export { loadSchedule } from './taskScheduleStore.js';
 export {
@@ -159,7 +167,13 @@ async function getPerformanceAdjustedInterval(taskType, baseIntervalMs) {
 
 export async function getTaskInterval(taskType) {
   const schedule = await loadSchedule();
-  return schedule.tasks[taskType] || { type: INTERVAL_TYPES.ROTATION, enabled: false, providerId: null, model: null };
+  return schedule.tasks[taskType] || {
+    type: INTERVAL_TYPES.ROTATION,
+    enabled: false,
+    providerId: null,
+    model: null,
+    description: getTaskTypeDescription(taskType),
+  };
 }
 
 export async function updateTaskInterval(taskType, settings) {
@@ -171,6 +185,13 @@ export async function updateTaskInterval(taskType, settings) {
     // Normalize empty/whitespace prompts to null (treated as "use default")
     if ('prompt' in settings && typeof settings.prompt === 'string' && !settings.prompt.trim()) {
       settings.prompt = null;
+    }
+    // The description is display-only schedule metadata. Keep it separate from
+    // the prompt so custom card copy never becomes agent instructions.
+    if ('description' in settings) {
+      settings.description = typeof settings.description === 'string'
+        ? settings.description.trim().slice(0, 240) || null
+        : null;
     }
     // If user is setting a custom prompt, mark it so auto-upgrade won't overwrite it.
     // If user clears the prompt (null), remove the customized flag to resume defaults.
@@ -1128,7 +1149,12 @@ export async function getNextTaskType(appId = null, lastType = '', { perpetualOn
  * perpetual drain re-issued ITSELF through the same lane after a completed run —
  * automated, and therefore NOT allowed to clear its own brakes.
  */
-export async function triggerOnDemandTask(taskType, appId = null, { emit = true, origin = ON_DEMAND_ORIGINS.USER } = {}) {
+export async function triggerOnDemandTask(taskType, appId = null, { emit = true, origin = ON_DEMAND_ORIGINS.USER, targetPullRequest = null } = {}) {
+  // A targeted run names ONE open PR/MR instead of letting the task pick from
+  // the app's whole open set (the PR/MR row's "Review this PR" button). Coerced
+  // and validated here so a bad value can't reach the generator's forge filter.
+  const requested = Number(targetPullRequest);
+  const scopedPullRequest = Number.isInteger(requested) && requested > 0 ? requested : null;
   const request = await updateSchedule(async (schedule) => {
     // Cheap per-task-type check first; the master-flag check pays a state.json read.
     const tasks = schedule.tasks || {};
@@ -1140,6 +1166,13 @@ export async function triggerOnDemandTask(taskType, appId = null, { emit = true,
     }
     if (!(await createFeatureGate()(tasks[taskType]))) {
       return { result: { error: `Task type '${taskType}' requires the '${tasks[taskType].feature}' feature` }, changed: false };
+    }
+    const invocation = getTaskTypeInvocation(taskType);
+    if (origin === ON_DEMAND_ORIGINS.USER && !invocation.userInvokable) {
+      return { result: { error: `Task type '${taskType}' is managed by another automation and cannot be run manually` }, changed: false };
+    }
+    if (requiresManagedAppTarget(taskType) && !appId) {
+      return { result: { error: `Task type '${taskType}' requires a managed app target` }, changed: false };
     }
 
     // Reject if the master Improve toggle is off — request would be silently dropped downstream
@@ -1157,7 +1190,8 @@ export async function triggerOnDemandTask(taskType, appId = null, { emit = true,
       taskType,
       appId,
       origin,
-      requestedAt: new Date().toISOString()
+      requestedAt: new Date().toISOString(),
+      ...(scopedPullRequest ? { targetPullRequest: scopedPullRequest } : {})
     };
 
     schedule.onDemandRequests.push(request);
@@ -1165,6 +1199,23 @@ export async function triggerOnDemandTask(taskType, appId = null, { emit = true,
   });
 
   if (request.error) return request;
+
+  // Operator-action ledger (#5594): ONLY a human pressing Run Now. The perpetual
+  // drain re-issues itself through this same lane with `origin: REFILL` — logging
+  // that would fill the ledger with events the user never performed and make
+  // "what did I trigger?" unanswerable.
+  if (origin === ON_DEMAND_ORIGINS.USER) {
+    await recordUserAction({
+      type: 'cos.schedule.trigger',
+      target: taskType,
+      targetName: appId,
+      summary: `Ran scheduled task '${taskType}' on demand${appId ? ` for ${appId}` : ''}${scopedPullRequest ? ` (#${scopedPullRequest})` : ''}`,
+      payload: { taskType, appId: appId ?? null, requestId: request.id, ...(scopedPullRequest ? { targetPullRequest: scopedPullRequest } : {}) },
+      source: { service: 'taskSchedule', fn: 'triggerOnDemandTask' },
+      happenedAt: request.requestedAt,
+      dedupeKey: `cos.schedule.trigger:${request.id}`,
+    });
+  }
 
   emitLog('info', `On-demand task requested: ${taskType}`, { appId }, '📅 TaskSchedule');
   // The event's only consumer is a `dequeueNextTask()` trigger (cos.js). Callers
@@ -1213,7 +1264,8 @@ export async function getScheduleStatus() {
   // Surface the master Improve toggle so the UI can disable Run Now affordances
   const [schedule, state] = await Promise.all([loadSchedule(), loadState()]);
   const featureEnabled = createFeatureGate();
-  const onDemandRequests = await getAvailableOnDemandRequests(schedule, featureEnabled);
+  const onDemandRequests = (await getAvailableOnDemandRequests(schedule, featureEnabled))
+    .filter(request => getTaskTypeInvocation(request.taskType).visibility !== 'hidden');
 
   const status = {
     lastUpdated: schedule.lastUpdated,
@@ -1231,7 +1283,10 @@ export async function getScheduleStatus() {
 
   for (const [taskType, interval] of Object.entries(schedule.tasks)) {
     if (!(await featureEnabled(interval))) continue;
+    const invocation = getTaskTypeInvocation(taskType);
+    if (invocation.visibility === 'hidden') continue;
     const execution = schedule.executions[`task:${taskType}`] || { lastRun: null, count: 0, perApp: {} };
+    const promptInfo = getTaskTypePromptInfo(taskType);
 
     // Get learning adjustment info
     const baseInterval = interval.type === 'daily' ? DAY : interval.type === 'weekly' ? WEEK : (interval.intervalMs || DAY);
@@ -1281,6 +1336,10 @@ export async function getScheduleStatus() {
       dataPoints: learningInfo.dataPoints,
       adjustedIntervalMs: learningInfo.adjustedIntervalMs,
       recommendation: learningInfo.recommendation,
+      description: interval.description || getTaskTypeDescription(taskType),
+      promptMode: promptInfo.mode,
+      ...(promptInfo.description ? { promptDescription: promptInfo.description } : {}),
+      invocation,
       // Whether a "Run Now" with NO app is this type's real run (it sweeps every
       // managed app in one dispatch). Served from the server registry rather than
       // mirrored in client constants, so the UI cannot drift from the set the
@@ -1303,6 +1362,16 @@ export async function getScheduleStatus() {
     if (isAuditTaskType(taskType)) {
       taskStatus.fileIssuesCapable = true;
       taskStatus.defaultFileIssues = defaultFileIssuesFor(taskType);
+      if (auditDoWorkRequiresWorktree(taskType)) {
+        taskStatus.doWorkRequiresWorktree = true;
+      }
+    } else if (taskType === 'user-action-review') {
+      // Not an audit-catalog type (no mode-contract injection — its
+      // alternative to filing issues is queueing CoS tasks, not editing code),
+      // but its deliverable posture is the same fileIssues toggle, so the
+      // schedule UI surfaces the switch the same way.
+      taskStatus.fileIssuesCapable = true;
+      taskStatus.defaultFileIssues = true;
     }
 
     // Perpetual tasks park PER-APP (parkPerpetual is called with the appId), so
@@ -1404,6 +1473,7 @@ export async function getUpcomingTasks(limit = 10) {
   for (const [taskType, interval] of Object.entries(schedule.tasks)) {
     if (!interval.enabled) continue;
     if (!(await featureEnabled(interval))) continue;
+    if (getTaskTypeInvocation(taskType).visibility === 'hidden') continue;
     if (interval.type === INTERVAL_TYPES.ON_DEMAND) continue;
 
     const check = await shouldRunTask(taskType, null, { featureEnabled });
@@ -1450,7 +1520,7 @@ export async function getUpcomingTasks(limit = 10) {
       successRate: check.successRate ?? null,
       learningAdjusted: check.learningApplied || false,
       adjustmentMultiplier: check.adjustmentMultiplier || 1.0,
-      description: getTaskTypeDescription(taskType)
+      description: interval.description || getTaskTypeDescription(taskType)
     });
   }
 

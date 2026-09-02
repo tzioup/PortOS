@@ -2,7 +2,7 @@ import { readFile, rename } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join, dirname, delimiter, isAbsolute } from 'path';
 import { atomicWrite } from './internal/atomicWrite.js';
-import { assertSecretEndpoint, evaluateSecretEndpoint } from './internal/endpointGuard.js';
+import { assertSecretEndpoint, evaluateSecretEndpoint } from './endpointGuard.js';
 import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -143,7 +143,8 @@ const execFileAsync = (file, args, options) =>
 // Tool-use (function-calling) capable model families. Inlined here because the
 // aiToolkit is self-contained (no imports out to server/lib). MIRROR of
 // TOOL_USE_RE in server/lib/localModelHeuristics.js and isToolUseModel in
-// client/src/utils/providers.js — keep all three in lockstep.
+// client/src/utils/providers.js — keep all three in lockstep
+// (server/lib/localModelHeuristics.mirror.test.js fails when they drift).
 const TOOL_USE_RE = new RegExp([
   'qwen',
   'llama-?3\\.[1-9]', 'llama-?4',
@@ -177,16 +178,29 @@ function ollamaModelSupportsTools(id, capabilities) {
 
 const CODEX_CONFIGURED_DEFAULT = 'codex-configured-default';
 const CODEX_MODEL_KEYS = ['defaultModel', 'lightModel', 'mediumModel', 'heavyModel'];
-// Codex 0.144+ exposes three selectable coding-model tiers. Keep the ids in
-// provider config (rather than the old "use ~/.codex/config.toml" sentinel) so
-// PortOS can pass the user's choice through as `codex --model <id>`.
-const CODEX_MODELS = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol'];
+// Codex 0.144+ exposes selectable coding-model tiers. Keep the ids in provider
+// config (rather than the old "use ~/.codex/config.toml" sentinel) so PortOS
+// can pass the user's choice through as `codex --model <id>`.
+const CODEX_MODELS = [
+  'gpt-5.6-luna',
+  'gpt-5.6-terra',
+  'gpt-5.6-sol',
+  'gpt-5.3-codex-spark',
+];
 const CODEX_MODEL_DEFAULTS = {
   defaultModel: 'gpt-5.6-terra',
   lightModel: 'gpt-5.6-luna',
   mediumModel: 'gpt-5.6-terra',
   heavyModel: 'gpt-5.6-sol',
 };
+const PRIOR_CODEX_MODEL_CATALOGS = [
+  // Prior 2026-07 catalog before Codex-Spark was added.
+  [
+    'gpt-5.6-luna',
+    'gpt-5.6-terra',
+    'gpt-5.6-sol',
+  ],
+];
 const ANTIGRAVITY_MODEL_KEYS = ['defaultModel', 'lightModel', 'mediumModel', 'heavyModel'];
 // agy exposes a per-session `--model` flag and lists its catalog via
 // `agy models`. This is the shipped fallback list (agy 2026-08) used to seed a
@@ -236,6 +250,12 @@ const CODEX_CONTEXT_WINDOW = 1_000_000;
 const GEMINI_CONTEXT_WINDOW = 1_048_576;
 const STALE_GENERIC_CONTEXT_WINDOW = 128_000;
 
+function matchesAnyExactCatalog(models, catalogs) {
+  return Array.isArray(models) && catalogs.some(
+    (catalog) => catalog.length === models.length && catalog.every((model, index) => model === models[index]),
+  );
+}
+
 function shouldUpgradeContextWindow(value) {
   return value == null || Number(value) === STALE_GENERIC_CONTEXT_WINDOW;
 }
@@ -249,9 +269,10 @@ function canonicalProviderContextWindow(provider) {
   return null;
 }
 
-// Replace only the old sentinel-only Codex setup with the current selectable
-// Codex tier catalog. Real model choices are deliberately preserved: PortOS
-// must never silently erase a model selected in AI Providers.
+// Replace only the old sentinel-only Codex setup or a prior shipped catalog
+// with the current selectable Codex catalog. Real model choices are
+// deliberately preserved: PortOS must never silently erase a model selected
+// in AI Providers.
 function migrateCodexProvider(data) {
   if (!data?.providers) return false;
   let changed = false;
@@ -264,10 +285,11 @@ function migrateCodexProvider(data) {
       && provider.models.length === 1
       && provider.models[0] === CODEX_CONFIGURED_DEFAULT
       && CODEX_MODEL_KEYS.every((key) => provider[key] === CODEX_CONFIGURED_DEFAULT);
-    if (!isSentinelOnly) continue;
+    const isPriorSeededList = matchesAnyExactCatalog(provider.models, PRIOR_CODEX_MODEL_CATALOGS);
+    if (!isSentinelOnly && !isPriorSeededList) continue;
 
     provider.models = [...CODEX_MODELS];
-    Object.assign(provider, CODEX_MODEL_DEFAULTS);
+    if (isSentinelOnly) Object.assign(provider, CODEX_MODEL_DEFAULTS);
     changed = true;
   }
   return changed;
@@ -371,10 +393,7 @@ function migrateAntigravityModelCatalog(data) {
       && provider.models.length === 1
       && provider.models[0] === ANTIGRAVITY_CONFIGURED_DEFAULT;
 
-    const isPriorSeededList = Array.isArray(provider.models)
-      && PRIOR_ANTIGRAVITY_MODEL_CATALOGS.some(
-        (prior) => prior.length === provider.models.length && prior.every((m, i) => m === provider.models[i]),
-      );
+    const isPriorSeededList = matchesAnyExactCatalog(provider.models, PRIOR_ANTIGRAVITY_MODEL_CATALOGS);
 
     if (!isSentinelOnly && !isPriorSeededList) continue;
 
@@ -500,7 +519,7 @@ export function createProviderService(config = {}) {
     const migratedContextWindows = migrateProviderContextWindows(data);
     if (migratedCodex || migratedAntigravity || migratedAntigravityModels || migratedContextWindows) {
       await atomicWrite(PROVIDERS_PATH, data);
-      if (migratedCodex) console.log('🔧 Migrated Codex providers to the selectable GPT-5.6 model tiers');
+      if (migratedCodex) console.log('🔧 Migrated Codex providers to the selectable model catalog');
       if (migratedAntigravity) console.log('🔧 Migrated Gemini provider config to Antigravity CLI (agy)');
       if (migratedAntigravityModels) console.log('🔧 Migrated Antigravity providers to the selectable agy model catalog');
       if (migratedContextWindows) console.log('🔧 Migrated provider context windows to current canonical values');
@@ -613,6 +632,14 @@ export function createProviderService(config = {}) {
         ...modelContextWindowPatch(providerData.modelContextWindows),
         timeout: providerData.timeout || 300000,
         enabled: providerData.enabled !== false,
+        // Subscription text-transport capability + its explicit opt-in. Only
+        // persisted when set, so every existing HTTP/CLI record stays byte-identical
+        // and an older install reading this file sees nothing new.
+        ...(typeof providerData.textTransport === 'string' && providerData.textTransport
+          ? { textTransport: providerData.textTransport } : {}),
+        ...(providerData.textTransportEnabled === true ? { textTransportEnabled: true } : {}),
+        ...(providerData.textTransportReadRiskAcknowledged === true
+          ? { textTransportReadRiskAcknowledged: true } : {}),
         // Claude Ollama marker — preserve so adopting the sample via POST drives
         // ollama-backed model refresh (see isOllamaBackedProvider).
         ...(providerData.ollamaBacked === true ? { ollamaBacked: true } : {}),
@@ -636,7 +663,7 @@ export function createProviderService(config = {}) {
           ? { gatewayBacked: providerData.gatewayBacked } : {}),
         ...(providerData.orcarouterBacked === true ? { orcarouterBacked: true } : {}),
         // Explicit opt-in to send the API key to an arbitrary (non-local,
-        // non-allowlisted) endpoint — see internal/endpointGuard.js. Only
+        // non-allowlisted) endpoint — see endpointGuard.js. Only
         // persisted when true so existing keyless/local providers stay clean.
         ...(providerData.allowCustomEndpoint === true ? { allowCustomEndpoint: true } : {}),
         envVars: providerData.envVars || {},

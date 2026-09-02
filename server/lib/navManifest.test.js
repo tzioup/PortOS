@@ -36,7 +36,10 @@ const TABBED_PAGES = [
   { prefix: '/messages', file: 'client/src/pages/Messages.jsx', kind: 'ids', constName: 'TABS' },
   { prefix: '/wiki', file: 'client/src/pages/Wiki.jsx', kind: 'ids', constName: 'TABS' },
   { prefix: '/settings', file: 'client/src/components/settings/SettingsTabsHeader.jsx', kind: 'links', constName: 'TABS' },
-  { prefix: '/models', file: 'client/src/components/models/ModelsTabsHeader.jsx', kind: 'links', constName: 'TABS' },
+  { prefix: '/models', file: 'client/src/components/models/ModelsTabsHeader.jsx', kind: 'links', constName: 'TABS',
+    nestedIdSources: [
+      { parent: 'llms', file: 'client/src/components/settings/LocalLlmTab.jsx', constName: 'LLM_NAV_SUBROUTES' },
+    ] },
   { prefix: '/media', file: 'client/src/pages/MediaGen.jsx', kind: 'ids', constName: 'TABS', allowBasePrefix: true },
   { prefix: '/music', file: 'client/src/pages/Music.jsx', kind: 'ids', constName: 'TABS', allowBasePrefix: true },
   { prefix: '/sharing', file: 'client/src/pages/Sharing.jsx', kind: 'links', constName: 'SECTIONS' },
@@ -111,12 +114,15 @@ function extractTabPaths(filePath, { kind, constName, switchVar, prefix, nestedI
   const block = extractConstArrayBlock(src, constName);
   if (kind === 'ids') {
     const ids = [...block.matchAll(/id:\s*['"]([^'"]+)['"]/g)].map((m) => `${prefix}/${m[1]}`);
-    return allowBasePrefix ? [prefix, ...ids] : ids;
+    return [...(allowBasePrefix ? [prefix, ...ids] : ids), ...nested];
   }
   // kind 'links': keep only entries that point at this page, dropping cross-links.
-  return [...block.matchAll(/(?:to|path):\s*['"]([^'"]+)['"]/g)]
-    .map((m) => m[1])
-    .filter((p) => p === prefix || p.startsWith(`${prefix}/`));
+  return [
+    ...[...block.matchAll(/(?:to|path):\s*['"]([^'"]+)['"]/g)]
+      .map((m) => m[1])
+      .filter((p) => p === prefix || p.startsWith(`${prefix}/`)),
+    ...nested,
+  ];
 }
 
 describe('navManifest — shape invariants', () => {
@@ -244,6 +250,8 @@ describe('resolveNavCommand — fuzzy matching', () => {
     expect(resolveNavCommand('loras')?.path).toBe('/models/loras');
     expect(resolveNavCommand('lora training')?.path).toBe('/models/training');
     expect(resolveNavCommand('embeddings')?.path).toBe('/models/embeddings');
+    expect(resolveNavCommand('prompt guard')?.path).toBe('/models/llms/abuse');
+    expect(resolveNavCommand('abuse-guard')?.path).toBe('/models/llms/abuse');
   });
 
   it('resolves Universe Builder to the /universes index path', () => {
@@ -416,6 +424,8 @@ describe('getNavAliasMap — voice-agent compatibility', () => {
 // a second test fails if an opt-out entry goes stale (route deleted, or the path
 // gained a manifest entry) so the allow-list can't quietly rot.
 const APP_JSX = path.join(REPO_ROOT, 'client/src/App.jsx');
+const MAIN_JSX = path.join(REPO_ROOT, 'client/src/main.jsx');
+const SOCKET_JS = path.join(REPO_ROOT, 'client/src/services/socket.js');
 
 // Concrete leaf routes that render a real page but are deliberately absent from
 // the nav manifest — reached via an in-page button or as a create-mode sentinel,
@@ -454,6 +464,8 @@ function joinRoutePath(segments) {
 // containers. Returns:
 //  - required: absolute paths of every concrete, non-redirect, non-param leaf
 //    route — the set that must each have a NAV_COMMANDS entry (or an opt-out)
+//  - topLevel: absolute paths of concrete leaves directly under <Routes>, rather
+//    than inside a layout/container route
 //  - malformed: <Route>-opening lines whose tag doesn't close on the same line
 //  - stackDepth: open containers left unclosed at EOF
 // The scanner assumes each <Route> is a single line (true in App.jsx today). A
@@ -466,6 +478,7 @@ function joinRoutePath(segments) {
 function scanRoutes(appSrc) {
   const stack = []; // parent path segments of currently-open <Route> containers
   const required = [];
+  const topLevel = [];
   const redirects = []; // { from, to } for every forwarding leaf route
   const malformed = [];
   for (const rawLine of appSrc.split('\n')) {
@@ -493,6 +506,7 @@ function scanRoutes(appSrc) {
     const absolute = routePath === null
       ? joinRoutePath(stack)
       : joinRoutePath([...stack, routePath]);
+    if (stack.length === 0) topLevel.push(absolute);
 
     // Redirects are recorded rather than dropped: a moved page's old path has to
     // keep landing somewhere, and that is only assertable if the scanner reports
@@ -512,7 +526,7 @@ function scanRoutes(appSrc) {
     if (absolute.split('/').some((s) => s.startsWith(':'))) continue; // param route
     required.push(absolute);
   }
-  return { required: [...new Set(required)], redirects, malformed, stackDepth: stack.length };
+  return { required: [...new Set(required)], topLevel: [...new Set(topLevel)], redirects, malformed, stackDepth: stack.length };
 }
 
 // Settings owns a small declarative redirect map for retired tabs, while App.jsx
@@ -547,6 +561,25 @@ describe('nav coverage — every navigable App.jsx route has a manifest entry', 
     const uncovered = [...routePaths]
       .filter((p) => !navPaths.has(p) && !NAV_COVERAGE_OPT_OUT.has(p));
     expect(uncovered).toEqual([]);
+  });
+
+  it('keeps the hosted audience join route outside the chrome layout', () => {
+    // The hosted audience shell owns a full dynamic viewport and must not be
+    // nested under Layout's shorter overflow-hidden main (#5499).
+    expect(scan.topLevel).toContain('/fableloom/join');
+  });
+
+  it('keeps hosted audience joins free of authenticated app bootstraps', () => {
+    // A password-gated install must not redirect a QR audience device before
+    // the fragment token reaches FableLoomHostedJoin (#5499).
+    const appSrc = fs.readFileSync(APP_JSX, 'utf8');
+    const mainSrc = fs.readFileSync(MAIN_JSX, 'utf8');
+    const socketSrc = fs.readFileSync(SOCKET_JS, 'utf8');
+    expect(appSrc).toMatch(/useTimezoneBootstrap\(!isHostedAudienceRoute\)/);
+    expect(appSrc).toMatch(/useDocumentTitle\(!isHostedAudienceRoute\)/);
+    expect(appSrc).toMatch(/isHostedAudienceRoute\s*\?\s*routeContent/);
+    expect(mainSrc).toContain("const isHostedAudienceRoute = window.location.pathname.replace(/\\/+$/, '')");
+    expect(socketSrc).toMatch(/autoConnect: !isHostedAudienceRoute/);
   });
 
   // Every page that has ever moved leaves its old path behind in bookmarks, in

@@ -3,7 +3,7 @@
 //           | voice:dictation:set | voice:ui:index | voice:screenshot:result
 //           | voice:ui:read-response | voice:output:available | voice:output:claim
 // Outbound: voice:transcript | voice:llm:delta | voice:llm:done | voice:tts:audio
-//           | voice:tool | voice:dictation | voice:navigate
+//           | voice:tts:cancel | voice:tool | voice:dictation | voice:navigate
 //           | voice:ui:click | voice:ui:fill | voice:ui:select | voice:ui:check
 //           | voice:ui:read-request
 //           | voice:dailyLog:appended | voice:error | voice:idle
@@ -34,6 +34,7 @@ import {
   endCall,
   getCallContext,
   getCallHost,
+  getCallState,
   isCallActive,
   markListening,
   markSpeaking,
@@ -540,8 +541,20 @@ export const registerVoiceHandlers = (socket) => {
   });
 
   socket.on('voice:call:detach', async () => {
-    call.endpointer = null;
-    emitCallState(await detachHost(socket));
+    try {
+      call.endpointer = null;
+      emitCallState(await detachHost(socket));
+    } catch (err) {
+      // Socket.IO hands a listener's promise to nobody: an unguarded throw in
+      // here surfaces as an unhandled rejection, which Node terminates the
+      // process for — taking every agent run, PTY session and media job with
+      // it. A detach during a live call funnels into endCall(), the same
+      // teardown voice:call:hangup guards below for exactly this reason. Emit
+      // the current state anyway so the client's call widget leaves its
+      // detaching state instead of hanging.
+      console.error(`❌ voice:call:detach failed: ${err.message}`);
+      emitCallState(getCallState());
+    }
   });
 
   // Hang up the active call from any tab, not just the one carrying the
