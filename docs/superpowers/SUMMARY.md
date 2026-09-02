@@ -1,0 +1,15 @@
+# Table of contents
+
+* [Superpowers Plan/Spec Records](README.md)
+* [plans](plans/README.md)
+  * [2026-05-23-federated-media-sync-integrity](plans/2026-05-23-federated-media-sync-integrity.md)
+  * [Sidebar IA Collapse + Pinned/Recent Implementation Plan](plans/2026-06-04-sidebar-collapse-ia.md)
+  * [Verified, Restorable PostgreSQL Backups — Implementation Plan](plans/2026-06-05-verified-pg-backup.md)
+  * [Branch & PR Reconciler Implementation Plan](plans/2026-07-06-branch-pr-reconciler.md)
+* [specs](specs/README.md)
+  * [Rigged 3D Avatar — Stage View & Header Slot](specs/2026-04-20-rigged-3d-avatar-stage-design.md)
+  * [Creative Director / Pipeline Polish Batch — 2026-05-10](specs/2026-05-10-cd-pipeline-polish-design.md)
+  * [Federated Media Sync Parity + Per-Category Sync Integrity](specs/2026-05-23-federated-media-sync-integrity-design.md)
+  * [Sidebar IA Collapse + Pinned/Recent — Design](specs/2026-06-04-sidebar-collapse-ia-design.md)
+  * [Verified, Restorable PostgreSQL Backups — Design](specs/2026-06-05-verified-pg-backup-design.md)
+  * [Unified CoS Tool-Calling Interface](specs/2026-08-27-unified-cos-tool-calling-interface.md)
