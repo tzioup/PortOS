@@ -246,7 +246,6 @@ This complements the Security Model (which governs the deployed product) — thi
 
 `docs/README.md` indexes everything under `docs/` — guides, feature deep dives, ADRs (`docs/decisions/`), and design records (`docs/plans/`). The contracts referenced most often from code review: `docs/STORAGE.md` (where a record lives), `docs/PORTS.md`, `docs/BACKUP.md`, `docs/SELF_UPDATE.md`, `docs/ARCHITECTURE.md`, `docs/API.md`.
 
-
 <!-- gitbook-agent-instructions:start -->
 
 ## GitBook Documentation Editing
