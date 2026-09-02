@@ -2,7 +2,7 @@
 
 * **Date:** 2026-08-20
 * **Status:** Accepted
-* **Related:** issue #4682 (this record), epic #4348 (federated media providers), PRs #4674 / #4676 (the image/video wire and peer-routed renders), [`server/lib/validation.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/validation.js) (`federatedMediaImageJobSubmissionSchema`, `federatedMediaVideoJobSubmissionSchema`), [`docs/FEDERATED_MEDIA_PROVIDERS.md`](https://github.com/tzioup/PortOS/tree/main/docs/FEDERATED_MEDIA_PROVIDERS.md), ADR [privacy records machine-local](2026-08-08-privacy-records-machine-local.md) (#2148).
+* **Related:** issue #4682 (this record), epic #4348 (federated media providers), PRs #4674 / #4676 (the image/video wire and peer-routed renders), [`server/lib/validation.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/validation.js) (`federatedMediaImageJobSubmissionSchema`, `federatedMediaVideoJobSubmissionSchema`), [`docs/FEDERATED_MEDIA_PROVIDERS.md`](../federated_media_providers.md), ADR [privacy records machine-local](2026-08-08-privacy-records-machine-local.md) (#2148).
 
 ## Context
 

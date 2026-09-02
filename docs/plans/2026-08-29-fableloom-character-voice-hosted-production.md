@@ -422,7 +422,7 @@ If the host is the audio target, the phone still receives the spoken text and ti
 
 ## Future investigation — diegetic FaceTime calls
 
-The investigation is complete. ADR [`2026-08-30-diegetic-facetime-transport.md`](https://github.com/tzioup/PortOS/tree/main/docs/decisions/2026-08-30-diegetic-facetime-transport.md) accepts this as a later, explicitly triggered macOS transport experiment, with browser-hosted play retained as the canonical fallback and no simultaneous story-audio ownership.
+The investigation is complete. ADR [`2026-08-30-diegetic-facetime-transport.md`](../decisions/2026-08-30-diegetic-facetime-transport.md) accepts this as a later, explicitly triggered macOS transport experiment, with browser-hosted play retained as the canonical fallback and no simultaneous story-audio ownership.
 
 A later game mechanic could let an in-story character place or receive a real FaceTime Audio call while the computer continues an authored hold loop or related pre-rendered sequence. The audience would speak through the call and hear the approved character voice on the call return path, turning the phone itself into a diegetic story object rather than only a browser microphone.
 

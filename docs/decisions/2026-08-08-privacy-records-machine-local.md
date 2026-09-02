@@ -2,7 +2,7 @@
 
 * **Date:** 2026-08-08
 * **Status:** Accepted
-* **Related:** issue #2148 (closes the federation half; household subjects split out), epic #2138, [design record](https://github.com/tzioup/PortOS/tree/main/docs/plans/2026-07-04-privacy-center-pii-vault-broker-optout.md), [`server/lib/vaultCrypto.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/vaultCrypto.js), [`server/services/sharing/peerSync.js`](https://github.com/tzioup/PortOS/tree/main/server/services/sharing/peerSync.js), [`docs/STORAGE.md`](https://github.com/tzioup/PortOS/tree/main/docs/STORAGE.md), ADR [tribe + universe-runs local](2026-06-26-tribe-and-universe-runs-local.md) (#1724), ADR [federated visual prompts](2026-08-20-federated-visual-prompts.md) (#4682).
+* **Related:** issue #2148 (closes the federation half; household subjects split out), epic #2138, [design record](../plans/2026-07-04-privacy-center-pii-vault-broker-optout.md), [`server/lib/vaultCrypto.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/vaultCrypto.js), [`server/services/sharing/peerSync.js`](https://github.com/tzioup/PortOS/tree/main/server/services/sharing/peerSync.js), [`docs/STORAGE.md`](../storage.md), ADR [tribe + universe-runs local](2026-06-26-tribe-and-universe-runs-local.md) (#1724), ADR [federated visual prompts](2026-08-20-federated-visual-prompts.md) (#4682).
 
 ## Context
 

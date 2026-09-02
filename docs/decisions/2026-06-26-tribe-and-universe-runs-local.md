@@ -2,7 +2,7 @@
 
 * **Date:** 2026-06-26
 * **Status:** Accepted
-* **Related:** issue #1724 (folded from the #1561 full-sync gap matrix), [`server/services/tribe.js`](https://github.com/tzioup/PortOS/tree/main/server/services/tribe.js), [`server/services/universeBuilder/db.js`](https://github.com/tzioup/PortOS/tree/main/server/services/universeBuilder/db.js), [`server/services/memorySync.js`](https://github.com/tzioup/PortOS/tree/main/server/services/memorySync.js), [`docs/STORAGE.md`](https://github.com/tzioup/PortOS/tree/main/docs/STORAGE.md).
+* **Related:** issue #1724 (folded from the #1561 full-sync gap matrix), [`server/services/tribe.js`](https://github.com/tzioup/PortOS/tree/main/server/services/tribe.js), [`server/services/universeBuilder/db.js`](https://github.com/tzioup/PortOS/tree/main/server/services/universeBuilder/db.js), [`server/services/memorySync.js`](https://github.com/tzioup/PortOS/tree/main/server/services/memorySync.js), [`docs/STORAGE.md`](../storage.md).
 
 ## Context
 

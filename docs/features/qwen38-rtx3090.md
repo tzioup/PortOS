@@ -131,7 +131,7 @@ Node reads that path, and `docker compose` accepts it as a working directory, so
 4. Under **Generation Defaults** on the same card, set **thinking off** and **temperature 0.7** (see below).
 5. Assign the provider to a CoS agent task.
 
-**Turn thinking off for agent work.** Qwen3.8's tool-call format is markedly more reliable with `enable_thinking: false`, and every measurement in the [bring-up record](https://github.com/tzioup/PortOS/tree/main/docs/research/2026-08-21-qwen38-rtx3090-vllm.md) was taken that way. The provider card's **Generation Defaults** block is where you set it: PortOS emits the toggle as `chat_template_kwargs.enable_thinking` on the spawned OpenCode's `agent.build`, which is how vLLM takes it. Temperature \~0.7 is the matching default for coding work.
+**Turn thinking off for agent work.** Qwen3.8's tool-call format is markedly more reliable with `enable_thinking: false`, and every measurement in the [bring-up record](../research/2026-08-21-qwen38-rtx3090-vllm.md) was taken that way. The provider card's **Generation Defaults** block is where you set it: PortOS emits the toggle as `chat_template_kwargs.enable_thinking` on the spawned OpenCode's `agent.build`, which is how vLLM takes it. Temperature \~0.7 is the matching default for coding work.
 
 Both controls ship **unset**, not pre-filled — an unset control means the container keeps its own chat-template default, which is not the same as being pinned to a value. So this is a step you take once per install, not something the preset does for you.
 
@@ -152,6 +152,6 @@ The \~381 tok/s figure quoted upstream is _document reproduction_: 15 of 16 draf
 
 * [MTPLX](mtplx.md) — the Apple Silicon native-MTP equivalent.
 * [DFlash 2 / DSpark on llama.cpp](dflash2.md) — the llama-server path, and the 2026-08-19 evaluation that concluded PortOS should not vendor an unmerged engine patch. That conclusion still holds; what changed is that upstream froze a working container for this exact card, so PortOS points at it instead of building it.
-* [The 3090 bring-up record](https://github.com/tzioup/PortOS/tree/main/docs/research/2026-08-21-qwen38-rtx3090-vllm.md) — the measurements behind the numbers above, and how each required setting was found.
-* [SGLang Qwen3.8-27B](sglang-qwen38.md) — the Hopper / Blackwell path that shipped from that evaluation. It does **not** replace this container: the SGLang cookbook publishes no 3090 cell, so Ampere 24 GB stays here. The two also spell the tool-call parser differently (`qwen3_xml` here, `qwen3_coder` there), which fails silently if crossed. Background: [the evaluation note](https://github.com/tzioup/PortOS/tree/main/docs/research/2026-08-21-sglang-qwen38-27b.md).
-* [docs/PORTS.md](https://github.com/tzioup/PortOS/tree/main/docs/PORTS.md) — why `:18020` sits outside the 5553–5569 range.
+* [The 3090 bring-up record](../research/2026-08-21-qwen38-rtx3090-vllm.md) — the measurements behind the numbers above, and how each required setting was found.
+* [SGLang Qwen3.8-27B](sglang-qwen38.md) — the Hopper / Blackwell path that shipped from that evaluation. It does **not** replace this container: the SGLang cookbook publishes no 3090 cell, so Ampere 24 GB stays here. The two also spell the tool-call parser differently (`qwen3_xml` here, `qwen3_coder` there), which fails silently if crossed. Background: [the evaluation note](../research/2026-08-21-sglang-qwen38-27b.md).
+* [docs/PORTS.md](../ports.md) — why `:18020` sits outside the 5553–5569 range.

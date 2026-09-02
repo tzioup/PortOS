@@ -45,7 +45,7 @@ portos-browser (PM2 process)
 
 ## Security
 
-Browser management relies on PortOS's network-level access control (see [Security Model](https://github.com/tzioup/PortOS/tree/main/docs/API.md#security-model)). The `cdpHost` config is restricted to localhost values (`127.0.0.1`, `localhost`, `::1`) to prevent SSRF via CDP endpoint redirection. Do not expose the PortOS server to untrusted networks.
+Browser management relies on PortOS's network-level access control (see [Security Model](../api.md#security-model)). The `cdpHost` config is restricted to localhost values (`127.0.0.1`, `localhost`, `::1`) to prevent SSRF via CDP endpoint redirection. Do not expose the PortOS server to untrusted networks.
 
 ## Configuration
 

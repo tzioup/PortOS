@@ -51,4 +51,4 @@ Port 5560 provides:
 
 * [Error Handling](error-handling.md)
 * [Chief of Staff](chief-of-staff.md)
-* [PM2 Configuration](https://github.com/tzioup/PortOS/tree/main/docs/PM2.md)
+* [PM2 Configuration](../pm2.md)

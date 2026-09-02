@@ -50,7 +50,7 @@ Semantic memory system for the Chief of Staff that stores facts, learnings, obse
 
 ## Data Storage
 
-Memories and links live in PostgreSQL — the `memories` and `memory_links` tables, with pgvector columns for embeddings (see [docs/STORAGE.md](https://github.com/tzioup/PortOS/tree/main/docs/STORAGE.md)).
+Memories and links live in PostgreSQL — the `memories` and `memory_links` tables, with pgvector columns for embeddings (see [docs/STORAGE.md](../storage.md)).
 
 The test-only file backend (`MEMORY_BACKEND=file` / `NODE_ENV=test`) uses this JSON layout instead:
 

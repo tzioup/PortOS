@@ -107,7 +107,7 @@ Epic: #2138
 
 ## Deferred / open questions
 
-* **Federation**: ~~encrypted vault sync across peers needs a key-distribution decision~~ — **RESOLVED 2026-08-08: privacy records never federate.** Machine-local is a product guarantee, not a deferred feature. See ADR [privacy records machine-local](https://github.com/tzioup/PortOS/tree/main/docs/decisions/2026-08-08-privacy-records-machine-local.md) (#2148) for the reasoning — chiefly that the peer-sync _pull_ path carries no peer identity, `masked_value` is plaintext by design, and a shared `PRIVACY_VAULT_KEY` would widen the at-rest blast radius to every peer. A second machine gets the vault via backup restore + a manual key copy.
+* **Federation**: ~~encrypted vault sync across peers needs a key-distribution decision~~ — **RESOLVED 2026-08-08: privacy records never federate.** Machine-local is a product guarantee, not a deferred feature. See ADR [privacy records machine-local](../decisions/2026-08-08-privacy-records-machine-local.md) (#2148) for the reasoning — chiefly that the peer-sync _pull_ path carries no peer identity, `masked_value` is plaintext by design, and a shared `PRIVACY_VAULT_KEY` would widen the at-rest blast radius to every peer. A second machine gets the vault via backup restore + a manual key copy.
 * **Household subjects**: unbroker manages multiple consenting people; schema leaves room (`privacy_consents.subject`) but v1 is self-only.
 * **Cloud/residential browser** for antibot brokers (unbroker's Browserbase lane): out of scope; `blocked` cases stay in the digest with the broker's rights-request email as the rescue lane.
 * **Key rotation**: ciphertext format is versioned (`v1:`); a rotation script is trivial to add later, not in v1.

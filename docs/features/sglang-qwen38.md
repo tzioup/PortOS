@@ -4,7 +4,7 @@ The third CUDA path for CoS agents, alongside the Ampere-only [vLLM container](q
 
 **PortOS never starts this container, never pulls the image, and never downloads the weights.** It holds the whole GPU, so local image/video generation cannot run while it is up — see [GPU exclusivity](sglang-qwen38.md#gpu-exclusivity) below.
 
-Investigation record: [2026-08-21 SGLang Qwen3.8-27B](https://github.com/tzioup/PortOS/tree/main/docs/research/2026-08-21-sglang-qwen38-27b.md). The latest local-model comparison is recorded in the [2026-08-22 performance audit](https://github.com/tzioup/PortOS/tree/main/docs/research/2026-08-22-local-llm-performance-audit.md); it found this Apple Silicon install cannot run the recipe. The seed presets stay disabled by default; a live TUI card may be enabled for an explicit future test, but the readiness checklist keeps it blocked until a supported NVIDIA endpoint is reachable.
+Investigation record: [2026-08-21 SGLang Qwen3.8-27B](../research/2026-08-21-sglang-qwen38-27b.md). The latest local-model comparison is recorded in the [2026-08-22 performance audit](../research/2026-08-22-local-llm-performance-audit.md); it found this Apple Silicon install cannot run the recipe. The seed presets stay disabled by default; a live TUI card may be enabled for an explicit future test, but the readiness checklist keeps it blocked until a supported NVIDIA endpoint is reachable.
 
 ## Which card
 
@@ -167,5 +167,5 @@ The probe is skipped entirely when no enabled `sglangBacked` provider exists, an
 
 * [vLLM Qwen3.8-27B on an RTX 3090](qwen38-rtx3090.md) — the Ampere path
 * [MTPLX](mtplx.md) and [DFlash 2 / DSpark](dflash2.md) — the Apple Silicon paths
-* [Ports](https://github.com/tzioup/PortOS/tree/main/docs/PORTS.md) — why `18021`
-* [Research: SGLang Qwen3.8-27B cookbook](https://github.com/tzioup/PortOS/tree/main/docs/research/2026-08-21-sglang-qwen38-27b.md)
+* [Ports](../ports.md) — why `18021`
+* [Research: SGLang Qwen3.8-27B cookbook](../research/2026-08-21-sglang-qwen38-27b.md)

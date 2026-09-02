@@ -46,7 +46,7 @@ The Fable checkpoint passed all fiction anchors and craft checks. Several genera
 
 ## SGLang status and bring-up requirement
 
-SGLang was **not a failed model result**. The configured local endpoint on port 18021 was unreachable because this install has no Docker runtime and no NVIDIA GPU probe, while the shipped SGLang Qwen3.8 recipe requires an NVIDIA Hopper or Blackwell host. The feature guide explicitly routes Apple Silicon to MTPLX or llama.cpp instead. See [SGLang Qwen3.8-27B](https://github.com/tzioup/PortOS/tree/main/docs/features/sglang-qwen38.md).
+SGLang was **not a failed model result**. The configured local endpoint on port 18021 was unreachable because this install has no Docker runtime and no NVIDIA GPU probe, while the shipped SGLang Qwen3.8 recipe requires an NVIDIA Hopper or Blackwell host. The feature guide explicitly routes Apple Silicon to MTPLX or llama.cpp instead. See [SGLang Qwen3.8-27B](../features/sglang-qwen38.md).
 
 There is also an upstream image-pin decision still waiting for that hardware: the repository recipe is pinned to `lmsysorg/sglang:qwen38-27b`, while the current [SGLang Qwen3.8-27B cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) documents `lmsysorg/sglang:dev-qwen38-27b-dflash2`. The pin was not changed without a supported host on which to validate the parser flags and end-to-end TUI behavior.
 

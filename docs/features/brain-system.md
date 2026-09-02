@@ -157,7 +157,7 @@ Paste a single-video YouTube URL into **Quick Capture** (dashboard widget) and t
 
 **Obsidian.** The transcript note is written to the vault configured under **Brain → Config → YouTube Ingest**. An unset vault inherits the Daily Log's, so anyone who already pointed the journal at Obsidian needs no setup. The note carries YAML frontmatter (title, source, channel, duration, published, captured, tags) so vault queries and Dataview can find it.
 
-**Storage.** `data/brain/youtube/index.json` is machine-local and never federated — every field in it is a local path, an Obsidian vault id, or a local video-history id. See [STORAGE.md](https://github.com/tzioup/PortOS/tree/main/docs/STORAGE.md).
+**Storage.** `data/brain/youtube/index.json` is machine-local and never federated — every field in it is a local path, an Obsidian vault id, or a local video-history id. See [STORAGE.md](../storage.md).
 
 **Requirements.** `yt-dlp` on PATH for any ingest; `ffmpeg` additionally for the video/audio switches (a transcript-only ingest works without it).
 

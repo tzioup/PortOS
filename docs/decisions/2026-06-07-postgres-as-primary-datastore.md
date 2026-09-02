@@ -3,7 +3,7 @@
 * **Date:** 2026-06-07
 * **Status:** Accepted
 * **Supersedes:** the implicit "JSON files in `./data/` are primary" assumption that held through early development.
-* **Related:** [`docs/STORAGE.md`](https://github.com/tzioup/PortOS/tree/main/docs/STORAGE.md) (storage-classification contract), [`docs/plans/2026-06-06-create-postgres-storage-inventory.md`](https://github.com/tzioup/PortOS/tree/main/docs/plans/2026-06-06-create-postgres-storage-inventory.md) (inventory + phase roadmap), [`docs/plans/2026-06-07-create-relational-schema-design.md`](https://github.com/tzioup/PortOS/tree/main/docs/plans/2026-06-07-create-relational-schema-design.md) (Create-domain schema design).
+* **Related:** [`docs/STORAGE.md`](../storage.md) (storage-classification contract), [`docs/plans/2026-06-06-create-postgres-storage-inventory.md`](../plans/2026-06-06-create-postgres-storage-inventory.md) (inventory + phase roadmap), [`docs/plans/2026-06-07-create-relational-schema-design.md`](../plans/2026-06-07-create-relational-schema-design.md) (Create-domain schema design).
 
 ## Context
 

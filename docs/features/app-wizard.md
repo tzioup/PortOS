@@ -62,6 +62,6 @@ Scaffold a new project from template:
 
 ## Related Features
 
-* [PM2 Configuration](https://github.com/tzioup/PortOS/tree/main/docs/PM2.md)
-* [Port Allocation](https://github.com/tzioup/PortOS/tree/main/docs/PORTS.md)
+* [PM2 Configuration](../pm2.md)
+* [Port Allocation](../ports.md)
 * Scaffold templates — `GET /api/scaffold/templates` (`server/routes/scaffold.js`)

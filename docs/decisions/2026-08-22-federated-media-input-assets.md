@@ -3,7 +3,7 @@
 * **Date:** 2026-08-22
 * **Status:** Accepted
 * **Supersedes (in part):** the "Local input assets are out of scope, and stay out" section and rule 2's closing sentence of ADR [federated visual prompts](2026-08-20-federated-visual-prompts.md), which named both as decisions to be revisited by a later ADR. Rules 1, 3, 4 and 5 of that ADR are unchanged and still govern.
-* **Related:** epic #4348 (federated media providers), [`server/lib/federatedMediaWire.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/federatedMediaWire.js), [`server/lib/validation.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/validation.js), [`docs/FEDERATED_MEDIA_PROVIDERS.md`](https://github.com/tzioup/PortOS/tree/main/docs/FEDERATED_MEDIA_PROVIDERS.md), ADR [privacy records machine-local](2026-08-08-privacy-records-machine-local.md) (#2148).
+* **Related:** epic #4348 (federated media providers), [`server/lib/federatedMediaWire.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/federatedMediaWire.js), [`server/lib/validation.js`](https://github.com/tzioup/PortOS/tree/main/server/lib/validation.js), [`docs/FEDERATED_MEDIA_PROVIDERS.md`](../federated_media_providers.md), ADR [privacy records machine-local](2026-08-08-privacy-records-machine-local.md) (#2148).
 
 ## Context
 
