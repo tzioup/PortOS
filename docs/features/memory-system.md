@@ -4,14 +4,14 @@ Semantic memory system for the Chief of Staff that stores facts, learnings, obse
 
 ## Architecture
 
-- **Memory Backend** (`server/services/memoryBackend.js`): Selects the storage backend — `memoryDB.js` (PostgreSQL + pgvector) for real installs; `memory.js` (JSON files) is a test-only escape hatch (`MEMORY_BACKEND=file` / `NODE_ENV=test`), not a supported deployment mode
-- **Memory DB Service** (`server/services/memoryDB.js`): Primary CRUD, search, and lifecycle operations against PostgreSQL
-- **Embeddings Service** (`server/services/memoryEmbeddings.js`): LM Studio integration for vector generation
-- **Memory Extractor** (`server/services/memoryExtractor.js`): Extract memories from agent output
-- **Memory Classifier** (`server/services/memoryClassifier.js`): LLM-based quality filtering
-- **Memory Retriever** (`server/services/memoryRetriever.js`): Context injection for agent prompts
-- **Memory Routes** (`server/routes/memory.js`): REST API endpoints
-- **Memory Tab** (`ChiefOfStaff.jsx`): UI with list, timeline, and graph views
+* **Memory Backend** (`server/services/memoryBackend.js`): Selects the storage backend — `memoryDB.js` (PostgreSQL + pgvector) for real installs; `memory.js` (JSON files) is a test-only escape hatch (`MEMORY_BACKEND=file` / `NODE_ENV=test`), not a supported deployment mode
+* **Memory DB Service** (`server/services/memoryDB.js`): Primary CRUD, search, and lifecycle operations against PostgreSQL
+* **Embeddings Service** (`server/services/memoryEmbeddings.js`): LM Studio integration for vector generation
+* **Memory Extractor** (`server/services/memoryExtractor.js`): Extract memories from agent output
+* **Memory Classifier** (`server/services/memoryClassifier.js`): LLM-based quality filtering
+* **Memory Retriever** (`server/services/memoryRetriever.js`): Context injection for agent prompts
+* **Memory Routes** (`server/routes/memory.js`): REST API endpoints
+* **Memory Tab** (`ChiefOfStaff.jsx`): UI with list, timeline, and graph views
 
 ## Features
 
@@ -50,7 +50,7 @@ Semantic memory system for the Chief of Staff that stores facts, learnings, obse
 
 ## Data Storage
 
-Memories and links live in PostgreSQL — the `memories` and `memory_links` tables, with pgvector columns for embeddings (see [docs/STORAGE.md](../STORAGE.md)).
+Memories and links live in PostgreSQL — the `memories` and `memory_links` tables, with pgvector columns for embeddings (see [docs/STORAGE.md](https://github.com/tzioup/PortOS/tree/main/docs/STORAGE.md)).
 
 The test-only file backend (`MEMORY_BACKEND=file` / `NODE_ENV=test`) uses this JSON layout instead:
 
@@ -69,17 +69,17 @@ The memory classifier uses LM Studio's gptoss-20b model to intelligently evaluat
 
 ### Good Memories
 
-- Codebase facts: File locations, architecture patterns, dependencies
-- User preferences: Coding style, tool preferences, workflow patterns
-- Learnings: Discovered behaviors, gotchas, workarounds
-- Decisions: Architectural choices with reasoning
+* Codebase facts: File locations, architecture patterns, dependencies
+* User preferences: Coding style, tool preferences, workflow patterns
+* Learnings: Discovered behaviors, gotchas, workarounds
+* Decisions: Architectural choices with reasoning
 
 ### Rejected Memories
 
-- Task echoes: Just restating what the task was
-- Generic summaries: "The task was successful"
-- Temporary info: Session-specific data, timestamps
-- Truncated/incomplete content
+* Task echoes: Just restating what the task was
+* Generic summaries: "The task was successful"
+* Temporary info: Session-specific data, timestamps
+* Truncated/incomplete content
 
 ### Configuration
 
@@ -117,38 +117,38 @@ Before agent task execution:
 
 ## API Endpoints
 
-| Route | Description |
-|-------|-------------|
-| GET /api/memory | List memories with filters |
-| GET /api/memory/:id | Get single memory |
-| POST /api/memory | Create memory |
-| PUT /api/memory/:id | Update memory |
-| DELETE /api/memory/:id | Delete (soft) memory |
-| POST /api/memory/search | Semantic search |
-| GET /api/memory/categories | List categories |
-| GET /api/memory/tags | List tags |
-| GET /api/memory/timeline | Timeline view data |
-| GET /api/memory/graph | Graph visualization data |
-| GET /api/memory/stats | Memory statistics |
-| POST /api/memory/link | Link two memories |
-| POST /api/memory/consolidate | Merge similar memories |
-| POST /api/memory/decay | Apply importance decay |
-| DELETE /api/memory/expired | Clear expired memories |
-| GET /api/memory/embeddings/status | LM Studio connection status |
-| GET /api/memory/backend/status | Active storage backend status |
-| GET /api/memory/sync | File↔DB sync status |
-| POST /api/memory/sync | Trigger file↔DB sync |
-| POST /api/memory/:id/approve | Approve a pending memory |
-| POST /api/memory/:id/reject | Reject a pending memory |
+| Route                             | Description                   |
+| --------------------------------- | ----------------------------- |
+| GET /api/memory                   | List memories with filters    |
+| GET /api/memory/:id               | Get single memory             |
+| POST /api/memory                  | Create memory                 |
+| PUT /api/memory/:id               | Update memory                 |
+| DELETE /api/memory/:id            | Delete (soft) memory          |
+| POST /api/memory/search           | Semantic search               |
+| GET /api/memory/categories        | List categories               |
+| GET /api/memory/tags              | List tags                     |
+| GET /api/memory/timeline          | Timeline view data            |
+| GET /api/memory/graph             | Graph visualization data      |
+| GET /api/memory/stats             | Memory statistics             |
+| POST /api/memory/link             | Link two memories             |
+| POST /api/memory/consolidate      | Merge similar memories        |
+| POST /api/memory/decay            | Apply importance decay        |
+| DELETE /api/memory/expired        | Clear expired memories        |
+| GET /api/memory/embeddings/status | LM Studio connection status   |
+| GET /api/memory/backend/status    | Active storage backend status |
+| GET /api/memory/sync              | File↔DB sync status           |
+| POST /api/memory/sync             | Trigger file↔DB sync          |
+| POST /api/memory/:id/approve      | Approve a pending memory      |
+| POST /api/memory/:id/reject       | Reject a pending memory       |
 
 ## WebSocket Events
 
-| Event | Description |
-|-------|-------------|
-| cos:memory:created | New memory created |
-| cos:memory:updated | Memory updated |
-| cos:memory:deleted | Memory deleted |
-| cos:memory:extracted | Memories extracted from agent |
+| Event                      | Description                                 |
+| -------------------------- | ------------------------------------------- |
+| cos:memory:created         | New memory created                          |
+| cos:memory:updated         | Memory updated                              |
+| cos:memory:deleted         | Memory deleted                              |
+| cos:memory:extracted       | Memories extracted from agent               |
 | cos:memory:approval-needed | Medium-confidence memories pending approval |
 
 ## Setup Requirements
@@ -178,23 +178,23 @@ memory: {
 
 ## Implementation Files
 
-| File | Purpose |
-|------|---------|
-| `server/lib/memoryValidation.js` | Zod schemas for memory operations |
-| `server/lib/vectorMath.js` | Cosine similarity, clustering helpers |
-| `server/services/memoryBackend.js` | Backend switcher (Postgres primary, file test-only) |
-| `server/services/memoryDB.js` | Core CRUD, search, lifecycle (PostgreSQL + pgvector) |
-| `server/services/memory.js` | File-backed CRUD (test-only backend) |
-| `server/services/memoryEmbeddings.js` | LM Studio embedding generation |
-| `server/services/memoryExtractor.js` | Extract memories from agent output |
-| `server/services/memoryClassifier.js` | LLM-based classification service |
-| `server/services/memoryRetriever.js` | Retrieve and format for injection |
-| `server/routes/memory.js` | REST API endpoints |
-| `client/src/pages/ChiefOfStaff.jsx` | MemoryTab, MemoryTimeline, MemoryGraph |
-| `client/src/services/api.js` | Memory API client functions |
-| `data/prompts/stages/memory-evaluate.md` | Memory evaluation prompt template |
+| File                                     | Purpose                                              |
+| ---------------------------------------- | ---------------------------------------------------- |
+| `server/lib/memoryValidation.js`         | Zod schemas for memory operations                    |
+| `server/lib/vectorMath.js`               | Cosine similarity, clustering helpers                |
+| `server/services/memoryBackend.js`       | Backend switcher (Postgres primary, file test-only)  |
+| `server/services/memoryDB.js`            | Core CRUD, search, lifecycle (PostgreSQL + pgvector) |
+| `server/services/memory.js`              | File-backed CRUD (test-only backend)                 |
+| `server/services/memoryEmbeddings.js`    | LM Studio embedding generation                       |
+| `server/services/memoryExtractor.js`     | Extract memories from agent output                   |
+| `server/services/memoryClassifier.js`    | LLM-based classification service                     |
+| `server/services/memoryRetriever.js`     | Retrieve and format for injection                    |
+| `server/routes/memory.js`                | REST API endpoints                                   |
+| `client/src/pages/ChiefOfStaff.jsx`      | MemoryTab, MemoryTimeline, MemoryGraph               |
+| `client/src/services/api.js`             | Memory API client functions                          |
+| `data/prompts/stages/memory-evaluate.md` | Memory evaluation prompt template                    |
 
 ## Related Features
 
-- [Chief of Staff](./chief-of-staff.md)
-- [Brain System](./brain-system.md)
+* [Chief of Staff](chief-of-staff.md)
+* [Brain System](brain-system.md)

@@ -4,9 +4,9 @@ Autonomous crash detection and repair using Claude CLI.
 
 ## Architecture
 
-- **Daemon Process** (`autofixer/server.js`): Monitors PM2 for crashed processes registered in PortOS
-- **UI Server** (`autofixer/ui.js`): Web interface for viewing logs and fix history on port 5560
-- **PM2 Integration**: Runs as `portos-autofixer` and `portos-autofixer-ui` processes
+* **Daemon Process** (`autofixer/server.js`): Monitors PM2 for crashed processes registered in PortOS
+* **UI Server** (`autofixer/ui.js`): Web interface for viewing logs and fix history on port 5560
+* **PM2 Integration**: Runs as `portos-autofixer` and `portos-autofixer-ui` processes
 
 ## Features
 
@@ -32,22 +32,23 @@ Autonomous crash detection and repair using Claude CLI.
 ## Autofixer UI
 
 Port 5560 provides:
-- Process sidebar with live status indicators
-- SSE-powered log viewer with pause/clear controls
-- History tab showing fix attempts with success/failure status
-- Links back to PortOS Dashboard
+
+* Process sidebar with live status indicators
+* SSE-powered log viewer with pause/clear controls
+* History tab showing fix attempts with success/failure status
+* Links back to PortOS Dashboard
 
 ## Configuration
 
-| Setting | Value |
-|---------|-------|
-| UI Port | 5560 |
-| Check Interval | 15 minutes |
-| Fix Cooldown | 30 minutes |
-| Max History | 100 entries |
+| Setting        | Value       |
+| -------------- | ----------- |
+| UI Port        | 5560        |
+| Check Interval | 15 minutes  |
+| Fix Cooldown   | 30 minutes  |
+| Max History    | 100 entries |
 
 ## Related Features
 
-- [Error Handling](./error-handling.md)
-- [Chief of Staff](./chief-of-staff.md)
-- [PM2 Configuration](../PM2.md)
+* [Error Handling](error-handling.md)
+* [Chief of Staff](chief-of-staff.md)
+* [PM2 Configuration](https://github.com/tzioup/PortOS/tree/main/docs/PM2.md)

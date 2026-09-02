@@ -22,30 +22,30 @@ portos-browser (PM2 process)
 
 ## Ports
 
-| Port | Purpose |
-|------|---------|
+| Port | Purpose                        |
+| ---- | ------------------------------ |
 | 5556 | Chrome DevTools Protocol (CDP) |
-| 5557 | Browser health check endpoint |
+| 5557 | Browser health check endpoint  |
 
 ## API Endpoints
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/browser` | Full combined status |
-| GET | `/api/browser/config` | Get browser configuration |
-| PUT | `/api/browser/config` | Update browser configuration |
-| POST | `/api/browser/launch` | Start browser via PM2 |
-| POST | `/api/browser/stop` | Stop browser via PM2 |
-| POST | `/api/browser/restart` | Restart browser via PM2 |
-| GET | `/api/browser/health` | Quick health check |
-| GET | `/api/browser/process` | PM2 process details |
-| GET | `/api/browser/pages` | List open CDP pages |
-| GET | `/api/browser/version` | CDP version info |
-| GET | `/api/browser/logs` | Recent PM2 logs |
+| Method | Path                   | Description                  |
+| ------ | ---------------------- | ---------------------------- |
+| GET    | `/api/browser`         | Full combined status         |
+| GET    | `/api/browser/config`  | Get browser configuration    |
+| PUT    | `/api/browser/config`  | Update browser configuration |
+| POST   | `/api/browser/launch`  | Start browser via PM2        |
+| POST   | `/api/browser/stop`    | Stop browser via PM2         |
+| POST   | `/api/browser/restart` | Restart browser via PM2      |
+| GET    | `/api/browser/health`  | Quick health check           |
+| GET    | `/api/browser/process` | PM2 process details          |
+| GET    | `/api/browser/pages`   | List open CDP pages          |
+| GET    | `/api/browser/version` | CDP version info             |
+| GET    | `/api/browser/logs`    | Recent PM2 logs              |
 
 ## Security
 
-Browser management relies on PortOS's network-level access control (see [Security Model](../API.md#security-model)). The `cdpHost` config is restricted to localhost values (`127.0.0.1`, `localhost`, `::1`) to prevent SSRF via CDP endpoint redirection. Do not expose the PortOS server to untrusted networks.
+Browser management relies on PortOS's network-level access control (see [Security Model](https://github.com/tzioup/PortOS/tree/main/docs/API.md#security-model)). The `cdpHost` config is restricted to localhost values (`127.0.0.1`, `localhost`, `::1`) to prevent SSRF via CDP endpoint redirection. Do not expose the PortOS server to untrusted networks.
 
 ## Configuration
 
