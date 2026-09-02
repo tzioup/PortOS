@@ -1,7 +1,7 @@
 # ADR: Beeper Message Bodies Are Mirrored Machine-Local
 
 - **Date:** 2026-08-31
-- **Status:** Accepted
+- **Status:** Proposed (accepted on the fork; upstream direction confirmed by the maintainer on atomantic/PortOS#5872, 2026-09-02)
 - **Related:** wayfinder map [Beeper in Comms](https://github.com/tzioup/PortOS/issues/1),
   ticket [Design the Beeper conversation and message store](https://github.com/tzioup/PortOS/issues/7),
   research [#2](https://github.com/tzioup/PortOS/issues/2) (API surface),
@@ -76,9 +76,9 @@ exactly, and permanently unless this ADR is superseded:
 - No Beeper kind is added to `PEER_SUBSCRIBABLE_KINDS`.
 - No Beeper category is added to `dataSync`'s `CATEGORIES`.
 - No Beeper table gains a `sync_sequence` cursor or a sync-flavoured
-  `deleted` / `deleted_at` tombstone pair. (`beeper_messages.deleted_at` is an
-  **inbound source tombstone** and is unrelated to sync; the naming collision is
-  called out here so a future reader does not mistake it for a sync cursor.)
+  `deleted` / `deleted_at` tombstone pair. The inbound source tombstone is named
+  `beeper_messages.unsent_at` precisely so there is no name to collide with, and
+  the guard test therefore keys on `sync_sequence` alone.
 - No Beeper category is added to `PORTOS_SCHEMA_VERSIONS`. There is no wire
   contract to version because there is no wire.
 - A guard test asserts no table matching `beeper_%` appears in any of those
@@ -94,15 +94,31 @@ change cannot opt these tables in by accident.
 cap, no silent eviction. An archive that quietly forgets is not trustworthy for
 the purposes it was built for.
 
+**This rule covers bodies, not attachment bytes.** Text is cheap, indexable, and
+the thing the archive exists to hold. Bytes are neither: a census of one
+nine-network install measured 3.93 GB across 3,922 attachments, ~87% of which
+Beeper already held on the same disk. So bytes get a disk budget with
+least-recently-viewed eviction, guarded by a `HEAD` re-fetch check so nothing
+Beeper can no longer supply is ever dropped, plus a per-attachment keep lock.
+Decided while resolving attachment handling; the reasoning is recorded there.
+
 Deletion is an explicit user action only, offered at two grains: purge one
 conversation, or purge the whole Beeper store. Both are hard deletes.
 
 ### Source deletions and edits
 
 A deletion **at the source** is a tombstone, not a removal, matching what the
-reference client does and what the API reports: the row is kept, `deleted_at` is
-stamped, and `body` is set to `NULL`. The message keeps its sender and its
-position in the timeline.
+reference client does and what the API reports: the row is kept, `unsent_at` is
+stamped, and nothing else changes. Body kept, attachment bytes kept, sender kept,
+timeline position kept. The thread renders a visible "unsent" mark with the
+content still readable underneath.
+
+An earlier draft of this ADR nulled `body` and stamped `deleted_at`. That was
+amended: keeping a photo while erasing its caption is the one outcome nobody
+would choose on purpose, and it read badly against this ADR's own argument that
+an archive that quietly forgets is not trustworthy. It works precisely because
+PortOS mirrors — Beeper reports the message deleted and stops serving it, so the
+copy PortOS already took is the only thing left to show.
 
 An edit at the source overwrites `body` and stamps `edited_at`. PortOS keeps no
 revision history: it cannot reconstruct one from the API, so a partial history
