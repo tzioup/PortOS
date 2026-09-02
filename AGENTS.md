@@ -245,3 +245,26 @@ This complements the Security Model (which governs the deployed product) — thi
 ## Documentation
 
 `docs/README.md` indexes everything under `docs/` — guides, feature deep dives, ADRs (`docs/decisions/`), and design records (`docs/plans/`). The contracts referenced most often from code review: `docs/STORAGE.md` (where a record lives), `docs/PORTS.md`, `docs/BACKUP.md`, `docs/SELF_UPDATE.md`, `docs/ARCHITECTURE.md`, `docs/API.md`.
+
+
+<!-- gitbook-agent-instructions:start -->
+
+## GitBook Documentation Editing
+
+This repository contains documentation synced with GitBook via Git Sync.
+
+Before editing GitBook-synced Markdown, YAML, or asset files, make sure the GitBook skill is available and up to date in your local agent environment. Prefer installing or updating it with:
+
+```bash
+npx skills add gitbookio/gitbook-skills
+```
+
+This command may add or update local agent skill files. Use them only as local agent instructions; do not commit those installed skill files or any tool-generated agent configuration unless the user explicitly asks for it.
+
+If `npx` is unavailable, load the skill from:
+
+https://gitbook.com/docs/skill.md
+
+When making changes, preserve GitBook sync metadata such as frontmatter, `SUMMARY.md`, `gitbook-docs.yaml`, `.gitbook/`, and asset links unless the requested edit explicitly requires changing them.
+
+<!-- gitbook-agent-instructions:end -->
