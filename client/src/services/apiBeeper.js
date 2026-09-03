@@ -59,3 +59,14 @@ export const setBeeperConversationLowPriority = (conversationId, lowPriority, op
     body: JSON.stringify({ lowPriority }),
     ...options,
   });
+
+// Connect flow (#31). PortOS runs OAuth itself (PKCE S256, dynamic client
+// registration); `startBeeperOAuth` returns the authorization URL for the
+// browser to open, and the redirect lands on the server callback, never here.
+// Pasting a token is a first-class alternative — Beeper's own UI can mint a
+// no-expiry token and the OAuth surface accepts no lifetime at all. None of
+// these ever return a token value: the client only ever sees `tokenConfigured`,
+// `tokenExpiresAt` and `tokenSource`.
+export const startBeeperOAuth = (options = {}) => request('/beeper/oauth/start', { method: 'POST', ...options });
+export const saveBeeperToken = (token, options = {}) => request('/beeper/token', { method: 'POST', body: JSON.stringify({ token }), ...options });
+export const disconnectBeeper = (options = {}) => request('/beeper/token', { method: 'DELETE', ...options });

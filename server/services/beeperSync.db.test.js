@@ -18,10 +18,14 @@
  * file is not auto-globbed). Every fixture uses placeholder names/handles per
  * root AGENTS.md Sensitive Data & Privacy — no real handle, name, or content.
  *
- * `settings.js` is the ONE mocked module: the sweep resolves its credential
- * through `beeperClient.resolveBeeperConfig`, which reads it from settings on
- * this branch and from the encrypted vault once #31 lands. Every other module
- * in the graph — the Beeper client, `beeperTribe`, `tribe`, `db` — is real.
+ * The credential path is the ONLY mocked part: the sweep resolves its token
+ * through `beeperClient.resolveBeeperConfig`, which since #31 reads the
+ * AES-256-GCM vault (`beeperCredentials.resolveBeeperToken`) with the legacy
+ * plaintext `settings.beeper.token` as a read-only fallback. Both are stubbed
+ * here so this suite never depends on whether `portos_test` happens to hold a
+ * credential row, or on whether the vault key that encrypted it is still the
+ * current one. Every other module in the graph — the Beeper client,
+ * `beeperTribe`, `tribe`, `db` — is real.
  */
 import {
   it, expect, beforeAll, afterAll, vi,
@@ -33,7 +37,17 @@ vi.mock('./settings.js', async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    getSettings: async () => ({ beeper: { token: 'db-test-token', baseUrl: 'http://127.0.0.1:23373' } }),
+    getSettings: async () => ({ beeper: { baseUrl: 'http://127.0.0.1:23373' } }),
+  };
+});
+
+vi.mock('./beeperCredentials.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    resolveBeeperToken: async () => ({
+      token: 'db-test-token', tokenExpiresAt: null, tokenSource: 'pasted',
+    }),
   };
 });
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { useParams } from 'react-router';
+import { useParams, useSearchParams } from 'react-router';
+import toast from '../ui/Toast';
 import Drawer from '../Drawer';
 import useDrawerTab from '../../hooks/useDrawerTab';
 import useBeeperRealtime from '../../hooks/useBeeperRealtime';
@@ -52,11 +53,40 @@ export default function BeeperTab() {
   // does not push the current transport state, and the drawer's own status
   // fetch only runs once it is opened — so without this the rail's dot would
   // stay blank on a healthy install until something changed.
-  useEffect(() => {
+  const seedStatus = useCallback(() => {
     getBeeperStatus({ silent: true })
       .then((status) => { if (mountedRef.current && status?.realtime) handleRealtimeSeed(status.realtime); })
       .catch(() => {});
   }, [handleRealtimeSeed, mountedRef]);
+
+  useEffect(() => { seedStatus(); }, [seedStatus]);
+
+  // Beeper redirects the BROWSER back to this PAGE after consent (#31), not to
+  // the settings drawer — so the outcome flag is read here, where something is
+  // always mounted, rather than in the panel that only exists while the drawer
+  // is open. The server callback already exchanged the code and vaulted the
+  // token; all that arrives is the outcome. Report it once, then strip it so a
+  // reload doesn't repeat the toast, and on a FAILURE open the settings drawer
+  // in the same URL write, because that is where the connect card that fixes it
+  // lives.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const oauthConnected = searchParams.get('beeperConnected');
+  const oauthError = searchParams.get('beeperOauthError');
+  useEffect(() => {
+    if (!oauthConnected && !oauthError) return;
+    if (oauthError) toast.error(`Beeper connect failed: ${oauthError}`);
+    else {
+      toast.success('Beeper connected');
+      seedStatus();
+    }
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('beeperConnected');
+      next.delete('beeperOauthError');
+      if (oauthError) next.set('settings', '1');
+      return next;
+    }, { replace: true });
+  }, [oauthConnected, oauthError, setSearchParams, seedStatus]);
 
   return (
     <div className="h-full min-h-0">

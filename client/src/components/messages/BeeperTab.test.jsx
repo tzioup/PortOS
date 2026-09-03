@@ -28,10 +28,15 @@ const api = vi.hoisted(() => ({
   linkBeeperParticipant: vi.fn(),
   createTribePersonFromBeeper: vi.fn(),
   getTribePeople: vi.fn(),
-  // Reached only through the settings drawer, which these tests never open.
+  // Reached through the settings drawer. Declared here because
+  // `BeeperSettingsPanel` imports them at module load, whether or not a test
+  // opens the drawer — a named import missing from the mock throws.
   getSettings: vi.fn(),
   updateSettings: vi.fn(),
   checkBeeperConnection: vi.fn(),
+  startBeeperOAuth: vi.fn(),
+  saveBeeperToken: vi.fn(),
+  disconnectBeeper: vi.fn(),
 }));
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn() }));
 const socketMock = vi.hoisted(() => {
@@ -105,6 +110,7 @@ beforeEach(() => {
   api.getBeeperConversation.mockResolvedValue(conversation());
   api.getBeeperMessages.mockResolvedValue({ messages: [], nextCursor: null });
   api.getTribePeople.mockResolvedValue([]);
+  api.getSettings.mockResolvedValue({ beeper: { enabled: false, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 } });
 });
 
 afterEach(cleanup);
@@ -391,6 +397,23 @@ describe('the inline Tribe link action', () => {
       { conversationId: CONV_A, sourceUserId: 'user-1', personId: '55555555-5555-4555-8555-555555555555' },
       { silent: true },
     ));
+  });
+});
+
+// Beeper's consent screen redirects the BROWSER back to this page, never to
+// the settings drawer, so the page shell — not the panel inside the drawer —
+// is what has to read the outcome off the URL (#31).
+describe('the OAuth outcome carried back on the URL', () => {
+  it('reports a successful connect', async () => {
+    renderTab('/messages/beeper?beeperConnected=1');
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Beeper connected'));
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('reports a failure and opens the settings drawer, where the connect card that fixes it lives', async () => {
+    renderTab('/messages/beeper?beeperOauthError=access_denied');
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect failed: access_denied'));
+    expect(await screen.findByRole('heading', { name: 'Beeper Settings' })).toBeInTheDocument();
   });
 });
 

@@ -20,14 +20,14 @@
  * `readResponseJson`. A future byte-streaming asset fetch (attachment mirror,
  * #37) is the caller that would want that pattern; it doesn't exist yet.
  *
- * Auth and base URL: `settings.beeper.baseUrl` (default below) and
- * `settings.beeper.token`. Durable, encrypted token storage is #31's scope
- * (OAuth connect + vault, per fork issue #11 decision 10 — vaultCrypto in
- * Postgres). This module reads a plain `settings.beeper.token` field so #31
- * has one stable call site (`resolveBeeperConfig`) to swap real vault-backed
- * resolution behind, without touching anything else in this file — every
- * caller-facing function already accepts an explicit `{ baseUrl, token }`
- * override for exactly this reason.
+ * Auth and base URL: `settings.beeper.baseUrl` (default below) and, since #31,
+ * the vault-backed credential store (`beeperCredentials.resolveBeeperToken` —
+ * AES-256-GCM in Postgres, per fork issue #11 decision 6). `resolveBeeperConfig`
+ * is the one call site that resolves it; the legacy plaintext
+ * `settings.beeper.token` from #29 survives there as a READ-only fallback so an
+ * install that hand-edited one keeps working. Nothing here ever writes a token.
+ * Every caller-facing function also accepts an explicit `{ baseUrl, token }`
+ * override, which skips both stores entirely.
  */
 
 import { fetchWithTimeout } from '../lib/fetchWithTimeout.js';
@@ -36,6 +36,7 @@ import { describeFetchError, isReplayableConnectionError } from '../lib/fetchErr
 import { ServerError } from '../lib/errorHandler.js';
 import { isPlainObject } from '../lib/objects.js';
 import { getSettings } from './settings.js';
+import { resolveBeeperToken } from './beeperCredentials.js';
 
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:23373';
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -74,16 +75,33 @@ function normalizeBaseUrl(value) {
   return trimmed || DEFAULT_BASE_URL;
 }
 
+/**
+ * The configured Beeper Desktop base URL, trailing slash trimmed, falling back
+ * to the loopback default. Exported so the connect flow (#31) resolves it
+ * exactly the way every API call does instead of re-deriving it.
+ */
+export async function resolveBeeperBaseUrl() {
+  const settings = await getSettings().catch(() => null);
+  return normalizeBaseUrl(settings?.beeper?.baseUrl);
+}
+
 function normalizeToken(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
 /**
  * Resolve `{ baseUrl, token }` for a call. An explicit `baseUrl` AND `token`
- * (token may be `null`, meaning "deliberately unauthenticated") skip the
- * settings read entirely — this is what keeps every test in this file free of
- * a `settings.js` mock. Otherwise each field falls back independently to
- * `settings.beeper.{baseUrl,token}`, then to the hardcoded default base URL.
+ * (token may be `null`, meaning "deliberately unauthenticated") skip both
+ * stores entirely — this is what keeps most tests in this file free of any
+ * mock. Otherwise the base URL falls back to `settings.beeper.baseUrl` and then
+ * to the hardcoded default, while the token comes from the vault-backed store
+ * (`resolveBeeperToken`, #31), which itself falls back to the legacy plaintext
+ * `settings.beeper.token` for reads.
+ *
+ * An unreadable vault THROWS out of here rather than resolving `token: null`:
+ * "the credential cannot be read" and "no credential is configured" are
+ * different conditions, and collapsing them would report a connected install as
+ * unconfigured (the absent-vs-empty sentinel rule).
  */
 export async function resolveBeeperConfig({ baseUrl, token } = {}) {
   if (baseUrl !== undefined && token !== undefined) {
@@ -91,8 +109,11 @@ export async function resolveBeeperConfig({ baseUrl, token } = {}) {
   }
   const settings = await getSettings().catch(() => null);
   const resolvedBaseUrl = baseUrl !== undefined ? baseUrl : settings?.beeper?.baseUrl;
-  const resolvedToken = token !== undefined ? token : settings?.beeper?.token;
-  return { baseUrl: normalizeBaseUrl(resolvedBaseUrl), token: normalizeToken(resolvedToken) };
+  if (token !== undefined) {
+    return { baseUrl: normalizeBaseUrl(resolvedBaseUrl), token: normalizeToken(token) };
+  }
+  const stored = await resolveBeeperToken();
+  return { baseUrl: normalizeBaseUrl(resolvedBaseUrl), token: normalizeToken(stored?.token) };
 }
 
 /**
@@ -196,7 +217,13 @@ async function beeperRequest(path, {
 // Discovery / liveness
 // ---------------------------------------------------------------------------
 
-/** `GET /v1/info` — the one unauthenticated endpoint. */
+/**
+ * `GET /v1/info` — the one endpoint that also answers UNAUTHENTICATED, which is
+ * what makes it the liveness probe and what disqualifies it as a credential
+ * check: it answers 200 for a bogus token just as happily (#31's connect flow
+ * introspects instead). `token: null` is explicit, so a probe never triggers a
+ * credential read.
+ */
 export async function getInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
   return beeperRequest('/v1/info', { baseUrl, token: null, requireAuth: false, timeoutMs });
 }

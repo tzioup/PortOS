@@ -56,10 +56,11 @@ export const youtubeConfigSchema = z.object({
 // Beeper Desktop bridge ingestion + connection config (#30) — the
 // `settings.beeper` slice. Sync is OFF by default and only talks to the local
 // Beeper Desktop API (default http://127.0.0.1:23373) when enabled.
-// Deliberately excludes `token`/`tokenExpiresAt`: durable, encrypted token
-// storage is fork issue #31's scope (OAuth connect + vault), and this slice's
-// Settings surface may show whether a token is configured but must never
-// accept or persist one in plaintext. `.strict()` so a client attempting to
+// Deliberately excludes `token`/`tokenExpiresAt`: the credential is stored
+// AES-256-GCM encrypted in Postgres and written only through the connect routes
+// (`beeperPastedTokenSchema` below, #31). This slice's Settings surface may show
+// whether a token is configured but must never accept or persist one in
+// plaintext. `.strict()` so a client attempting to
 // smuggle a token through this generic route 400s instead of the value
 // silently reaching disk.
 export const beeperSettingsSchema = z.object({
@@ -68,6 +69,26 @@ export const beeperSettingsSchema = z.object({
   baseUrl: z.string().trim().min(1).max(500).optional(),
   attachmentBudgetGb: z.number().min(0.1).max(1000).optional(),
 }).strict();
+
+// Beeper connect flow (#31). The token NEVER rides the generic settings route
+// (`beeperSettingsSchema` above is `.strict()` with no token field) — it is
+// accepted here, on its own dedicated write path, and stored AES-256-GCM
+// encrypted in Postgres by `services/beeperCredentials.js`. The upper bound is
+// slack for an opaque bearer of unknown shape, not a claim about its format.
+export const beeperPastedTokenSchema = z.object({
+  token: z.string().trim().min(1).max(4096),
+}).strict();
+
+// The OAuth redirect target Beeper sends the browser back to. `state` is the
+// PKCE-flow correlator minted by `startBeeperOAuth`; `code` is single-use. Both
+// are validated before anything is looked up, and an authorization-server
+// `error` is accepted so the callback can report a user-side denial instead of
+// reading as a malformed request.
+export const beeperOAuthCallbackSchema = z.object({
+  code: z.string().trim().min(1).max(2048).optional(),
+  state: z.string().trim().min(1).max(512).optional(),
+  error: z.string().trim().max(256).optional(),
+}).passthrough();
 
 // Shared LoRA-training parameter bounds — used by both the settings-slice
 // defaults and the per-run override on POST /api/lora-training/runs.

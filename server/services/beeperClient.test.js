@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getSettings } from './settings.js';
+import { resolveBeeperToken } from './beeperCredentials.js';
 import {
   BeeperApiError,
   DEFAULT_BASE_URL,
@@ -25,10 +26,14 @@ import {
   updateChat,
 } from './beeperClient.js';
 
-// resolveBeeperConfig only touches settings.js when EITHER baseUrl or token is
-// omitted; every other test in this file passes both explicitly and never
-// exercises this mock, so it's safe to hoist for the whole file.
+// resolveBeeperConfig only touches settings.js (base URL) and the vault-backed
+// credential store (token) when EITHER baseUrl or token is omitted; every other
+// test in this file passes both explicitly and never exercises these mocks, so
+// they're safe to hoist for the whole file. `beeperCredentials` is mocked
+// rather than exercised because its own suite covers the vault contract and it
+// would otherwise reach for Postgres from here.
 vi.mock('./settings.js', () => ({ getSettings: vi.fn() }));
+vi.mock('./beeperCredentials.js', () => ({ resolveBeeperToken: vi.fn() }));
 
 // A fixture-shaped fake Response, matching what readResponseJson consumes
 // (only `.text()` is read; `.ok`/`.status` drive the beeperRequest branch).
@@ -57,14 +62,25 @@ describe('beeperClient', () => {
   describe('resolveBeeperConfig', () => {
     it('defaults the base URL and reports no token when neither is configured', async () => {
       vi.mocked(getSettings).mockResolvedValue({});
+      vi.mocked(resolveBeeperToken).mockResolvedValue(null);
       const config = await resolveBeeperConfig();
       expect(config).toEqual({ baseUrl: DEFAULT_BASE_URL, token: null });
     });
 
-    it('reads settings.beeper.{baseUrl,token} when the caller supplies neither', async () => {
-      vi.mocked(getSettings).mockResolvedValue({ beeper: { baseUrl: 'http://127.0.0.1:23373/', token: '  secret-token  ' } });
+    it('reads the base URL from settings and the token from the vault-backed store (#31)', async () => {
+      vi.mocked(getSettings).mockResolvedValue({ beeper: { baseUrl: 'http://127.0.0.1:23373/' } });
+      vi.mocked(resolveBeeperToken).mockResolvedValue({ token: 'vaulted-token', tokenSource: 'oauth' });
       const config = await resolveBeeperConfig();
-      expect(config).toEqual({ baseUrl: 'http://127.0.0.1:23373', token: 'secret-token' });
+      expect(config).toEqual({ baseUrl: 'http://127.0.0.1:23373', token: 'vaulted-token' });
+    });
+
+    // The vault read throwing means "the credential cannot be read", which is
+    // NOT "no credential is configured" — collapsing the two would silently
+    // make an authenticated call anonymous.
+    it('propagates an unreadable credential store instead of resolving token:null', async () => {
+      vi.mocked(getSettings).mockResolvedValue({});
+      vi.mocked(resolveBeeperToken).mockRejectedValue(new Error('Malformed vault ciphertext'));
+      await expect(resolveBeeperConfig()).rejects.toThrow(/vault ciphertext/);
     });
 
     it('an explicit baseUrl + token bypasses settings entirely', async () => {
@@ -73,8 +89,21 @@ describe('beeperClient', () => {
     });
 
     it('an explicit token of null is honored as "deliberately unauthenticated", not "unset"', async () => {
+      vi.mocked(resolveBeeperToken).mockClear();
       const config = await resolveBeeperConfig({ baseUrl: DEFAULT_BASE_URL, token: null });
       expect(config.token).toBeNull();
+      expect(resolveBeeperToken).not.toHaveBeenCalled();
+    });
+
+    // The liveness probe must never trigger a credential read: /v1/info is the
+    // one endpoint that answers unauthenticated, and a probe that decrypts the
+    // vault on every status poll would be both slower and a wider blast radius.
+    it('an explicit token (with no baseUrl) still skips the credential store', async () => {
+      vi.mocked(resolveBeeperToken).mockClear();
+      vi.mocked(getSettings).mockResolvedValue({ beeper: { baseUrl: DEFAULT_BASE_URL } });
+      const config = await resolveBeeperConfig({ token: null });
+      expect(config).toEqual({ baseUrl: DEFAULT_BASE_URL, token: null });
+      expect(resolveBeeperToken).not.toHaveBeenCalled();
     });
   });
 

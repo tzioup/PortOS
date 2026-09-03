@@ -1663,6 +1663,22 @@ CREATE TABLE IF NOT EXISTS beeper_accounts (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- The ONE Beeper credential this install holds (#31), AES-256-GCM encrypted by
+-- server/lib/vaultCrypto.js. Single-row by construction (id = 'default'): PortOS
+-- models one Beeper account per install. token_expires_at NULL = never expires
+-- (only Beeper's own UI can mint that); there is no refresh grant, so an expired
+-- token is re-connected, never refreshed. scopes/client_id exist for the
+-- disconnect-time revocation call and never reach a client payload.
+CREATE TABLE IF NOT EXISTS beeper_credentials (
+  id TEXT PRIMARY KEY,
+  token_enc TEXT NOT NULL,
+  token_expires_at TIMESTAMPTZ,
+  scopes TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'pasted' CHECK (source IN ('oauth','pasted')),
+  client_id TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 CREATE TABLE IF NOT EXISTS beeper_conversations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   account_id TEXT NOT NULL REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,

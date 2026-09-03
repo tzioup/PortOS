@@ -31,6 +31,31 @@ export const beeperDdl = [
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`,
 
+  // The ONE Beeper credential this install holds (#31). AES-256-GCM ciphertext
+  // via `server/lib/vaultCrypto.js` — never `settings.json`, never a plaintext
+  // file, never a log line. Single-row by construction (`id = 'default'`),
+  // because PortOS models one Beeper account per install (#1 charting decision
+  // 8); a second row would silently create a second identity no surface can
+  // choose between.
+  //
+  // `token_expires_at NULL` means "never expires" — the state only Beeper's own
+  // UI can mint, and the reason pasting a token is a first-class alternative to
+  // OAuth rather than a fallback (#11 decision 3). There is no refresh grant, so
+  // an expired token is re-connected, never refreshed. `scopes` and `client_id`
+  // are stored for the disconnect-time revocation call, and are NEVER surfaced
+  // to a client payload; `client_id` is a public-client identifier from dynamic
+  // registration, not a secret, and is empty for a pasted token.
+  `CREATE TABLE IF NOT EXISTS beeper_credentials (
+    id TEXT PRIMARY KEY,
+    token_enc TEXT NOT NULL,
+    token_expires_at TIMESTAMPTZ,
+    scopes TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'pasted' CHECK (source IN ('oauth','pasted')),
+    client_id TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
+
   // Synthetic UUID primary key so a later cross-network merge never has to
   // repoint every child row — `source_chat_id` is the Beeper-side identity.
   // Pin/archive/mute/low-priority/unread state is Beeper's own state, mirrored
