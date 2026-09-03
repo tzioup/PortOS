@@ -84,6 +84,7 @@ import { startPrivacyRecheckScheduler } from './privacyRecheckScheduler.js';
 import { startQuotaBurnScheduler } from './quotaBurnRunner.js';
 import { startSeriesAutopilotScheduler } from './seriesAutopilotScheduler.js';
 import { startCommissionScheduler } from './creativeCommissions/scheduler.js';
+import { startBeeperScheduler } from './beeperScheduler.js';
 import { startImessageScheduler } from './imessageScheduler.js';
 import { startSignalScheduler } from './signalScheduler.js';
 import { startSpotifyScheduler } from './spotifyScheduler.js';
@@ -446,6 +447,12 @@ const startBackgroundServices = ({ spawnerReady, io }) => {
   // the signed-in history page in the managed browser when the user opts in via
   // Settings → YouTube (#2153).
   startYoutubeScheduler().catch(err => console.error(`❌ YouTube sync scheduler init failed: ${err.message}`));
+  // Initialize the Beeper ingestion sweep — OFF by default; registers only when
+  // the Beeper instance feature is on AND a token is configured, and then only
+  // runs when `settings.beeper.enabled` is set (fork issue #32). Deliberately
+  // NOT gated on Beeper's own `app.state`, which was measured reporting
+  // `initializing` for 105s while every account was connected.
+  startBeeperScheduler().catch(err => console.error(`❌ Beeper sync scheduler init failed: ${err.message}`));
   // Periodically GC orphan zero-issue/zero-canon importer shells left by an
   // abandoned analyze (issue #727).
   startOrphanShellGc();

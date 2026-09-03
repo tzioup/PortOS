@@ -1582,6 +1582,14 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/api/beeper/sync",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
       "method": "DELETE",
       "path": "/api/beeper/token",
       "mountPath": "/api/beeper",
@@ -17488,8 +17496,8 @@
   ],
   "stats": {
     "mounts": 146,
-    "operations": 2166,
-    "declarations": 2174,
+    "operations": 2167,
+    "declarations": 2175,
     "sourceFiles": 229
   }
 }

@@ -3,6 +3,7 @@ import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
 import { beeperOAuthCallbackSchema, beeperPastedTokenSchema, validateRequest } from '../lib/validation.js';
 import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus.js';
 import { completeBeeperOAuth, connectWithPastedToken, disconnectBeeper, startBeeperOAuth } from '../services/beeperOAuth.js';
+import { runBeeperSweep } from '../services/beeperSync.js';
 
 const router = Router();
 
@@ -18,6 +19,10 @@ const BEEPER_ERROR_STATUS = {
   NOT_CONFIGURED: 412,
   MALFORMED_RESPONSE: 502,
   ASSET_UNAVAILABLE: 404,
+  // Every account failed in one sweep (#32). An upstream failure, not the
+  // caller's, and worth retrying — it must not answer 200 with a quietly
+  // non-zero `failedAccounts`.
+  SWEEP_FAILED: 502,
   UNAUTHORIZED: 401,
   TOKEN_REQUIRED: 400,
   TOKEN_REJECTED: 401,
@@ -70,6 +75,20 @@ router.get('/status', asyncHandler(async (_req, res) => {
 // per HTTP status (503 unreachable, 412 not configured, 502 malformed reply).
 router.post('/status/check', asyncHandler(async (_req, res) => {
   const result = await checkBeeperConnection().catch((err) => { throw mapBeeperError(err); });
+  res.json(result);
+}));
+
+// POST /api/beeper/sync — run one watermark-bounded ingestion sweep now
+// (#32). The scheduled sweep is the normal path; this is the explicit
+// user-triggered equivalent, for a user who has just connected a token or
+// just changed a setting and does not want to wait out the interval. Deterministic
+// ingestion only — no AI provider call — so it needs no consent step.
+//
+// A sweep already in flight is reported as `skipped: true` rather than queued
+// or run concurrently; a missing token maps to 412 through the same coded
+// mapper the status routes use, never a raw `status: 0`.
+router.post('/sync', asyncHandler(async (_req, res) => {
+  const result = await runBeeperSweep({ reason: 'manual' }).catch((err) => { throw mapBeeperError(err); });
   res.json(result);
 }));
 
