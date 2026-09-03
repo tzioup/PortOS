@@ -11,6 +11,10 @@ const toast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn(), success:
 
 vi.mock('../../services/api', () => api);
 vi.mock('../ui/Toast', () => ({ default: toast }));
+// `useBeeperRealtime` imports the socket.io singleton. Without this the real
+// client is instantiated in jsdom and leaves a reconnect loop running for the
+// life of the file (54 other client suites mock it for the same reason).
+vi.mock('../../services/socket', () => ({ default: { on: vi.fn(), off: vi.fn(), emit: vi.fn() } }));
 
 const BeeperTab = (await import('./BeeperTab')).default;
 
@@ -70,9 +74,6 @@ describe('BeeperTab — status card states', () => {
     expect(screen.getByText('whatsapp')).toBeInTheDocument();
   });
 
-  // The absent-vs-empty sentinel (#30 Acceptance): reachable:null must never
-  // render as offline, even in the (normally unreachable) case where a token
-  // is configured but the probe never ran.
   it('renders the transport liveness dot from the status payload, with its actionable app.state remedy (#33)', async () => {
     api.getBeeperStatus.mockResolvedValue({
       tokenConfigured: true,
@@ -90,6 +91,44 @@ describe('BeeperTab — status card states', () => {
     expect(screen.getByText('Beeper Desktop needs you to sign in again.')).toBeInTheDocument();
   });
 
+  it('renders the liveness row while Beeper Desktop is unreachable — the probe failing is when it matters', async () => {
+    // The HTTP probe and the WebSocket are different transports: hiding the dot
+    // and its remedy inside the reachable branch hid them exactly when a human
+    // needed them.
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true,
+      reachable: false,
+      lastProbeError: 'Beeper request failed: connection refused',
+      baseUrl: 'http://127.0.0.1:23373',
+      accounts: [],
+      realtime: {
+        state: 'connecting', lastEventAt: null, lastPingAt: null, appState: 'needs-login', appStateActionable: true,
+      },
+    });
+    render(<BeeperTab />);
+
+    await screen.findByText('Beeper Desktop unreachable');
+    expect(screen.getByTestId('connection-status-dot')).toHaveAttribute('data-status', 'connecting');
+    expect(screen.getByText('Beeper Desktop needs you to sign in again.')).toBeInTheDocument();
+  });
+
+  it('names the remedy when Beeper rejected the stored token (#33)', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true,
+      reachable: null,
+      lastProbeError: null,
+      accounts: [],
+      realtime: {
+        state: 'down', lastEventAt: null, lastPingAt: null, appState: null, appStateActionable: false, authRejected: true,
+      },
+    });
+    render(<BeeperTab />);
+
+    await screen.findByText('Checking Beeper Desktop…');
+    expect(screen.getByTestId('connection-status-dot')).toHaveAttribute('data-status', 'down');
+    expect(screen.getByText('Beeper Desktop rejected the stored token — reconnect Beeper.')).toBeInTheDocument();
+  });
+
   it('renders no liveness row at all when the transport has never reported', async () => {
     // `realtime` absent is not-yet-known, never "offline" — the same
     // absent-vs-empty rule the `reachable` tri-state follows.
@@ -102,6 +141,9 @@ describe('BeeperTab — status card states', () => {
     expect(screen.queryByTestId('connection-status-dot')).toBeNull();
   });
 
+  // The absent-vs-empty sentinel (#30 Acceptance): reachable:null must never
+  // render as offline, even in the (normally unreachable) case where a token
+  // is configured but the probe never ran.
   it('never renders reachable:null as offline', async () => {
     api.getBeeperStatus.mockResolvedValue({
       tokenConfigured: true, reachable: null, lastProbeError: null, accounts: [],

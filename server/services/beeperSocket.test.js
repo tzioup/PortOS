@@ -51,11 +51,16 @@ class FakeSocket {
 vi.mock('ws', () => ({ default: FakeSocket }));
 
 let armed = true;
+// `settings.beeper.enabled` — the user's ingestion opt-in, DEFAULT OFF in
+// production. Every test that expects a sweep has to turn it on, which is the
+// point: the transport arms without it, the sweep never runs without it.
+let syncEnabled = true;
 let resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
 const sweeps = [];
 
 vi.mock('./beeperSync.js', () => ({
   isBeeperIngestionArmed: vi.fn(async () => armed),
+  getBeeperSyncConfig: vi.fn(async () => ({ enabled: syncEnabled, intervalMinutes: 5 })),
   runBeeperSweep: vi.fn(async ({ reason }) => { sweeps.push(reason); return { skipped: false }; }),
 }));
 vi.mock('./beeperClient.js', () => ({
@@ -69,6 +74,7 @@ const {
 } = await import('./beeperSocket.js');
 const { beeperSocketEvents } = await import('./beeperSocketEvents.js');
 const { isBeeperIngestionArmed } = await import('./beeperSync.js');
+const { resolveBeeperConfig } = await import('./beeperClient.js');
 
 // A controllable clock: timers are recorded rather than run, so a test advances
 // exactly the one it cares about.
@@ -99,6 +105,11 @@ function makeClock() {
 let clock;
 let random;
 
+// The sweep gate is re-read asynchronously on every trigger, so a sweep now
+// costs several microtask turns. Drain the whole queue instead of counting
+// `Promise.resolve()`s.
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 async function start(overrides = {}) {
   clock = makeClock();
   return startBeeperSocket({
@@ -117,6 +128,7 @@ describe('beeperSocket — arming gate', () => {
     createdSockets.length = 0;
     sweeps.length = 0;
     armed = true;
+    syncEnabled = true;
     random = 0.5;
     resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
   });
@@ -170,6 +182,50 @@ describe('beeperSocket — arming gate', () => {
     expect(frame.app).toEqual({ state: true });
   });
 
+  it('still connects with the ingestion toggle off — the transport is not the opt-in', async () => {
+    // Documented decision (#11 two gates): the socket writes nothing, and the
+    // liveness dot it feeds is what the settings card shows while the user is
+    // deciding whether to enable ingestion. What the toggle gates is the sweep.
+    syncEnabled = false;
+    expect(await start()).toBe(true);
+    latest().handshake();
+    expect(createdSockets).toHaveLength(1);
+    expect(getBeeperRealtimeState().state).toBe('connected');
+  });
+
+  it('reports `connecting`, not `reconnecting`, before it has ever connected', async () => {
+    await start();
+    expect(getBeeperRealtimeState().state).toBe('connecting');
+    latest().handshake();
+    expect(getBeeperRealtimeState().state).toBe('connected');
+    latest().fire('close', 1006);
+    expect(getBeeperRealtimeState().state).toBe('reconnecting');
+  });
+
+  it('never opens a socket when a stop lands during the arming gate read', async () => {
+    // `stopBeeperSocket()` (shutdown) while `isBeeperIngestionArmed()` is still
+    // suspended must not be undone by the start that was already in flight.
+    const started = start();
+    stopBeeperSocket();
+    expect(await started).toBe(false);
+    expect(createdSockets).toHaveLength(0);
+  });
+
+  it('never opens a socket when a stop lands during the config read', async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    vi.mocked(resolveBeeperConfig).mockImplementationOnce(async () => { await gate; return resolvedConfig; });
+
+    const started = start();
+    await flush(); // suspended inside connect()'s credential read
+    stopBeeperSocket();
+    release();
+    await started;
+
+    expect(createdSockets).toHaveLength(0);
+    expect(getBeeperRealtimeState().state).toBe('down');
+  });
+
   it('derives the ws URL from the configured base URL, wss:// for https', () => {
     expect(beeperWebSocketUrl('https://192.0.2.10:23373/')).toBe('wss://192.0.2.10:23373/v1/ws');
     expect(beeperWebSocketUrl('')).toBe('ws://127.0.0.1:23373/v1/ws');
@@ -181,6 +237,7 @@ describe('beeperSocket — silence watchdog (injected time)', () => {
     createdSockets.length = 0;
     sweeps.length = 0;
     armed = true;
+    syncEnabled = true;
     random = 0.5;
     resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -250,8 +307,7 @@ describe('beeperSocket — silence watchdog (injected time)', () => {
       const [delay] = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
       delays.push(delay);
       clock.runTimersWithDelay(delay); // fire the reconnect timer
-      await Promise.resolve();
-      await Promise.resolve();
+      await flush();
       latest().fire('close', 1006); // the retry never got to `open`
     }
     expect(delays).toEqual([500, 1000, 2000, 4000]);
@@ -261,8 +317,7 @@ describe('beeperSocket — silence watchdog (injected time)', () => {
     // followed by a brief blip does not inherit a minute-long delay.
     const [delay] = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
     clock.runTimersWithDelay(delay);
-    await Promise.resolve();
-    await Promise.resolve();
+    await flush();
     latest().handshake();
     latest().fire('close', 1006);
     expect(clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS)).toEqual([500]);
@@ -274,6 +329,7 @@ describe('beeperSocket — sweep triggers', () => {
     createdSockets.length = 0;
     sweeps.length = 0;
     armed = true;
+    syncEnabled = true;
     random = 0.5;
     resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -284,7 +340,7 @@ describe('beeperSocket — sweep triggers', () => {
   it('does not sweep on the first connection of the process — boot arms, it does not fire', async () => {
     await start();
     latest().handshake();
-    await Promise.resolve();
+    await flush();
     expect(sweeps).toEqual([]);
   });
 
@@ -295,10 +351,9 @@ describe('beeperSocket — sweep triggers', () => {
     latest().fire('close', 1006);
     const [delay] = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
     clock.runTimersWithDelay(delay);
-    await Promise.resolve();
-    await Promise.resolve();
+    await flush();
     latest().handshake();
-    await Promise.resolve();
+    await flush();
 
     expect(sweeps).toEqual(['socket-reconnect']);
   });
@@ -308,7 +363,7 @@ describe('beeperSocket — sweep triggers', () => {
     latest().handshake();
     latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 4, ts: 1, chatID: 'chat-1', ids: ['m1'] }));
     latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 9, ts: 2, chatID: 'chat-1', ids: ['m2'] }));
-    await Promise.resolve();
+    await flush();
     expect(sweeps).toEqual(['socket-seq-gap']);
   });
 
@@ -318,7 +373,7 @@ describe('beeperSocket — sweep triggers', () => {
     for (const seq of [2, 3, 4]) {
       latest().fire('message', JSON.stringify({ type: 'message.upserted', seq, ts: 1, chatID: 'chat-1', ids: ['m'] }));
     }
-    await Promise.resolve();
+    await flush();
     expect(sweeps).toEqual([]);
   });
 
@@ -330,14 +385,120 @@ describe('beeperSocket — sweep triggers', () => {
     }));
 
     send('needs-login');
-    await Promise.resolve();
+    await flush();
     expect(sweeps).toEqual([]);
     expect(getBeeperRealtimeState().appStateActionable).toBe(true);
 
     send('ready');
-    await Promise.resolve();
+    await flush();
     expect(sweeps).toEqual(['socket-app-state-recovery']);
     expect(getBeeperRealtimeState().appStateActionable).toBe(false);
+  });
+
+  it('runs NO sweep on any of the three triggers while the ingestion toggle is off', async () => {
+    // `isBeeperIngestionArmed()` (feature + token) is not the sweep's gate:
+    // `settings.beeper.enabled` is, and `runBeeperSweep` does not check it
+    // itself. With it off, a socket trigger must not write a single
+    // conversation or message body to Postgres.
+    syncEnabled = false;
+    await start();
+    latest().handshake();
+
+    // 1. reconnect
+    latest().fire('close', 1006);
+    const [delay] = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
+    clock.runTimersWithDelay(delay);
+    await flush();
+    latest().handshake();
+    // 2. seq gap
+    latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 4, ts: 1, chatID: 'chat-1', ids: ['m1'] }));
+    latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 9, ts: 2, chatID: 'chat-1', ids: ['m2'] }));
+    // 3. app.state recovery
+    latest().fire('message', JSON.stringify({ type: 'app.state.updated', ts: 3, appState: { state: 'needs-login' } }));
+    latest().fire('message', JSON.stringify({ type: 'app.state.updated', ts: 4, appState: { state: 'ready' } }));
+    await flush();
+
+    // `sweeps` is the mock's own per-test record: nothing reached the sweep.
+    expect(sweeps).toEqual([]);
+  });
+
+  it('stops sweeping the moment the toggle is flipped off mid-session, without a restart', async () => {
+    // The gate is re-read at every trigger, exactly as the scheduler factory
+    // re-reads it on every tick.
+    await start();
+    latest().handshake();
+    latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 4, ts: 1, chatID: 'chat-1', ids: ['m1'] }));
+    latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 9, ts: 2, chatID: 'chat-1', ids: ['m2'] }));
+    await flush();
+    expect(sweeps).toEqual(['socket-seq-gap']);
+
+    syncEnabled = false;
+    latest().fire('message', JSON.stringify({ type: 'message.upserted', seq: 20, ts: 3, chatID: 'chat-1', ids: ['m3'] }));
+    await flush();
+    expect(sweeps).toEqual(['socket-seq-gap']);
+  });
+});
+
+describe('beeperSocket — a closed Beeper Desktop, and a rejected token', () => {
+  beforeEach(() => {
+    createdSockets.length = 0;
+    sweeps.length = 0;
+    armed = true;
+    syncEnabled = true;
+    random = 0;
+    resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
+  });
+  afterEach(() => { stopBeeperSocket(); vi.restoreAllMocks(); });
+
+  it('narrates the first few reconnect attempts, then only every tenth', async () => {
+    // Beeper Desktop being closed reconnects forever by design — it will be
+    // reopened — so the loop must not write a line a minute for the life of
+    // the process.
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    await start();
+
+    latest().fire('close', 1006);
+    for (let cycle = 0; cycle < 29; cycle += 1) {
+      const [delay] = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
+      clock.runTimersWithDelay(delay);
+      await flush();
+      latest().fire('close', 1006);
+    }
+
+    const lines = log.mock.calls.map(([line]) => String(line));
+    const attempts = lines
+      .filter((line) => line.includes('reconnecting in'))
+      .map((line) => Number(line.match(/attempt (\d+)/)[1]));
+    expect(attempts).toEqual([1, 2, 3, 10, 20, 30]);
+    // 30 failed cycles, and the whole loop stays inside a handful of lines.
+    expect(lines.length).toBeLessThanOrEqual(15);
+  });
+
+  it('stands down when Beeper rejects the token, instead of reconnecting forever', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await start();
+
+    latest().fire('unexpected-response', {}, { statusCode: 401 });
+
+    const state = getBeeperRealtimeState();
+    expect(state.state).toBe('down');
+    expect(state.authRejected).toBe(true); // the settings card's remedy line
+    expect(clock.timers.size).toBe(0); // no reconnect timer, no watchdog
+    expect(createdSockets).toHaveLength(1);
+  });
+
+  it('keeps reconnecting for an upgrade failure that is not an auth rejection', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await start();
+
+    latest().fire('unexpected-response', {}, { statusCode: 503 });
+
+    expect(getBeeperRealtimeState().authRejected).toBe(false);
+    expect(getBeeperRealtimeState().state).toBe('connecting');
+    expect(clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS)).toEqual([500]);
   });
 });
 
@@ -346,6 +507,7 @@ describe('beeperSocket — invalidation payloads carry no content', () => {
     createdSockets.length = 0;
     sweeps.length = 0;
     armed = true;
+    syncEnabled = true;
     random = 0.5;
     resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
     vi.spyOn(console, 'log').mockImplementation(() => {});

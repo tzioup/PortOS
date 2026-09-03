@@ -9,7 +9,7 @@ import { EventEmitter } from 'events';
  * pool, settings, the HTTP client) into every module that touches Socket.IO.
  *
  * Two events, both INVALIDATION-ONLY (#12 decision 3):
- *   - `invalidate` — `{ kind, chatID, messageIDs, seq, ts }`. Ids and kinds,
+ *   - `invalidate` — `{ kind, chatID, ids, seq, ts }`. Ids and kinds,
  *     never message bodies, display names or handles. The browser refetches
  *     from the PortOS mirror, which is the read path (#7).
  *   - `state` — `{ state, lastEventAt, lastPingAt, ... }`, the transport

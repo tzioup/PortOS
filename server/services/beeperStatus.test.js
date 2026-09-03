@@ -10,7 +10,7 @@ vi.mock('./settings.js', () => ({ getSettings: vi.fn() }));
 // reads its snapshot, so the module is stubbed at that one function.
 vi.mock('./beeperSocket.js', () => ({
   getBeeperRealtimeState: vi.fn(() => ({
-    state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false,
+    state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false, authRejected: false,
   })),
 }));
 vi.mock('./beeperClient.js', async () => {
@@ -66,7 +66,7 @@ describe('getBeeperStatus', () => {
     expect(probeBeeperInfo).toHaveBeenCalledWith({ baseUrl: 'http://127.0.0.1:23373' });
     // The transport snapshot the settings card's liveness dot renders from (#33).
     expect(status.realtime).toEqual({
-      state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false,
+      state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false, authRejected: false,
     });
   });
 

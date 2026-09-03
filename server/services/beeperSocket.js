@@ -28,6 +28,20 @@
  * for 105 continuous seconds while nine accounts were connected and a chat page
  * returned in 230ms. It is a display input for the settings card, never a gate.
  *
+ * **Two gates, and the transport and the sweep sit behind different ones (#11).**
+ *   - `isBeeperIngestionArmed()` — the instance FEATURE plus a stored token —
+ *     arms the TRANSPORT. Holding the socket open writes nothing: it only feeds
+ *     the settings card's liveness dot and its actionable `app.state` line,
+ *     which is the surface a user needs precisely when they are deciding
+ *     whether to turn ingestion on. So the connection is deliberately kept.
+ *   - `settings.beeper.enabled` ("Enable scheduled Beeper sync", default OFF)
+ *     is the user's ingestion opt-in, and it gates every `runBeeperSweep` call
+ *     from here — re-read at EVERY trigger, exactly as
+ *     `createSettingsGatedSyncScheduler.js` re-reads it on every tick, so
+ *     flipping the toggle off mid-session stops sweeps without a restart.
+ *     With it off the socket connects, subscribes and relays invalidations, and
+ *     never writes a conversation or a message body to Postgres.
+ *
  * Everything below runs OUTSIDE the Express request lifecycle — socket callbacks
  * and timers — so hook bodies catch and log rather than letting a throw take the
  * process down, per root AGENTS.md.
@@ -36,7 +50,7 @@
 import WebSocket from 'ws';
 import { beeperSocketEvents } from './beeperSocketEvents.js';
 import { DEFAULT_BASE_URL, resolveBeeperConfig } from './beeperClient.js';
-import { isBeeperIngestionArmed, runBeeperSweep } from './beeperSync.js';
+import { getBeeperSyncConfig, isBeeperIngestionArmed, runBeeperSweep } from './beeperSync.js';
 
 const LOG_PREFIX = '🫧 Beeper socket';
 
@@ -45,6 +59,12 @@ const LOG_PREFIX = '🫧 Beeper socket';
 export const SILENCE_TIMEOUT_MS = 75_000;
 const BASE_RECONNECT_DELAY_MS = 1_000;
 const MAX_RECONNECT_DELAY_MS = 60_000;
+
+// Beeper Desktop simply being closed is the common case, and at the 60s ceiling
+// an unbounded loop writes a line a minute forever. The first few attempts are
+// the diagnostic ones; after that only every 10th is narrated.
+const VERBOSE_RECONNECT_ATTEMPTS = 3;
+const QUIET_RECONNECT_LOG_EVERY = 10;
 
 // The four domain events, all with the same flat frame: `type`, `seq`, `ts`,
 // `chatID`, `ids` required, `entries` OPTIONAL on every one of them (not only
@@ -80,6 +100,11 @@ let lastPingAt = null;
 let lastSeq = null;
 let appState = null;
 let requestCounter = 0;
+// Bumped by every `stopBeeperSocket()` so an in-flight `await` can tell that the
+// session it belongs to was torn down while it was suspended.
+let stopGeneration = 0;
+let hasEverConnected = false;
+let authRejected = false;
 
 /**
  * `http://127.0.0.1:23373` → `ws://127.0.0.1:23373/v1/ws`. Exported for the
@@ -92,9 +117,10 @@ export function beeperWebSocketUrl(baseUrl) {
 }
 
 /**
- * The transport liveness snapshot. Three states, matching what the settings
- * card renders: `connected`, `reconnecting` (down but trying), `down` (not
- * armed, or deliberately stopped).
+ * The transport liveness snapshot. Four states, matching what the settings
+ * card renders: `connected`, `connecting` (trying, never yet connected),
+ * `reconnecting` (was connected, trying again), `down` (not armed, deliberately
+ * stopped, or stood down after Beeper rejected the token).
  */
 export function getBeeperRealtimeState() {
   return {
@@ -106,7 +132,31 @@ export function getBeeperRealtimeState() {
     // The card's actionable-fault line: an `app.state` a human must act on.
     // Never `initializing`, which the probe proved is not evidence of anything.
     appStateActionable: appState !== null && ACTIONABLE_APP_STATES.has(appState),
+    // Beeper answered the upgrade with 401/403: the stored token is not going
+    // to start working, so the transport stood down rather than looping. The
+    // settings card turns this into its own remedy line.
+    authRejected,
   };
+}
+
+/** `connecting` until the first successful handshake of this session; `reconnecting` after. */
+function pendingStateWord() {
+  return hasEverConnected ? 'reconnecting' : 'connecting';
+}
+
+/**
+ * The sweep's effective gate, re-read at EVERY trigger.
+ *
+ * `isBeeperIngestionArmed()` alone is only "may the sweep be armed at all"
+ * (feature + token). The user's own `settings.beeper.enabled` opt-in is the
+ * second gate, and `runBeeperSweep` does not check it itself — the scheduler
+ * factory re-reads it on every tick for exactly this reason, so a socket
+ * trigger re-reads it too and a mid-session toggle-off takes effect at once.
+ */
+async function isSweepEnabled() {
+  if (!await isBeeperIngestionArmed()) return false;
+  const { enabled } = await getBeeperSyncConfig();
+  return enabled === true;
 }
 
 function emitState() {
@@ -162,9 +212,17 @@ function noteFrame() {
  * be an unhandled rejection in the process, not a 500.
  */
 function triggerSweep(reason) {
-  console.log(`${LOG_PREFIX}: requesting a sweep (${reason})`);
   Promise.resolve()
-    .then(() => runBeeperSweep({ reason }))
+    .then(async () => {
+      if (!await isSweepEnabled()) {
+        // Debug level: with the toggle off this fires on every reconnect and
+        // every seq gap, and it is the configured behaviour, not a fault.
+        console.debug(`${LOG_PREFIX}: sweep (${reason}) skipped — scheduled Beeper sync is off`);
+        return;
+      }
+      console.log(`${LOG_PREFIX}: requesting a sweep (${reason})`);
+      await runBeeperSweep({ reason });
+    })
     .catch((err) => console.error(`${LOG_PREFIX}: sweep (${reason}) failed: ${err?.message ?? err}`));
 }
 
@@ -178,13 +236,25 @@ function nextReconnectDelayMs() {
   return Math.round((capped / 2) + (runtime.random() * (capped / 2)));
 }
 
+/**
+ * Whether this reconnect cycle gets logged. A closed Beeper Desktop reconnects
+ * forever by design (it will be reopened), so the loop narrates the first few
+ * attempts and then only every 10th.
+ */
+function shouldNarrateAttempt() {
+  return reconnectAttempts <= VERBOSE_RECONNECT_ATTEMPTS
+    || reconnectAttempts % QUIET_RECONNECT_LOG_EVERY === 0;
+}
+
 function scheduleReconnect() {
   if (!running) return;
   clearReconnectTimer();
   const delay = nextReconnectDelayMs();
   reconnectAttempts += 1;
-  setConnectionState('reconnecting');
-  console.log(`${LOG_PREFIX}: reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})`);
+  setConnectionState(pendingStateWord());
+  if (shouldNarrateAttempt()) {
+    console.log(`${LOG_PREFIX}: reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts})`);
+  }
   reconnectTimer = runtime.setTimeout(() => {
     reconnectTimer = null;
     connect().catch((err) => console.error(`${LOG_PREFIX}: reconnect failed: ${err?.message ?? err}`));
@@ -297,6 +367,7 @@ function handleFrame(raw, target) {
     return;
   }
   if (frame.type === 'subscriptions.updated') {
+    hasEverConnected = true;
     setConnectionState('connected');
     // The first connection of a process is not a reconnect: boot arms the
     // transport, it does not fire a sweep (`type: 'interval'` in #32's
@@ -325,7 +396,12 @@ function handleFrame(raw, target) {
 
 async function connect() {
   if (!running || socket) return;
+  const generation = stopGeneration;
   const { baseUrl, token } = await resolveBeeperConfig();
+  // A `stopBeeperSocket()` (shutdown, token revoked) can land while the config
+  // read is suspended. Without this the teardown is followed by a brand new
+  // socket the shutdown path no longer knows about.
+  if (!running || stopGeneration !== generation || socket) return;
   if (!token) {
     // The token went away mid-session (revoked, vault cleared). Stop rather
     // than loop against a socket that can only ever answer 401.
@@ -336,7 +412,7 @@ async function connect() {
 
   connectionCount += 1;
   lastSeq = null;
-  if (connectionState !== 'reconnecting') setConnectionState('reconnecting');
+  setConnectionState(pendingStateWord());
   // Armed before the handshake so a half-open connect trips the watchdog too.
   armWatchdog();
 
@@ -373,42 +449,74 @@ async function connect() {
     handleFrame(typeof data === 'string' ? data : String(data), instance);
   }));
   instance.on('error', guard('error', (err) => {
-    console.error(`${LOG_PREFIX}: connection error: ${err?.message ?? err}`);
+    if (shouldNarrateAttempt()) console.error(`${LOG_PREFIX}: connection error: ${err?.message ?? err}`);
+  }));
+  // A non-101 answer to the upgrade. 401/403 means the stored token is rejected,
+  // not that Beeper is momentarily away: reconnecting can only produce the same
+  // answer forever, so the transport stands down and the settings card carries
+  // the remedy. `ws` routes this here instead of `error` because a listener is
+  // attached; `dropSocket()` terminates the still-CONNECTING socket, which
+  // aborts the underlying request.
+  instance.on('unexpected-response', guard('unexpected-response', (_request, response) => {
+    const status = response?.statusCode ?? null;
+    if (status === 401 || status === 403) {
+      console.error(`${LOG_PREFIX}: Beeper rejected the token (HTTP ${status}) — standing down`);
+      stopBeeperSocket();
+      authRejected = true;
+      emitState();
+      return;
+    }
+    if (shouldNarrateAttempt()) console.error(`${LOG_PREFIX}: unexpected upgrade response (HTTP ${status ?? 'unknown'})`);
+    dropSocket();
+    scheduleReconnect();
   }));
   instance.on('close', guard('close', (code) => {
-    console.log(`${LOG_PREFIX}: closed (code=${code ?? 'none'})`);
+    if (shouldNarrateAttempt()) console.log(`${LOG_PREFIX}: closed (code=${code ?? 'none'})`);
     dropSocket();
     scheduleReconnect();
   }));
 }
 
 /**
- * Arm the realtime transport at boot. Same gate as #32's sweep scheduler — the
- * instance FEATURE on plus a token present, and never `app.state` — and just as
- * SILENT when it does not apply: a fresh install that has never opened the
- * Beeper card neither connects nor logs.
+ * Arm the realtime transport at boot on the TRANSPORT gate — the instance
+ * FEATURE on plus a token present, and never `app.state` — and just as SILENT
+ * when it does not apply: a fresh install that has never opened the Beeper card
+ * neither connects nor logs.
+ *
+ * Deliberately NOT gated on `settings.beeper.enabled`: the socket writes
+ * nothing, and the liveness dot it feeds is what the settings card shows while
+ * the user decides whether to enable ingestion. Every sweep it would request is
+ * gated on that toggle instead (`isSweepEnabled`), re-read per trigger.
  *
  * `overrides` injects `{ now, setTimeout, clearTimeout, random, createSocket }`
  * so the watchdog and the backoff are provable without a real sleep.
  */
 export async function startBeeperSocket(overrides = {}) {
   if (running) return false;
+  const generation = stopGeneration;
   if (!await isBeeperIngestionArmed()) return false;
+  // A stop landing during the gate read must not be undone by the start that
+  // was already in flight when it arrived.
+  if (stopGeneration !== generation || running) return false;
   runtime = { ...DEFAULT_RUNTIME, ...overrides };
   running = true;
   reconnectAttempts = 0;
   connectionCount = 0;
+  hasEverConnected = false;
+  authRejected = false;
   await connect();
   return true;
 }
 
-/** Tear the transport down (shutdown, or a token that disappeared). */
+/** Tear the transport down (shutdown, a token that disappeared, or a rejected one). */
 export function stopBeeperSocket() {
   running = false;
+  stopGeneration += 1;
   clearReconnectTimer();
   dropSocket();
   reconnectAttempts = 0;
   lastSeq = null;
+  hasEverConnected = false;
   setConnectionState('down');
   runtime = { ...DEFAULT_RUNTIME };
 }
