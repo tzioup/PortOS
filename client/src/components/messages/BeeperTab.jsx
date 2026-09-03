@@ -7,6 +7,7 @@ import { useBeeperSettings } from '../../hooks/useBeeperSettings';
 import useBeeperRealtime from '../../hooks/useBeeperRealtime';
 import useMounted from '../../hooks/useMounted';
 import ConnectionStatusDot from '../ui/ConnectionStatusDot';
+import BeeperOutboxBreakerBanner from './BeeperOutboxBreakerBanner';
 import {
   getBeeperStatus, checkBeeperConnection, startBeeperOAuth, saveBeeperToken, disconnectBeeper,
 } from '../../services/api';
@@ -257,6 +258,11 @@ export default function BeeperTab() {
           </div>
         </div>
       </div>
+
+      {/* The outbound runaway breaker (#36) — an actionable fault, so it
+          renders here with the other actionable faults rather than as a global
+          banner. Absent entirely unless it has actually tripped. */}
+      <BeeperOutboxBreakerBanner breaker={status?.outbox?.breaker} onCleared={loadStatus} />
 
       {statusLoading ? (
         <BrailleSpinner text="Checking Beeper status" />

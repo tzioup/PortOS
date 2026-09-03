@@ -90,6 +90,36 @@ export const beeperOAuthCallbackSchema = z.object({
   error: z.string().trim().max(256).optional(),
 }).passthrough();
 
+// The outbound outbox (#36, decided on #8). Two schemas for the two-step send:
+// creating the row from the composer body, then sending it.
+//
+// `confirmFirstContact` is NOT a UI nicety riding on the request — it is the
+// gate. The server refuses the first outbound message to a conversation unless
+// it is explicitly `true`, so the flag has to survive validation as its own
+// field rather than being inferred from anything else in the body. `.strict()`
+// on both: an unrecognized field on a send request is a client bug worth a 400,
+// not something to ignore on a path that talks to a real person.
+export const beeperOutboxCreateSchema = z.object({
+  conversationId: z.string().uuid(),
+  body: z.string().min(1).max(10000),
+}).strict();
+
+export const beeperOutboxSendSchema = z.object({
+  confirmFirstContact: z.boolean().optional(),
+}).strict();
+
+// The row id in the send path. Validated as a UUID before it reaches a query,
+// so a malformed id answers 400 rather than a Postgres cast error rendered as
+// a 500 — the same guard `routes/messages.js` puts on its draft ids.
+export const beeperOutboxParamsSchema = z.object({
+  id: z.string().uuid(),
+}).strict();
+
+export const beeperOutboxListSchema = z.object({
+  conversationId: z.string().uuid(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+}).strict();
+
 // Shared LoRA-training parameter bounds — used by both the settings-slice
 // defaults and the per-run override on POST /api/lora-training/runs.
 const loraTrainingParamsSchema = z.object({

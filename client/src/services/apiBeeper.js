@@ -20,3 +20,25 @@ export const checkBeeperConnection = (options = {}) => request('/beeper/status/c
 export const startBeeperOAuth = (options = {}) => request('/beeper/oauth/start', { method: 'POST', ...options });
 export const saveBeeperToken = (token, options = {}) => request('/beeper/token', { method: 'POST', body: JSON.stringify({ token }), ...options });
 export const disconnectBeeper = (options = {}) => request('/beeper/token', { method: 'DELETE', ...options });
+
+// Outbound outbox (#36, decided on #8). Two calls for the two-step send, plus
+// the breaker reset — every one of them a WRITE, and none of them ever retried:
+// Beeper has no idempotency key on send, so a client-side retry is a second
+// real message to a real person. The server marks these `retryable: false` in
+// the error envelope for the same reason; nothing here re-issues a request.
+//
+// `confirmFirstContact` is passed explicitly and only when the user has
+// answered an inline confirmation. It is a gate, not a hint: the server refuses
+// the first outbound message to a conversation without it.
+export const listOutboxEntries = (conversationId, options = {}) => request(`/beeper/outbox?conversationId=${encodeURIComponent(conversationId)}`, options);
+export const createOutboxEntry = (conversationId, body, options = {}) => request('/beeper/outbox', {
+  method: 'POST',
+  body: JSON.stringify({ conversationId, body }),
+  ...options,
+});
+export const sendOutboxEntry = (id, { confirmFirstContact = false } = {}, options = {}) => request(`/beeper/outbox/${encodeURIComponent(id)}/send`, {
+  method: 'POST',
+  body: JSON.stringify({ confirmFirstContact }),
+  ...options,
+});
+export const clearOutboxBreaker = (options = {}) => request('/beeper/outbox/breaker/clear', { method: 'POST', ...options });

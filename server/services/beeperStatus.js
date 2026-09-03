@@ -17,6 +17,7 @@
 import { query } from '../lib/db.js';
 import { probeBeeperInfo, getInfo, assertValidInfoResponse, BeeperApiError, DEFAULT_BASE_URL } from './beeperClient.js';
 import { getBeeperRealtimeState } from './beeperSocket.js';
+import { getOutboxStatus } from './beeperOutbox.js';
 import { resolveBeeperTokenMeta } from './beeperCredentials.js';
 import { getSettings } from './settings.js';
 
@@ -108,6 +109,11 @@ export async function getBeeperStatus() {
     // the iMessage-shape card exists to surface — it is NEVER a gate, having
     // been measured reporting `initializing` for 105s on a working install.
     realtime: getBeeperRealtimeState(),
+    // Outbound-send health (#36): the runaway breaker's state, and how many
+    // sends are still awaiting confirmation. The breaker is the one fault here
+    // that needs a human action, so it renders on the settings card the same
+    // way an actionable transport fault does — never as a global banner.
+    outbox: getOutboxStatus(),
     accounts,
   };
 }

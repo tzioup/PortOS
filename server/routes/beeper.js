@@ -1,9 +1,15 @@
 import { Router } from 'express';
 import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
-import { beeperOAuthCallbackSchema, beeperPastedTokenSchema, validateRequest } from '../lib/validation.js';
+import {
+  beeperOAuthCallbackSchema, beeperOutboxCreateSchema, beeperOutboxListSchema,
+  beeperOutboxParamsSchema, beeperOutboxSendSchema, beeperPastedTokenSchema, validateRequest,
+} from '../lib/validation.js';
 import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus.js';
 import { completeBeeperOAuth, connectWithPastedToken, disconnectBeeper, startBeeperOAuth } from '../services/beeperOAuth.js';
 import { runBeeperSweep } from '../services/beeperSync.js';
+import {
+  clearOutboxBreaker, createOutboxEntry, listOutboxEntries, sendOutboxEntry,
+} from '../services/beeperOutbox.js';
 
 const router = Router();
 
@@ -33,6 +39,16 @@ const BEEPER_ERROR_STATUS = {
   OAUTH_DISCOVERY_INVALID: 502,
   OAUTH_REGISTRATION_FAILED: 502,
   OAUTH_EXCHANGE_FAILED: 502,
+  // Outbox (#36). Every one is a 4xx the composer renders inline: the entry is
+  // gone, it is not in a sendable state, the first-contact confirmation has not
+  // been given, or the runaway breaker is open and only a human closes it.
+  OUTBOX_ENTRY_NOT_FOUND: 404,
+  OUTBOX_INVALID_STATE: 409,
+  OUTBOX_EMPTY_BODY: 400,
+  FIRST_CONTACT_CONFIRMATION_REQUIRED: 409,
+  OUTBOX_BREAKER_OPEN: 429,
+  CONVERSATION_NOT_FOUND: 404,
+  SEND_FAILED: 502,
 };
 
 const mapBeeperError = createServiceErrorMapper(BEEPER_ERROR_STATUS);
@@ -154,6 +170,53 @@ router.post('/token', asyncHandler(async (req, res) => {
 router.delete('/token', asyncHandler(async (_req, res) => {
   const result = await disconnectBeeper().catch((err) => { throw mapBeeperWriteError(err); });
   res.json(result);
+}));
+
+// ---------------------------------------------------------------------------
+// Outbox (#36, decided on #8) — the ONLY send path, and a human one.
+//
+// Two steps, two routes, two human actions, mirroring the email drafts surface
+// (`POST /api/messages/drafts/:id/approve` then `.../send`): creating the entry
+// records the approved text, sending it performs the POST. No scheduler, no
+// agent, no voice tool and no CoS tool reaches either — asserted structurally
+// by `beeperOutboxHumanGate.test.js`, not left to convention.
+// ---------------------------------------------------------------------------
+
+// GET /api/beeper/outbox?conversationId=… — the composer's own history for one
+// conversation, newest first. Failed entries stay in it: a failed send is
+// visible and never silently retried.
+router.get('/outbox', asyncHandler(async (req, res) => {
+  const params = validateRequest(beeperOutboxListSchema, req.query);
+  res.json({ entries: await listOutboxEntries(params) });
+}));
+
+// POST /api/beeper/outbox — step one. Writes the durable row BEFORE anything is
+// sent, so intent survives a crash between the click and the POST.
+router.post('/outbox', asyncHandler(async (req, res) => {
+  const input = validateRequest(beeperOutboxCreateSchema, req.body);
+  const entry = await createOutboxEntry(input).catch((err) => { throw mapBeeperWriteError(err); });
+  res.status(201).json(entry);
+}));
+
+// POST /api/beeper/outbox/:id/send — step two. `confirmFirstContact` must be
+// explicitly true on the first outbound message to a conversation; without it
+// the send is refused with a coded 409 the composer renders as an inline
+// confirmation. A transport failure answers a coded error and leaves exactly
+// one row in `failed` — the client never retries it (`retryable: false`), and
+// re-sending means composing a new entry.
+router.post('/outbox/:id/send', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(beeperOutboxParamsSchema, req.params);
+  const { confirmFirstContact } = validateRequest(beeperOutboxSendSchema, req.body ?? {});
+  const entry = await sendOutboxEntry(id, { confirmFirstContact: confirmFirstContact === true })
+    .catch((err) => { throw mapBeeperWriteError(err); });
+  res.json(entry);
+}));
+
+// POST /api/beeper/outbox/breaker/clear — the runaway breaker's only reset.
+// Deliberately a human HTTP action with no timed recovery anywhere: a breaker
+// that clears itself is a delay, not a breaker.
+router.post('/outbox/breaker/clear', asyncHandler(async (_req, res) => {
+  res.json(clearOutboxBreaker());
 }));
 
 export default router;
