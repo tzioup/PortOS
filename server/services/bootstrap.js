@@ -85,6 +85,7 @@ import { startQuotaBurnScheduler } from './quotaBurnRunner.js';
 import { startSeriesAutopilotScheduler } from './seriesAutopilotScheduler.js';
 import { startCommissionScheduler } from './creativeCommissions/scheduler.js';
 import { startBeeperScheduler } from './beeperScheduler.js';
+import { startBeeperSocket, stopBeeperSocket } from './beeperSocket.js';
 import { startImessageScheduler } from './imessageScheduler.js';
 import { startSignalScheduler } from './signalScheduler.js';
 import { startSpotifyScheduler } from './spotifyScheduler.js';
@@ -453,6 +454,12 @@ const startBackgroundServices = ({ spawnerReady, io }) => {
   // NOT gated on Beeper's own `app.state`, which was measured reporting
   // `initializing` for 105s while every account was connected.
   startBeeperScheduler().catch(err => console.error(`❌ Beeper sync scheduler init failed: ${err.message}`));
+  // Arm the Beeper realtime transport on the SAME gate as the sweep above
+  // (feature on + token present, never `app.state`) — one long-lived WebSocket
+  // to the local Beeper Desktop whose only job is to make ingestion prompt
+  // (fork issue #33). Correctness stays with the sweep: a reconnect, a `seq`
+  // gap or an `app.state` recovery each ask it to run early.
+  startBeeperSocket().catch(err => console.error(`❌ Beeper realtime transport init failed: ${err.message}`));
   // Periodically GC orphan zero-issue/zero-canon importer shells left by an
   // abandoned analyze (issue #727).
   startOrphanShellGc();
@@ -888,6 +895,10 @@ export const registerShutdownHandlers = ({ io, httpServer, localHttpServer }) =>
     // Same reasoning for the hosted-session sweeper: a tick mid-shutdown would
     // emit into a namespace we are about to close.
     stopHostedSessionSweep();
+    // And the Beeper transport: an open WebSocket is a live handle that would
+    // hold the event loop past the last server close, and a reconnect firing
+    // mid-shutdown would emit into a socket namespace we are about to close.
+    stopBeeperSocket();
     // Diagnostic context for the shutdown trigger. ppid tells us whether the
     // signal came from PM2 (parent is the PM2 god process), a TTY (parent is
     // the user's shell), or some external orchestrator. pm_* env vars are set

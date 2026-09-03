@@ -6,6 +6,13 @@ vi.mock('../lib/db.js', () => ({
   withTransaction: vi.fn(),
 }));
 vi.mock('./settings.js', () => ({ getSettings: vi.fn() }));
+// The realtime transport is a live long-lived socket; the status card only
+// reads its snapshot, so the module is stubbed at that one function.
+vi.mock('./beeperSocket.js', () => ({
+  getBeeperRealtimeState: vi.fn(() => ({
+    state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false,
+  })),
+}));
 vi.mock('./beeperClient.js', async () => {
   const actual = await vi.importActual('./beeperClient.js');
   return { ...actual, probeBeeperInfo: vi.fn(), getInfo: vi.fn() };
@@ -57,6 +64,10 @@ describe('getBeeperStatus', () => {
     expect(status.appVersion).toBe('4.3.73');
     expect(status.accounts).toEqual([{ accountId: 'acc1' }]);
     expect(probeBeeperInfo).toHaveBeenCalledWith({ baseUrl: 'http://127.0.0.1:23373' });
+    // The transport snapshot the settings card's liveness dot renders from (#33).
+    expect(status.realtime).toEqual({
+      state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false,
+    });
   });
 
   it('reports reachable:false with lastProbeError when a token is configured but unreachable', async () => {

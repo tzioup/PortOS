@@ -56,6 +56,7 @@ export { default as useMusicVideoModelSettings } from './useMusicVideoModelSetti
 export { default as useMusicVideoRenderJob } from './useMusicVideoRenderJob.js';
 export { default as useMusicVideoSceneMedia } from './useMusicVideoSceneMedia.js';
 export { default as useMusicVideoYoutubeImport } from './useMusicVideoYoutubeImport.js';
+export { default as useBeeperRealtime } from './useBeeperRealtime.js';
 export { default as useMoltworldWs } from './useMoltworldWs.js';
 export { default as useMounted } from './useMounted.js';
 export { default as usePendingListRows } from './usePendingListRows.js';

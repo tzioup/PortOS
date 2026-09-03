@@ -3,7 +3,9 @@ import { Save, Loader2, MessageCircle, ShieldCheck, ShieldAlert, RefreshCw, Cloc
 import toast from '../ui/Toast';
 import BrailleSpinner from '../BrailleSpinner';
 import { useBeeperSettings } from '../../hooks/useBeeperSettings';
+import useBeeperRealtime from '../../hooks/useBeeperRealtime';
 import useMounted from '../../hooks/useMounted';
+import ConnectionStatusDot from '../ui/ConnectionStatusDot';
 import { getBeeperStatus, checkBeeperConnection } from '../../services/api';
 
 // Comms → Messages → Beeper (#30, fork issue #1). Instance feature gate + nav
@@ -26,6 +28,9 @@ export default function BeeperTab() {
   const [statusRetrying, setStatusRetrying] = useState(false);
   const [checking, setChecking] = useState(false);
   const mountedRef = useMounted();
+  // Transport liveness (#33). The socket is the live source; the status GET
+  // carries the same snapshot so the dot is right before the first frame lands.
+  const { realtime, seedRealtime } = useBeeperRealtime();
 
   const loadStatus = useCallback(async () => {
     const [result, error] = await getBeeperStatus({ silent: true })
@@ -40,6 +45,10 @@ export default function BeeperTab() {
   useEffect(() => {
     loadStatus();
   }, [loadStatus]);
+
+  useEffect(() => {
+    if (status?.realtime) seedRealtime(status.realtime);
+  }, [status?.realtime, seedRealtime]);
 
   const retryStatus = async () => {
     setStatusRetrying(true);
@@ -156,6 +165,7 @@ export default function BeeperTab() {
       ) : (
         <BeeperStatusCard
           status={status}
+          realtime={realtime || status?.realtime || null}
           error={statusError}
           checking={checking}
           onCheck={handleCheck}
@@ -187,6 +197,35 @@ function TokenExpiryNotice({ status }) {
   );
 }
 
+// The transport liveness row (#33 decision 4): a Moltworld-shape dot, and — on
+// the same card, never in a global banner — the one `app.state` value a human
+// has to act on. `initializing` is deliberately absent from the actionable set:
+// it was measured lying for 105 continuous seconds on a fully working install,
+// so surfacing it would train the user to ignore this line.
+const APP_STATE_REMEDY = {
+  'needs-login': 'Beeper Desktop needs you to sign in again.',
+  'needs-verification': 'Beeper Desktop needs this device verified.',
+  'needs-secrets': 'Beeper Desktop is missing its encryption secrets.',
+  'needs-cross-signing-setup': 'Beeper Desktop needs cross-signing set up.',
+};
+
+function BeeperRealtimeRow({ realtime }) {
+  // `null` = the transport has not reported yet. Never rendered as offline.
+  if (!realtime?.state) return null;
+  const remedy = realtime.appStateActionable ? APP_STATE_REMEDY[realtime.appState] : null;
+  return (
+    <div className="space-y-1">
+      <ConnectionStatusDot status={realtime.state} label="Realtime:" />
+      {remedy && (
+        <p className="text-xs text-port-warning flex items-center gap-1.5">
+          <ShieldAlert size={12} />
+          {remedy}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Every state the status card can be in, decided at fork issue #11 and
 // carried into #30's Acceptance criteria. `reachable` is read with strict
 // equality throughout (`=== false` / `=== true` / `=== null`) — never
@@ -195,7 +234,7 @@ function TokenExpiryNotice({ status }) {
 // handled by the `error` branch immediately below, before any of this ever
 // runs, so a broken GET can never collapse into "no token configured".
 function BeeperStatusCard({
-  status, error, checking, onCheck, checkDisabled, onRetryStatus, retryingStatus,
+  status, realtime, error, checking, onCheck, checkDisabled, onRetryStatus, retryingStatus,
 }) {
   if (error) {
     return (
@@ -275,6 +314,7 @@ function BeeperStatusCard({
           {status.appVersion && <span className="text-xs text-gray-500">v{status.appVersion}</span>}
         </div>
         <TokenExpiryNotice status={status} />
+        <BeeperRealtimeRow realtime={realtime} />
         {accounts.length === 0 ? (
           <p className="text-sm text-gray-500">No accounts synced yet.</p>
         ) : (
