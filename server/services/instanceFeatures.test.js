@@ -259,7 +259,7 @@ describe('instance features', () => {
     const { features } = await getInstanceFeatures();
     expect(Object.fromEntries(features.map((f) => [f.id, f.enabled]))).toEqual({
       post: true, datadog: true, jira: false, eidoverse: false, gsd: true, openclaw: true, health: true,
-      facetime: false, imessage: true, signal: true,
+      facetime: false, imessage: true, signal: true, beeper: false,
     });
   });
 

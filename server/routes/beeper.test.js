@@ -1,0 +1,81 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import express from 'express';
+import { request } from '../lib/testHelper.js';
+
+vi.mock('../services/beeperStatus.js', () => ({
+  getBeeperStatus: vi.fn(),
+  checkBeeperConnection: vi.fn(),
+}));
+
+import beeperRoutes from './beeper.js';
+import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus.js';
+import { BeeperApiError } from '../services/beeperClient.js';
+
+const buildApp = () => {
+  const app = express();
+  app.use(express.json());
+  app.use('/api/beeper', beeperRoutes);
+  return app;
+};
+
+describe('GET /api/beeper/status', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns the status payload as-is', async () => {
+    vi.mocked(getBeeperStatus).mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [] });
+    const res = await request(buildApp()).get('/api/beeper/status');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ tokenConfigured: false, reachable: null, accounts: [] });
+  });
+});
+
+// The wave-one reviewer contract this route exists to prove: every recognized
+// BeeperApiError code maps to its own explicit HTTP status, and the mapper
+// never lets a status:0 network-failure error reach res.status() raw (which
+// would crash Express).
+describe('POST /api/beeper/status/check — createServiceErrorMapper contract', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('maps NETWORK_ERROR (status:0 on the source error) to 503, not a raw 0', async () => {
+    vi.mocked(checkBeeperConnection).mockRejectedValue(
+      new BeeperApiError('Beeper request failed: connection refused', { status: 0, code: 'NETWORK_ERROR', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/status/check');
+    expect(res.status).toBe(503);
+    expect(res.body.code).toBe('NETWORK_ERROR');
+  });
+
+  it('maps NOT_CONFIGURED to 412', async () => {
+    vi.mocked(checkBeeperConnection).mockRejectedValue(
+      new BeeperApiError('Beeper access token is not configured', { status: 401, code: 'NOT_CONFIGURED', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/status/check');
+    expect(res.status).toBe(412);
+    expect(res.body.code).toBe('NOT_CONFIGURED');
+  });
+
+  it('maps MALFORMED_RESPONSE to 502', async () => {
+    vi.mocked(checkBeeperConnection).mockRejectedValue(
+      new BeeperApiError('Beeper API returned an unexpected /v1/info response shape', { status: 502, code: 'MALFORMED_RESPONSE', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/status/check');
+    expect(res.status).toBe(502);
+    expect(res.body.code).toBe('MALFORMED_RESPONSE');
+  });
+
+  it('maps ASSET_UNAVAILABLE to 404', async () => {
+    vi.mocked(checkBeeperConnection).mockRejectedValue(
+      new BeeperApiError('Asset no longer available', { status: 502, code: 'ASSET_UNAVAILABLE', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/status/check');
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('ASSET_UNAVAILABLE');
+  });
+
+  it('resolves 200 with the connection result on success', async () => {
+    vi.mocked(checkBeeperConnection).mockResolvedValue({ reachable: true, info: { app: { name: 'Beeper' } } });
+    const res = await request(buildApp()).post('/api/beeper/status/check');
+    expect(res.status).toBe(200);
+    expect(res.body.reachable).toBe(true);
+  });
+});

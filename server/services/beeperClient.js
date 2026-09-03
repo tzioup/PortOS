@@ -34,6 +34,7 @@ import { fetchWithTimeout } from '../lib/fetchWithTimeout.js';
 import { readResponseJson } from '../lib/readResponseJson.js';
 import { describeFetchError, isReplayableConnectionError } from '../lib/fetchErrorChain.js';
 import { ServerError } from '../lib/errorHandler.js';
+import { isPlainObject } from '../lib/objects.js';
 import { getSettings } from './settings.js';
 
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:23373';
@@ -201,14 +202,40 @@ export async function getInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } 
 }
 
 /**
+ * Structural check on `/v1/info`'s response body (#30 — a wave-one reviewer
+ * requirement on the status probe). `app.name` and `server.status` are the
+ * two fields every documented shape carries (see the API-surface research
+ * note). A 200 with an unexpected body — some other local HTTP service
+ * answering on a misconfigured `settings.beeper.baseUrl` (#30 makes that
+ * user-editable), or a Beeper Desktop version mid-upgrade — must not be
+ * reported as a healthy probe just because the transport succeeded. Exported
+ * so a caller that wants the raw typed error (rather than `probeBeeperInfo`'s
+ * swallowed boolean) can throw it directly.
+ */
+export function assertValidInfoResponse(info) {
+  const valid = isPlainObject(info)
+    && typeof info?.app?.name === 'string' && info.app.name.length > 0
+    && typeof info?.server?.status === 'string' && info.server.status.length > 0;
+  if (!valid) {
+    throw new BeeperApiError('Beeper API returned an unexpected /v1/info response shape (expected { app: { name }, server: { status } })', {
+      status: 502, code: 'MALFORMED_RESPONSE', retryable: false,
+    });
+  }
+}
+
+/**
  * Liveness probe with a 1s cap (#11) — generous headroom over a live Beeper
  * Desktop's actual response time, without being a real request budget. Never
  * throws — an unreachable/misconfigured install is a normal outcome for a
- * feature the user hasn't set up yet, not an exceptional one.
+ * feature the user hasn't set up yet, not an exceptional one. A shape-invalid
+ * 200 (see `assertValidInfoResponse`) reports `reachable: false` exactly like
+ * a transport failure — a body that isn't Beeper's `/v1/info` never counts as
+ * "reachable" just because *something* answered.
  */
 export async function probeBeeperInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
   try {
     const info = await getInfo({ baseUrl, timeoutMs });
+    assertValidInfoResponse(info);
     return { reachable: true, info, error: null };
   } catch (err) {
     return { reachable: false, info: null, error: err instanceof BeeperApiError ? err.message : describeFetchError(err) };

@@ -29,6 +29,7 @@ export * from './apiStackerNews.js';
 export * from './apiX.js';
 export * from './apiContacts.js';
 export * from './apiSignal.js';
+export * from './apiBeeper.js';
 export * from './apiSpotify.js';
 export * from './apiYoutube.js';
 export * from './apiCalendar.js';

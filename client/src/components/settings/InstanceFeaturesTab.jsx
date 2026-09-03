@@ -185,13 +185,16 @@ export function InstanceFeaturesTab() {
   // Ungrouped features render unchanged, one card each. A grouped feature
   // renders once, as part of its group's card, at the position of the first
   // member the registry lists — so the overall order still follows the
-  // registry, and a group with a still-loading `groups` list quietly renders
-  // nothing rather than crashing on a lookup miss.
+  // registry. When the group's own record isn't in `groups` (still loading,
+  // or a response that carries `features` but an empty/missing `groups`
+  // list), fall back to rendering each member as its own ungrouped card
+  // instead of a group row with nothing to key off — a feature must never
+  // vanish from the tab just because its group's metadata didn't load.
   const groupsById = new Map((groups || []).map((group) => [group.id, group]));
   const renderedGroupIds = new Set();
   const rows = [];
   for (const feature of features) {
-    if (feature.group) {
+    if (feature.group && groupsById.has(feature.group)) {
       if (renderedGroupIds.has(feature.group)) continue;
       renderedGroupIds.add(feature.group);
       rows.push({ kind: 'group', group: groupsById.get(feature.group), members: features.filter((f) => f.group === feature.group) });

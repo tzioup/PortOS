@@ -87,6 +87,7 @@ export { default as useWakeLock } from './useWakeLock.js';
 export { default as useYoutubeIngest } from './useYoutubeIngest.js';
 export { default as useYoutubeTrackImport } from './useYoutubeTrackImport.js';
 export * from './useSyncSourceSettings.js';
+export * from './useBeeperSettings.js';
 export { default as useReferenceAudioImport } from './useReferenceAudioImport.js';
 export { default as useMidiTranscription } from './useMidiTranscription.js';
 export { default as useMidiNotes } from './useMidiNotes.js';

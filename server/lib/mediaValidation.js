@@ -53,6 +53,22 @@ export const youtubeConfigSchema = z.object({
   intervalMinutes: z.number().int().min(1).max(1440).optional()
 });
 
+// Beeper Desktop bridge ingestion + connection config (#30) — the
+// `settings.beeper` slice. Sync is OFF by default and only talks to the local
+// Beeper Desktop API (default http://127.0.0.1:23373) when enabled.
+// Deliberately excludes `token`/`tokenExpiresAt`: durable, encrypted token
+// storage is fork issue #31's scope (OAuth connect + vault), and this slice's
+// Settings surface may show whether a token is configured but must never
+// accept or persist one in plaintext. `.strict()` so a client attempting to
+// smuggle a token through this generic route 400s instead of the value
+// silently reaching disk.
+export const beeperSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalMinutes: z.number().int().min(1).max(1440).optional(),
+  baseUrl: z.string().trim().min(1).max(500).optional(),
+  attachmentBudgetGb: z.number().min(0.1).max(1000).optional(),
+}).strict();
+
 // Shared LoRA-training parameter bounds — used by both the settings-slice
 // defaults and the per-run override on POST /api/lora-training/runs.
 const loraTrainingParamsSchema = z.object({
