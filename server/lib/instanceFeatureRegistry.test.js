@@ -57,12 +57,13 @@ describe('instance feature groups (#40)', () => {
     expect(INSTANCE_FEATURE_IDS).toContain('facetime');
     expect(INSTANCE_FEATURE_IDS).toContain('imessage');
     expect(INSTANCE_FEATURE_IDS).toContain('signal');
+    expect(INSTANCE_FEATURE_IDS).toContain('beeper');
   });
 
-  it('buckets the proof-of-concept comms group as FaceTime Audio, iMessage and Signal', () => {
+  it('buckets the comms group as FaceTime Audio, iMessage, Signal and Beeper (#30)', () => {
     expect(INSTANCE_FEATURE_GROUP_IDS).toContain('comms');
     const members = INSTANCE_FEATURES.filter((feature) => feature.group === 'comms').map((feature) => feature.id);
-    expect(members.sort()).toEqual(['facetime', 'imessage', 'signal']);
+    expect(members.sort()).toEqual(['beeper', 'facetime', 'imessage', 'signal']);
   });
 
   it('defaults iMessage and Signal to enabled with no detector, like the existing manual toggles', () => {
@@ -72,6 +73,16 @@ describe('instance feature groups (#40)', () => {
         group: 'comms',
       });
     }
+  });
+
+  // Beeper deliberately defaults OFF with no detector (fork issue #11): a
+  // token-presence gate can't bootstrap the very screen that sets the token,
+  // unlike iMessage/Signal which are always readable once enabled.
+  it('defaults Beeper to disabled with no detector', () => {
+    expect(INSTANCE_FEATURES.find((feature) => feature.id === 'beeper')).toMatchObject({
+      defaultEnabled: false,
+      group: 'comms',
+    });
   });
 });
 

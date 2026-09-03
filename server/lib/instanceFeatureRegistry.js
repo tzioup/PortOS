@@ -95,14 +95,25 @@ export const INSTANCE_FEATURES = Object.freeze([
     defaultEnabled: true,
     group: 'comms',
   }),
+  Object.freeze({
+    id: 'beeper',
+    label: 'Beeper',
+    description: 'Local Beeper Desktop bridge — WhatsApp, Discord, Telegram, and other bridged networks, mirrored machine-local.',
+    // No detector, by design (fork issue #11 decision): a token-presence gate
+    // can't bootstrap the very screen that sets the token. A plain manual
+    // toggle, off by default, like every other feature with no detector.
+    defaultEnabled: false,
+    group: 'comms',
+  }),
 ]);
 
 export const INSTANCE_FEATURE_IDS = Object.freeze(INSTANCE_FEATURES.map((feature) => feature.id));
 
 // Buckets features under one group toggle with per-feature overrides (#40).
-// Proof-of-concept membership: comms (FaceTime Audio, iMessage, Signal — Beeper
-// joins later). Widening membership is a one-line change to a feature's `group`
-// above; adding a new group is a one-line addition here. A group's own
+// Membership: comms (FaceTime Audio, iMessage, Signal, Beeper — #30 joined
+// Beeper to the group #40 stood up). Widening membership is a one-line change
+// to a feature's `group` above; adding a new group is a one-line addition
+// here. A group's own
 // `enabled` flag defaults to true (see storedGroupEnabled in
 // services/instanceFeatures.js) so registering this never hides a feature an
 // existing install already saw with no settings write required.

@@ -749,6 +749,74 @@ describe('Settings routes — videoGen slice (#3231 Phase 4)', () => {
   });
 });
 
+describe('Settings routes — beeper slice (#30)', () => {
+  beforeEach(() => {
+    store = {};
+    vi.clearAllMocks();
+  });
+
+  it('accepts a valid beeper slice and persists it', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 10, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 } });
+    expect(res.status).toBe(200);
+    expect(res.body.beeper).toEqual({ enabled: true, intervalMinutes: 10, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 });
+  });
+
+  it('rejects a non-boolean enabled gate', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: 'yes' } });
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects an out-of-range interval', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { intervalMinutes: 0 } });
+    expect(res.status).toBe(400);
+  });
+
+  // The security-load-bearing case (#30/#31): this slice must never add a
+  // plaintext write path for the token, and `.strict()` is what enforces it —
+  // a client attempting to smuggle one through the generic settings route
+  // gets a 400, not a silent write to disk.
+  it('rejects a beeper patch that carries a token — no plaintext write path through this route', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, token: 'smuggled-token' } });
+    expect(res.status).toBe(400);
+  });
+
+  it('never echoes a stored beeper token back on GET /api/settings', async () => {
+    store = { beeper: { enabled: true, token: 'super-secret-token' } };
+    const res = await request(buildApp()).get('/api/settings');
+    expect(res.status).toBe(200);
+    expect(res.body.beeper.token).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toMatch(/super-secret-token/);
+  });
+
+  // Without this, the generic top-level shallow merge would REPLACE
+  // current.beeper wholesale and silently wipe out a token stored by another
+  // write path (#31's vault, or a hand-edited settings.json) the instant the
+  // user saves an unrelated field like `enabled` from this slice's settings
+  // card — same posture as imageGen.hfToken / civitai.apiKey above. The
+  // ordinary ingestion-config fields (baseUrl, intervalMinutes,
+  // attachmentBudgetGb) follow the existing iMessage/Signal convention
+  // instead: the settings card always PUTs its complete known slice, so
+  // there's no separate "don't drop this on a partial patch" guard for them.
+  it('preserves a stored token across a beeper patch that only touches other fields', async () => {
+    store = { beeper: { enabled: false, token: 'existing-token' } };
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true } });
+    expect(res.status).toBe(200);
+    // The response itself redacts the token (see the GET test above); assert
+    // against the mocked store, which reflects what was actually persisted.
+    expect(store.beeper).toEqual({ enabled: true, token: 'existing-token' });
+  });
+});
+
 describe('Settings routes — credential inventory', () => {
   it('returns presence and source without secret values', async () => {
     const { getCredentialInventory } = await import('../services/credentialInventory.js');

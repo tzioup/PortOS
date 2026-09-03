@@ -437,5 +437,26 @@ describe('InstanceFeaturesTab', () => {
       await waitFor(() => expect(mock.updateInstanceFeature).toHaveBeenCalledWith('imessage', null, { silent: true }));
       expect(within(control).getByRole('button', { name: 'Inherit' })).toHaveAttribute('aria-pressed', 'true');
     });
+
+    // Regression: a response that carries grouped features but an
+    // empty/missing `groups` list must not silently drop those features from
+    // the tab. `renderGroupCard` returns null for an unresolved group, so
+    // without the row-building fallback every comms member vanished here.
+    it('falls back to rendering a grouped feature as its own ungrouped card when the groups list is empty', async () => {
+      mock.getInstanceFeatures.mockResolvedValue({
+        features: [POST_FEATURE, IMESSAGE_FEATURE, SIGNAL_FEATURE, FACETIME_FEATURE],
+        groups: [],
+      });
+      render(<InstanceFeaturesTab />);
+
+      // Every grouped member still renders — as a plain on/off switch, since
+      // there's no resolved group to attach a three-way override control to.
+      expect(await screen.findByRole('switch', { name: 'Disable POST on this instance' })).toBeInTheDocument();
+      expect(screen.getByRole('switch', { name: 'Disable iMessage on this instance' })).toBeInTheDocument();
+      expect(screen.getByRole('switch', { name: 'Disable Signal on this instance' })).toBeInTheDocument();
+      expect(screen.getByRole('switch', { name: 'Enable FaceTime Audio on this instance' })).toBeInTheDocument();
+      // No group toggle or group heading rendered — there's no group record to render one from.
+      expect(screen.queryByRole('switch', { name: /the Comms feature group/ })).not.toBeInTheDocument();
+    });
   });
 });

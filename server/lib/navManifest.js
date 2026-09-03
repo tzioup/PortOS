@@ -144,6 +144,11 @@ const RAW_NAV_COMMANDS = [
   // links, and voice `ui_navigate` still land — only ⌘K/sidebar visibility gates.
   { id: 'nav.messages.imessage', path: '/messages/imessage', label: 'iMessage', section: 'Comms', feature: 'imessage', previousPaths: ['/imessage'], aliases: ['imessage', 'i-message', 'apple-messages', 'comms-imessage'], keywords: ['comms', 'imessage', 'sms', 'text messages', 'chat.db', 'blocklist', 'spam'] },
   { id: 'nav.messages.signal', path: '/messages/signal', label: 'Signal', section: 'Comms', feature: 'signal', previousPaths: ['/settings/signal'], aliases: ['signal', 'signal-desktop', 'comms-signal', 'signal-settings'], keywords: ['comms', 'signal', 'signal desktop', 'messages', 'sqlcipher', 'chat', 'tribe', 'timeline', 'encrypted', 'keychain'] },
+  // Beeper (#30, fork issue #1): a local Beeper Desktop bridge fronting
+  // WhatsApp/Discord/Telegram/Instagram/X/Slack and more, joining the Comms
+  // group #40 stood up. Off by default (no detector — #11) — the route keeps
+  // resolving with the feature off, so bookmarks and voice ui_navigate still land.
+  { id: 'nav.messages.beeper', path: '/messages/beeper', label: 'Beeper', section: 'Comms', feature: 'beeper', aliases: ['beeper', 'beeper-chat', 'comms-beeper', 'beeper-settings'], keywords: ['comms', 'beeper', 'bridge', 'whatsapp', 'discord', 'telegram', 'instagram', 'slack', 'chat', 'unified inbox'] },
   { id: 'nav.messages.contacts', path: '/messages/contacts', label: 'Contacts', section: 'Comms', previousPaths: ['/settings/contacts'], aliases: ['contacts', 'address-book', 'comms-contacts', 'settings-contacts'], keywords: ['comms', 'contacts', 'address book', 'phone', 'email', 'tribe', 'imessage', 'names', 'resolve'] },
   // Ingestion config is a drawer over the iMessage manager (?settings=1), not a
   // Settings page — the settings-* aliases stay so "open iMessage settings" still lands.
