@@ -59,4 +59,36 @@ export const tribeDdl = [
       PRIMARY KEY (person_id, memory_id)
     )`,
     `CREATE INDEX IF NOT EXISTS idx_tribe_memory_links_memory ON tribe_memory_links (memory_id)`,
+    // Network-scoped identity claims (#34, decided on #10) — the durable-handle
+    // truth for matching an external counterpart (a Beeper participant today;
+    // any future network-scoped source tomorrow) to a Tribe person. `kind`
+    // distinguishes what TYPE of identifier `handle` is: 'phone' for a
+    // phone-shaped handle (E.164-normalized, `network` left '' since the same
+    // phone means the same person regardless of which network reported it) or
+    // 'handle' for a network-specific username (network-scoped, so `network`
+    // is required). This also leaves room for a later `kind='email'` /
+    // consolidation of the legacy tribe_people.emails[]/phones[] arrays into
+    // this table without a second schema decision (deferred, #10 decision 7 —
+    // not done here). A handle is lowercased, trimmed, leading '@' stripped
+    // before it reaches this table (see server/lib/tribeMatch.js).
+    // ON DELETE CASCADE: a HARD delete of a Tribe person also removes their
+    // claimed identities, so a later re-link starts clean rather than
+    // colliding on UNIQUE (kind, network, handle) with a stale row. The app's
+    // only delete path (tribe.deletePerson) is a SOFT delete (`deleted =
+    // TRUE`), which this cascade does NOT fire on — resolvePersonByIdentity
+    // and resolveParticipantPerson (server/services/beeperTribe.js) instead
+    // filter `tribe_people.deleted = FALSE` explicitly, and linkIdentity /
+    // linkParticipant refuse to claim/link a soft-deleted personId.
+    `CREATE TABLE IF NOT EXISTS tribe_identities (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      person_id UUID NOT NULL REFERENCES tribe_people(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      network TEXT NOT NULL DEFAULT '',
+      handle TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT '',
+      linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (kind, network, handle)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_tribe_identities_person ON tribe_identities (person_id)`,
 ];

@@ -15670,6 +15670,22 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/api/tribe/beeper/link",
+      "mountPath": "/api/tribe",
+      "sources": [
+        "server/routes/tribe.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/tribe/beeper/link-new",
+      "mountPath": "/api/tribe",
+      "sources": [
+        "server/routes/tribe.js"
+      ]
+    },
+    {
       "method": "GET",
       "path": "/api/tribe/care",
       "mountPath": "/api/tribe",
@@ -17440,8 +17456,8 @@
   ],
   "stats": {
     "mounts": 146,
-    "operations": 2160,
-    "declarations": 2168,
+    "operations": 2162,
+    "declarations": 2170,
     "sourceFiles": 229
   }
 }
