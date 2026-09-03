@@ -9,3 +9,53 @@ import { request } from './apiCore.js';
 // those don't.
 export const getBeeperStatus = (options = {}) => request('/beeper/status', options);
 export const checkBeeperConnection = (options = {}) => request('/beeper/status/check', { method: 'POST', ...options });
+
+// ---------------------------------------------------------------------------
+// Chat surface (#35) — everything below reads the PortOS MIRROR, not Beeper.
+// The sweep (#32) and the socket relay (#33) keep the mirror current, so the
+// list stays correct with Beeper Desktop closed and a socket invalidation frame
+// costs one local query rather than an upstream fan-out.
+// ---------------------------------------------------------------------------
+
+const queryString = (params) => {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === '') continue;
+    qs.set(key, String(value));
+  }
+  const encoded = qs.toString();
+  return encoded ? `?${encoded}` : '';
+};
+
+// `unreadOnly` / `archived` / `lowPriority` are omitted when undefined and sent
+// as the literal "true"/"false" otherwise: the server reads an absent filter as
+// "do not filter", which is a different query from `false`.
+export const getBeeperConversations = ({
+  network, unreadOnly, archived, lowPriority, limit, cursor,
+} = {}, options = {}) =>
+  request(`/beeper/conversations${queryString({ network, unreadOnly, archived, lowPriority, limit, cursor })}`, options);
+
+export const getBeeperConversation = (conversationId, options = {}) =>
+  request(`/beeper/conversations/${encodeURIComponent(conversationId)}`, options);
+
+export const getBeeperMessages = (conversationId, { limit, cursor } = {}, options = {}) =>
+  request(`/beeper/conversations/${encodeURIComponent(conversationId)}/messages${queryString({ limit, cursor })}`, options);
+
+export const getBeeperNetworks = (options = {}) => request('/beeper/networks', options);
+
+// The two rail controls #9 wired. Both are WRITES to Beeper: they never retry,
+// and their thrown error carries `context.retryable === false` so no caller can
+// invent one on an API with no idempotency key.
+export const setBeeperConversationArchived = (conversationId, archived, options = {}) =>
+  request(`/beeper/conversations/${encodeURIComponent(conversationId)}/archive`, {
+    method: 'POST',
+    body: JSON.stringify({ archived }),
+    ...options,
+  });
+
+export const setBeeperConversationLowPriority = (conversationId, lowPriority, options = {}) =>
+  request(`/beeper/conversations/${encodeURIComponent(conversationId)}/low-priority`, {
+    method: 'POST',
+    body: JSON.stringify({ lowPriority }),
+    ...options,
+  });

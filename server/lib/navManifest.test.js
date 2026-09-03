@@ -208,6 +208,7 @@ describe('nav contract — instance-feature gating', () => {
     expect(byId['nav.messages.imessage-settings']).toBe('imessage');
     expect(byId['nav.messages.signal']).toBe('signal');
     expect(byId['nav.messages.beeper']).toBe('beeper');
+    expect(byId['nav.messages.beeper-settings']).toBe('beeper');
     // Contacts spans both networks (and every other message source) so it stays
     // ungated even though it lives in the same Comms section.
     expect(byId['nav.messages.contacts']).toBeUndefined();

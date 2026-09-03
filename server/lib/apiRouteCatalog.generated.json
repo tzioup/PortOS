@@ -1551,6 +1551,54 @@
     },
     {
       "method": "GET",
+      "path": "/api/beeper/conversations",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/beeper/conversations/:id",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/conversations/:id/archive",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/conversations/:id/low-priority",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/beeper/conversations/:id/messages",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/beeper/networks",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/api/beeper/status",
       "mountPath": "/api/beeper",
       "sources": [
@@ -17464,8 +17512,8 @@
   ],
   "stats": {
     "mounts": 146,
-    "operations": 2163,
-    "declarations": 2171,
+    "operations": 2169,
+    "declarations": 2177,
     "sourceFiles": 229
   }
 }

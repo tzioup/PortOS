@@ -68,3 +68,22 @@ export const generateTribeOutreachDraft = (seed, options = {}) =>
     body: JSON.stringify(seed),
     ...options,
   });
+
+// Beeper participant → Tribe person (#34), called from the inline action on a
+// thread participant (#35). `linkBeeperParticipant` never creates a person;
+// `createTribePersonFromBeeper` does both in one step. The server derives the
+// identity's network from the participant's own conversation — it is
+// deliberately not a client-supplied field.
+export const linkBeeperParticipant = ({ conversationId, sourceUserId, personId }, options = {}) =>
+  request('/tribe/beeper/link', {
+    method: 'POST',
+    body: JSON.stringify({ conversationId, sourceUserId, personId }),
+    ...options,
+  });
+
+export const createTribePersonFromBeeper = ({ conversationId, sourceUserId, name, ring, relationship }, options = {}) =>
+  request('/tribe/beeper/link-new', {
+    method: 'POST',
+    body: JSON.stringify({ conversationId, sourceUserId, name, ring, relationship }),
+    ...options,
+  });

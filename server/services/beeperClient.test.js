@@ -22,6 +22,7 @@ import {
   editMessage,
   deleteMessage,
   downloadAsset,
+  updateChat,
 } from './beeperClient.js';
 
 // resolveBeeperConfig only touches settings.js when EITHER baseUrl or token is
@@ -332,6 +333,29 @@ describe('beeperClient', () => {
       await expect(editMessage('chat1', 'msg1', 'edited text', { baseUrl: DEFAULT_BASE_URL, token: 't' }))
         .rejects.toMatchObject({ code: 'UPSTREAM_ERROR', retryable: false });
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('updateChat does NOT retry a replayable connection error — it is a write, like every other chat-state PATCH', async () => {
+      const fetchMock = vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await expect(updateChat('chat1', { isArchived: true }, { baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'NETWORK_ERROR', retryable: false });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('updateChat sends ONLY the two allowlisted flags — a PATCH body spread could clear the chat draft as a side effect', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { id: 'chat1', isArchived: true }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await updateChat(
+        'chat1',
+        { isArchived: true, isLowPriority: false, draft: { text: 'nope' }, isPinned: true },
+        { baseUrl: DEFAULT_BASE_URL, token: 't' },
+      );
+
+      const [, init] = fetchMock.mock.calls[0];
+      expect(JSON.parse(init.body)).toEqual({ isArchived: true, isLowPriority: false });
     });
 
     it('a read call (allowRetry) still surfaces retryable: true on a 500 — the write clamp above must not leak into reads', async () => {
