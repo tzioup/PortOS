@@ -16,6 +16,7 @@
  */
 import { query } from '../lib/db.js';
 import { probeBeeperInfo, getInfo, assertValidInfoResponse, BeeperApiError, DEFAULT_BASE_URL } from './beeperClient.js';
+import { getBeeperRealtimeState } from './beeperSocket.js';
 import { resolveBeeperTokenMeta } from './beeperCredentials.js';
 import { getSettings } from './settings.js';
 
@@ -100,6 +101,13 @@ export async function getBeeperStatus() {
     lastProbeError: probe?.error ?? null,
     appVersion: probe?.info?.app?.version ?? null,
     ...expiry,
+    // Transport liveness for the card's dot and its actionable-fault line
+    // (#33): `connected | reconnecting | down`, plus the last frame and last
+    // server ping. `appState` rides along because an actionable value
+    // (`needs-login`, `needs-verification`, `needs-secrets`) is exactly what
+    // the iMessage-shape card exists to surface — it is NEVER a gate, having
+    // been measured reporting `initializing` for 105s on a working install.
+    realtime: getBeeperRealtimeState(),
     accounts,
   };
 }

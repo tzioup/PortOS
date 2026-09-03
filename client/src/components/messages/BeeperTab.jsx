@@ -4,7 +4,9 @@ import { Save, Loader2, MessageCircle, ShieldCheck, ShieldAlert, RefreshCw, Cloc
 import toast from '../ui/Toast';
 import BrailleSpinner from '../BrailleSpinner';
 import { useBeeperSettings } from '../../hooks/useBeeperSettings';
+import useBeeperRealtime from '../../hooks/useBeeperRealtime';
 import useMounted from '../../hooks/useMounted';
+import ConnectionStatusDot from '../ui/ConnectionStatusDot';
 import {
   getBeeperStatus, checkBeeperConnection, startBeeperOAuth, saveBeeperToken, disconnectBeeper,
 } from '../../services/api';
@@ -39,6 +41,9 @@ export default function BeeperTab() {
   const [confirmingDisconnect, setConfirmingDisconnect] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const mountedRef = useMounted();
+  // Transport liveness (#33). The socket is the live source; the status GET
+  // carries the same snapshot so the dot is right before the first frame lands.
+  const { realtime, seedRealtime } = useBeeperRealtime();
 
   const loadStatus = useCallback(async () => {
     const [result, error] = await getBeeperStatus({ silent: true })
@@ -53,6 +58,10 @@ export default function BeeperTab() {
   useEffect(() => {
     loadStatus();
   }, [loadStatus]);
+
+  useEffect(() => {
+    if (status?.realtime) seedRealtime(status.realtime);
+  }, [status?.realtime, seedRealtime]);
 
   // Beeper redirects the BROWSER back here after consent; the server callback
   // already exchanged the code and vaulted the token, so all that arrives is an
@@ -254,6 +263,7 @@ export default function BeeperTab() {
       ) : (
         <BeeperStatusCard
           status={status}
+          realtime={realtime || status?.realtime || null}
           error={statusError}
           connect={connect}
           checking={checking}
@@ -384,6 +394,49 @@ function TokenExpiryNotice({ status }) {
   );
 }
 
+// The transport liveness row (#33 decision 4): a Moltworld-shape dot, and — on
+// the same card, never in a global banner — the one `app.state` value a human
+// has to act on. Rendered in EVERY branch where a token is configured, not only
+// the reachable one: the HTTP probe failing is exactly when the socket's own
+// liveness and its `needs-login` remedy are worth reading. `initializing` is deliberately absent from the actionable set:
+// it was measured lying for 105 continuous seconds on a fully working install,
+// so surfacing it would train the user to ignore this line.
+const APP_STATE_REMEDY = {
+  'needs-login': 'Beeper Desktop needs you to sign in again.',
+  'needs-verification': 'Beeper Desktop needs this device verified.',
+  'needs-secrets': 'Beeper Desktop is missing its encryption secrets.',
+  'needs-cross-signing-setup': 'Beeper Desktop needs cross-signing set up.',
+};
+
+// The transport stood down because Beeper answered the upgrade with 401/403.
+// Reconnecting could only ever produce the same answer, so the fix is a human's.
+const TOKEN_REJECTED_REMEDY = 'Beeper Desktop rejected the stored token — reconnect Beeper.';
+
+// `showRemedy` exists for the one card that IS the remedy: the expired-token
+// branch below already says "reconnect Beeper" in its heading, its body and its
+// button, and a token that expired is exactly the token the transport's own
+// 401 stand-down reports as `authRejected` — so the dot still belongs there
+// (it corroborates that the socket is down for that reason and not looping),
+// while a fourth copy of the same instruction does not.
+function BeeperRealtimeRow({ realtime, showRemedy = true }) {
+  // `null` = the transport has not reported yet. Never rendered as offline.
+  if (!realtime?.state) return null;
+  const remedy = !showRemedy ? null : (realtime.authRejected
+    ? TOKEN_REJECTED_REMEDY
+    : (realtime.appStateActionable ? APP_STATE_REMEDY[realtime.appState] : null));
+  return (
+    <div className="space-y-1">
+      <ConnectionStatusDot status={realtime.state} label="Realtime:" />
+      {remedy && (
+        <p className="text-xs text-port-warning flex items-center gap-1.5">
+          <ShieldAlert size={12} />
+          {remedy}
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Every state the status card can be in, decided at fork issue #11 and
 // carried into #30's Acceptance criteria. `reachable` is read with strict
 // equality throughout (`=== false` / `=== true` / `=== null`) — never
@@ -392,7 +445,7 @@ function TokenExpiryNotice({ status }) {
 // handled by the `error` branch immediately below, before any of this ever
 // runs, so a broken GET can never collapse into "no token configured".
 function BeeperStatusCard({
-  status, error, connect, checking, onCheck, checkDisabled, onRetryStatus, retryingStatus,
+  status, realtime, error, connect, checking, onCheck, checkDisabled, onRetryStatus, retryingStatus,
 }) {
   if (error) {
     return (
@@ -446,6 +499,7 @@ function BeeperStatusCard({
         <p className="text-sm text-gray-400 mb-4">
           Beeper issues no refresh grant, so an expired token is reconnected rather than renewed.
         </p>
+        <div className="mb-3"><BeeperRealtimeRow realtime={realtime} showRemedy={false} /></div>
         <BeeperConnectPanel connect={connect} submitLabel="Reconnect Beeper" />
         <div className="mt-4 border-t border-port-border pt-3">
           <DisconnectButton connect={connect} />
@@ -464,6 +518,7 @@ function BeeperStatusCard({
         <p className="text-sm text-port-error">{status.lastProbeError || 'Could not reach Beeper Desktop.'}</p>
         <p className="text-xs text-gray-500 mt-1">Checked against {status.baseUrl}.</p>
         <TokenExpiryNotice status={status} />
+        <div className="mt-2"><BeeperRealtimeRow realtime={realtime} /></div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -491,6 +546,7 @@ function BeeperStatusCard({
           {status.appVersion && <span className="text-xs text-gray-500">v{status.appVersion}</span>}
         </div>
         <TokenExpiryNotice status={status} />
+        <BeeperRealtimeRow realtime={realtime} />
         {accounts.length === 0 ? (
           <p className="text-sm text-gray-500">No accounts synced yet.</p>
         ) : (
@@ -524,11 +580,12 @@ function BeeperStatusCard({
   // transient gap between saving settings and the status refresh landing).
   // Neutral, never rendered as offline.
   return (
-    <div className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6">
+    <div className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6 space-y-2">
       <div className="flex items-center gap-2">
         <Loader2 size={16} className="text-gray-400 animate-spin" />
         <h3 className="text-sm font-semibold text-white">Checking Beeper Desktop…</h3>
       </div>
+      <BeeperRealtimeRow realtime={realtime} />
     </div>
   );
 }
