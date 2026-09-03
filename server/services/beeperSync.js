@@ -109,7 +109,12 @@ export async function getBeeperSyncConfig() {
 export async function isBeeperIngestionArmed() {
   const featureEnabled = await isInstanceFeatureEnabled('beeper').catch(() => false);
   if (!featureEnabled) return false;
-  const { token } = await resolveBeeperConfig().catch(() => ({ token: null }));
+  // A vault that cannot be read (corrupt row, rotated key) must not masquerade
+  // as "no token": say so once, then decline to arm.
+  const { token } = await resolveBeeperConfig().catch((err) => {
+    console.error(`❌ Beeper credential unreadable, ingestion not armed: ${err.message}`);
+    return { token: null };
+  });
   return Boolean(token);
 }
 
