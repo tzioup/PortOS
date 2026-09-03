@@ -38,8 +38,9 @@ import { getSettings } from './settings.js';
 
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:23373';
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-// "Measured at 11-27 ms; a closed loopback port refuses in 0.3 ms" (#11) — 1s
-// is generous headroom for a liveness probe, not a real request budget.
+// A live Beeper Desktop answers in single-digit-to-low-double-digit ms and a
+// closed loopback port refuses near-instantly, so 1s is generous headroom for
+// a liveness probe, not a real request budget.
 export const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
 // Reads may retry once on a replayable connection failure (Beeper Desktop
 // restarting mid-request); a fresh request-scoped budget on the replay, same
@@ -58,6 +59,12 @@ export class BeeperApiError extends ServerError {
     super(message, { status, code, context: { retryable, ...(details !== undefined ? { details } : {}) } });
     this.name = 'BeeperApiError';
     this.retryable = retryable;
+    // ServerError's constructor does `this.status = options.status || 500`, which
+    // silently rewrites a deliberate `status: 0` ("no HTTP response at all", the
+    // network-error case below) into a fabricated 500. Restore the caller's actual
+    // value here so `err.status === 0` is a reliable way to spot a transport
+    // failure, not just `err.code === 'NETWORK_ERROR'`.
+    this.status = status;
   }
 }
 
@@ -194,10 +201,10 @@ export async function getInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } 
 }
 
 /**
- * Liveness probe with a 1s cap (#11: "Measured at 11-27ms; a closed loopback
- * port refuses in 0.3ms"). Never throws — an unreachable/misconfigured
- * install is a normal outcome for a feature the user hasn't set up yet, not
- * an exceptional one.
+ * Liveness probe with a 1s cap (#11) — generous headroom over a live Beeper
+ * Desktop's actual response time, without being a real request budget. Never
+ * throws — an unreachable/misconfigured install is a normal outcome for a
+ * feature the user hasn't set up yet, not an exceptional one.
  */
 export async function probeBeeperInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
   try {
@@ -224,13 +231,24 @@ export async function probeBeeperInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEO
  * a defensive stop, since the spec never documents that combination. Same
  * defense if a server answers `hasMore: true` with the SAME cursor it was
  * just called with (a value that would otherwise walk in place forever).
+ *
+ * A page whose `items` isn't an array (a malformed/unexpected response body —
+ * see `getAccounts`/`getBridges` below for the same rule) throws a typed
+ * `MALFORMED_RESPONSE` `BeeperApiError` rather than silently coercing to `[]`
+ * and reporting "no items" — the AGENTS.md "sentinel + validate" rule: absent,
+ * failed, and invalid must never collapse into the same value as
+ * legitimately-empty.
  */
 export async function* paginateBeeperCursor(fetchPage, { direction = 'before' } = {}) {
   let cursor;
   for (;;) {
     const page = await fetchPage({ cursor, direction });
-    const items = Array.isArray(page?.items) ? page.items : [];
-    for (const item of items) yield item;
+    if (!Array.isArray(page?.items)) {
+      throw new BeeperApiError('Beeper API returned an unexpected paginated response shape (expected { items: [] })', {
+        status: 502, code: 'MALFORMED_RESPONSE', retryable: false,
+      });
+    }
+    for (const item of page.items) yield item;
     if (!page?.hasMore) return;
     const nextCursor = direction === 'after' ? page?.newestCursor : page?.oldestCursor;
     if (!nextCursor || nextCursor === cursor) return;
@@ -250,6 +268,27 @@ function clampLimit(value, { min = 1, max, fallback }) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/**
+ * Append arbitrary search/filter params onto a `URLSearchParams`. An array
+ * value (`accountIDs`, `chatIDs`, `mediaTypes` — all declared as array query
+ * params in `/v1/spec`) is serialized as REPEATED keys (`?chatIDs=a&chatIDs=b`),
+ * not `qs.set(key, String(array))`, which would comma-join it into one value
+ * (`chatIDs=a%2Cb`) that the server reads as a single id matching nothing.
+ */
+function appendSearchParams(qs, params) {
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === '') continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item === undefined || item === null || item === '') continue;
+        qs.append(key, String(item));
+      }
+      continue;
+    }
+    qs.set(key, String(value));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,10 +315,7 @@ export async function getChat(chatId, { baseUrl, token, timeoutMs } = {}) {
 /** `GET /v1/chats/search` — has `limit` (default 50, max 200). One page. */
 export async function searchChatsPage({ limit, cursor, direction = 'before', baseUrl, token, timeoutMs, ...params } = {}) {
   const qs = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value === undefined || value === null || value === '') continue;
-    qs.set(key, String(value));
-  }
+  appendSearchParams(qs, params);
   const clamped = clampLimit(limit, { min: 1, max: 200, fallback: undefined });
   if (clamped !== undefined) qs.set('limit', String(clamped));
   if (cursor) qs.set('cursor', cursor);
@@ -318,10 +354,7 @@ export async function getMessage(chatId, messageId, { baseUrl, token, timeoutMs 
 /** `GET /v1/messages/search` — `limit` is hard-capped at 20 (default 20). One page. */
 export async function searchMessagesPage({ limit, cursor, direction = 'before', baseUrl, token, timeoutMs, ...params } = {}) {
   const qs = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value === undefined || value === null || value === '') continue;
-    qs.set(key, String(value));
-  }
+  appendSearchParams(qs, params);
   const clamped = clampLimit(limit, { min: 1, max: 20, fallback: 20 });
   qs.set('limit', String(clamped));
   if (cursor) qs.set('cursor', cursor);
@@ -463,20 +496,44 @@ function stripBridgeAccountsLoginId(bridge) {
   };
 }
 
-/** `GET /v1/accounts` — a BARE array, not a paginated envelope. */
+/**
+ * `GET /v1/accounts` — a BARE array, not a paginated envelope.
+ *
+ * Throws a typed `MALFORMED_RESPONSE` `BeeperApiError` when the body isn't an
+ * array, instead of coercing to `[]` — the AGENTS.md "sentinel + validate"
+ * rule (`lmStudioManager.getLastListError` is the named precedent): a 200 with
+ * a non-JSON body becomes `{ message: text }` and a blank 200 becomes `{}` via
+ * `readResponseJson`'s fallback, and both used to be indistinguishable from a
+ * genuinely empty roster. With `settings.beeper.baseUrl` user-editable (#30),
+ * any other local service answering 200 must surface as a fault here, not as
+ * "no accounts connected".
+ */
 export async function getAccounts({ baseUrl, token, timeoutMs } = {}) {
   const raw = await beeperRequest('/v1/accounts', { baseUrl, token, timeoutMs, allowRetry: true });
-  return (Array.isArray(raw) ? raw : []).map(stripLoginId);
+  if (!Array.isArray(raw)) {
+    throw new BeeperApiError('Beeper API returned an unexpected /v1/accounts response shape (expected an array)', {
+      status: 502, code: 'MALFORMED_RESPONSE', retryable: false,
+    });
+  }
+  return raw.map(stripLoginId);
 }
 
 /**
  * `GET /v1/bridges` — `{ items: Bridge[] }`. Deliberately does not surface
  * `activeAccountCount` (documented to over-report; requirement: do not use it).
+ *
+ * Same "sentinel + validate" rule as `getAccounts` above: throws a typed
+ * `MALFORMED_RESPONSE` `BeeperApiError` when `items` isn't an array, instead
+ * of coercing a missing/invalid `items` to `[]`.
  */
 export async function getBridges({ baseUrl, token, timeoutMs } = {}) {
   const raw = await beeperRequest('/v1/bridges', { baseUrl, token, timeoutMs, allowRetry: true });
-  const items = Array.isArray(raw?.items) ? raw.items.map(stripBridgeAccountsLoginId) : [];
-  return { items };
+  if (!Array.isArray(raw?.items)) {
+    throw new BeeperApiError('Beeper API returned an unexpected /v1/bridges response shape (expected { items: [] })', {
+      status: 502, code: 'MALFORMED_RESPONSE', retryable: false,
+    });
+  }
+  return { items: raw.items.map(stripBridgeAccountsLoginId) };
 }
 
 /**

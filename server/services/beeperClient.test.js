@@ -9,6 +9,7 @@ import {
   listChatsPage,
   listChats,
   listMessages,
+  searchChatsPage,
   searchMessagesPage,
   getInfo,
   probeBeeperInfo,
@@ -31,6 +32,14 @@ vi.mock('./settings.js', () => ({ getSettings: vi.fn() }));
 // (only `.text()` is read; `.ok`/`.status` drive the beeperRequest branch).
 function jsonResponse(status, body) {
   return { ok: status >= 200 && status < 300, status, text: async () => JSON.stringify(body) };
+}
+
+// A response whose body is NOT valid JSON — readResponseJson's fallback turns
+// this into `{ message: text }`, which is the exact shape the malformed-
+// response tests below must NOT let getAccounts/getBridges/paginateBeeperCursor
+// coerce into an empty (but "successful") roster.
+function nonJsonResponse(status, text) {
+  return { ok: status >= 200 && status < 300, status, text: async () => text };
 }
 
 describe('beeperClient', () => {
@@ -149,6 +158,26 @@ describe('beeperClient', () => {
       for await (const item of paginateBeeperCursor(fetchPage)) collected.push(item);
       expect(collected).toEqual([]);
       expect(fetchPage).toHaveBeenCalledTimes(1);
+    });
+
+    it('throws MALFORMED_RESPONSE instead of silently treating a missing items array as exhausted', async () => {
+      const fetchPage = vi.fn(async () => ({ hasMore: false }));
+      const collected = [];
+      await expect((async () => {
+        for await (const item of paginateBeeperCursor(fetchPage)) collected.push(item);
+      })()).rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+      expect(collected).toEqual([]);
+    });
+
+    it('throws MALFORMED_RESPONSE when a later page (not the first) has a non-array items', async () => {
+      const fetchPage = vi.fn(async ({ cursor }) => (!cursor
+        ? { items: ['a'], hasMore: true, oldestCursor: 'c1' }
+        : { items: 'not-an-array', hasMore: true, oldestCursor: 'c2' }));
+      const collected = [];
+      await expect((async () => {
+        for await (const item of paginateBeeperCursor(fetchPage)) collected.push(item);
+      })()).rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+      expect(collected).toEqual(['a']);
     });
 
     it('walks newestCursor when direction is "after"', async () => {
@@ -430,6 +459,54 @@ describe('beeperClient', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Malformed response shapes — must throw a typed MALFORMED_RESPONSE error,
+  // never silently coerce to an empty roster (AGENTS.md "sentinel + validate":
+  // absent/failed/invalid must never collapse into "legitimately empty").
+  // -------------------------------------------------------------------------
+
+  describe('getAccounts / getBridges malformed response', () => {
+    it('getAccounts throws MALFORMED_RESPONSE (not an empty roster) on a 200 with a non-JSON body', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(nonJsonResponse(200, 'not json at all')));
+      await expect(getAccounts({ baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+    });
+
+    it('getAccounts throws MALFORMED_RESPONSE on a 200 object body where an array is expected', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(200, { accounts: [] })));
+      await expect(getAccounts({ baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+    });
+
+    it('getAccounts throws MALFORMED_RESPONSE on a blank 200 body (readResponseJson\'s emptyValue {})', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(nonJsonResponse(200, '')));
+      await expect(getAccounts({ baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+    });
+
+    it('getBridges throws MALFORMED_RESPONSE (not an empty roster) on a 200 with a non-JSON body', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(nonJsonResponse(200, 'not json at all')));
+      await expect(getBridges({ baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+    });
+
+    it('getBridges throws MALFORMED_RESPONSE on a 200 body whose items is not an array', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(200, { items: 'not-an-array' })));
+      await expect(getBridges({ baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'MALFORMED_RESPONSE', retryable: false });
+    });
+
+    it('a genuinely empty roster (200 with []/{ items: [] }) is NOT malformed — still resolves empty', async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse(200, []))
+        .mockResolvedValueOnce(jsonResponse(200, { items: [] }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await expect(getAccounts({ baseUrl: DEFAULT_BASE_URL, token: 't' })).resolves.toEqual([]);
+      await expect(getBridges({ baseUrl: DEFAULT_BASE_URL, token: 't' })).resolves.toEqual({ items: [] });
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Search endpoint limit clamping (limit max 20 on /v1/messages/search)
   // -------------------------------------------------------------------------
 
@@ -448,6 +525,44 @@ describe('beeperClient', () => {
 
       await searchMessagesPage({ query: 'hello', baseUrl: DEFAULT_BASE_URL, token: 't' });
       expect(fetchMock.mock.calls[0][0]).toContain('limit=20');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Array query params (accountIDs, chatIDs, mediaTypes) must serialize as
+  // repeated keys, not one comma-joined value the server reads as a single id.
+  // -------------------------------------------------------------------------
+
+  describe('array query param serialization', () => {
+    it('searchMessagesPage serializes an array filter (accountIDs) as repeated keys, not comma-joined', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { items: [], hasMore: false }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await searchMessagesPage({ query: 'hello', accountIDs: ['acct-a', 'acct-b'], baseUrl: DEFAULT_BASE_URL, token: 't' });
+      const url = fetchMock.mock.calls[0][0];
+      const params = new URL(url).searchParams;
+      expect(params.getAll('accountIDs')).toEqual(['acct-a', 'acct-b']);
+      expect(url).not.toContain('acct-a%2Cacct-b');
+    });
+
+    it('searchChatsPage serializes an array filter (chatIDs) as repeated keys, not comma-joined', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { items: [], hasMore: false }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await searchChatsPage({ chatIDs: ['chat-a', 'chat-b'], baseUrl: DEFAULT_BASE_URL, token: 't' });
+      const url = fetchMock.mock.calls[0][0];
+      const params = new URL(url).searchParams;
+      expect(params.getAll('chatIDs')).toEqual(['chat-a', 'chat-b']);
+      expect(url).not.toContain('chat-a%2Cchat-b');
+    });
+
+    it('a scalar filter still serializes as a single key (no regression from the array path)', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { items: [], hasMore: false }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await searchMessagesPage({ query: 'hello', chatType: 'group', baseUrl: DEFAULT_BASE_URL, token: 't' });
+      const params = new URL(fetchMock.mock.calls[0][0]).searchParams;
+      expect(params.getAll('chatType')).toEqual(['group']);
     });
   });
 
