@@ -31,6 +31,7 @@ export const DB_TEST_INCLUDE = [
   'services/privacyOptOut.db.test.js',
   'services/catalogCanonProjection.test.js',
   'services/catalogRefResolver.test.js',
+  'lib/db/schema/beeper.db.test.js',
   'services/creativeDirector/projectsDB.test.js',
   'services/musicVideo/projectsDB.test.js',
   'routes/catalog.test.js',
