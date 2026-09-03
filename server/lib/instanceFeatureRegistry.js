@@ -10,8 +10,9 @@
 // Adding a feature:
 //   1. add a descriptor here;
 //   2. tag its pages in navManifest.js (`feature: '<id>'`, or a SECTION_FEATURE
-//      entry when a whole sidebar section belongs to it) and the matching rows
-//      in client/src/components/Layout.jsx;
+//      entry when a whole sidebar section belongs to it); the sidebar derives
+//      each feature from NAV_COMMANDS, so Layout only needs the NAV_PRESENTATION
+//      icon row for a new page;
 //   3. add a `detect` hook in services/instanceFeatures.js when a fresh install
 //      should infer the default from whether the integration is configured.
 // The validation schemas and the install-wide Features tab pick it up with no

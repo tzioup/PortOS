@@ -15,7 +15,7 @@ The **Vault** is an encrypted, machine-local key-value store for sensitive perso
 - Financial identity (Bank account references, tax entity IDs)
 - Emergency contacts & private physical addresses
 
-Data in the Vault is stored encrypted at rest (`server/lib/vaultCrypto.js`) using machine-derived key material and requires standard authentication when auth is enabled.
+Data in the Vault is stored encrypted at rest (`server/lib/vaultCrypto.js`) using `PRIVACY_VAULT_KEY`; an existing valid key is used when configured, otherwise a random key is generated on first write and stored in the install-root `.env`. Standard authentication is required when auth is enabled.
 
 ### 2. Organizations
 The **Organizations** registry maintains a list of third-party companies, services, and institutions that hold your personal data (e.g. financial institutions, utility providers, subscription services, medical providers). Each entry tracks:
