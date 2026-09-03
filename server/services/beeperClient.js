@@ -218,14 +218,14 @@ async function beeperRequest(path, {
 // ---------------------------------------------------------------------------
 
 /**
- * `GET /v1/info` — the one endpoint that also answers unauthenticated, which is
- * what makes it the liveness probe. `token` defaults to `null` (explicitly
- * unauthenticated, so a probe never triggers a credential read); the connect
- * flow passes a candidate token so the same shape check runs against the
- * credential the user just supplied (#31's paste path).
+ * `GET /v1/info` — the one endpoint that also answers UNAUTHENTICATED, which is
+ * what makes it the liveness probe and what disqualifies it as a credential
+ * check: it answers 200 for a bogus token just as happily (#31's connect flow
+ * introspects instead). `token: null` is explicit, so a probe never triggers a
+ * credential read.
  */
-export async function getInfo({ baseUrl, token = null, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
-  return beeperRequest('/v1/info', { baseUrl, token, requireAuth: false, timeoutMs });
+export async function getInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
+  return beeperRequest('/v1/info', { baseUrl, token: null, requireAuth: false, timeoutMs });
 }
 
 /**

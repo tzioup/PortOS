@@ -29,7 +29,7 @@ import { readResponseJson } from '../lib/readResponseJson.js';
 import { describeFetchError } from '../lib/fetchErrorChain.js';
 import { isPlainObject } from '../lib/objects.js';
 import {
-  BeeperApiError, assertValidInfoResponse, getInfo, probeBeeperInfo, resolveBeeperBaseUrl,
+  BeeperApiError, getAccounts, probeBeeperInfo, resolveBeeperBaseUrl,
 } from './beeperClient.js';
 import { deleteBeeperCredential, readBeeperCredential, saveBeeperCredential } from './beeperCredentials.js';
 
@@ -139,6 +139,44 @@ export async function discoverAuthorizationServer({ baseUrl } = {}) {
     revocationEndpoint: body.revocation_endpoint
       ? resolveEndpoint(body.revocation_endpoint, resolvedBase, 'revocation_endpoint')
       : null,
+    // Optional: RFC 7662 introspection, which is how the paste path proves a
+    // pasted token is real (see `connectWithPastedToken`).
+    introspectionEndpoint: body.introspection_endpoint
+      ? resolveEndpoint(body.introspection_endpoint, resolvedBase, 'introspection_endpoint')
+      : null,
+  };
+}
+
+/**
+ * RFC 7662 token introspection. Returns `{ active, expiresAt, scopes }` — the
+ * only three fields this flow reads. `exp` is seconds since the epoch; absent
+ * means the token does not expire, which is exactly the no-expiry credential
+ * Beeper's own UI can mint, so it becomes `null` rather than a guessed default.
+ *
+ * `sub` is deliberately ignored: on this API it is an account identity, and
+ * PortOS never stores or displays one.
+ */
+export async function introspectToken(token, { introspectionEndpoint, clientId } = {}) {
+  const params = new URLSearchParams({ token });
+  if (clientId) params.set('client_id', clientId);
+  const { ok, status, body } = await fetchJson(introspectionEndpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      // Some deployments gate introspection on the token itself; sending it as
+      // a bearer as well is harmless when they do not.
+      Authorization: `Bearer ${token}`,
+    },
+    body: params.toString(),
+  });
+  if (!ok) {
+    throw oauthError(`Beeper token introspection failed (HTTP ${status})`, 'OAUTH_INTROSPECTION_FAILED');
+  }
+  const exp = Number(body?.exp);
+  return {
+    active: body?.active === true,
+    expiresAt: Number.isFinite(exp) && exp > 0 ? new Date(exp * 1000).toISOString() : null,
+    scopes: typeof body?.scope === 'string' && body.scope.trim() ? body.scope.trim().split(/\s+/) : [],
   };
 }
 
@@ -273,27 +311,53 @@ export async function completeBeeperOAuth({ code, state } = {}) {
 }
 
 /**
- * The paste path (#11 decision 3). Validates the token by probing `/v1/info`
- * with it, then stores it with `expiresAt: null` — the no-expiry credential
- * Beeper's UI can mint and OAuth cannot, which is the whole reason this path
- * exists. Same resulting state as a completed OAuth flow.
+ * The paste path (#11 decision 3). Beeper's own UI can mint a NO-EXPIRY token
+ * and no OAuth parameter can request one, so this is a first-class alternative
+ * rather than a fallback — and it terminates in the same vaulted credential.
  *
- * `/v1/info` is Beeper's one endpoint that also answers unauthenticated, so
- * this proves the API is reachable and well-shaped rather than proving the
- * credential is accepted; a token Beeper rejects surfaces at first
- * authenticated use. Probing it authenticated is still the cheapest check that
- * refuses to store a credential against a base URL that isn't Beeper at all.
+ * Validation must actually exercise the credential. `/v1/info` is Beeper's one
+ * endpoint that ALSO answers unauthenticated, so probing it would happily
+ * store a bogus token as connected. Instead:
+ *
+ *   1. RFC 7662 introspection when the authorization server advertises an
+ *      `introspection_endpoint` — an inactive token is refused, and `exp`
+ *      (absent for a no-expiry token) plus the returned scopes are stored.
+ *   2. Otherwise `GET /v1/accounts`, which REQUIRES the bearer, so a rejected
+ *      token surfaces here as a 401 instead of at first use. Nothing is known
+ *      about its lifetime on this path, so the expiry is stored as `null`.
+ *
+ * Either way a token the server refuses is never written to the vault.
  */
 export async function connectWithPastedToken(token) {
   const value = typeof token === 'string' ? token.trim() : '';
   if (!value) {
     throw oauthError('A Beeper access token is required', 'TOKEN_REQUIRED', { status: 400 });
   }
-  const baseUrl = await resolveBeeperBaseUrl();
-  const info = await getInfo({ baseUrl, token: value });
-  assertValidInfoResponse(info);
-  const saved = await saveBeeperCredential({ token: value, expiresAt: null, scopes: [], source: 'pasted' });
+  const discovery = await discoverAuthorizationServer();
+  const verified = discovery.introspectionEndpoint
+    ? await verifyByIntrospection(value, discovery)
+    : await verifyByAuthenticatedCall(value, discovery.baseUrl);
+
+  const saved = await saveBeeperCredential({
+    token: value, expiresAt: verified.expiresAt, scopes: verified.scopes, source: 'pasted',
+  });
   return { ...saved, reachable: true, lastProbeError: null };
+}
+
+async function verifyByIntrospection(token, { introspectionEndpoint }) {
+  const result = await introspectToken(token, { introspectionEndpoint });
+  if (!result.active) {
+    // Nothing about the token itself goes into the message — only the verdict.
+    throw oauthError('Beeper rejected that access token (introspection reports it is not active)', 'TOKEN_REJECTED', { status: 401 });
+  }
+  return { expiresAt: result.expiresAt, scopes: result.scopes };
+}
+
+async function verifyByAuthenticatedCall(token, baseUrl) {
+  // Throws UNAUTHORIZED on a rejected token and MALFORMED_RESPONSE when the
+  // base URL points at something that answers 200 but isn't Beeper.
+  await getAccounts({ baseUrl, token });
+  return { expiresAt: null, scopes: [] };
 }
 
 /**

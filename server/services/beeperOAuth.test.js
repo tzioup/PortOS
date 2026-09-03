@@ -19,8 +19,16 @@ import { deleteBeeperCredential, readBeeperCredential, saveBeeperCredential } fr
 import {
   __resetPendingAuthorizationsForTests, completeBeeperOAuth, connectWithPastedToken,
   createPkcePair, disconnectBeeper, discoverAuthorizationServer, expiryFromTokenResponse,
-  startBeeperOAuth,
+  introspectToken, startBeeperOAuth,
 } from './beeperOAuth.js';
+
+// Metadata WITHOUT introspection — the fallback branch of the paste path.
+const { introspection_endpoint: _omitted, ...METADATA_NO_INTROSPECTION } = {
+  authorization_endpoint: '/oauth/authorize',
+  token_endpoint: '/oauth/token',
+  registration_endpoint: '/oauth/register',
+  introspection_endpoint: '/oauth/introspect',
+};
 
 const BASE_URL = 'http://127.0.0.1:23373';
 const REDIRECT_URI = 'https://example.com/api/beeper/oauth/callback';
@@ -32,6 +40,7 @@ const METADATA = {
   token_endpoint: '/oauth/token',
   registration_endpoint: '/oauth/register',
   revocation_endpoint: '/oauth/revoke',
+  introspection_endpoint: '/oauth/introspect',
   grant_types_supported: ['authorization_code'],
   token_endpoint_auth_methods_supported: ['none'],
   code_challenge_methods_supported: ['S256'],
@@ -78,6 +87,12 @@ describe('discoverAuthorizationServer', () => {
     expect(discovery.tokenEndpoint).toBe(`${BASE_URL}/oauth/token`);
     expect(discovery.registrationEndpoint).toBe(`${BASE_URL}/oauth/register`);
     expect(discovery.revocationEndpoint).toBe(`${BASE_URL}/oauth/revoke`);
+    expect(discovery.introspectionEndpoint).toBe(`${BASE_URL}/oauth/introspect`);
+  });
+
+  it('reports a null introspection endpoint when the server advertises none', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse(METADATA_NO_INTROSPECTION));
+    await expect(discoverAuthorizationServer()).resolves.toMatchObject({ introspectionEndpoint: null });
   });
 
   // The base URL is user-editable (#30). Whatever answers on it must not be
@@ -248,26 +263,107 @@ describe('expiryFromTokenResponse', () => {
   });
 });
 
+describe('introspectToken', () => {
+  it('reads active, exp and scope, and treats an absent exp as no expiry', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse({
+      active: true, scope: 'read write', exp: Math.floor(Date.parse('2026-12-01T00:00:00.000Z') / 1000),
+    }));
+    await expect(introspectToken(TOKEN, { introspectionEndpoint: `${BASE_URL}/oauth/introspect` })).resolves.toEqual({
+      active: true, expiresAt: '2026-12-01T00:00:00.000Z', scopes: ['read', 'write'],
+    });
+    const call = vi.mocked(fetchWithTimeout).mock.calls[0];
+    expect(new URLSearchParams(bodyOf(call)).get('token')).toBe(TOKEN);
+  });
+
+  it('reports inactive without inventing an expiry', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse({ active: false }));
+    await expect(introspectToken(TOKEN, { introspectionEndpoint: `${BASE_URL}/oauth/introspect` }))
+      .resolves.toEqual({ active: false, expiresAt: null, scopes: [] });
+  });
+});
+
+// The paste path must EXERCISE the credential. /v1/info also answers
+// unauthenticated, so probing it would store a bogus token as connected —
+// introspection (or, failing that, a call that requires the bearer) is what
+// makes "saved" mean "Beeper accepted this".
 describe('connectWithPastedToken', () => {
-  it('validates against /v1/info with the pasted token, then vaults it with no expiry', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse(INFO));
+  it('introspects the pasted token, then vaults it with the expiry and scopes introspection reported', async () => {
+    const exp = Math.floor(Date.parse('2026-12-01T00:00:00.000Z') / 1000);
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse(METADATA))
+      .mockResolvedValueOnce(mockJsonResponse({ active: true, scope: 'read write', exp }));
+
     const result = await connectWithPastedToken(`  ${TOKEN}  `);
 
-    const call = vi.mocked(fetchWithTimeout).mock.calls[0];
-    expect(urlOf(call)).toBe(`${BASE_URL}/v1/info`);
-    expect(call[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+    const introspect = vi.mocked(fetchWithTimeout).mock.calls[1];
+    expect(urlOf(introspect)).toBe(`${BASE_URL}/oauth/introspect`);
+    expect(new URLSearchParams(bodyOf(introspect)).get('token')).toBe(TOKEN);
     expect(saveBeeperCredential).toHaveBeenCalledWith({
-      token: TOKEN, expiresAt: null, scopes: [], source: 'pasted',
+      token: TOKEN, expiresAt: '2026-12-01T00:00:00.000Z', scopes: ['read', 'write'], source: 'pasted',
     });
-    // Same resulting shape as a completed OAuth flow, minus the expiry.
-    expect(result).toMatchObject({ tokenConfigured: true, tokenExpiresAt: null, tokenSource: 'pasted', reachable: true });
+    expect(result).toMatchObject({ tokenConfigured: true, tokenSource: 'pasted', reachable: true });
     expect(JSON.stringify(result)).not.toContain(TOKEN);
   });
 
-  it('stores nothing when the base URL answers with something that is not Beeper', async () => {
-    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse({ hello: 'other service' }));
-    await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'MALFORMED_RESPONSE' });
+  // A no-expiry token — the credential this path exists for — introspects
+  // active with no `exp` at all, which must stay `null`, never a guess.
+  it('stores a null expiry for an active token introspection reports no exp for', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse(METADATA))
+      .mockResolvedValueOnce(mockJsonResponse({ active: true, scope: 'read write' }));
+    const result = await connectWithPastedToken(TOKEN);
+    expect(vi.mocked(saveBeeperCredential).mock.calls[0][0].expiresAt).toBeNull();
+    expect(result.tokenExpiresAt).toBeNull();
+  });
+
+  it('refuses an inactive token and stores nothing', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse(METADATA))
+      .mockResolvedValueOnce(mockJsonResponse({ active: false }));
+    await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'TOKEN_REJECTED', status: 401 });
     expect(saveBeeperCredential).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a failed introspection call rather than storing the token anyway', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse(METADATA))
+      .mockResolvedValueOnce(mockJsonResponse({ error: 'server_error' }, { ok: false, status: 500 }));
+    await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'OAUTH_INTROSPECTION_FAILED' });
+    expect(saveBeeperCredential).not.toHaveBeenCalled();
+  });
+
+  describe('without an introspection endpoint', () => {
+    it('falls back to an authenticated call (never /v1/info) and stores on success', async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse([{ accountID: 'acct-1', network: 'Example Network' }]));
+
+      const result = await connectWithPastedToken(TOKEN);
+
+      const probe = vi.mocked(fetchWithTimeout).mock.calls[1];
+      expect(urlOf(probe)).toBe(`${BASE_URL}/v1/accounts`);
+      expect(probe[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
+      expect(saveBeeperCredential).toHaveBeenCalledWith({
+        token: TOKEN, expiresAt: null, scopes: [], source: 'pasted',
+      });
+      expect(result).toMatchObject({ tokenConfigured: true, tokenSource: 'pasted' });
+    });
+
+    it('stores nothing when the authenticated call rejects the token', async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValue(mockJsonResponse({ message: 'unauthorized' }, { ok: false, status: 401 }));
+      await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+      expect(saveBeeperCredential).not.toHaveBeenCalled();
+    });
+
+    it('stores nothing when the base URL answers 200 with something that is not Beeper', async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse({ hello: 'other service' }));
+      await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'MALFORMED_RESPONSE' });
+      expect(saveBeeperCredential).not.toHaveBeenCalled();
+    });
   });
 
   it('rejects an empty token without a network call', async () => {

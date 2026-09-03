@@ -20,6 +20,8 @@ const BEEPER_ERROR_STATUS = {
   ASSET_UNAVAILABLE: 404,
   UNAUTHORIZED: 401,
   TOKEN_REQUIRED: 400,
+  TOKEN_REJECTED: 401,
+  OAUTH_INTROSPECTION_FAILED: 502,
   OAUTH_REDIRECT_URI_MISSING: 400,
   OAUTH_STATE_UNKNOWN: 400,
   OAUTH_DISCOVERY_FAILED: 502,
@@ -117,8 +119,10 @@ router.get('/oauth/callback', asyncHandler(async (req, res) => {
 // POST /api/beeper/token — the paste path (#11 decision 3), a first-class
 // alternative to OAuth rather than a fallback: Beeper's own UI can mint a
 // no-expiry token and the OAuth surface accepts no lifetime at all. Validated
-// against a live /v1/info probe, then vaulted with `expiresAt: null`. The
-// response reports presence, expiry and provenance — never the value.
+// by RFC 7662 introspection (or, failing that, a call that requires the
+// bearer) so a token the server refuses is never stored, then vaulted with
+// whatever expiry introspection reported. The response carries presence,
+// expiry and provenance — never the value.
 router.post('/token', asyncHandler(async (req, res) => {
   const { token } = validateRequest(beeperPastedTokenSchema, req.body);
   const result = await connectWithPastedToken(token).catch((err) => { throw mapBeeperWriteError(err); });

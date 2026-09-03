@@ -170,6 +170,18 @@ describe('POST /api/beeper/token — the paste path', () => {
     });
   });
 
+  // Introspection says the token is not active: a 401 the client can act on,
+  // marked non-retryable so nothing re-posts the same dead credential.
+  it('maps a rejected token to 401 with retryable:false', async () => {
+    vi.mocked(connectWithPastedToken).mockRejectedValue(
+      new BeeperApiError('Beeper rejected that access token (introspection reports it is not active)', { status: 401, code: 'TOKEN_REJECTED', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/token').send({ token: 'example-beeper-token' });
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe('TOKEN_REJECTED');
+    expect(res.body.context.retryable).toBe(false);
+  });
+
   it('400s on an empty token instead of reaching the service', async () => {
     const res = await request(buildApp()).post('/api/beeper/token').send({ token: '   ' });
     expect(res.status).toBe(400);
