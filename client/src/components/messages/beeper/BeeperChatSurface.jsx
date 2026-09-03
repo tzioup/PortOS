@@ -247,6 +247,10 @@ function ConversationRow({ conversation, unified, selected, onSelect }) {
   const previewText = preview
     ? (preview.isUnsent ? 'Message unsent' : preview.body)
     : 'No messages mirrored yet';
+  // The reference's leading state chip. Direction is the mirrored `isSender`,
+  // never a comparison against the local user — there is nothing to compare
+  // `senderId` against (#2).
+  const outbound = preview?.isSender === true;
   return (
     <button
       type="button"
@@ -272,6 +276,7 @@ function ConversationRow({ conversation, unified, selected, onSelect }) {
           <span className="ml-auto shrink-0 pl-1 text-[11px] text-gray-500">{rowTime(conversation.lastActivity)}</span>
         </span>
         <span className="mt-0.5 flex items-center gap-1">
+          {outbound && <span className="shrink-0 text-xs text-gray-500">You:</span>}
           <span className="min-w-0 flex-1 truncate text-xs text-gray-400">{previewText}</span>
           {conversation.unreadCount > 0 && (
             <span className="shrink-0 rounded-full bg-port-accent px-1.5 py-px text-[10px] font-semibold text-port-bg">

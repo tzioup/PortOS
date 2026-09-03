@@ -185,6 +185,11 @@ export function normalizeMessageRow(message, observedAt) {
     editedAt: toIsoOrNull(message?.editedTimestamp),
     unsentAt: message?.isDeleted === true ? observedAt : null,
     sortKey: String(message?.sortKey ?? ''),
+    // The API's own `isSender`, and the ONLY reliable inbound/outbound signal:
+    // `accounts[].user.id` differs from `senderID` on every network (#2), so a
+    // comparison against the local user cannot be made. Strict `=== true`, so a
+    // bridge that omits the field lands on inbound rather than on `undefined`.
+    isSender: message?.isSender === true,
   };
 }
 
@@ -375,8 +380,8 @@ async function commitMessages({ conversationId, accountId, sourceChatId, rows, c
     for (const { message, attachments } of rows) {
       // eslint-disable-next-line no-await-in-loop -- ordered writes inside one transaction
       await client.query(
-        `INSERT INTO beeper_messages (id, conversation_id, sender_id, body, sent_at, edited_at, unsent_at, sort_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `INSERT INTO beeper_messages (id, conversation_id, sender_id, body, sent_at, edited_at, unsent_at, sort_key, is_sender)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (id) DO UPDATE SET
            body = COALESCE(NULLIF(EXCLUDED.body, ''), beeper_messages.body),
            sender_id = COALESCE(NULLIF(EXCLUDED.sender_id, ''), beeper_messages.sender_id),
@@ -384,10 +389,15 @@ async function commitMessages({ conversationId, accountId, sourceChatId, rows, c
            edited_at = COALESCE(EXCLUDED.edited_at, beeper_messages.edited_at),
            unsent_at = COALESCE(beeper_messages.unsent_at, EXCLUDED.unsent_at),
            sort_key = COALESCE(NULLIF(EXCLUDED.sort_key, ''), beeper_messages.sort_key),
+           -- Never downgrades a stored TRUE to FALSE: the field is optional on
+           -- the inbound Message, so a later page that omits it must not flip a
+           -- message the user actually sent onto the other side of the thread.
+           is_sender = beeper_messages.is_sender OR EXCLUDED.is_sender,
            updated_at = NOW()`,
         [
           message.id, conversationId, message.senderId, message.body,
           message.sentAt, message.editedAt, message.unsentAt, message.sortKey,
+          message.isSender,
         ],
       );
       for (const attachment of attachments) {

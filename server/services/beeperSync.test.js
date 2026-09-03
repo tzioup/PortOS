@@ -10,6 +10,9 @@ import {
 
 const dbCalls = [];
 const txCalls = [];
+// Statement text PLUS bind parameters, so a test can assert what a row was
+// actually written with rather than only which statements ran in what order.
+const txStatements = [];
 let storedCursorRows = [];
 let txFailPattern = null;
 
@@ -26,8 +29,9 @@ const queryMock = vi.fn(async (text, params) => {
 const withTransactionMock = vi.fn(async (fn) => {
   txCalls.push('BEGIN');
   const client = {
-    query: async (text) => {
+    query: async (text, params) => {
       txCalls.push(text.trim().split('\n')[0].trim());
+      txStatements.push({ text, params });
       if (txFailPattern && txFailPattern.test(text)) throw new Error('simulated write failure');
       return { rows: [] };
     },
@@ -111,6 +115,7 @@ const messageRequests = () => fetchedUrls.filter((url) => /\/messages$/.test(new
 beforeEach(() => {
   dbCalls.length = 0;
   txCalls.length = 0;
+  txStatements.length = 0;
   fetchedUrls.length = 0;
   storedCursorRows = [];
   txFailPattern = null;
@@ -384,6 +389,27 @@ describe('cursor transactionality', () => {
     expect(cursorIndex).toBeGreaterThan(attachmentIndex);
   });
 
+  it('persists isSender on the message row, and never downgrades a stored TRUE', async () => {
+    installFetch({
+      chatPages: [ONE_CHAT],
+      messagePages: {
+        'chat-1': {
+          ...ONE_MESSAGE['chat-1'],
+          items: [{ ...ONE_MESSAGE['chat-1'].items[0], isSender: true }],
+        },
+      },
+    });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    const insert = txStatements.find(({ text }) => text.includes('INSERT INTO beeper_messages'));
+    expect(insert).toBeTruthy();
+    expect(insert.params.at(-1)).toBe(true);
+    // A later page may omit the optional field; the upsert must not flip a
+    // message the user actually sent onto the other side of the thread.
+    expect(insert.text).toContain('is_sender = beeper_messages.is_sender OR EXCLUDED.is_sender');
+  });
+
   it('leaves the cursor unmoved when a row write throws before the commit', async () => {
     txFailPattern = /INSERT INTO beeper_messages/;
     installFetch({ chatPages: [ONE_CHAT], messagePages: ONE_MESSAGE });
@@ -482,6 +508,23 @@ describe('normalizers', () => {
     );
     expect(row.unsentAt).toBe('2026-09-02T12:00:00.000Z');
     expect(row.id).toBe('msg-1');
+  });
+
+  // Direction is the ONLY thing a chat surface cannot reconstruct from the rest
+  // of the row: `accounts[].user.id` differs from `senderID` on every network
+  // (#2), so there is nothing to compare a sender against. It has to be
+  // mirrored from the API's own `isSender`.
+  it('mirrors isSender, and reads an omitted field as inbound rather than undefined', () => {
+    const sent = normalizeMessageRow(
+      { id: 'msg-1', senderID: 'user-me', text: 'placeholder', isSender: true },
+      '2026-09-02T12:00:00.000Z',
+    );
+    const received = normalizeMessageRow(
+      { id: 'msg-2', senderID: 'user-1', text: 'placeholder' },
+      '2026-09-02T12:00:00.000Z',
+    );
+    expect(sent.isSender).toBe(true);
+    expect(received.isSender).toBe(false);
   });
 
   it('reads an edit off editedTimestamp and leaves unsentAt null', () => {

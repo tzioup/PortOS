@@ -24,6 +24,12 @@ import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
  *  - **It does not name the transport.** #9 wants "… on Google Messages (RCS)";
  *    the mirror carries `network` but not `transport` (#27), so the label stops
  *    at the network rather than inventing one.
+ *
+ * Direction comes from the mirrored `isSender`, never from comparing
+ * `senderId` against the local user — `accounts[].user.id` differs from
+ * `senderID` on every network (#2), so there is nothing to compare against.
+ * Own messages sit right-aligned with no sender name and no avatar, the
+ * reference interface's shape.
  */
 
 const dayLabel = (iso) => {
@@ -288,6 +294,7 @@ export default function BeeperThread({
           const showDay = day !== lastDay;
           lastDay = day;
           const name = senderName.get(message.senderId) || message.senderId || 'Unknown sender';
+          const out = message.isSender === true;
           return (
             <div key={message.id}>
               {showDay && (
@@ -295,10 +302,14 @@ export default function BeeperThread({
                   <span className="rounded-full bg-port-card px-2.5 py-0.5 text-[11px] text-gray-400">{day}</span>
                 </p>
               )}
-              <div className="flex items-end gap-2">
-                <Avatar name={name} size={26} />
-                <div className="max-w-[75%] rounded-2xl bg-port-card px-3 py-2 text-sm text-gray-100">
-                  <p className="mb-0.5 text-[11px] font-medium text-port-accent">{name}</p>
+              <div
+                data-testid="beeper-message"
+                data-direction={out ? 'out' : 'in'}
+                className={`flex items-end gap-2 ${out ? 'justify-end' : 'justify-start'}`}
+              >
+                {!out && <Avatar name={name} size={26} />}
+                <div className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm text-gray-100 ${out ? 'bg-port-accent/25' : 'bg-port-card'}`}>
+                  {!out && <p className="mb-0.5 text-[11px] font-medium text-port-accent">{name}</p>}
                   {message.unsentAt ? (
                     <p className="flex items-center gap-1.5 italic text-gray-500">
                       <Trash2 size={12} /> This message was unsent

@@ -193,6 +193,43 @@ describe('rendering at every install size', () => {
   });
 });
 
+describe('message direction', () => {
+  it('puts own messages on the other side of the thread, from the mirrored isSender', async () => {
+    api.getBeeperConversation.mockResolvedValue(conversation({
+      title: 'Example Contact',
+      participants: [{ sourceUserId: 'user-1', displayName: 'Sam Example', handle: '', tribePersonId: null, tribePersonName: null, observedVia: 'participant-list' }],
+    }));
+    api.getBeeperMessages.mockResolvedValue({
+      messages: [
+        { id: 'm2', conversationId: CONV_A, senderId: 'user-me', body: 'Placeholder outbound', sentAt: '2026-09-01T10:00:00.000Z', isSender: true, attachments: [] },
+        { id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder inbound', sentAt: '2026-09-01T09:00:00.000Z', isSender: false, attachments: [] },
+      ],
+      nextCursor: null,
+    });
+
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    await screen.findByText('Placeholder outbound');
+    const bubbles = screen.getAllByTestId('beeper-message');
+    // Rendered oldest-first, so the inbound one comes first.
+    expect(bubbles.map((node) => node.dataset.direction)).toEqual(['in', 'out']);
+    // An own message carries no sender name — the reference's shape, and the
+    // reason direction has to be mirrored rather than guessed from senderId.
+    expect(within(bubbles[1]).queryByText('user-me')).toBeNull();
+    expect(within(bubbles[0]).getByText('Sam Example')).toBeInTheDocument();
+  });
+
+  it('renders a message with no direction as inbound rather than as unknown', async () => {
+    api.getBeeperMessages.mockResolvedValue({
+      messages: [{ id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder body', sentAt: '2026-09-01T09:00:00.000Z', attachments: [] }],
+      nextCursor: null,
+    });
+    renderTab(`/messages/beeper/${CONV_A}`);
+    await screen.findByText('Placeholder body');
+    expect(screen.getByTestId('beeper-message').dataset.direction).toBe('in');
+  });
+});
+
 describe('the pinned grid is Beeper’s own isPinned, mirrored', () => {
   it('lifts pinned conversations into the grid without any local pin state', async () => {
     api.getBeeperConversations.mockResolvedValue({

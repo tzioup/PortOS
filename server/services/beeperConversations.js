@@ -102,6 +102,7 @@ function shapeConversation(row) {
         senderId: row.preview_sender_id || '',
         sentAt: toIso(row.preview_sent_at),
         isUnsent: Boolean(row.preview_unsent_at),
+        isSender: row.preview_is_sender === true,
       }
       : null,
     participants: [],
@@ -135,6 +136,11 @@ function shapeMessage(row) {
     sentAt: toIso(row.sent_at),
     editedAt: toIso(row.edited_at),
     unsentAt: toIso(row.unsent_at),
+    // Which side of the thread this belongs on, mirrored from the API's own
+    // `Message.isSender` (#27's `is_sender`). Derived server-side and never
+    // guessed from `senderId`: `accounts[].user.id` differs from `senderID` on
+    // every network, so the client has nothing to compare against.
+    isSender: row.is_sender === true,
     attachments: [],
   };
 }
@@ -240,10 +246,11 @@ export async function listConversations({
     `SELECT c.*,
             lm.id AS preview_id, lm.body AS preview_body, lm.sender_id AS preview_sender_id,
             lm.sent_at AS preview_sent_at, lm.unsent_at AS preview_unsent_at,
+            lm.is_sender AS preview_is_sender,
             COALESCE(c.last_activity, c.created_at) AS ordering_ts
        FROM beeper_conversations c
        LEFT JOIN LATERAL (
-         SELECT m.id, m.body, m.sender_id, m.sent_at, m.unsent_at
+         SELECT m.id, m.body, m.sender_id, m.sent_at, m.unsent_at, m.is_sender
            FROM beeper_messages m
           WHERE m.conversation_id = c.id
           ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC
@@ -272,10 +279,11 @@ export async function getConversation(conversationId) {
   const result = await query(
     `SELECT c.*,
             lm.id AS preview_id, lm.body AS preview_body, lm.sender_id AS preview_sender_id,
-            lm.sent_at AS preview_sent_at, lm.unsent_at AS preview_unsent_at
+            lm.sent_at AS preview_sent_at, lm.unsent_at AS preview_unsent_at,
+            lm.is_sender AS preview_is_sender
        FROM beeper_conversations c
        LEFT JOIN LATERAL (
-         SELECT m.id, m.body, m.sender_id, m.sent_at, m.unsent_at
+         SELECT m.id, m.body, m.sender_id, m.sent_at, m.unsent_at, m.is_sender
            FROM beeper_messages m
           WHERE m.conversation_id = c.id
           ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC

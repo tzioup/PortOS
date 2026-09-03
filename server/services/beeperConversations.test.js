@@ -161,6 +161,22 @@ describe('listConversations — row shaping', () => {
     expect(conversations[0].lastMessage).toMatchObject({ id: 'msg-example-1', body: '', isUnsent: true });
   });
 
+  it('carries the preview\'s direction, so the row can show its leading state chip', async () => {
+    vi.mocked(query)
+      .mockResolvedValueOnce({
+        rows: [conversationRow({
+          preview_id: 'msg-example-1',
+          preview_body: 'placeholder body',
+          preview_sender_id: 'user-me',
+          preview_sent_at: '2026-09-01T09:59:00.000Z',
+          preview_is_sender: true,
+        })],
+      })
+      .mockResolvedValueOnce({ rows: [] });
+    const { conversations } = await listConversations({});
+    expect(conversations[0].lastMessage.isSender).toBe(true);
+  });
+
   it('reports a conversation with no mirrored message as lastMessage: null, not as an empty string', async () => {
     vi.mocked(query)
       .mockResolvedValueOnce({ rows: [conversationRow()] })
@@ -221,6 +237,17 @@ describe('listMessages', () => {
     }).mockResolvedValueOnce({ rows: [] });
     const page = await listMessages(CONV_A, {});
     expect(page.messages[0]).toMatchObject({ id: 'm9', body: '', unsentAt: '2026-09-01T11:00:00.000Z' });
+  });
+
+  it('carries the mirrored direction through, and reads a missing column as inbound', async () => {
+    vi.mocked(query).mockResolvedValueOnce({
+      rows: [
+        { id: 'm2', conversation_id: CONV_A, sender_id: 'user-me', body: 'placeholder', sent_at: '2026-09-01T10:00:00.000Z', created_at: '2026-09-01T10:00:00.000Z', is_sender: true, ordering_ts: '2026-09-01T10:00:00.000Z' },
+        { id: 'm1', conversation_id: CONV_A, sender_id: 'user-1', body: 'placeholder', sent_at: '2026-09-01T09:00:00.000Z', created_at: '2026-09-01T09:00:00.000Z', ordering_ts: '2026-09-01T09:00:00.000Z' },
+      ],
+    }).mockResolvedValueOnce({ rows: [] });
+    const page = await listMessages(CONV_A, {});
+    expect(page.messages.map((m) => m.isSender)).toEqual([true, false]);
   });
 
   it('answers an empty page rather than an error — an empty thread is often correct', async () => {

@@ -1691,6 +1691,10 @@ CREATE TABLE IF NOT EXISTS beeper_messages (
   edited_at TIMESTAMPTZ,
   unsent_at TIMESTAMPTZ,
   sort_key TEXT NOT NULL DEFAULT '',
+  -- Mirrors the API's own Message.isSender. senderID cannot be compared
+  -- against the local user (accounts[].user.id differs from senderID on every
+  -- network), so this is the only reliable inbound/outbound signal.
+  is_sender BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );

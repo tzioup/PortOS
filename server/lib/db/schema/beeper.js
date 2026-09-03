@@ -61,6 +61,13 @@ export const beeperDdl = [
 
   // Keyed on Beeper's own message id (TEXT — bridges do not guarantee a UUID
   // shape). Full bodies persist machine-local, per the store ADR.
+  //
+  // `is_sender` mirrors the API's own `Message.isSender` and is the ONLY
+  // reliable way to tell an outbound message from an inbound one: `senderID`
+  // cannot be compared against the local user, because `accounts[].user.id`
+  // differs from `senderID` on every network (#2). Without the column a chat
+  // surface has to guess which side of the thread a message belongs on, and a
+  // guess is wrong on exactly the networks that matter most.
   `CREATE TABLE IF NOT EXISTS beeper_messages (
     id TEXT PRIMARY KEY,
     conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
@@ -70,9 +77,17 @@ export const beeperDdl = [
     edited_at TIMESTAMPTZ,
     unsent_at TIMESTAMPTZ,
     sort_key TEXT NOT NULL DEFAULT '',
+    is_sender BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`,
+  // Additive, for an install whose `beeper_messages` predates the column —
+  // `CREATE TABLE IF NOT EXISTS` is a no-op there, so the inline declaration
+  // above only reaches a FRESH install. Same shape as catalog.js's
+  // `chunk_index` / `parent_scrap_id`, and the reason the default is FALSE
+  // rather than NULL: an unbackfilled row renders as inbound, which is the
+  // right way round for a mirror that is mostly other people's messages.
+  `ALTER TABLE beeper_messages ADD COLUMN IF NOT EXISTS is_sender BOOLEAN NOT NULL DEFAULT FALSE`,
   `CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_sort ON beeper_messages (conversation_id, sort_key)`,
 
   // `observed_via` is required, not cosmetic: the Beeper API's participant
