@@ -157,6 +157,11 @@ describe('Settings routes — instance feature participation', () => {
     expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'gsd', enabled: true }));
     expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'openclaw', enabled: true }));
     expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'health', enabled: true }));
+    // #40 — iMessage and Signal join the comms group, defaulting to enabled
+    // with no settings write, exactly like an existing install saw before.
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'imessage', enabled: true, group: 'comms' }));
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'signal', enabled: true, group: 'comms' }));
+    expect(res.body.groups).toContainEqual(expect.objectContaining({ id: 'comms', enabled: true }));
   });
 
   it('lists an integration-backed feature as auto-enabled when its detector finds configuration', async () => {
@@ -263,6 +268,96 @@ describe('Settings routes — instance feature participation', () => {
 
     expect(res.status).toBe(400);
     expect(installEidoverse).not.toHaveBeenCalled();
+  });
+
+  it('clears a grouped feature override back to inherit with enabled: null', async () => {
+    store = { instanceFeatures: { facetime: { enabled: true } } };
+
+    const res = await request(buildApp())
+      .put('/api/settings/features/facetime')
+      .send({ enabled: null });
+
+    expect(res.status).toBe(200);
+    expect(store).toEqual({ instanceFeatures: {} });
+    // This suite doesn't mock voice/facetimeBridge.js, so only the storage and
+    // the no-longer-`explicit` source are pinned — the resolved boolean depends
+    // on the real (unmocked) detector's answer on the machine running the test.
+    const facetime = res.body.features.find((f) => f.id === 'facetime');
+    expect(facetime.source).not.toBe('explicit');
+  });
+
+  it('uses iMessage as a grouped feature with no override to prove the same clear-to-inherit path on a feature with no detector', async () => {
+    store = { instanceFeatures: { imessage: { enabled: false } } };
+
+    const res = await request(buildApp())
+      .put('/api/settings/features/imessage')
+      .send({ enabled: null });
+
+    expect(res.status).toBe(200);
+    expect(store).toEqual({ instanceFeatures: {} });
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'imessage', enabled: true, source: 'default' }));
+  });
+
+  it('toggles the comms feature group and reflects it on the group and member list', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings/features/groups/comms')
+      .send({ enabled: false });
+
+    expect(res.status).toBe(200);
+    expect(store).toEqual({ instanceFeatureGroups: { comms: { enabled: false } } });
+    expect(res.body.groups).toContainEqual(expect.objectContaining({ id: 'comms', enabled: false }));
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'imessage', enabled: false, source: 'group-off' }));
+  });
+
+  it('lets an explicit per-feature override outrank an off group', async () => {
+    store = { instanceFeatureGroups: { comms: { enabled: false } } };
+
+    const res = await request(buildApp())
+      .put('/api/settings/features/imessage')
+      .send({ enabled: true });
+
+    expect(res.status).toBe(200);
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'imessage', enabled: true, source: 'explicit' }));
+    // Signal has no override of its own, so it stays hidden by the off group.
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'signal', enabled: false, source: 'group-off' }));
+  });
+
+  it('rejects an unknown feature group id and a non-boolean group enabled value', async () => {
+    const unknown = await request(buildApp())
+      .put('/api/settings/features/groups/not-registered')
+      .send({ enabled: false });
+    const malformed = await request(buildApp())
+      .put('/api/settings/features/groups/comms')
+      .send({ enabled: 'false' });
+    // Unlike the per-feature route, a group has no inherit state of its own —
+    // null is rejected rather than treated as a third value.
+    const nullEnabled = await request(buildApp())
+      .put('/api/settings/features/groups/comms')
+      .send({ enabled: null });
+
+    expect(unknown.status).toBe(400);
+    expect(malformed.status).toBe(400);
+    expect(nullEnabled.status).toBe(400);
+    expect(unknown.body.code).toBe('VALIDATION_ERROR');
+    expect(malformed.body.code).toBe('VALIDATION_ERROR');
+    expect(nullEnabled.body.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('validates the instanceFeatureGroups slice on the generic settings PUT', async () => {
+    const ok = await request(buildApp())
+      .put('/api/settings')
+      .send({ instanceFeatureGroups: { comms: { enabled: false } } });
+    const malformed = await request(buildApp())
+      .put('/api/settings')
+      .send({ instanceFeatureGroups: { comms: { enabled: 'nope' } } });
+    const unknownGroup = await request(buildApp())
+      .put('/api/settings')
+      .send({ instanceFeatureGroups: { 'not-a-group': { enabled: false } } });
+
+    expect(ok.status).toBe(200);
+    expect(store.instanceFeatureGroups).toEqual({ comms: { enabled: false } });
+    expect(malformed.status).toBe(400);
+    expect(unknownGroup.status).toBe(400);
   });
 
   it('rejects unknown feature ids and malformed enabled values', async () => {
