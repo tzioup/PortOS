@@ -1551,6 +1551,22 @@
     },
     {
       "method": "GET",
+      "path": "/api/beeper/oauth/callback",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/oauth/start",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/api/beeper/status",
       "mountPath": "/api/beeper",
       "sources": [
@@ -1568,6 +1584,22 @@
     {
       "method": "POST",
       "path": "/api/beeper/sync",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/beeper/token",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/token",
       "mountPath": "/api/beeper",
       "sources": [
         "server/routes/beeper.js"
@@ -17464,8 +17496,8 @@
   ],
   "stats": {
     "mounts": 146,
-    "operations": 2163,
-    "declarations": 2171,
+    "operations": 2167,
+    "declarations": 2175,
     "sourceFiles": 229
   }
 }

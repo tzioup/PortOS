@@ -5,6 +5,8 @@
  *     attachment, plus the sync-cursor row) inserts and cascade-deletes cleanly
  *   - the `observed_via` CHECK constraint rejects an out-of-set value
  *   - `UNIQUE (account_id, source_chat_id)` holds on beeper_conversations
+ *   - `beeper_credentials` (#31) stores one row keyed on a fixed id, accepts a
+ *     NULL expiry (the no-expiry pasted token), and rejects an unknown `source`
  *
  * `*.db.test.js` → runs ONLY via `npm run test:db` against `portos_test`, never
  * the real `portos` DB (the db.js runner guard + the suite skip below enforce
@@ -57,6 +59,7 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
       'beeper_accounts',
       'beeper_attachments',
       'beeper_conversations',
+      'beeper_credentials',
       'beeper_messages',
       'beeper_participants',
       'beeper_sync_cursors',
@@ -121,6 +124,42 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
     expect(afterPart.rows[0].n).toBe(0);
     expect(afterAttach.rows[0].n).toBe(0);
     expect(afterCursor.rows[0].n).toBe(0);
+  });
+
+  // #31's vaulted credential. Ciphertext is opaque to the DB, so this covers
+  // only what the SCHEMA promises: one row per install (PRIMARY KEY on the
+  // fixed id, upsert-replaced), a nullable expiry meaning "never expires", and
+  // a provenance CHECK that refuses an unclassified credential.
+  it('holds exactly one beeper_credentials row, with a nullable expiry and a checked source', async () => {
+    const credentialId = `cred-${nonce}`;
+    await query(
+      `INSERT INTO beeper_credentials (id, token_enc, token_expires_at, scopes, source, client_id)
+       VALUES ($1, 'v1:iv:tag:ct', NULL, 'read write', 'pasted', '')`,
+      [credentialId],
+    );
+    await query(
+      `INSERT INTO beeper_credentials (id, token_enc, token_expires_at, scopes, source, client_id)
+       VALUES ($1, 'v1:iv2:tag2:ct2', NOW() + INTERVAL '1 day', 'read write', 'oauth', 'client-1')
+       ON CONFLICT (id) DO UPDATE SET
+         token_enc = EXCLUDED.token_enc,
+         token_expires_at = EXCLUDED.token_expires_at,
+         source = EXCLUDED.source,
+         client_id = EXCLUDED.client_id`,
+      [credentialId],
+    );
+    const { rows } = await query('SELECT * FROM beeper_credentials WHERE id = $1', [credentialId]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].source).toBe('oauth');
+    expect(rows[0].token_expires_at).not.toBeNull();
+
+    await expect(
+      query(
+        `INSERT INTO beeper_credentials (id, token_enc, source) VALUES ($1, 'v1:x:y:z', 'guessed')`,
+        [`${credentialId}-bad`],
+      ),
+    ).rejects.toThrow();
+
+    await query('DELETE FROM beeper_credentials WHERE id = $1', [credentialId]);
   });
 
   it('rejects a participant observed_via outside the participant-list/message-sender set', async () => {
