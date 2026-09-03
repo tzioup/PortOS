@@ -82,8 +82,10 @@ describe('beeper conversation mirror never federates (#27)', () => {
 
   it('gives no beeper table a sync cursor column', () => {
     // Sanity: if the filter ever matches nothing the assertion below is
-    // vacuous, so pin the table count we expect to be guarding.
-    expect(beeperCreateTableStatements).toHaveLength(6);
+    // vacuous, so pin the table count we expect to be guarding. Seven since
+    // #31 added the vaulted `beeper_credentials` row — which is exactly the
+    // kind of table that must never federate.
+    expect(beeperCreateTableStatements).toHaveLength(7);
     for (const stmt of beeperCreateTableStatements) {
       const table = stmt.match(/beeper_[a-z_]+/i)?.[0];
       for (const column of FEDERATION_COLUMNS) {

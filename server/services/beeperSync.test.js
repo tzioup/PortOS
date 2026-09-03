@@ -10,6 +10,10 @@ import {
 
 const dbCalls = [];
 const txCalls = [];
+// Same statements as `txCalls`, with their params — `txCalls` is asserted as an
+// ordered list of SQL strings all over this file, so the values ride alongside
+// rather than inside it.
+const txWrites = [];
 let storedCursorRows = [];
 let txFailPattern = null;
 
@@ -26,8 +30,9 @@ const queryMock = vi.fn(async (text, params) => {
 const withTransactionMock = vi.fn(async (fn) => {
   txCalls.push('BEGIN');
   const client = {
-    query: async (text) => {
+    query: async (text, params) => {
       txCalls.push(text.trim().split('\n')[0].trim());
+      txWrites.push({ text, params });
       if (txFailPattern && txFailPattern.test(text)) throw new Error('simulated write failure');
       return { rows: [] };
     },
@@ -111,6 +116,7 @@ const messageRequests = () => fetchedUrls.filter((url) => /\/messages$/.test(new
 beforeEach(() => {
   dbCalls.length = 0;
   txCalls.length = 0;
+  txWrites.length = 0;
   fetchedUrls.length = 0;
   storedCursorRows = [];
   txFailPattern = null;
@@ -397,8 +403,11 @@ describe('cursor transactionality', () => {
     // refetches exactly the same window.
     expect(txCalls.some((sql) => sql.includes('beeper_sync_cursors'))).toBe(false);
     expect(dbCalls.some(({ text }) => /UPDATE beeper_sync_cursors|INSERT INTO beeper_sync_cursors/.test(text))).toBe(false);
-    // One broken chat costs its account the pass, not the whole sweep.
-    expect(result).toMatchObject({ skipped: false, failedAccounts: 1, messages: 0 });
+    // One broken chat is isolated to itself: the account keeps its pass and the
+    // sweep still resolves, with the failure surfaced as `failedChats`.
+    expect(result).toMatchObject({
+      skipped: false, failedAccounts: 0, failedChats: 1, messages: 0,
+    });
   });
 
   it('rolls the rows back too when the cursor write itself throws', async () => {
@@ -428,6 +437,202 @@ describe('cursor transactionality', () => {
       idx: 0, mxcId: 'mxc://example.invalid/abc', mimeType: 'image/png',
       byteLength: 2048, fileName: 'photo.png', width: 800, height: 600,
     }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Truncated forward walk — the watermark must not outrun the fetch
+// ---------------------------------------------------------------------------
+
+// A chat further behind than MAX_MESSAGE_PAGES_PER_CHAT is the one case where
+// the cursor advances but the chat is NOT caught up. Committing its current
+// `lastActivity` as the watermark would make the two timestamps equal, so
+// `chatNeedsSweep` would return false, `sweepAccount` would treat that as
+// "watermark reached", and the un-fetched newest messages would never arrive
+// until unrelated activity moved the chat again — the mirror showing a stale
+// last message indefinitely. The watermark therefore stays put (null into the
+// COALESCE) while the cursor moves, so the next pass resumes mid-backlog.
+describe('a chat with more new messages than the page cap', () => {
+  const CHAT_ID = 'chat-backlog';
+  const CHAT_ACTIVITY = '2026-09-02T10:00:00.000Z';
+  const STORED_WATERMARK = '2026-09-01T00:00:00.000Z';
+
+  const chatPage = () => ({
+    items: [{
+      id: CHAT_ID,
+      accountID: 'acct-a',
+      network: 'Example Net',
+      title: 'Example Backlog Chat',
+      type: 'single',
+      lastActivity: CHAT_ACTIVITY,
+      participants: { hasMore: false, total: 1, items: [{ id: 'user-1', fullName: 'Alice Example' }] },
+    }],
+    hasMore: false,
+  });
+
+  // Every message page reports `hasMore: true` and a fresh `newestCursor`, so
+  // the forward walk can only ever stop by running out of page budget.
+  function installEndlessBacklogFetch() {
+    let messagePageIndex = 0;
+    const fetchMock = vi.fn(async (url) => {
+      fetchedUrls.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname === '/v1/accounts') return jsonResponse(ACCOUNTS);
+      if (parsed.pathname === '/v1/bridges') return jsonResponse(BRIDGES);
+      if (parsed.pathname === '/v1/chats') return jsonResponse(chatPage());
+      if (/\/messages$/.test(parsed.pathname)) {
+        messagePageIndex++;
+        return jsonResponse({
+          items: [{
+            id: `msg-${messagePageIndex}`,
+            senderID: 'user-1',
+            text: 'Example message',
+            timestamp: '2026-09-02T09:00:00.000Z',
+            sortKey: `${messagePageIndex}`,
+          }],
+          hasMore: true,
+          newestCursor: `cursor-${messagePageIndex}`,
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+  }
+
+  const committedCursorRow = () => txWrites
+    .filter(({ text }) => text.includes('INSERT INTO beeper_sync_cursors'))
+    .map(({ params }) => ({ cursor: params[2], lastActivity: params[3] }))
+    .at(-1);
+
+  it('leaves last_activity unchanged on the first pass and resumes from the advanced cursor on the second', async () => {
+    storedCursorRows = [{ chat_id: CHAT_ID, cursor: 'cursor-0', last_activity: STORED_WATERMARK }];
+    installEndlessBacklogFetch();
+
+    const first = await runBeeperSweep({ reason: 'manual' });
+
+    // Pass one stopped at the cap, so it walked exactly MAX_MESSAGE_PAGES_PER_CHAT
+    // message pages and wrote a row per page.
+    expect(messageRequests()).toHaveLength(10);
+    expect(first).toMatchObject({ skipped: false, chats: 1, messages: 10 });
+    // The cursor moved; the watermark did NOT. A null here is what makes the
+    // existing `COALESCE(EXCLUDED.last_activity, beeper_sync_cursors.last_activity)`
+    // keep the stored value instead of jumping to the chat's current activity.
+    const committed = committedCursorRow();
+    expect(committed.cursor).toBe('cursor-10');
+    expect(committed.lastActivity).toBeNull();
+    expect(committed.lastActivity).not.toBe(CHAT_ACTIVITY);
+
+    // Now play the database's part: the cursor took EXCLUDED, the watermark
+    // kept its old value through the COALESCE.
+    fetchedUrls.length = 0;
+    txWrites.length = 0;
+    storedCursorRows = [{ chat_id: CHAT_ID, cursor: committed.cursor, last_activity: STORED_WATERMARK }];
+
+    const second = await runBeeperSweep({ reason: 'manual' });
+
+    // The chat is still newer than its watermark, so pass two sweeps it again
+    // rather than deciding the account walk had reached the watermark.
+    expect(second).toMatchObject({ skipped: false, chats: 1, messages: 10 });
+    const firstMessageRequest = new URL(messageRequests()[0]);
+    expect(firstMessageRequest.searchParams.get('cursor')).toBe('cursor-10');
+    expect(firstMessageRequest.searchParams.get('direction')).toBe('after');
+  });
+
+  it('does commit the watermark once the walk actually reaches the end', async () => {
+    storedCursorRows = [{ chat_id: CHAT_ID, cursor: 'cursor-0', last_activity: STORED_WATERMARK }];
+    installFetch({
+      chatPages: [chatPage()],
+      messagePages: {
+        [CHAT_ID]: {
+          items: [{ id: 'msg-1', senderID: 'user-1', text: 'Example message', timestamp: '2026-09-02T09:00:00.000Z' }],
+          hasMore: false,
+          newestCursor: 'cursor-final',
+        },
+      },
+    });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    expect(committedCursorRow()).toEqual({ cursor: 'cursor-final', lastActivity: CHAT_ACTIVITY });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure isolation
+// ---------------------------------------------------------------------------
+
+describe('failure isolation', () => {
+  const chatRow = (id, lastActivity) => ({
+    id,
+    accountID: 'acct-a',
+    network: 'Example Net',
+    title: `Example Chat ${id}`,
+    type: 'single',
+    lastActivity,
+    participants: { hasMore: false, total: 0, items: [] },
+  });
+
+  it('keeps walking an account after one chat throws, so a broken chat cannot starve the ones below it', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      fetchedUrls.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname === '/v1/accounts') return jsonResponse(ACCOUNTS);
+      if (parsed.pathname === '/v1/bridges') return jsonResponse(BRIDGES);
+      if (parsed.pathname === '/v1/chats') {
+        return jsonResponse({
+          items: [chatRow('chat-broken', '2026-09-02T10:00:00.000Z'), chatRow('chat-ok', '2026-09-02T09:00:00.000Z')],
+          hasMore: false,
+        });
+      }
+      const match = parsed.pathname.match(/^\/v1\/chats\/([^/]+)\/messages$/);
+      if (match && decodeURIComponent(match[1]) === 'chat-broken') {
+        return { ok: false, status: 502, text: async () => '{"error":"bridge down"}' };
+      }
+      if (match) {
+        return jsonResponse({
+          items: [{ id: 'msg-ok', senderID: 'user-9', text: 'Example message', timestamp: '2026-09-02T09:00:00.000Z' }],
+          hasMore: false,
+          newestCursor: 'cursor-ok',
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await runBeeperSweep({ reason: 'manual' });
+
+    expect(result).toMatchObject({
+      skipped: false, failedAccounts: 0, failedChats: 1, chats: 1, messages: 1,
+    });
+    expect(messageRequests().some((url) => url.includes('chat-ok'))).toBe(true);
+  });
+
+  it('throws when every account fails, so the scheduler records a failed run instead of a green one', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      fetchedUrls.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname === '/v1/accounts') return jsonResponse(ACCOUNTS);
+      if (parsed.pathname === '/v1/bridges') return jsonResponse(BRIDGES);
+      if (parsed.pathname === '/v1/chats') return { ok: false, status: 502, text: async () => '{"error":"down"}' };
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runBeeperSweep({ reason: 'scheduler' })).rejects.toMatchObject({ code: 'SWEEP_FAILED' });
+  });
+
+  it('still resolves when there are no accounts at all', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      fetchedUrls.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname === '/v1/accounts') return jsonResponse([]);
+      if (parsed.pathname === '/v1/bridges') return jsonResponse({ items: [] });
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runBeeperSweep({ reason: 'manual' }))
+      .resolves.toMatchObject({ skipped: false, accounts: 0, failedAccounts: 0 });
   });
 });
 

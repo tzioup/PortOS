@@ -59,7 +59,9 @@ export const DEFAULT_INTERVAL_MINUTES = 5;
 const MAX_CHAT_PAGES_PER_ACCOUNT = 20;
 // Catching up on new messages walks forward from the stored cursor, so this is
 // a burst ceiling, not a history depth. A chat that is further behind than this
-// keeps its (advanced) cursor and finishes catching up on the next sweep.
+// keeps its (advanced) cursor AND its old watermark — see `fetchNewMessages`'s
+// `truncated` flag — so it stays eligible and finishes catching up on the next
+// sweep instead of being skipped as caught-up.
 const MAX_MESSAGE_PAGES_PER_CHAT = 10;
 
 const LOG_PREFIX = '🫧 Beeper sweep';
@@ -107,7 +109,12 @@ export async function getBeeperSyncConfig() {
 export async function isBeeperIngestionArmed() {
   const featureEnabled = await isInstanceFeatureEnabled('beeper').catch(() => false);
   if (!featureEnabled) return false;
-  const { token } = await resolveBeeperConfig().catch(() => ({ token: null }));
+  // A vault that cannot be read (corrupt row, rotated key) must not masquerade
+  // as "no token": say so once, then decline to arm.
+  const { token } = await resolveBeeperConfig().catch((err) => {
+    console.error(`❌ Beeper credential unreadable, ingestion not armed: ${err.message}`);
+    return { token: null };
+  });
   return Boolean(token);
 }
 
@@ -269,7 +276,8 @@ function assertPagedShape(page, what) {
 }
 
 /**
- * New messages for one chat, plus the opaque cursor to store.
+ * New messages for one chat, plus the opaque cursor to store and whether the
+ * forward walk stopped short of the end.
  *
  * With a stored cursor this walks FORWARD (`direction: 'after'`), which the
  * SDK's own auto-pagination never does — it only ever reads `oldestCursor` —
@@ -280,6 +288,14 @@ function assertPagedShape(page, what) {
  * profile (history depth varies wildly per network, #3), and silently pulling
  * every message of every chat the first time a user enables the toggle is not
  * a sweep.
+ *
+ * `truncated` is true only when the walk ran out of PAGE BUDGET with the
+ * server still reporting `hasMore` — i.e. messages exist that this pass did
+ * not fetch. The caller MUST NOT advance the chat's watermark in that case
+ * (see `sweepChat`): the cursor moved forward but the newest messages are
+ * still missing, and a watermark equal to the chat's current activity would
+ * make `chatNeedsSweep` skip the chat forever. The first-page-only anchor walk
+ * is never truncated — it is not trying to reach the end.
  */
 async function fetchNewMessages(chatId, storedCursor, clientOptions) {
   const direction = storedCursor ? 'after' : 'before';
@@ -287,6 +303,7 @@ async function fetchNewMessages(chatId, storedCursor, clientOptions) {
   const messages = [];
   let cursor = storedCursor || undefined;
   let anchorCursor = null;
+  let truncated = false;
 
   for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
     // eslint-disable-next-line no-await-in-loop -- cursor pagination is inherently sequential
@@ -298,9 +315,10 @@ async function fetchNewMessages(chatId, storedCursor, clientOptions) {
     const nextCursor = direction === 'after' ? page.newestCursor : page.oldestCursor;
     if (!nextCursor || nextCursor === cursor) break;
     cursor = nextCursor;
+    if (direction === 'after' && pageIndex === maxPages - 1) truncated = true;
   }
 
-  return { messages, cursor: anchorCursor };
+  return { messages, cursor: anchorCursor, truncated };
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +453,7 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
   const conversationId = await upsertConversation(normalized);
   if (!conversationId) return { messages: 0 };
 
-  const { messages, cursor } = await fetchNewMessages(
+  const { messages, cursor, truncated } = await fetchNewMessages(
     normalized.sourceChatId, stored?.cursor, clientOptions,
   );
 
@@ -487,17 +505,35 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
     sourceChatId: normalized.sourceChatId,
     rows,
     cursor: cursor || stored?.cursor || null,
-    lastActivity: normalized.lastActivity,
+    // A truncated forward walk advanced the cursor but did NOT reach the
+    // chat's newest message, so the watermark must stay where it was: a null
+    // here hits `COALESCE(EXCLUDED.last_activity, beeper_sync_cursors.…)` in
+    // `commitMessages` and keeps the stored value. `chatNeedsSweep` then still
+    // sees the chat as newer than its watermark next pass and resumes from the
+    // advanced cursor. Committing `normalized.lastActivity` instead would make
+    // the two timestamps equal, end the account walk at this chat, and strand
+    // the un-fetched backlog until unrelated new activity arrived.
+    lastActivity: truncated ? null : normalized.lastActivity,
   });
 
   return { messages: rows.length };
 }
 
+/**
+ * One account's newest-first walk. A chat that throws is logged and counted,
+ * and the walk CONTINUES — the same blast-radius bound `executeSweep` gives
+ * each account. Without it, one chat that fails persistently (a bridge that
+ * 502s on its messages, say) sitting at the top of the newest-first list would
+ * abort this account's whole walk on every single pass and starve every chat
+ * below it indefinitely. Its cursor and watermark are untouched by the failed
+ * transaction, so it is retried next pass either way.
+ */
 async function sweepAccount(account, clientOptions, observedAt) {
   const cursors = await readAccountCursors(account.accountId);
   let cursor;
   let chatsSwept = 0;
   let messagesWritten = 0;
+  let failedChats = 0;
   let reachedWatermark = false;
 
   for (let pageIndex = 0; pageIndex < MAX_CHAT_PAGES_PER_ACCOUNT && !reachedWatermark; pageIndex++) {
@@ -516,7 +552,12 @@ async function sweepAccount(account, clientOptions, observedAt) {
         break;
       }
       // eslint-disable-next-line no-await-in-loop -- one chat at a time; each is its own transaction
-      const result = await sweepChat({ chat, stored, clientOptions, observedAt });
+      const result = await sweepChat({ chat, stored, clientOptions, observedAt }).catch((err) => {
+        failedChats++;
+        console.error(`❌ ${LOG_PREFIX}: chat ${String(chat?.id ?? 'unknown')} failed: ${err.message}`);
+        return null;
+      });
+      if (!result) continue;
       chatsSwept++;
       messagesWritten += result.messages;
     }
@@ -526,7 +567,7 @@ async function sweepAccount(account, clientOptions, observedAt) {
     cursor = page.oldestCursor;
   }
 
-  return { chatsSwept, messagesWritten };
+  return { chatsSwept, messagesWritten, failedChats };
 }
 
 // A per-run re-entrancy guard: one sweep at a time, process-wide. The timer,
@@ -552,6 +593,7 @@ async function executeSweep(reason) {
   let chats = 0;
   let messages = 0;
   let failedAccounts = 0;
+  let failedChats = 0;
   for (const account of accounts) {
     // eslint-disable-next-line no-await-in-loop -- accounts are swept in order; each owns its own cursors
     const result = await sweepAccount(account, clientOptions, observedAt).catch((err) => {
@@ -562,12 +604,31 @@ async function executeSweep(reason) {
     if (!result) continue;
     chats += result.chatsSwept;
     messages += result.messagesWritten;
+    failedChats += result.failedChats;
+  }
+
+  // Every account failing is a FAILED sweep, not a successful one that wrote
+  // nothing. Resolving here would have `eventScheduler` record a green run and
+  // `POST /api/beeper/sync` answer 200 while nothing was ingested at all —
+  // with only the `failedAccounts` count in the payload to say otherwise.
+  // Partial failure still resolves: the accounts that worked kept their pass.
+  if (accounts.length > 0 && failedAccounts === accounts.length) {
+    throw new BeeperApiError(`Beeper sweep failed for all ${accounts.length} accounts`, {
+      status: 502, code: 'SWEEP_FAILED', retryable: true,
+    });
   }
 
   const durationMs = Date.now() - startedAt;
   console.log(`${LOG_PREFIX} (${reason}): ${accounts.length} accounts, ${chats} chats, ${messages} messages in ${durationMs}ms`);
   return {
-    skipped: false, reason, accounts: accounts.length, chats, messages, failedAccounts, durationMs,
+    skipped: false,
+    reason,
+    accounts: accounts.length,
+    chats,
+    messages,
+    failedAccounts,
+    failedChats,
+    durationMs,
   };
 }
 
@@ -575,14 +636,19 @@ async function executeSweep(reason) {
  * Run one watermark-bounded sweep. Exported for the scheduler, the manual
  * run-now route, and #33's three socket triggers.
  *
- * Throws only when the sweep cannot start at all (no token, roster
- * unreachable); a single account failing is isolated and reported as
- * `failedAccounts` so one broken bridge cannot cost the others their pass.
+ * Throws when the sweep cannot start at all (no token, roster unreachable) or
+ * when EVERY account failed — that is a failed run, not a successful one that
+ * wrote nothing. Partial failure resolves: a single account is isolated and
+ * reported as `failedAccounts` so one broken bridge cannot cost the others
+ * their pass, and a single failing chat as `failedChats` so it cannot starve
+ * the chats below it in its account's walk.
  */
 export async function runBeeperSweep({ reason = 'scheduler' } = {}) {
   if (inFlightSweep) {
     console.log(`${LOG_PREFIX} (${reason}): a sweep is already running — skipping`);
-    return { skipped: true, reason, accounts: 0, chats: 0, messages: 0, failedAccounts: 0, durationMs: 0 };
+    return {
+      skipped: true, reason, accounts: 0, chats: 0, messages: 0, failedAccounts: 0, failedChats: 0, durationMs: 0,
+    };
   }
   const run = executeSweep(reason);
   inFlightSweep = run;
