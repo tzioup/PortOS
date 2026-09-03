@@ -26,8 +26,9 @@ const clampBudget = (value) => Math.max(0.1, Math.min(1000, toFiniteNumber(value
 // ingestion + connection config this slice's Comms → Beeper card edits (#30).
 // Deliberately never reads or writes `token`/`tokenExpiresAt`: the server
 // strips the token from every GET /api/settings response and rejects a
-// `beeper` PUT that includes one — durable, encrypted token storage is fork
-// issue #31's scope (OAuth connect + vault).
+// `beeper` PUT that includes one. The credential lives encrypted in Postgres
+// and is written only through the dedicated connect routes (#31) — the Beeper
+// card's Connect / paste / Disconnect actions, never this settings save.
 //
 // `save()` always PUTs the complete four-field object, never a diff — same
 // convention as `useSyncSourceSettings` for iMessage/Signal/Spotify/YouTube —

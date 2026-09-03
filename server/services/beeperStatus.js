@@ -1,9 +1,9 @@
 /**
  * Beeper status resolution for the Comms → Beeper status card (#30, fork
  * issue #1). Combines three things the card renders from:
- *   - whether a token is configured (never the token itself — #31 owns the
- *     vault and the connect flow; this module never reads or writes
- *     `settings.beeper.token` beyond checking its presence);
+ *   - whether a token is configured (never the token itself — the vaulted
+ *     credential store #31 landed answers presence/expiry/provenance without
+ *     ever decrypting, and this module has no path to the value);
  *   - a liveness probe against the local Beeper Desktop API;
  *   - the read-only account roster mirrored by fork issue #27's schema, so
  *     the card renders something even with Beeper Desktop closed (accounts
@@ -16,30 +16,32 @@
  */
 import { query } from '../lib/db.js';
 import { probeBeeperInfo, getInfo, assertValidInfoResponse, BeeperApiError, DEFAULT_BASE_URL } from './beeperClient.js';
+import { resolveBeeperTokenMeta } from './beeperCredentials.js';
 import { getSettings } from './settings.js';
 
 const TOKEN_EXPIRY_WARNING_DAYS = 7;
 
-function hasConfiguredToken(settings) {
-  const token = settings?.beeper?.token;
-  return typeof token === 'string' && token.trim().length > 0;
-}
-
-// `tokenExpiresAt` rides beside the token in whatever store #31 lands it in
-// (per the fork issue #11 decision: "token expiry stored beside the token").
-// This module only ever READS it to warn — it never writes it, so it stays
-// correct however #31 ultimately persists the pair.
-function tokenExpiryInfo(settings) {
-  const raw = settings?.beeper?.tokenExpiresAt;
-  if (typeof raw !== 'string' || !raw) {
-    return { tokenExpiresAt: null, tokenExpiresInDays: null, tokenExpiringSoon: false };
+// Expiry rides beside the token in the vault (#11 decision 10 — "stored beside
+// the token and displayed without a network call"). There is no refresh grant,
+// so `tokenExpired` is an actionable RE-CONNECT state, deliberately distinct
+// from `tokenExpiringSoon`; a pasted no-expiry token (`tokenExpiresAt: null`)
+// triggers neither, which is exactly why that path exists.
+function tokenExpiryInfo(tokenExpiresAt) {
+  if (typeof tokenExpiresAt !== 'string' || !tokenExpiresAt) {
+    return { tokenExpiresAt: null, tokenExpiresInDays: null, tokenExpiringSoon: false, tokenExpired: false };
   }
-  const expires = new Date(raw);
+  const expires = new Date(tokenExpiresAt);
   if (Number.isNaN(expires.getTime())) {
-    return { tokenExpiresAt: null, tokenExpiresInDays: null, tokenExpiringSoon: false };
+    return { tokenExpiresAt: null, tokenExpiresInDays: null, tokenExpiringSoon: false, tokenExpired: false };
   }
-  const days = Math.ceil((expires.getTime() - Date.now()) / (24 * 60 * 60 * 1000));
-  return { tokenExpiresAt: raw, tokenExpiresInDays: days, tokenExpiringSoon: days <= TOKEN_EXPIRY_WARNING_DAYS };
+  const remainingMs = expires.getTime() - Date.now();
+  const days = Math.ceil(remainingMs / (24 * 60 * 60 * 1000));
+  return {
+    tokenExpiresAt,
+    tokenExpiresInDays: days,
+    tokenExpiringSoon: days <= TOKEN_EXPIRY_WARNING_DAYS,
+    tokenExpired: remainingMs <= 0,
+  };
 }
 
 /**
@@ -74,18 +76,25 @@ export async function listBeeperAccounts() {
  */
 export async function getBeeperStatus() {
   const settings = await getSettings();
-  const tokenConfigured = hasConfiguredToken(settings);
-  const expiry = tokenExpiryInfo(settings);
+  // Deliberately NOT wrapped in a catch: an unreadable credential store throws
+  // (#11 decision 8), and the card renders its "could not read status" branch
+  // rather than telling a connected install to connect again.
+  const credential = await resolveBeeperTokenMeta();
+  const expiry = tokenExpiryInfo(credential.tokenExpiresAt);
 
   const [probe, accounts] = await Promise.all([
-    tokenConfigured
+    credential.tokenConfigured
       ? probeBeeperInfo({ baseUrl: settings?.beeper?.baseUrl })
       : Promise.resolve(null),
     listBeeperAccounts().catch(() => []),
   ]);
 
   return {
-    tokenConfigured,
+    tokenConfigured: credential.tokenConfigured,
+    // 'oauth' | 'pasted' | 'legacy-settings' | null — provenance, never the
+    // value. This is the ONLY credential detail a client payload ever carries
+    // besides presence and expiry.
+    tokenSource: credential.tokenSource,
     baseUrl: settings?.beeper?.baseUrl || DEFAULT_BASE_URL,
     reachable: probe ? probe.reachable : null,
     lastProbeError: probe?.error ?? null,
@@ -105,7 +114,8 @@ export async function getBeeperStatus() {
  */
 export async function checkBeeperConnection() {
   const settings = await getSettings();
-  if (!hasConfiguredToken(settings)) {
+  const { tokenConfigured } = await resolveBeeperTokenMeta();
+  if (!tokenConfigured) {
     throw new BeeperApiError('Beeper access token is not configured', {
       status: 401, code: 'NOT_CONFIGURED', retryable: false,
     });

@@ -71,9 +71,11 @@ const redactExternalTokens = (settings) => {
     next.civitai = rest;
   }
   // Beeper access token (#30/#31) — write-only, same posture as
-  // imageGen.hfToken / civitai.apiKey above: beeperClient.js reads it
-  // server-side only (settings.beeper.token), and it must never be echoed
-  // back to the client on a settings GET.
+  // imageGen.hfToken / civitai.apiKey above. Since #31 the live credential is
+  // AES-256-GCM in `beeper_credentials`, not here; this strip covers the LEGACY
+  // plaintext field, which `beeperCredentials.resolveBeeperToken` still reads as
+  // a fallback for an install that hand-edited one. Nothing writes it, and it
+  // must never be echoed back to the client on a settings GET.
   if (isPlainObject(next.beeper)) {
     const { token, ...rest } = next.beeper;
     next.beeper = rest;
@@ -120,8 +122,9 @@ const preserveExternallyOwnedKeys = (next, current) => {
   // field, so a valid `beeper` PUT through this route can never carry either
   // — without this, the generic top-level shallow merge (`{ ...current,
   // ...settingsPatch }`) would REPLACE `current.beeper` wholesale and silently
-  // wipe out a token #31's vault-backed write path (or a hand-edited
-  // settings.json) already stored there.
+  // wipe out a legacy hand-edited token that `resolveBeeperToken` still falls
+  // back to (#31's own credential lives in Postgres, out of reach of this
+  // route entirely).
   carryOver('beeper', 'token');
   carryOver('beeper', 'tokenExpiresAt');
   return next;
@@ -318,7 +321,8 @@ router.put('/', asyncHandler(async (req, res) => {
   // reach disk. `beeperSettingsSchema` is `.strict()` and deliberately has no
   // `token`/`tokenExpiresAt` field, so a client attempting to smuggle a token
   // through this generic route 400s instead of it silently reaching disk —
-  // durable, encrypted token storage is fork issue #31's scope.
+  // the credential's own write path is POST/DELETE /api/beeper/token (#31),
+  // which stores it AES-256-GCM encrypted in Postgres.
   if (req.body?.beeper !== undefined) {
     validateRequest(beeperSettingsSchema.partial(), req.body.beeper);
   }
