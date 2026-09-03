@@ -13,6 +13,7 @@ import {
   searchMessagesPage,
   getInfo,
   probeBeeperInfo,
+  assertValidInfoResponse,
   getAccounts,
   getBridges,
   joinAccountsWithBridges,
@@ -201,6 +202,47 @@ describe('beeperClient', () => {
       expect(chats.map((c) => c.id)).toEqual(['chat1', 'chat2']);
       expect(fetchMock).toHaveBeenCalledTimes(2);
       expect(fetchMock.mock.calls[1][0]).toContain('cursor=cur1');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // probeBeeperInfo body-shape check (#30 — a wave-one reviewer requirement:
+  // a 200 with an unexpected body must not be reported as a healthy probe)
+  // -------------------------------------------------------------------------
+
+  describe('probeBeeperInfo / assertValidInfoResponse', () => {
+    it('reports reachable:true for a well-shaped /v1/info body', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+        jsonResponse(200, { app: { name: 'Beeper', version: '4.3.73' }, server: { status: 'running' } }),
+      ));
+      const result = await probeBeeperInfo({ baseUrl: DEFAULT_BASE_URL });
+      expect(result).toEqual({ reachable: true, info: expect.objectContaining({ app: expect.any(Object) }), error: null });
+    });
+
+    it('reports reachable:false — not true — for a 200 whose body is not the documented /v1/info shape', async () => {
+      // A misconfigured settings.beeper.baseUrl (#30 makes it user-editable)
+      // could point at some other local HTTP service that happens to answer
+      // 200 with an unrelated JSON body. The transport succeeded but this is
+      // not Beeper, so it must never read as a healthy probe.
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(200, { ok: true })));
+      const result = await probeBeeperInfo({ baseUrl: DEFAULT_BASE_URL });
+      expect(result.reachable).toBe(false);
+      expect(result.info).toBeNull();
+      expect(result.error).toMatch(/unexpected \/v1\/info response shape/);
+    });
+
+    it('reports reachable:false for a 200 with a blank/non-JSON body', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(nonJsonResponse(200, '')));
+      const result = await probeBeeperInfo({ baseUrl: DEFAULT_BASE_URL });
+      expect(result.reachable).toBe(false);
+      expect(result.error).toMatch(/unexpected \/v1\/info response shape/);
+    });
+
+    it('assertValidInfoResponse throws a typed MALFORMED_RESPONSE BeeperApiError directly', () => {
+      expect(() => assertValidInfoResponse({ app: { name: '' }, server: { status: 'running' } }))
+        .toThrow(expect.objectContaining({ code: 'MALFORMED_RESPONSE', status: 502 }));
+      expect(() => assertValidInfoResponse(null)).toThrow(BeeperApiError);
+      expect(() => assertValidInfoResponse({ app: { name: 'Beeper' }, server: { status: 'running' } })).not.toThrow();
     });
   });
 

@@ -23,6 +23,7 @@
     "/api/autofix",
     "/api/avatar",
     "/api/backup",
+    "/api/beeper",
     "/api/brain",
     "/api/brain/import",
     "/api/browser",
@@ -1546,6 +1547,22 @@
       "mountPath": "/api/backup",
       "sources": [
         "server/routes/backup.js"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/beeper/status",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/status/check",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
       ]
     },
     {
@@ -17422,9 +17439,9 @@
     }
   ],
   "stats": {
-    "mounts": 145,
-    "operations": 2158,
-    "declarations": 2166,
-    "sourceFiles": 228
+    "mounts": 146,
+    "operations": 2160,
+    "declarations": 2168,
+    "sourceFiles": 229
   }
 }

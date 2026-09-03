@@ -20,7 +20,7 @@ import { asyncHandler } from '../lib/errorHandler.js';
 import { isPlainObject } from '../lib/objects.js';
 import { agentContextSettingsSchema } from '../lib/agentContextValidation.js';
 import { EFFORT_LEVELS } from '../lib/providerModels.js';
-import { backupConfigSchema, sharingSettingsPatchSchema, featureProviderConfigSchema, autofixerSettingsSchema, codeReviewSettingsSchema, locationSettingsSchema, settingsEmbeddingsSchema, localLlmSettingsSchema, imessageConfigSchema, signalConfigSchema, spotifyConfigSchema, youtubeConfigSchema, apiAccessSettingsSchema, instanceFeatureSettingsSchema, instanceFeatureIdSchema, instanceFeatureUpdateSchema, instanceFeatureGroupSettingsSchema, instanceFeatureGroupIdSchema, instanceFeatureGroupUpdateSchema, loraTrainingConfigSchema, pipelineEditorialChecksSettingsSchema, creativeDirectorSettingsSchema, musicSettingsSchema, federationSettingsSchema, privacySettingsSchema, seriesAutopilotSettingsSchema, layeredIntelligenceSettingsSchema, imageGenGrokSettingsSchema, imageGenAgySettingsSchema, renderDefaultsSettingsSchema, videoGenSettingsSchema, subscriptionCostsMapSchema, usageApiBilledInstanceIdsSchema, validateRequest } from '../lib/validation.js';
+import { backupConfigSchema, sharingSettingsPatchSchema, featureProviderConfigSchema, autofixerSettingsSchema, codeReviewSettingsSchema, locationSettingsSchema, settingsEmbeddingsSchema, localLlmSettingsSchema, imessageConfigSchema, signalConfigSchema, beeperSettingsSchema, spotifyConfigSchema, youtubeConfigSchema, apiAccessSettingsSchema, instanceFeatureSettingsSchema, instanceFeatureIdSchema, instanceFeatureUpdateSchema, instanceFeatureGroupSettingsSchema, instanceFeatureGroupIdSchema, instanceFeatureGroupUpdateSchema, loraTrainingConfigSchema, pipelineEditorialChecksSettingsSchema, creativeDirectorSettingsSchema, musicSettingsSchema, federationSettingsSchema, privacySettingsSchema, seriesAutopilotSettingsSchema, layeredIntelligenceSettingsSchema, imageGenGrokSettingsSchema, imageGenAgySettingsSchema, renderDefaultsSettingsSchema, videoGenSettingsSchema, subscriptionCostsMapSchema, usageApiBilledInstanceIdsSchema, validateRequest } from '../lib/validation.js';
 
 const router = Router();
 
@@ -70,6 +70,14 @@ const redactExternalTokens = (settings) => {
     const { apiKey, ...rest } = next.civitai;
     next.civitai = rest;
   }
+  // Beeper access token (#30/#31) — write-only, same posture as
+  // imageGen.hfToken / civitai.apiKey above: beeperClient.js reads it
+  // server-side only (settings.beeper.token), and it must never be echoed
+  // back to the client on a settings GET.
+  if (isPlainObject(next.beeper)) {
+    const { token, ...rest } = next.beeper;
+    next.beeper = rest;
+  }
   return next;
 };
 
@@ -108,6 +116,14 @@ const preserveExternallyOwnedKeys = (next, current) => {
   carryOver('imageGen', 'hfToken');
   carryOver('civitai', 'apiKey');
   carryOver('videoGen', 'acceptedModelTerms', { alwaysStored: true });
+  // beeperSettingsSchema is `.strict()` with no `token`/`tokenExpiresAt`
+  // field, so a valid `beeper` PUT through this route can never carry either
+  // — without this, the generic top-level shallow merge (`{ ...current,
+  // ...settingsPatch }`) would REPLACE `current.beeper` wholesale and silently
+  // wipe out a token #31's vault-backed write path (or a hand-edited
+  // settings.json) already stored there.
+  carryOver('beeper', 'token');
+  carryOver('beeper', 'tokenExpiresAt');
   return next;
 };
 
@@ -296,6 +312,15 @@ router.put('/', asyncHandler(async (req, res) => {
   // malformed enabled/interval can't reach disk and break the sync scheduler.
   if (req.body?.signal !== undefined) {
     validateRequest(signalConfigSchema.partial(), req.body.signal);
+  }
+  // Beeper Desktop bridge ingestion + connection config (#30) — validate the
+  // slice when present so a malformed enabled/interval/baseUrl/budget can't
+  // reach disk. `beeperSettingsSchema` is `.strict()` and deliberately has no
+  // `token`/`tokenExpiresAt` field, so a client attempting to smuggle a token
+  // through this generic route 400s instead of it silently reaching disk —
+  // durable, encrypted token storage is fork issue #31's scope.
+  if (req.body?.beeper !== undefined) {
+    validateRequest(beeperSettingsSchema.partial(), req.body.beeper);
   }
   // Spotify ingestion config (#2152) — validate the slice when present so a
   // malformed enabled/interval can't reach disk and break the sync scheduler.

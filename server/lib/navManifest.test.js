@@ -202,11 +202,12 @@ describe('nav contract — instance-feature gating', () => {
   // the `comms` group. Nav gating stays per-entry (unlike Health's whole-section
   // SECTION_FEATURE gate) because Comms holds ungated siblings — Inbox, Drafts,
   // Contacts, X, Stacker News.
-  it('gates the iMessage and Signal pages on their own instance features', () => {
+  it('gates the iMessage, Signal and Beeper pages on their own instance features', () => {
     const byId = Object.fromEntries(NAV_COMMANDS.map((c) => [c.id, c.feature]));
     expect(byId['nav.messages.imessage']).toBe('imessage');
     expect(byId['nav.messages.imessage-settings']).toBe('imessage');
     expect(byId['nav.messages.signal']).toBe('signal');
+    expect(byId['nav.messages.beeper']).toBe('beeper');
     // Contacts spans both networks (and every other message source) so it stays
     // ungated even though it lives in the same Comms section.
     expect(byId['nav.messages.contacts']).toBeUndefined();

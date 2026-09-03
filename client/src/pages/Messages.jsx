@@ -1,5 +1,5 @@
 import { useNavigate, useParams } from 'react-router';
-import { Mail, RefreshCw, Settings, MessageSquare, Users } from 'lucide-react';
+import { Mail, RefreshCw, Settings, MessageSquare, MessageCircle, Users } from 'lucide-react';
 import { useState, useEffect, useCallback } from 'react';
 import * as api from '../services/api';
 import PageSkeleton from '../components/ui/PageSkeleton';
@@ -13,6 +13,7 @@ import DraftsTab from '../components/messages/DraftsTab';
 import SyncTab from '../components/messages/SyncTab';
 import IMessageTab from '../components/messages/IMessageTab';
 import SignalTab from '../components/messages/SignalTab';
+import BeeperTab from '../components/messages/BeeperTab';
 import ContactsTab from '../components/messages/ContactsTab';
 
 // Exported for the nav-manifest tab-coverage guard (server/lib/navManifest.test.js).
@@ -23,6 +24,7 @@ export const TABS = [
   { id: 'drafts', label: 'Drafts', icon: Mail, needsAccounts: true },
   { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true },
   { id: 'signal', label: 'Signal', icon: MessageSquare },
+  { id: 'beeper', label: 'Beeper', icon: MessageCircle },
   { id: 'contacts', label: 'Contacts', icon: Users },
   { id: 'sync', label: 'Sync', icon: RefreshCw, needsAccounts: true },
   { id: 'config', label: 'Config', icon: Settings, needsAccounts: true },
@@ -94,6 +96,8 @@ export default function Messages() {
         return <IMessageTab />;
       case 'signal':
         return <SignalTab />;
+      case 'beeper':
+        return <BeeperTab />;
       case 'contacts':
         return <ContactsTab />;
       default:

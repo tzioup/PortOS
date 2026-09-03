@@ -89,6 +89,7 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `apiX.js` | X account diagnostics, public post metrics, review-gated drafts, and manual browser handoffs. |
 | `apiContacts.js` | macOS Contacts sync + identity resolve + Tribe enrich (#2415). |
 | `apiSignal.js` | Signal Desktop ingestion status / setup-check / sync. |
+| `apiBeeper.js` | Beeper Desktop bridge status card + live connectivity check (#30). |
 | `apiSpotify.js` | Spotify OAuth + listening-history and playlist-library sync. |
 | `apiYoutube.js` | YouTube watch-history scrape, playlist/video library sync, and setup check. |
 | `apiPersonalities.js` | Agent personality profiles. |
