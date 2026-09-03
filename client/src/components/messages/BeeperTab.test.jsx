@@ -82,6 +82,20 @@ describe('BeeperTab — status card states', () => {
     expect(await screen.findByText('Checking Beeper Desktop…')).toBeInTheDocument();
     expect(screen.queryByText('Beeper Desktop unreachable')).toBeNull();
   });
+
+  // The absent-vs-empty rule (root AGENTS.md line 233): a status fetch that
+  // itself fails must never collapse into "no token configured" — an
+  // install with a working token whose status request errors would
+  // otherwise be silently told to connect.
+  it('never renders "Connect Beeper" when the status fetch itself rejects', async () => {
+    api.getBeeperStatus.mockRejectedValue(new Error('network down'));
+    render(<BeeperTab />);
+
+    expect(await screen.findByText('Could not read Beeper status')).toBeInTheDocument();
+    expect(screen.getByText('network down')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Connect Beeper' })).toBeNull();
+    expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
+  });
 });
 
 describe('BeeperTab — settings', () => {

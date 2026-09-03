@@ -3,6 +3,7 @@ import { Save, Loader2, MessageCircle, ShieldCheck, ShieldAlert, RefreshCw, Cloc
 import toast from '../ui/Toast';
 import BrailleSpinner from '../BrailleSpinner';
 import { useBeeperSettings } from '../../hooks/useBeeperSettings';
+import useMounted from '../../hooks/useMounted';
 import { getBeeperStatus, checkBeeperConnection } from '../../services/api';
 
 // Comms → Messages → Beeper (#30, fork issue #1). Instance feature gate + nav
@@ -16,12 +17,23 @@ export default function BeeperTab() {
     loading: settingsLoading, form, setForm, saving, dirty, save,
   } = useBeeperSettings();
   const [status, setStatus] = useState(null);
+  // Distinguishes "the GET failed" from "the GET succeeded and says no token
+  // is configured" — the absent-vs-empty rule (root AGENTS.md). Collapsing
+  // both into `status = null` would tell a working-token install to
+  // "Connect Beeper" just because the status request itself errored.
+  const [statusError, setStatusError] = useState(null);
   const [statusLoading, setStatusLoading] = useState(true);
+  const [statusRetrying, setStatusRetrying] = useState(false);
   const [checking, setChecking] = useState(false);
+  const mountedRef = useMounted();
 
   const loadStatus = useCallback(async () => {
-    const result = await getBeeperStatus({ silent: true }).catch(() => null);
+    const [result, error] = await getBeeperStatus({ silent: true })
+      .then((value) => [value, null])
+      .catch((err) => [null, err]);
+    if (!mountedRef.current) return;
     setStatus(result);
+    setStatusError(error ? (error?.message || 'Could not read Beeper status') : null);
     setStatusLoading(false);
   }, []);
 
@@ -29,9 +41,15 @@ export default function BeeperTab() {
     loadStatus();
   }, [loadStatus]);
 
+  const retryStatus = async () => {
+    setStatusRetrying(true);
+    await loadStatus();
+    if (mountedRef.current) setStatusRetrying(false);
+  };
+
   const handleSave = async () => {
     if (!await save()) return;
-    toast.success('Saved — the ingestion scheduler applies on next server restart');
+    toast.success('Saved');
     loadStatus();
   };
 
@@ -138,12 +156,34 @@ export default function BeeperTab() {
       ) : (
         <BeeperStatusCard
           status={status}
+          error={statusError}
           checking={checking}
           onCheck={handleCheck}
           checkDisabled={dirty || saving}
+          onRetryStatus={retryStatus}
+          retryingStatus={statusRetrying}
         />
       )}
     </div>
+  );
+}
+
+// Shown whenever a stored token is inside the expiry warning window,
+// regardless of whether Beeper Desktop is currently reachable — an expired
+// token is exactly as actionable on an unreachable install as on a
+// connected one, so this renders in both the `reachable === false` and
+// `reachable === true` branches below.
+function TokenExpiryNotice({ status }) {
+  if (!status?.tokenExpiringSoon) return null;
+  const days = status.tokenExpiresInDays;
+  const label = Number.isFinite(days) && days <= 0
+    ? 'Token has expired — reconnect to keep syncing.'
+    : `Token expires in ${days} day(s) — reconnect soon.`;
+  return (
+    <p className="text-xs text-port-warning flex items-center gap-1.5">
+      <Clock size={12} />
+      {label}
+    </p>
   );
 }
 
@@ -151,8 +191,33 @@ export default function BeeperTab() {
 // carried into #30's Acceptance criteria. `reachable` is read with strict
 // equality throughout (`=== false` / `=== true` / `=== null`) — never
 // truthiness — so the absent-vs-empty sentinel (`null` = not yet probed)
-// can never fall through to the "offline" branch.
-function BeeperStatusCard({ status, checking, onCheck, checkDisabled }) {
+// can never fall through to the "offline" branch. A failed status fetch is
+// handled by the `error` branch immediately below, before any of this ever
+// runs, so a broken GET can never collapse into "no token configured".
+function BeeperStatusCard({
+  status, error, checking, onCheck, checkDisabled, onRetryStatus, retryingStatus,
+}) {
+  if (error) {
+    return (
+      <div className="bg-port-card border border-port-error/40 rounded-lg p-4 sm:p-6">
+        <div className="flex items-center gap-2 mb-2">
+          <ShieldAlert size={16} className="text-port-error" />
+          <h3 className="text-sm font-semibold text-white">Could not read Beeper status</h3>
+        </div>
+        <p className="text-sm text-port-error">{error}</p>
+        <button
+          type="button"
+          onClick={onRetryStatus}
+          disabled={retryingStatus}
+          className="mt-3 inline-flex items-center justify-center gap-2 min-h-[40px] px-4 py-2 bg-port-bg border border-port-border hover:border-port-accent text-gray-200 rounded-lg text-sm transition-colors disabled:opacity-40"
+        >
+          {retryingStatus ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+          Retry
+        </button>
+      </div>
+    );
+  }
+
   if (!status?.tokenConfigured) {
     return (
       <div className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6">
@@ -185,6 +250,7 @@ function BeeperStatusCard({ status, checking, onCheck, checkDisabled }) {
         </div>
         <p className="text-sm text-port-error">{status.lastProbeError || 'Could not reach Beeper Desktop.'}</p>
         <p className="text-xs text-gray-500 mt-1">Checked against {status.baseUrl}.</p>
+        <TokenExpiryNotice status={status} />
         <button
           type="button"
           onClick={onCheck}
@@ -208,12 +274,7 @@ function BeeperStatusCard({ status, checking, onCheck, checkDisabled }) {
           <h3 className="text-sm font-semibold text-white">Beeper Desktop connected</h3>
           {status.appVersion && <span className="text-xs text-gray-500">v{status.appVersion}</span>}
         </div>
-        {status.tokenExpiringSoon && (
-          <p className="text-xs text-port-warning flex items-center gap-1.5">
-            <Clock size={12} />
-            Token expires in {Math.max(status.tokenExpiresInDays, 0)} day(s) — reconnect soon.
-          </p>
-        )}
+        <TokenExpiryNotice status={status} />
         {accounts.length === 0 ? (
           <p className="text-sm text-gray-500">No accounts synced yet.</p>
         ) : (
@@ -241,8 +302,8 @@ function BeeperStatusCard({ status, checking, onCheck, checkDisabled }) {
   }
 
   // reachable === null: a token is configured but the probe never ran (a
-  // status fetch that failed before this render, or a transient gap on
-  // load). Neutral, never rendered as offline.
+  // transient gap between saving settings and the status refresh landing).
+  // Neutral, never rendered as offline.
   return (
     <div className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6">
       <div className="flex items-center gap-2">

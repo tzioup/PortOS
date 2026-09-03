@@ -10,8 +10,17 @@ const DEFAULTS = {
   attachmentBudgetGb: 5,
 };
 
-const clampInterval = (value) => Math.max(1, Math.min(1440, Math.floor(Number(value) || DEFAULTS.intervalMinutes)));
-const clampBudget = (value) => Math.max(0.1, Math.min(1000, Number(value) || DEFAULTS.attachmentBudgetGb));
+// `value === ''` (a cleared field) falls back to the default; any other
+// numeric-looking input — including a typed `0` — is clamped to the schema
+// bounds instead. `Number(x) || fallback` would treat a typed 0 as falsy
+// and silently substitute the default, masking the user's actual input.
+const toFiniteNumber = (value, fallback) => {
+  if (value === '' || value === null || value === undefined) return fallback;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+};
+const clampInterval = (value) => Math.max(1, Math.min(1440, Math.floor(toFiniteNumber(value, DEFAULTS.intervalMinutes))));
+const clampBudget = (value) => Math.max(0.1, Math.min(1000, toFiniteNumber(value, DEFAULTS.attachmentBudgetGb)));
 
 // settings.beeper.{enabled,intervalMinutes,baseUrl,attachmentBudgetGb} — the
 // ingestion + connection config this slice's Comms → Beeper card edits (#30).
