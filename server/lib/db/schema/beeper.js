@@ -10,10 +10,11 @@
 //
 // Deletions from the source are tombstones, not removals: a message the
 // source unsends keeps its row, body, and attachments and gains `unsent_at`
-// (never `deleted_at` — that name collides with the federation guard's
-// column list even though this table is never federated, and an archive
-// that quietly forgets a caption while keeping its photo is not
-// trustworthy). See the ADR landing alongside #7 for the full argument.
+// — the column is named for what the source actually reports, and an archive
+// that quietly forgets a caption while keeping its photo is not trustworthy.
+// Because the inbound tombstone is `unsent_at`, the federation guard keys on
+// `sync_sequence` alone and needs no soft-delete exemption. See the ADR
+// landing alongside #7 for the full argument.
 export const beeperDdl = [
   // The account roster the settings card renders from with Beeper closed
   // (#11 left the store to this issue). `loginID` is never stored — it is
