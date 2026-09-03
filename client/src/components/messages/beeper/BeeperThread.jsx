@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowLeft, Archive, BellOff, ChevronDown, Loader2, Paperclip, Plus, Send, Trash2, UserPlus, Users,
+  ArrowLeft, Archive, BellOff, ChevronDown, Loader2, Paperclip, Plus, RefreshCw, Send, Trash2, UserPlus, Users,
 } from 'lucide-react';
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
 
@@ -144,6 +144,7 @@ export default function BeeperThread({
   onLinkParticipant,
   onCreateAndLinkParticipant,
   onBack,
+  onRetry,
   onArchive,
   onLowPriority,
   writePending,
@@ -166,6 +167,51 @@ export default function BeeperThread({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
   }, [conversation?.id, ordered.length]);
+
+  // Order matters, and this is the whole reason these three are separate
+  // branches: `loading` and `error` are both reachable with NO conversation —
+  // a cold deep link whose detail fetch fails (503, 500, offline) leaves
+  // `conversation` null and `error` set. Answering that with "Pick a
+  // conversation" renders a named URL as if nothing were selected, with no
+  // error and no way back: every fetch behind this passes `{ silent: true }`,
+  // so there is no toast either. "Pick a conversation" is only correct when
+  // nothing is selected, nothing is in flight, and nothing went wrong.
+  if (!conversation && error) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
+        <p className="text-sm text-gray-300">Could not open this conversation</p>
+        <p className="max-w-sm text-[11px] text-port-error">{error}</p>
+        <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              disabled={loading}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-port-border px-3 text-xs text-gray-200 transition-colors hover:border-port-accent disabled:opacity-40"
+            >
+              {loading ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+              Retry
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onBack}
+            className="min-h-[36px] rounded-lg px-3 text-xs text-gray-400 transition-colors hover:text-gray-200"
+          >
+            Back to conversations
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (!conversation && loading) {
+    return (
+      <div className="flex h-full items-center justify-center p-6 text-center text-xs text-gray-500">
+        Loading conversation…
+      </div>
+    );
+  }
 
   if (!conversation) {
     return (
@@ -366,7 +412,7 @@ export default function BeeperThread({
           type="button"
           disabled
           aria-label="Send"
-          title="Sending from PortOS is not wired yet — the durable outbox lands in a follow-up slice. Your draft is kept."
+          title="Sending from PortOS is not wired yet — the durable outbox is issue #36. Your draft is kept."
           className="shrink-0 rounded-full bg-port-accent/40 p-2 text-port-bg disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Send size={15} />

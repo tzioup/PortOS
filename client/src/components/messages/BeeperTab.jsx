@@ -35,19 +35,10 @@ export default function BeeperTab() {
   // (#33) and carry no rows, so the only information the surface needs from one
   // is "something changed, re-read the mirror".
   const [invalidationSeq, setInvalidationSeq] = useState(0);
-  const [seededRealtime, setSeededRealtime] = useState(null);
 
   const mountedRef = useMounted();
   const onInvalidate = useCallback(() => setInvalidationSeq((seq) => seq + 1), []);
   const { realtime, seedRealtime } = useBeeperRealtime({ onInvalidate });
-
-  // The status GET carries the same liveness snapshot the socket reports, so
-  // the dot is correct before the first frame lands rather than blank until
-  // something changes. `seedRealtime` no-ops once the socket has spoken.
-  const handleRealtimeSeed = useCallback((state) => {
-    seedRealtime(state);
-    setSeededRealtime(state);
-  }, [seedRealtime]);
 
   // Seeded from the page, not from the settings drawer: `beeper:subscribe`
   // does not push the current transport state, and the drawer's own status
@@ -55,9 +46,9 @@ export default function BeeperTab() {
   // stay blank on a healthy install until something changed.
   const seedStatus = useCallback(() => {
     getBeeperStatus({ silent: true })
-      .then((status) => { if (mountedRef.current && status?.realtime) handleRealtimeSeed(status.realtime); })
+      .then((status) => { if (mountedRef.current && status?.realtime) seedRealtime(status.realtime); })
       .catch(() => {});
-  }, [handleRealtimeSeed, mountedRef]);
+  }, [seedRealtime, mountedRef]);
 
   useEffect(() => { seedStatus(); }, [seedStatus]);
 
@@ -92,7 +83,7 @@ export default function BeeperTab() {
     <div className="h-full min-h-0">
       <BeeperChatSurface
         conversationId={chatKey || null}
-        realtime={realtime || seededRealtime}
+        realtime={realtime}
         invalidationSeq={invalidationSeq}
         onOpenSettings={() => setSettingsParam('1')}
       />
@@ -103,7 +94,7 @@ export default function BeeperTab() {
         title="Beeper Settings"
         size="md"
       >
-        <BeeperSettingsPanel realtime={realtime} onRealtimeSeed={handleRealtimeSeed} />
+        <BeeperSettingsPanel realtime={realtime} onRealtimeSeed={seedRealtime} />
       </Drawer>
     </div>
   );

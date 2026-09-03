@@ -2,7 +2,7 @@ import {
   afterEach, beforeEach, describe, expect, it, vi,
 } from 'vitest';
 import {
-  act, cleanup, render, screen, waitFor, within,
+  act, cleanup, fireEvent, render, screen, waitFor, within,
 } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
 
@@ -138,6 +138,28 @@ describe('deep linking', () => {
     api.getBeeperConversation.mockRejectedValue(Object.assign(new Error('Conversation not found'), { status: 404 }));
     renderTab(`/messages/beeper/${CONV_B}`);
     expect(await screen.findByText('Conversation not found')).toBeInTheDocument();
+  });
+
+  // The regression the reviewer found: an `apiCore` failure with no `.status`
+  // (503 unreachable, 500, offline) leaves the detail null and the error set,
+  // and the thread's "Pick a conversation" early return used to sit AHEAD of
+  // the error branch — so a URL that names a conversation rendered as if
+  // nothing were selected. Every fetch behind it is `{ silent: true }`, so
+  // there was no toast either: the failure was completely invisible.
+  it('renders the thread error with a Retry when a deep link fails, never "Pick a conversation"', async () => {
+    api.getBeeperConversation.mockRejectedValue(new Error('Beeper request failed: connection refused'));
+    api.getBeeperMessages.mockRejectedValue(new Error('Beeper request failed: connection refused'));
+    renderTab(`/messages/beeper/${CONV_B}`);
+
+    expect(await screen.findByText('Could not open this conversation')).toBeInTheDocument();
+    expect(screen.getByText('Beeper request failed: connection refused')).toBeInTheDocument();
+    expect(screen.queryByText('Pick a conversation')).toBeNull();
+    expect(screen.queryByText('Conversation not found')).toBeNull();
+
+    // Retry re-reads the mirror rather than leaving the pane stuck.
+    const calls = api.getBeeperConversation.mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: /Retry/ }));
+    await waitFor(() => expect(api.getBeeperConversation.mock.calls.length).toBeGreaterThan(calls));
   });
 
   it('scopes the list from the URL, so a shared link reopens the same scope', async () => {
@@ -419,11 +441,19 @@ describe('the OAuth outcome carried back on the URL', () => {
 
 // A guard, not a formality: this file is the one place a real conversation,
 // handle or contact name could slip into a PUBLIC repo while developing against
-// a live install (root AGENTS.md, Sensitive Data & Privacy). It scans the
-// fixtures this suite actually feeds the surface.
+// a live install (root AGENTS.md, Sensitive Data & Privacy).
+//
+// It scans this file's own SOURCE rather than a hand-listed set of fixtures.
+// Most fixtures here are written inline inside a single test — participants,
+// messages, Tribe people, network rosters — so a guard that enumerates the two
+// shared ones stops guarding the moment somebody pastes a third.
 describe('fixture hygiene', () => {
-  it('carries no value that could have come from a running instance', () => {
-    const corpus = JSON.stringify([NINE_NETWORKS, conversation(), CONV_A, CONV_B]);
+  it('carries no value that could have come from a running instance', async () => {
+    const { readFileSync } = await import('node:fs');
+    const source = readFileSync(new URL(import.meta.url), 'utf8');
+    // Everything above this block. The patterns below necessarily spell out
+    // the shapes they forbid, so scanning them would fail on the guard itself.
+    const corpus = source.slice(0, source.indexOf("describe('fixture hygiene'"));
     // No e164-looking number outside the reserved 555-01xx block, no email
     // outside example.com, no bare hostname, no absolute home path.
     expect(corpus).not.toMatch(/\+(?!1555010)\d{7,}/);

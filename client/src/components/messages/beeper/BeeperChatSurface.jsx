@@ -66,7 +66,7 @@ const DRAFTS_STORAGE_KEY = 'portos-beeper-drafts';
 const INVALIDATION_DEBOUNCE_MS = 350;
 
 /** The filter set one scope means. Absent keys are absent FILTERS, not `false`. */
-export function filtersForScope(scope, unreadOnly) {
+function filtersForScope(scope, unreadOnly) {
   const base = unreadOnly ? { unreadOnly: true } : {};
   if (scope === 'archive') return { ...base, archived: true };
   if (scope === 'low') return { ...base, lowPriority: true };
@@ -498,8 +498,11 @@ export default function BeeperChatSurface({
     if (!mountedRef.current) return;
     setWritePending(false);
     if (!updated) return;
+    // The open thread's own row is set from the server's answer; the LIST is
+    // refetched rather than merged, because archiving changes which scope a
+    // conversation belongs to — a local merge would leave it sitting in a
+    // scope it no longer matches until the next load anyway.
     setConversation(updated);
-    setConversations((prev) => prev.map((row) => (row.id === updated.id ? { ...row, ...updated } : row)));
     loadList();
   }, [conversationId, loadList, mountedRef]);
 
@@ -560,7 +563,10 @@ export default function BeeperChatSurface({
         onOpenSettings={onOpenSettings}
       />
 
-      <div className={`flex min-h-0 w-full flex-col border-port-border sm:w-[280px] sm:shrink-0 sm:border-r ${conversationId ? 'hidden md:flex' : 'flex'}`}>
+      {/* The thread pane only appears at `md`, so the list is full width below
+          it: a fixed 280px column in the 640–767px band put a narrow strip
+          beside dead space. */}
+      <div className={`flex min-h-0 w-full flex-col border-port-border md:w-[280px] md:shrink-0 md:border-r ${conversationId ? 'hidden md:flex' : 'flex'}`}>
         {/* Liveness renders on exactly two surfaces (#12 decision 4): this
             Moltworld-shape dot, and the settings card for an actionable fault.
             There is no global banner, and the dot lives at the head of the
@@ -679,6 +685,7 @@ export default function BeeperChatSurface({
             onLinkParticipant={linkParticipant}
             onCreateAndLinkParticipant={createAndLinkParticipant}
             onBack={clearSelection}
+            onRetry={conversationId ? () => loadThread(conversationId) : null}
             writePending={writePending}
             onArchive={(value) => applyFlag(api.setBeeperConversationArchived, value, 'archive')}
             onLowPriority={(value) => applyFlag(api.setBeeperConversationLowPriority, value, 'update')}
