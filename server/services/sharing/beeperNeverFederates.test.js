@@ -1,5 +1,5 @@
 /**
- * Guard: Beeper conversation-mirror records must NEVER federate (#27).
+ * Guard: Beeper conversation-mirror records must NEVER federate (#27, #28).
  *
  * The mirror holds full message bodies and attachment metadata pulled from
  * every connected network — exactly the shape of data the peer-sync PULL path
@@ -13,21 +13,39 @@
  * purpose: they match the string `beeper` broadly across each federation
  * surface, so a future `beeperConversation` or `beeperMessage` kind trips the
  * guard no matter what it is called.
+ *
+ * Every filter is paired with a floor on the list it filters. A federation
+ * surface that collapsed to `[]` (a renamed export, a lazily-populated
+ * registry read too early) would satisfy a bare `.filter(...).toEqual([])`
+ * while guarding nothing, so each list must also still be recognizably
+ * populated. Floors sit well under today's counts: they catch a collapse, not
+ * ordinary growth or pruning of unrelated kinds.
  */
 
 import { describe, it, expect } from 'vitest';
 import { PEER_SUBSCRIBABLE_KINDS } from './peerSyncShared.js';
 import { PORTOS_SCHEMA_VERSIONS, NON_RECORD_SCHEMA_CATEGORIES } from '../../lib/schemaVersions.js';
 import { beeperDdl } from '../../lib/db/schema/beeper.js';
+import { mediaLibraryDirs } from './peerMediaLibrarySync.js';
 
 const mentionsBeeper = (value) => /beeper/i.test(String(value));
 
 // Columns that only exist to support cross-instance sync. A beeper table that
 // grows one is either federating already or is being prepared to — both are
-// the thing this design forbids. `deleted_at` is included even though the
-// store uses `unsent_at` for its tombstone, precisely because that rename
-// was made to keep this list collision-free.
-const FEDERATION_COLUMNS = ['sync_sequence', 'deleted_at'];
+// the thing this design forbids. `sync_sequence` is the whole list: the Beeper
+// schema uses `unsent_at` for the inbound source tombstone specifically so no
+// exemption is needed here, and re-adding `deleted_at` would only make the
+// guard fire on a future plain soft-delete column with no federation intent.
+const FEDERATION_COLUMNS = ['sync_sequence'];
+
+/**
+ * A media-library walk entry that would carry a beeper directory to a peer.
+ * The kind is matched broadly (a `beeperAttachments` kind trips it); the path
+ * is anchored on a whole `beeper` segment so a checkout, worktree, or data
+ * root that merely contains the word cannot false-positive.
+ */
+const namesBeeperMedia = ({ kind, dir }) => mentionsBeeper(kind)
+  || /(^|[/\\])beeper([/\\]|$)/i.test(String(dir));
 
 /** The `CREATE TABLE beeper_*` statements, each a complete balanced string. */
 const beeperCreateTableStatements = beeperDdl.filter(
@@ -36,10 +54,13 @@ const beeperCreateTableStatements = beeperDdl.filter(
 
 describe('beeper conversation mirror never federates (#27)', () => {
   it('exposes no beeper kind to peer-sync subscriptions', () => {
+    expect(PEER_SUBSCRIBABLE_KINDS.length).toBeGreaterThan(10);
     expect(PEER_SUBSCRIBABLE_KINDS.filter(mentionsBeeper)).toEqual([]);
   });
 
   it('declares no beeper wire-schema category', () => {
+    expect(Object.keys(PORTOS_SCHEMA_VERSIONS).length).toBeGreaterThan(15);
+    expect([...NON_RECORD_SCHEMA_CATEGORIES].length).toBeGreaterThan(1);
     expect(Object.keys(PORTOS_SCHEMA_VERSIONS).filter(mentionsBeeper)).toEqual([]);
     expect([...NON_RECORD_SCHEMA_CATEGORIES].filter(mentionsBeeper)).toEqual([]);
   });
@@ -49,10 +70,11 @@ describe('beeper conversation mirror never federates (#27)', () => {
   // why that cost is paid here rather than at module load).
   it('declares no beeper dataSync snapshot category', async () => {
     const { getSupportedCategories } = await import('../dataSync.js');
+    expect(getSupportedCategories().length).toBeGreaterThan(5);
     expect(getSupportedCategories().filter(mentionsBeeper)).toEqual([]);
   }, 30000);
 
-  it('gives no beeper table a sync cursor or tombstone column', () => {
+  it('gives no beeper table a sync cursor column', () => {
     // Sanity: if the filter ever matches nothing the assertion below is
     // vacuous, so pin the table count we expect to be guarding.
     expect(beeperCreateTableStatements).toHaveLength(6);
@@ -64,6 +86,19 @@ describe('beeper conversation mirror never federates (#27)', () => {
     }
   });
 
+  // The media-library manifest is the OTHER way `data/` bytes reach a peer: it
+  // walks whole directories rather than record kinds, so no schema-version or
+  // subscription guard above covers it. `mediaLibraryDirs()` is the list
+  // `buildMediaLibraryManifest` walks, hence the list that decides what
+  // crosses — asserting on it (not the exclude-pattern name map beside it,
+  // which federates nothing) is what makes this guard real.
+  it('carries no beeper directory into the media-library federation walk', () => {
+    const dirs = mediaLibraryDirs();
+    // Non-vacuity pin: image, video, audio, music.
+    expect(dirs).toHaveLength(4);
+    expect(dirs.filter(namesBeeperMedia)).toEqual([]);
+  });
+
   // Bypass probe — proves the assertions above actually fire.
   it('the guard predicates reject a planted violation', () => {
     expect(['universe', 'beeperConversation'].filter(mentionsBeeper)).toEqual(['beeperConversation']);
@@ -71,5 +106,9 @@ describe('beeper conversation mirror never federates (#27)', () => {
       ['CREATE TABLE IF NOT EXISTS beeper_conversations (id UUID, sync_sequence BIGINT)']
         .filter((s) => FEDERATION_COLUMNS.some((c) => s.includes(c))),
     ).toHaveLength(1);
+    expect(
+      [{ kind: 'image', dir: '/data/images' }, { kind: 'beeper', dir: '/data/beeper' }]
+        .filter(namesBeeperMedia),
+    ).toEqual([{ kind: 'beeper', dir: '/data/beeper' }]);
   });
 });
