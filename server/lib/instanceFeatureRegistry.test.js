@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { APP_FEATURE_IDS, INSTANCE_FEATURES, INSTANCE_FEATURE_IDS, countConfiguredInstances } from './instanceFeatureRegistry.js';
+import {
+  APP_FEATURE_IDS,
+  INSTANCE_FEATURES,
+  INSTANCE_FEATURE_IDS,
+  INSTANCE_FEATURE_GROUPS,
+  INSTANCE_FEATURE_GROUP_IDS,
+  countConfiguredInstances,
+} from './instanceFeatureRegistry.js';
 
 describe('instance feature registry', () => {
   it('declares an id, label, description and default for every feature', () => {
@@ -24,6 +31,47 @@ describe('instance feature registry', () => {
       label: 'Health tracking',
       defaultEnabled: true,
     });
+  });
+});
+
+describe('instance feature groups (#40)', () => {
+  it('declares an id, label and description for every group, with unique ids', () => {
+    for (const group of INSTANCE_FEATURE_GROUPS) {
+      expect(group.id).toBeTruthy();
+      expect(group.label).toBeTruthy();
+      expect(group.description).toBeTruthy();
+    }
+    expect(INSTANCE_FEATURE_GROUP_IDS).toEqual(INSTANCE_FEATURE_GROUPS.map((g) => g.id));
+    expect(new Set(INSTANCE_FEATURE_GROUP_IDS).size).toBe(INSTANCE_FEATURE_GROUP_IDS.length);
+  });
+
+  it('keeps every feature `group` reference pointed at a declared group', () => {
+    const declared = new Set(INSTANCE_FEATURE_GROUP_IDS);
+    for (const feature of INSTANCE_FEATURES) {
+      if (feature.group === undefined) continue;
+      expect(declared.has(feature.group), `feature "${feature.id}" names unregistered group "${feature.group}"`).toBe(true);
+    }
+  });
+
+  it('still lists every feature in INSTANCE_FEATURE_IDS regardless of grouping', () => {
+    expect(INSTANCE_FEATURE_IDS).toContain('facetime');
+    expect(INSTANCE_FEATURE_IDS).toContain('imessage');
+    expect(INSTANCE_FEATURE_IDS).toContain('signal');
+  });
+
+  it('buckets the proof-of-concept comms group as FaceTime Audio, iMessage and Signal', () => {
+    expect(INSTANCE_FEATURE_GROUP_IDS).toContain('comms');
+    const members = INSTANCE_FEATURES.filter((feature) => feature.group === 'comms').map((feature) => feature.id);
+    expect(members.sort()).toEqual(['facetime', 'imessage', 'signal']);
+  });
+
+  it('defaults iMessage and Signal to enabled with no detector, like the existing manual toggles', () => {
+    for (const id of ['imessage', 'signal']) {
+      expect(INSTANCE_FEATURES.find((feature) => feature.id === id)).toMatchObject({
+        defaultEnabled: true,
+        group: 'comms',
+      });
+    }
   });
 });
 

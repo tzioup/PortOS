@@ -138,12 +138,16 @@ const RAW_NAV_COMMANDS = [
 
   { id: 'nav.messages.inbox', path: '/messages/inbox', label: 'Inbox', section: 'Comms', aliases: ['messages', 'comms', 'comms-inbox'], keywords: ['comms', 'email', 'inbox'] },
   { id: 'nav.messages.drafts', path: '/messages/drafts', label: 'Drafts', section: 'Comms', aliases: ['drafts', 'comms-drafts'], keywords: ['comms'] },
-  { id: 'nav.messages.imessage', path: '/messages/imessage', label: 'iMessage', section: 'Comms', previousPaths: ['/imessage'], aliases: ['imessage', 'i-message', 'apple-messages', 'comms-imessage'], keywords: ['comms', 'imessage', 'sms', 'text messages', 'chat.db', 'blocklist', 'spam'] },
-  { id: 'nav.messages.signal', path: '/messages/signal', label: 'Signal', section: 'Comms', previousPaths: ['/settings/signal'], aliases: ['signal', 'signal-desktop', 'comms-signal', 'signal-settings'], keywords: ['comms', 'signal', 'signal desktop', 'messages', 'sqlcipher', 'chat', 'tribe', 'timeline', 'encrypted', 'keychain'] },
+  // Comms feature group (#40): iMessage and Signal join the existing FaceTime
+  // Audio toggle under the `comms` group in instanceFeatureRegistry.js. The
+  // `<Route>` itself keeps resolving with the feature off, so bookmarks, direct
+  // links, and voice `ui_navigate` still land — only ⌘K/sidebar visibility gates.
+  { id: 'nav.messages.imessage', path: '/messages/imessage', label: 'iMessage', section: 'Comms', feature: 'imessage', previousPaths: ['/imessage'], aliases: ['imessage', 'i-message', 'apple-messages', 'comms-imessage'], keywords: ['comms', 'imessage', 'sms', 'text messages', 'chat.db', 'blocklist', 'spam'] },
+  { id: 'nav.messages.signal', path: '/messages/signal', label: 'Signal', section: 'Comms', feature: 'signal', previousPaths: ['/settings/signal'], aliases: ['signal', 'signal-desktop', 'comms-signal', 'signal-settings'], keywords: ['comms', 'signal', 'signal desktop', 'messages', 'sqlcipher', 'chat', 'tribe', 'timeline', 'encrypted', 'keychain'] },
   { id: 'nav.messages.contacts', path: '/messages/contacts', label: 'Contacts', section: 'Comms', previousPaths: ['/settings/contacts'], aliases: ['contacts', 'address-book', 'comms-contacts', 'settings-contacts'], keywords: ['comms', 'contacts', 'address book', 'phone', 'email', 'tribe', 'imessage', 'names', 'resolve'] },
   // Ingestion config is a drawer over the iMessage manager (?settings=1), not a
   // Settings page — the settings-* aliases stay so "open iMessage settings" still lands.
-  { id: 'nav.messages.imessage-settings', path: '/messages/imessage?settings=1', label: 'iMessage Settings', section: 'Comms', aliases: ['settings-imessage', 'imessage-settings', 'imessage-sync'], keywords: ['imessage', 'sync', 'chat.db', 'sms', 'texts', 'tribe', 'timeline', 'full disk access'] },
+  { id: 'nav.messages.imessage-settings', path: '/messages/imessage?settings=1', label: 'iMessage Settings', section: 'Comms', feature: 'imessage', aliases: ['settings-imessage', 'imessage-settings', 'imessage-sync'], keywords: ['imessage', 'sync', 'chat.db', 'sms', 'texts', 'tribe', 'timeline', 'full disk access'] },
   { id: 'nav.messages.config', path: '/messages/config', label: 'Config', section: 'Comms', aliases: ['messages-config', 'comms-config'], keywords: ['comms'] },
   { id: 'nav.messages.sync', path: '/messages/sync', label: 'Sync', section: 'Comms', aliases: ['messages-sync', 'comms-sync'], keywords: ['comms'] },
   { id: 'nav.stacker-news', path: '/stacker-news', label: 'Stacker News', section: 'Comms', aliases: ['stacker-news', 'stacker', 'sn'], keywords: ['comms', 'community', 'territory', 'moderation', 'stewardship'] },

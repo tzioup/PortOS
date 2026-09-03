@@ -198,6 +198,21 @@ describe('nav contract — instance-feature gating', () => {
     expect(command).toMatchObject({ path: '/eidoverse', feature: 'eidoverse' });
   });
 
+  // Comms feature group (#40): iMessage and Signal join FaceTime Audio under
+  // the `comms` group. Nav gating stays per-entry (unlike Health's whole-section
+  // SECTION_FEATURE gate) because Comms holds ungated siblings — Inbox, Drafts,
+  // Contacts, X, Stacker News.
+  it('gates the iMessage and Signal pages on their own instance features', () => {
+    const byId = Object.fromEntries(NAV_COMMANDS.map((c) => [c.id, c.feature]));
+    expect(byId['nav.messages.imessage']).toBe('imessage');
+    expect(byId['nav.messages.imessage-settings']).toBe('imessage');
+    expect(byId['nav.messages.signal']).toBe('signal');
+    // Contacts spans both networks (and every other message source) so it stays
+    // ungated even though it lives in the same Comms section.
+    expect(byId['nav.messages.contacts']).toBeUndefined();
+    expect(byId['nav.messages.inbox']).toBeUndefined();
+  });
+
   it('gates the complete Health section and MortalLoom settings', () => {
     const byId = Object.fromEntries(NAV_COMMANDS.map((c) => [c.id, c.feature]));
     expect([...SECTION_FEATURE]).toContainEqual(['Health', 'health']);

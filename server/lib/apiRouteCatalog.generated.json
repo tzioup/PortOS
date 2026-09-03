@@ -14317,6 +14317,14 @@
       ]
     },
     {
+      "method": "PUT",
+      "path": "/api/settings/features/groups/:groupId",
+      "mountPath": "/api/settings",
+      "sources": [
+        "server/routes/settings.js"
+      ]
+    },
+    {
       "method": "GET",
       "path": "/api/settings/media-share-candidates",
       "mountPath": "/api/settings",
@@ -17415,8 +17423,8 @@
   ],
   "stats": {
     "mounts": 145,
-    "operations": 2157,
-    "declarations": 2165,
+    "operations": 2158,
+    "declarations": 2166,
     "sourceFiles": 228
   }
 }
