@@ -6,6 +6,7 @@ import { validateRequest, parsePagination } from '../lib/validation.js';
 import { partialWithoutDefaults } from '../lib/zodCompat.js';
 import * as tribe from '../services/tribe.js';
 import * as tribeOutreach from '../services/tribeOutreach.js';
+import * as beeperTribe from '../services/beeperTribe.js';
 
 const router = Router();
 
@@ -58,6 +59,26 @@ const calendarTouchpointSchema = z.object({
 const memoryLinkSchema = z.object({
   memoryId: z.string().guid(),
   note: z.string().max(1000).optional().default(''),
+});
+
+// Beeper participant → Tribe linking (#34). conversationId/sourceUserId
+// identify the beeper_participants row; network is the Beeper network slug
+// (e.g. 'whatsapp'), used only to scope a username-shaped identity claim —
+// a phone-shaped one is network-less (see server/lib/tribeMatch.js).
+const beeperLinkSchema = z.object({
+  conversationId: z.string().guid(),
+  sourceUserId: z.string().min(1).max(500),
+  personId: z.string().guid(),
+  network: z.string().max(60).optional().default(''),
+});
+
+const beeperCreateAndLinkSchema = z.object({
+  conversationId: z.string().guid(),
+  sourceUserId: z.string().min(1).max(500),
+  name: z.string().min(1).max(200).optional(),
+  network: z.string().max(60).optional().default(''),
+  ring: ringSchema.optional().default('tribe'),
+  relationship: z.string().max(200).optional().default(''),
 });
 
 // Outreach draft generation (#2158). The seed fields come from a detected
@@ -201,6 +222,27 @@ router.delete('/people/:id/memories/:memoryId', asyncHandler(async (req, res) =>
   await tribe.unlinkMemory(req.params.id, req.params.memoryId);
   req.app.get('io')?.emit('tribe:changed', { personId: req.params.id });
   res.json({ success: true });
+}));
+
+// Link a Beeper conversation participant to an EXISTING Tribe person — the
+// inline thread-participant action decided on #10 (#34). Never creates a
+// person; see POST /beeper/link-new for that.
+router.post('/beeper/link', asyncHandler(async (req, res) => {
+  const { conversationId, sourceUserId, personId, network } = validateRequest(beeperLinkSchema, req.body);
+  const participant = await beeperTribe.linkParticipant({
+    conversationId, sourceUserId, personId, network,
+  });
+  req.app.get('io')?.emit('tribe:changed', { personId });
+  res.json({ participant });
+}));
+
+// Create a new Tribe person from a Beeper participant's own display name and
+// link it in the same action — the other half of #10 decision 4.
+router.post('/beeper/link-new', asyncHandler(async (req, res) => {
+  const data = validateRequest(beeperCreateAndLinkSchema, req.body);
+  const result = await beeperTribe.createPersonAndLinkParticipant(data);
+  req.app.get('io')?.emit('tribe:changed', { personId: result.person.id });
+  res.status(201).json(result);
 }));
 
 export default router;

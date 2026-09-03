@@ -174,6 +174,21 @@ CREATE TABLE IF NOT EXISTS tribe_memory_links (
 );
 CREATE INDEX IF NOT EXISTS idx_tribe_memory_links_memory ON tribe_memory_links (memory_id);
 
+-- Network-scoped identity claims (#34, decided on #10). Mirrors the block in
+-- server/lib/db/schema/tribe.js — see there for the `kind` rationale.
+CREATE TABLE IF NOT EXISTS tribe_identities (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  person_id UUID NOT NULL REFERENCES tribe_people(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  network TEXT NOT NULL DEFAULT '',
+  handle TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT '',
+  linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (kind, network, handle)
+);
+CREATE INDEX IF NOT EXISTS idx_tribe_identities_person ON tribe_identities (person_id);
+
 -- Human activity timeline (#2150) — unified, machine-local event store fed by
 -- message/calendar syncs (later: iMessage, Spotify, YouTube, Signal). Metadata +
 -- short summary only; full bodies stay in per-source caches. Idempotent via the
