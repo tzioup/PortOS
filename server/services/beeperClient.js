@@ -3,8 +3,10 @@
  *
  * Raw `fetch`, deliberately NOT `@beeper/desktop-api` — the published SDK lags
  * the live API and exposes no `Account.status`, no `loginID`, no `/v1/bridges`;
- * `GET /v1/spec` on the running instance is the authoritative reference
- * (docs/research/2026-08-31-beeper-api-surface.md). Every other Beeper feature
+ * `GET /v1/spec` on the running instance is the authoritative reference (see
+ * the API-surface research note, `docs/research/2026-08-31-beeper-api-surface.md`
+ * on the `research/beeper` branch — not merged onto `beeper/integration`, so the
+ * path is not resolvable from this branch alone). Every other Beeper feature
  * (#30-#37) is built on this module.
  *
  * `server/lib/safeUrlFetch.js` cannot wrap this: it blocks loopback in both
@@ -46,8 +48,10 @@ const READ_RETRY = { retries: 1, retryDelayMs: 300, shouldRetry: isReplayableCon
 
 /**
  * Typed Beeper API error. `retryable` reflects the mapping in
- * `mapBeeperResponseError` — callers building their own retry policy on top of
- * this client should key on it rather than re-deriving from `status`.
+ * `mapBeeperResponseError`, clamped to `false` whenever the originating call
+ * ran with `allowRetry: false` (every write: send/edit/delete/react/archive/
+ * read-state) — callers building their own retry policy on top of this client
+ * should key on it rather than re-deriving from `status`.
  */
 export class BeeperApiError extends ServerError {
   constructor(message, { status = 500, code, retryable = false, details } = {}) {
@@ -86,16 +90,28 @@ export async function resolveBeeperConfig({ baseUrl, token } = {}) {
 /**
  * Map a non-ok Beeper response to a typed, retry-classified error.
  *
+ * `retryEligible` (default `true`) clamps every status-table verdict to
+ * non-retryable when the call itself was never eligible to retry. A write
+ * call runs with `allowRetry: false` (the client-wide send-safe default) and
+ * must never hand back `retryable: true` on its thrown error — that field is
+ * the client's own documented "key on this, not on status" contract
+ * (`BeeperApiError` above), and a caller following it would otherwise
+ * duplicate a real send. `beeperRequest` passes its own `allowRetry` through
+ * unchanged as `retryEligible`; only the asset-502 branch below ignores it,
+ * since that mapping is `retryable: false` unconditionally regardless of
+ * retry eligibility.
+ *
  * The one non-conventional case: a missing/expired asset answers `502`
  * ("Failed to download asset: Transfer failed for mxc://…"), not `404`. A
  * generic "5xx is transient" retry policy loops forever on media the network
  * has aged out, so an asset-endpoint `502` maps to a TERMINAL
  * `ASSET_UNAVAILABLE` rather than the ordinarily-retryable `UPSTREAM_ERROR`.
- * Every other status follows the spec's documented meaning
- * (docs/research/2026-08-31-beeper-api-surface.md §7); `code` is never a
- * published enum, so it rides along under `details` for logging only.
+ * Every other status follows the spec's documented meaning (see the
+ * API-surface research note, `docs/research/2026-08-31-beeper-api-surface.md`
+ * §7, on the `research/beeper` branch); `code` is never a published enum, so
+ * it rides along under `details` for logging only.
  */
-export function mapBeeperResponseError(status, body, { isAssetEndpoint = false } = {}) {
+export function mapBeeperResponseError(status, body, { isAssetEndpoint = false, retryEligible = true } = {}) {
   const beeperCode = body?.code;
   const message = typeof body?.message === 'string' && body.message
     ? body.message
@@ -118,7 +134,7 @@ export function mapBeeperResponseError(status, body, { isAssetEndpoint = false }
     502: { code: 'UPSTREAM_ERROR', retryable: true },
   };
   const mapped = STATUS_TABLE[status] || { code: 'UNKNOWN_ERROR', retryable: status >= 500 };
-  return new BeeperApiError(message, { status, code: mapped.code, retryable: mapped.retryable, details });
+  return new BeeperApiError(message, { status, code: mapped.code, retryable: retryEligible && mapped.retryable, details });
 }
 
 /**
@@ -158,13 +174,13 @@ async function beeperRequest(path, {
     }, timeoutMs, allowRetry ? READ_RETRY : {});
   } catch (err) {
     throw new BeeperApiError(`Beeper request failed: ${describeFetchError(err)}`, {
-      status: 0, code: 'NETWORK_ERROR', retryable: isReplayableConnectionError(err),
+      status: 0, code: 'NETWORK_ERROR', retryable: allowRetry && isReplayableConnectionError(err),
     });
   }
 
   if (response.status === 204) return null;
   const data = await readResponseJson(response, { fallback: (text) => ({ message: text }) });
-  if (!response.ok) throw mapBeeperResponseError(response.status, data, { isAssetEndpoint });
+  if (!response.ok) throw mapBeeperResponseError(response.status, data, { isAssetEndpoint, retryEligible: allowRetry });
   return data;
 }
 
@@ -205,7 +221,9 @@ export async function probeBeeperInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEO
  * the endpoints this client wraps document as safe to auto-paginate (the SDK's
  * own auto-pagination only ever walks backwards too). `hasMore: true` with no
  * cursor to continue on is treated as exhausted rather than looping forever —
- * a defensive stop, since the spec never documents that combination.
+ * a defensive stop, since the spec never documents that combination. Same
+ * defense if a server answers `hasMore: true` with the SAME cursor it was
+ * just called with (a value that would otherwise walk in place forever).
  */
 export async function* paginateBeeperCursor(fetchPage, { direction = 'before' } = {}) {
   let cursor;
@@ -215,7 +233,7 @@ export async function* paginateBeeperCursor(fetchPage, { direction = 'before' } 
     for (const item of items) yield item;
     if (!page?.hasMore) return;
     const nextCursor = direction === 'after' ? page?.newestCursor : page?.oldestCursor;
-    if (!nextCursor) return;
+    if (!nextCursor || nextCursor === cursor) return;
     cursor = nextCursor;
   }
 }
@@ -418,18 +436,29 @@ export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
 // Accounts / bridges
 // ---------------------------------------------------------------------------
 
-// Never surface `loginID` — it is the user's phone number (requirement: never
-// log or persist it from either /v1/accounts or /v1/bridges).
+// Strips the top-level `loginID` field — it is the user's phone number
+// (requirement: never log or persist it from either /v1/accounts or
+// /v1/bridges) — and ONLY that field. This is a narrow, named boundary, not a
+// PII allowlist: `GET /v1/spec`'s `Account.user` (a `User`) carries its own
+// `phoneNumber`/`email`/`fullName`, and none of those are touched here — they
+// deliberately survive into every caller of `getAccounts`/`getBridges`/
+// `getJoinedAccounts`, because fork issue #10 (Tribe identity) needs
+// `user.phoneNumber` from this same client. A caller that logs or persists a
+// whole account/user row is still responsible for that PII itself.
 function stripLoginId(account) {
   if (!account || typeof account !== 'object') return account;
   const { loginID, ...rest } = account;
   return rest;
 }
 
+// Also strips `activeAccountCount` — documented to over-report (requirement:
+// do not surface it) — alongside the nested loginID strip, so a bridge row
+// never carries either field past this boundary.
 function stripBridgeAccountsLoginId(bridge) {
   if (!bridge || typeof bridge !== 'object') return bridge;
+  const { activeAccountCount, ...rest } = bridge;
   return {
-    ...bridge,
+    ...rest,
     accounts: Array.isArray(bridge.accounts) ? bridge.accounts.map(stripLoginId) : bridge.accounts,
   };
 }
