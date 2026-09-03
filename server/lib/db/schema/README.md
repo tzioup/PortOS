@@ -19,7 +19,7 @@ Parity with `server/scripts/init-db.sql` (the fresh-install path) is locked by
 | Module | Export(s) | Domain |
 |---|---|---|
 | `core.js` | `coreDdl` | Memory sync columns + the `schema_migrations` version tracker |
-| `tribe.js` | `tribeDdl` | Tribe CRM — people, touchpoints, memory links (machine-local) |
+| `tribe.js` | `tribeDdl` | Tribe CRM — people, network-scoped identities (`tribe_identities`, the durable-handle truth table behind Beeper linking), touchpoints, memory links (machine-local) |
 | `humanActivity.js` | `humanActivityDdl` | Human-activity timeline event store (machine-local) |
 | `post.js` | `postDdl` | MeatSpace POST normalized runs and attempts (machine-local) |
 | `commissions.js` | `commissionsDdl` | Creative Commissions + feedback (machine-local) |

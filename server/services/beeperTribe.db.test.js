@@ -289,6 +289,130 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
     expect(after).toHaveLength(before.length);
   });
 
+  it('lets an explicit tribe_identities claim outrank a STALE cached tribe_person_id', async () => {
+    await makeAccount();
+    const conversationId = await makeConversation(`${nonce}-stale-cache-chat`);
+    const cachedPerson = await makePerson('Example Stale Cache Person');
+    const claimingPerson = await makePerson('Example Claiming Person');
+
+    // The participant's cache is auto-filled from the LEGACY tribe_people
+    // phones[] axis onto the wrong person (the pre-#34 matching path).
+    await beeperTribe.upsertParticipant({
+      conversationId,
+      sourceUserId: 'stale-cache-user-1',
+      displayName: 'Example Stale Cache Person',
+      handle: '+1 (555) 010-0055',
+      observedVia: 'message-sender',
+    });
+    await query(
+      `UPDATE beeper_participants SET tribe_person_id = $3
+       WHERE conversation_id = $1 AND source_user_id = $2`,
+      [conversationId, 'stale-cache-user-1', cachedPerson.id],
+    );
+
+    // The user then explicitly claims that phone for somebody else.
+    await tribeIdentities.linkIdentity({
+      personId: claimingPerson.id, kind: 'phone', network: '', handle: '+15550100055',
+    });
+
+    // tribe_identities is the truth for a DURABLE handle — the cache column is
+    // authoritative only where no durable handle exists (#10), so the claim wins.
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId, sourceUserId: 'stale-cache-user-1',
+    })).toBe(claimingPerson.id);
+  });
+
+  it('clears the displaced person\'s OTHER participant caches when linkParticipant moves a handle', async () => {
+    await makeAccount();
+    const firstConversationId = await makeConversation(`${nonce}-move-chat-1`, { network: 'discord' });
+    const secondConversationId = await makeConversation(`${nonce}-move-chat-2`, { network: 'discord' });
+    const originalOwner = await makePerson('Example Original Owner');
+    const newOwner = await makePerson('Example New Owner');
+
+    await beeperTribe.upsertParticipant({
+      conversationId: firstConversationId,
+      sourceUserId: 'move-user-1',
+      displayName: 'Example Original Owner',
+      handle: '@example_moved',
+      observedVia: 'message-sender',
+    });
+    await beeperTribe.linkParticipant({
+      conversationId: firstConversationId, sourceUserId: 'move-user-1', personId: originalOwner.id,
+    });
+
+    // A second conversation's participant presents the same handle and
+    // auto-resolves (and caches) onto the original owner.
+    const second = await beeperTribe.upsertParticipant({
+      conversationId: secondConversationId,
+      sourceUserId: 'move-user-2',
+      displayName: 'Example Original Owner',
+      handle: '@Example_Moved',
+      observedVia: 'message-sender',
+    });
+    expect(second.tribePersonId).toBe(originalOwner.id);
+
+    // The user re-links the handle to someone else — an ownership move.
+    const moved = await beeperTribe.linkParticipant({
+      conversationId: firstConversationId, sourceUserId: 'move-user-1', personId: newOwner.id,
+    });
+    expect(moved.displacedPersonId).toBe(originalOwner.id);
+
+    // The OTHER conversation's stale cache is cleared and now resolves to the
+    // new owner instead of permanently attributing messages to the displaced one.
+    const refreshed = await beeperTribe.getParticipant(secondConversationId, 'move-user-2');
+    expect(refreshed.tribePersonId).toBeNull();
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId: secondConversationId, sourceUserId: 'move-user-2',
+    })).toBe(newOwner.id);
+  });
+
+  it('links a username-bearing participant on a network-less conversation by cache alone, instead of failing', async () => {
+    await makeAccount();
+    // beeper_conversations.network is NOT NULL DEFAULT '' — a conversation can
+    // legitimately arrive with no network, and such a participant must not
+    // become wholly unlinkable (#34 review).
+    const conversationId = await makeConversation(`${nonce}-no-network-chat`, { network: '' });
+    const person = await makePerson('Example No-Network Handle Person');
+
+    await beeperTribe.upsertParticipant({
+      conversationId,
+      sourceUserId: 'no-network-user-1',
+      displayName: 'Example No-Network Handle Person',
+      handle: '@example_no_network',
+      observedVia: 'message-sender',
+    });
+    const linked = await beeperTribe.linkParticipant({
+      conversationId, sourceUserId: 'no-network-user-1', personId: person.id,
+    });
+    expect(linked.tribePersonId).toBe(person.id);
+
+    // Nothing durable could be recorded, so no inert unscoped identity row exists.
+    const identities = await tribeIdentities.listIdentitiesForPerson(person.id);
+    expect(identities).toHaveLength(0);
+  });
+
+  it('does not wipe a durable handle when a later sweep re-observes the participant without one', async () => {
+    await makeAccount();
+    const conversationId = await makeConversation(`${nonce}-handle-keep-chat`, { network: 'discord' });
+
+    await beeperTribe.upsertParticipant({
+      conversationId,
+      sourceUserId: 'handle-keep-user-1',
+      displayName: 'Example Handle Keeper',
+      handle: '@example_keeper',
+      observedVia: 'message-sender',
+    });
+    // A truncated participant-list observation carries no phone/username.
+    const resynced = await beeperTribe.upsertParticipant({
+      conversationId,
+      sourceUserId: 'handle-keep-user-1',
+      displayName: 'Example Handle Keeper',
+      handle: '',
+      observedVia: 'participant-list',
+    });
+    expect(resynced.handle).toBe('@example_keeper');
+  });
+
   it('a group conversation creates touchpoints for senders only, never for a truncated roster', async () => {
     await makeAccount();
     const conversationId = await makeConversation(`${nonce}-group-chat`, { isGroup: true });
