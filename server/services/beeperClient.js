@@ -322,15 +322,33 @@ function appendSearchParams(qs, params) {
 // Chats
 // ---------------------------------------------------------------------------
 
-/** `GET /v1/chats` — no `limit` param (server-chosen page size). One page. */
-export async function listChatsPage({ cursor, direction = 'before', baseUrl, token, timeoutMs } = {}) {
-  return beeperRequest(`/v1/chats${cursorQuery({ cursor, direction })}`, { baseUrl, token, timeoutMs, allowRetry: true });
+/**
+ * `GET /v1/chats` — no `limit` param (server-chosen page size). One page.
+ *
+ * `accountIDs` is the endpoint's only filter and is declared as an ARRAY query
+ * param, so it goes through `appendSearchParams` (repeated keys) rather than
+ * `qs.set`, which would comma-join two ids into one value matching no account.
+ * The ingestion sweep (#32) pages one account at a time so a chat row is
+ * always attributable to the account whose cursor bounds it — without the
+ * filter it would have to page the whole cross-account list once per account.
+ * An omitted/empty `accountIDs` sends no filter at all (every account), never
+ * an empty `accountIDs=` that the server would read as "match nothing".
+ */
+export async function listChatsPage({ cursor, direction = 'before', accountIDs, baseUrl, token, timeoutMs } = {}) {
+  const qs = new URLSearchParams();
+  appendSearchParams(qs, { accountIDs });
+  if (cursor) qs.set('cursor', cursor);
+  if (direction) qs.set('direction', direction);
+  const query = qs.toString();
+  return beeperRequest(`/v1/chats${query ? `?${query}` : ''}`, { baseUrl, token, timeoutMs, allowRetry: true });
 }
 
 /** Async iterator over every chat, walking cursors automatically. */
-export function listChats({ direction = 'before', baseUrl, token, timeoutMs } = {}) {
+export function listChats({ direction = 'before', accountIDs, baseUrl, token, timeoutMs } = {}) {
   return paginateBeeperCursor(
-    ({ cursor, direction: dir }) => listChatsPage({ cursor, direction: dir, baseUrl, token, timeoutMs }),
+    ({ cursor, direction: dir }) => listChatsPage({
+      cursor, direction: dir, accountIDs, baseUrl, token, timeoutMs,
+    }),
     { direction },
   );
 }

@@ -1566,6 +1566,14 @@
       ]
     },
     {
+      "method": "POST",
+      "path": "/api/beeper/sync",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
       "method": "GET",
       "path": "/api/brain/admin",
       "mountPath": "/api/brain",
@@ -17456,8 +17464,8 @@
   ],
   "stats": {
     "mounts": 146,
-    "operations": 2162,
-    "declarations": 2170,
+    "operations": 2163,
+    "declarations": 2171,
     "sourceFiles": 229
   }
 }

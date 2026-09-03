@@ -598,6 +598,50 @@ describe('beeperClient', () => {
       expect(url).not.toContain('chat-a%2Cchat-b');
     });
 
+    // #32: the ingestion sweep pages ONE account at a time so every chat row is
+    // attributable to the account whose cursor bounds it. `GET /v1/chats` takes
+    // no `limit`, so `accountIDs` is its only filter and has to survive into the
+    // query string as repeated keys.
+    it('listChatsPage sends accountIDs as repeated keys alongside cursor and direction', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { items: [], hasMore: false }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await listChatsPage({
+        accountIDs: ['acct-a', 'acct-b'], cursor: 'cur1', direction: 'after', baseUrl: DEFAULT_BASE_URL, token: 't',
+      });
+      const url = fetchMock.mock.calls[0][0];
+      const params = new URL(url).searchParams;
+      expect(params.getAll('accountIDs')).toEqual(['acct-a', 'acct-b']);
+      expect(params.get('cursor')).toBe('cur1');
+      expect(params.get('direction')).toBe('after');
+      expect(url).not.toContain('acct-a%2Cacct-b');
+      expect(url).not.toContain('limit=');
+    });
+
+    it('listChatsPage omits accountIDs entirely when unset — an empty filter must not read as "match nothing"', async () => {
+      const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { items: [], hasMore: false }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      await listChatsPage({ baseUrl: DEFAULT_BASE_URL, token: 't' });
+      const url = fetchMock.mock.calls[0][0];
+      expect(url).not.toContain('accountIDs');
+      expect(new URL(url).searchParams.get('direction')).toBe('before');
+    });
+
+    it('the listChats iterator carries accountIDs onto every page it walks', async () => {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(jsonResponse(200, { items: [{ id: 'chat1' }], hasMore: true, oldestCursor: 'cur1' }))
+        .mockResolvedValueOnce(jsonResponse(200, { items: [{ id: 'chat2' }], hasMore: false }));
+      vi.stubGlobal('fetch', fetchMock);
+
+      const chats = [];
+      for await (const chat of listChats({ accountIDs: ['acct-a'], baseUrl: DEFAULT_BASE_URL, token: 't' })) chats.push(chat);
+      expect(chats.map((c) => c.id)).toEqual(['chat1', 'chat2']);
+      for (const call of fetchMock.mock.calls) {
+        expect(new URL(call[0]).searchParams.getAll('accountIDs')).toEqual(['acct-a']);
+      }
+    });
+
     it('a scalar filter still serializes as a single key (no regression from the array path)', async () => {
       const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { items: [], hasMore: false }));
       vi.stubGlobal('fetch', fetchMock);

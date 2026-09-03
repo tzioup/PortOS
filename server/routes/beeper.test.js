@@ -6,9 +6,11 @@ vi.mock('../services/beeperStatus.js', () => ({
   getBeeperStatus: vi.fn(),
   checkBeeperConnection: vi.fn(),
 }));
+vi.mock('../services/beeperSync.js', () => ({ runBeeperSweep: vi.fn() }));
 
 import beeperRoutes from './beeper.js';
 import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus.js';
+import { runBeeperSweep } from '../services/beeperSync.js';
 import { BeeperApiError } from '../services/beeperClient.js';
 
 const buildApp = () => {
@@ -77,5 +79,44 @@ describe('POST /api/beeper/status/check — createServiceErrorMapper contract', 
     const res = await request(buildApp()).post('/api/beeper/status/check');
     expect(res.status).toBe(200);
     expect(res.body.reachable).toBe(true);
+  });
+});
+
+// The manual run-now sweep (#32). The scheduled sweep is the normal path; this
+// is the same work on demand, and it inherits the coded-error contract above
+// rather than leaking a status:0 through to res.status().
+describe('POST /api/beeper/sync', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('runs one sweep and returns its summary', async () => {
+    vi.mocked(runBeeperSweep).mockResolvedValue({ skipped: false, accounts: 2, chats: 3, messages: 7, failedAccounts: 0, durationMs: 42 });
+    const res = await request(buildApp()).post('/api/beeper/sync');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ skipped: false, chats: 3, messages: 7 });
+    expect(vi.mocked(runBeeperSweep)).toHaveBeenCalledWith({ reason: 'manual' });
+  });
+
+  it('reports an already-running sweep as skipped rather than starting a second one', async () => {
+    vi.mocked(runBeeperSweep).mockResolvedValue({ skipped: true, reason: 'manual', accounts: 0, chats: 0, messages: 0 });
+    const res = await request(buildApp()).post('/api/beeper/sync');
+    expect(res.status).toBe(200);
+    expect(res.body.skipped).toBe(true);
+  });
+
+  it('maps a missing token to 412 through the same mapper, never a raw status', async () => {
+    vi.mocked(runBeeperSweep).mockRejectedValue(
+      new BeeperApiError('Beeper access token is not configured', { status: 401, code: 'NOT_CONFIGURED', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/sync');
+    expect(res.status).toBe(412);
+    expect(res.body.code).toBe('NOT_CONFIGURED');
+  });
+
+  it('maps an unreachable Beeper Desktop (status:0) to 503', async () => {
+    vi.mocked(runBeeperSweep).mockRejectedValue(
+      new BeeperApiError('Beeper request failed: connection refused', { status: 0, code: 'NETWORK_ERROR', retryable: false }),
+    );
+    const res = await request(buildApp()).post('/api/beeper/sync');
+    expect(res.status).toBe(503);
   });
 });
