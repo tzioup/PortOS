@@ -40,16 +40,43 @@ export function rowToIdentity(row) {
  * Look up the Tribe person currently claiming a `(kind, network, handle)`
  * identity, or `null`. `network` defaults to `''` (the network-less scope
  * `classifyNetworkHandle`'s `'phone'` kind uses — the same phone number means
- * the same person regardless of which network reported it).
+ * the same person regardless of which network reported it). A `kind='handle'`
+ * identity is always network-scoped — an empty network can never resolve one,
+ * since `linkIdentity` refuses to write such a row (see below).
+ *
+ * Joined against `tribe_people` and filtered to `deleted = FALSE`:
+ * `tribe.deletePerson` is a SOFT delete, so `ON DELETE CASCADE` on this
+ * table's `person_id` FK never fires for it, and an unfiltered lookup would
+ * keep resolving a Beeper participant onto a person the user deleted.
  */
 export async function resolvePersonByIdentity({ kind, network = '', handle }) {
   if (!kind || !handle) return null;
+  if (kind === 'handle' && !network) return null;
   await ensureReady();
   const result = await query(
-    `SELECT person_id FROM tribe_identities WHERE kind = $1 AND network = $2 AND handle = $3`,
+    `SELECT ti.person_id
+     FROM tribe_identities ti
+     JOIN tribe_people tp ON tp.id = ti.person_id
+     WHERE ti.kind = $1 AND ti.network = $2 AND ti.handle = $3 AND tp.deleted = FALSE`,
     [kind, network, handle],
   );
   return result.rows[0]?.person_id || null;
+}
+
+/**
+ * Confirm a person exists and is not soft-deleted before letting them claim
+ * an identity or a `beeper_participants` link. The `tribe_people` FK alone
+ * does not block linking to a soft-deleted person — `tribe.deletePerson` is
+ * `UPDATE ... SET deleted = TRUE`, not a hard delete, so the row (and its FK)
+ * still exists. Exported so `server/services/beeperTribe.js` can run the same
+ * check before writing `beeper_participants.tribe_person_id`, including the
+ * no-durable-handle case where `linkIdentity` below is never reached.
+ */
+export async function assertPersonLinkable(personId) {
+  await ensureReady();
+  const result = await query(`SELECT deleted FROM tribe_people WHERE id = $1`, [personId]);
+  const row = result.rows[0];
+  if (!row || row.deleted) throw new ServerError('Person not found', { status: 404 });
 }
 
 export async function listIdentitiesForPerson(personId) {
@@ -67,14 +94,37 @@ export async function listIdentitiesForPerson(personId) {
  * rather than erroring — there is no unlink UI yet (#10's "Not yet specified"
  * list), and a single-user install has no concurrent-writer race to defend
  * against (root AGENTS.md Security Model), so "the last explicit link wins"
- * is the simplest correct behavior until an unlink/merge flow exists.
+ * is the simplest correct behavior until an unlink/merge flow exists. Because
+ * that move is silent at the database level (the audit trigger on this table
+ * only captures hard deletes — there is no `deleted` column to tombstone-flip
+ * on — so a `person_id` UPDATE leaves no `record_audit` row either), the
+ * returned identity carries `displacedPersonId`: the id of whoever previously
+ * owned this exact identity, or `null` on a fresh claim / a re-link to the
+ * SAME person. Callers (`beeperTribe.linkParticipant`, the `/beeper/link*`
+ * routes) surface it so an ownership move is never silent to the user.
+ *
+ * `network` is required for `kind='handle'` — a network-scoped username
+ * claimed with no network is the inert-row / cross-network-collision hazard
+ * this function exists to prevent (see server/routes/tribe.js's
+ * `beeperLinkSchema` comment). `kind='phone'` stays network-less by design.
  */
 export async function linkIdentity({
   personId, kind, network = '', handle, source = '',
 }) {
   if (!personId) throw new ServerError('personId is required', { status: 400, code: 'BAD_REQUEST' });
   if (!kind || !handle) throw new ServerError('kind and handle are required', { status: 400, code: 'BAD_REQUEST' });
+  if (kind === 'handle' && !network) {
+    throw new ServerError('network is required to link a handle identity', { status: 400, code: 'BAD_REQUEST' });
+  }
   await ensureReady();
+  await assertPersonLinkable(personId);
+
+  const existing = await query(
+    `SELECT person_id FROM tribe_identities WHERE kind = $1 AND network = $2 AND handle = $3`,
+    [kind, network, handle],
+  );
+  const previousPersonId = existing.rows[0]?.person_id || null;
+
   const result = await query(
     `INSERT INTO tribe_identities (person_id, kind, network, handle, source, linked_at)
      VALUES ($1, $2, $3, $4, $5, NOW())
@@ -86,5 +136,6 @@ export async function linkIdentity({
     if (err?.code === '23503') throw new ServerError('Person not found', { status: 404 });
     throw err;
   });
-  return rowToIdentity(result.rows[0]);
+  const displacedPersonId = previousPersonId && previousPersonId !== personId ? previousPersonId : null;
+  return { ...rowToIdentity(result.rows[0]), displacedPersonId };
 }

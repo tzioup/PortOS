@@ -62,21 +62,24 @@ const memoryLinkSchema = z.object({
 });
 
 // Beeper participant → Tribe linking (#34). conversationId/sourceUserId
-// identify the beeper_participants row; network is the Beeper network slug
-// (e.g. 'whatsapp'), used only to scope a username-shaped identity claim —
-// a phone-shaped one is network-less (see server/lib/tribeMatch.js).
+// identify the beeper_participants row. No `network` field here on purpose:
+// it used to be client-supplied and scoped a username-shaped identity claim,
+// but that let a request omit it (writing an inert kind='handle' row no
+// later lookup can ever match) or spoof a WRONG network (silently stealing
+// another person's claim on a UNIQUE (kind, network, handle) collision) —
+// see server/services/beeperTribe.js. The network is now derived server-side
+// from the participant's own beeper_conversations.network; a phone-shaped
+// claim stays network-less (see server/lib/tribeMatch.js).
 const beeperLinkSchema = z.object({
   conversationId: z.string().guid(),
   sourceUserId: z.string().min(1).max(500),
   personId: z.string().guid(),
-  network: z.string().max(60).optional().default(''),
 });
 
 const beeperCreateAndLinkSchema = z.object({
   conversationId: z.string().guid(),
   sourceUserId: z.string().min(1).max(500),
   name: z.string().min(1).max(200).optional(),
-  network: z.string().max(60).optional().default(''),
   ring: ringSchema.optional().default('tribe'),
   relationship: z.string().max(200).optional().default(''),
 });
@@ -226,14 +229,17 @@ router.delete('/people/:id/memories/:memoryId', asyncHandler(async (req, res) =>
 
 // Link a Beeper conversation participant to an EXISTING Tribe person — the
 // inline thread-participant action decided on #10 (#34). Never creates a
-// person; see POST /beeper/link-new for that.
+// person; see POST /beeper/link-new for that. `displacedPersonId` is set
+// when the participant's handle was already claimed by a DIFFERENT person —
+// that ownership move is silent at the DB/audit-trigger level (see
+// tribeIdentities.linkIdentity), so it is surfaced here instead.
 router.post('/beeper/link', asyncHandler(async (req, res) => {
-  const { conversationId, sourceUserId, personId, network } = validateRequest(beeperLinkSchema, req.body);
-  const participant = await beeperTribe.linkParticipant({
-    conversationId, sourceUserId, personId, network,
+  const { conversationId, sourceUserId, personId } = validateRequest(beeperLinkSchema, req.body);
+  const { displacedPersonId, ...participant } = await beeperTribe.linkParticipant({
+    conversationId, sourceUserId, personId,
   });
   req.app.get('io')?.emit('tribe:changed', { personId });
-  res.json({ participant });
+  res.json({ participant, displacedPersonId: displacedPersonId || null });
 }));
 
 // Create a new Tribe person from a Beeper participant's own display name and

@@ -63,12 +63,12 @@ async function makeAccount() {
   );
 }
 
-async function makeConversation(sourceChatId, { isGroup = false } = {}) {
+async function makeConversation(sourceChatId, { isGroup = false, network = 'whatsapp' } = {}) {
   const { rows } = await query(
     `INSERT INTO beeper_conversations (account_id, network, source_chat_id, title, type, is_group)
-     VALUES ($1, 'whatsapp', $2, 'Example Chat', $3, $4)
+     VALUES ($1, $2, $3, 'Example Chat', $4, $5)
      RETURNING id`,
-    [ACCOUNT_ID, sourceChatId, isGroup ? 'group' : 'single', isGroup],
+    [ACCOUNT_ID, network, sourceChatId, isGroup ? 'group' : 'single', isGroup],
   );
   return rows[0].id;
 }
@@ -83,9 +83,10 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
   it('a counterparty with a phone links to an existing Tribe person without creating a duplicate', async () => {
     await makeAccount();
     const conversationId = await makeConversation(`${nonce}-phone-chat`);
+    const personName = `${nonce} Example Phone Person`;
 
     // Existing Tribe person already known via, say, iMessage/Contacts.
-    const person = await tribe.createPerson({ name: 'Example Phone Person', phones: ['+15550100001'] });
+    const person = await tribe.createPerson({ name: personName, phones: ['+15550100001'] });
     createdPersonIds.push(person.id);
 
     // Beeper hands us a participant whose `handle` is that same phone
@@ -93,16 +94,16 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
     const participant = await beeperTribe.upsertParticipant({
       conversationId,
       sourceUserId: 'wa-user-1',
-      displayName: 'Example Phone Person',
+      displayName: personName,
       handle: '+1 (555) 010-0001',
       observedVia: 'message-sender',
-      network: 'whatsapp',
     });
 
     // Auto-resolved on upsert — no manual link needed, and no new person made.
     expect(participant.tribePersonId).toBe(person.id);
     const peopleNamed = await query(
-      `SELECT COUNT(*)::int AS n FROM tribe_people WHERE name = 'Example Phone Person'`,
+      `SELECT COUNT(*)::int AS n FROM tribe_people WHERE name = $1`,
+      [personName],
     );
     expect(peopleNamed.rows[0].n).toBe(1);
   });
@@ -140,9 +141,12 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
     expect(resynced.tribePersonId).toBe(person.id);
   });
 
-  it('a durable USERNAME handle claims a tribe_identities row and resolves a second participant presenting it', async () => {
+  it('a durable USERNAME handle claims a tribe_identities row scoped to its OWN conversation network, and resolves a second participant presenting it', async () => {
     await makeAccount();
-    const conversationId = await makeConversation(`${nonce}-handle-chat`);
+    // network comes from the conversation row, never from a caller argument
+    // (#34 review) — created here as 'discord' so the claim below is scoped
+    // to it.
+    const conversationId = await makeConversation(`${nonce}-handle-chat`, { network: 'discord' });
     const person = await makePerson('Example Handle Person');
 
     await beeperTribe.upsertParticipant({
@@ -151,44 +155,138 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
       displayName: 'Example Handle Person',
       handle: '@example_handle',
       observedVia: 'message-sender',
-      network: 'discord',
     });
     const linked = await beeperTribe.linkParticipant({
-      conversationId, sourceUserId: 'dc-user-1', personId: person.id, network: 'discord',
+      conversationId, sourceUserId: 'dc-user-1', personId: person.id,
     });
     expect(linked.tribePersonId).toBe(person.id);
+    expect(linked.displacedPersonId).toBeNull();
 
     const identities = await tribeIdentities.listIdentitiesForPerson(person.id);
     expect(identities).toContainEqual(expect.objectContaining({
       kind: 'handle', network: 'discord', handle: 'example_handle',
     }));
 
-    // A second, DIFFERENT conversation's participant presents the identical
-    // handle — it should auto-resolve to the same person without a manual link.
-    const otherConversationId = await makeConversation(`${nonce}-handle-chat-2`);
+    // A second, DIFFERENT conversation's participant, ALSO on 'discord',
+    // presents the identical handle — it should auto-resolve to the same
+    // person without a manual link.
+    const otherConversationId = await makeConversation(`${nonce}-handle-chat-2`, { network: 'discord' });
     const secondParticipant = await beeperTribe.upsertParticipant({
       conversationId: otherConversationId,
       sourceUserId: 'dc-user-1-again',
       displayName: 'Example Handle Person',
       handle: '@Example_Handle',
       observedVia: 'message-sender',
-      network: 'discord',
     });
     expect(secondParticipant.tribePersonId).toBe(person.id);
   });
 
-  it('enforces UNIQUE (kind, network, handle) semantics via linkIdentity re-link (moves ownership, no duplicate row)', async () => {
+  it('scopes a username claim to its network — the SAME username on a DIFFERENT network never collides with a different person', async () => {
+    await makeAccount();
+    const discordPerson = await makePerson('Example Discord Namesake');
+    const slackPerson = await makePerson('Example Slack Namesake');
+
+    const discordConversationId = await makeConversation(`${nonce}-namesake-discord`, { network: 'discord' });
+    await beeperTribe.upsertParticipant({
+      conversationId: discordConversationId,
+      sourceUserId: 'discord-namesake-1',
+      displayName: 'Example Discord Namesake',
+      handle: '@example_namesake',
+      observedVia: 'message-sender',
+    });
+    await beeperTribe.linkParticipant({
+      conversationId: discordConversationId, sourceUserId: 'discord-namesake-1', personId: discordPerson.id,
+    });
+
+    const slackConversationId = await makeConversation(`${nonce}-namesake-slack`, { network: 'slack' });
+    const slackParticipant = await beeperTribe.upsertParticipant({
+      conversationId: slackConversationId,
+      sourceUserId: 'slack-namesake-1',
+      displayName: 'Example Slack Namesake',
+      handle: '@example_namesake',
+      observedVia: 'message-sender',
+    });
+    // Same literal handle, different network — must NOT auto-resolve to the
+    // Discord person; it must stay unlinked until claimed on its own network.
+    expect(slackParticipant.tribePersonId).toBeNull();
+
+    const linkedSlack = await beeperTribe.linkParticipant({
+      conversationId: slackConversationId, sourceUserId: 'slack-namesake-1', personId: slackPerson.id,
+    });
+    expect(linkedSlack.tribePersonId).toBe(slackPerson.id);
+    expect(linkedSlack.displacedPersonId).toBeNull();
+
+    const discordIdentities = await tribeIdentities.listIdentitiesForPerson(discordPerson.id);
+    expect(discordIdentities).toContainEqual(expect.objectContaining({
+      kind: 'handle', network: 'discord', handle: 'example_namesake',
+    }));
+    const slackIdentities = await tribeIdentities.listIdentitiesForPerson(slackPerson.id);
+    expect(slackIdentities).toContainEqual(expect.objectContaining({
+      kind: 'handle', network: 'slack', handle: 'example_namesake',
+    }));
+  });
+
+  it('enforces UNIQUE (kind, network, handle) semantics via linkIdentity re-link (moves ownership, no duplicate row, and reports the displaced person)', async () => {
     const personA = await makePerson('Example Identity Owner A');
     const personB = await makePerson('Example Identity Owner B');
 
-    await tribeIdentities.linkIdentity({ personId: personA.id, kind: 'handle', network: 'slack', handle: 'example-owner' });
+    const firstLink = await tribeIdentities.linkIdentity({ personId: personA.id, kind: 'handle', network: 'slack', handle: 'example-owner' });
+    expect(firstLink.displacedPersonId).toBeNull();
     const relinked = await tribeIdentities.linkIdentity({ personId: personB.id, kind: 'handle', network: 'slack', handle: 'example-owner' });
     expect(relinked.personId).toBe(personB.id);
+    expect(relinked.displacedPersonId).toBe(personA.id);
 
     const { rows } = await query(
       `SELECT COUNT(*)::int AS n FROM tribe_identities WHERE kind = 'handle' AND network = 'slack' AND handle = 'example-owner'`,
     );
     expect(rows[0].n).toBe(1);
+  });
+
+  it('refuses to write a kind=\'handle\' identity with no network (the inert-row hazard)', async () => {
+    const person = await makePerson('Example No-Network Person');
+    await expect(tribeIdentities.linkIdentity({
+      personId: person.id, kind: 'handle', network: '', handle: 'example-orphan',
+    })).rejects.toThrow();
+  });
+
+  it('refuses to link a soft-deleted person, and resolution/touchpoints treat them as unlinked', async () => {
+    await makeAccount();
+    const conversationId = await makeConversation(`${nonce}-deleted-chat`, { network: 'discord' });
+    const person = await makePerson('Example Deleted Person');
+
+    await beeperTribe.upsertParticipant({
+      conversationId,
+      sourceUserId: 'deleted-user-1',
+      displayName: 'Example Deleted Person',
+      handle: '@example_deleted',
+      observedVia: 'message-sender',
+    });
+    const linked = await beeperTribe.linkParticipant({
+      conversationId, sourceUserId: 'deleted-user-1', personId: person.id,
+    });
+    expect(linked.tribePersonId).toBe(person.id);
+
+    const deleted = await tribe.deletePerson(person.id);
+    expect(deleted).toBe(true);
+
+    // A further link attempt against the now-deleted person is refused, even
+    // though the FK alone would still permit it (soft delete only).
+    await expect(beeperTribe.linkParticipant({
+      conversationId, sourceUserId: 'deleted-user-1', personId: person.id,
+    })).rejects.toThrow();
+
+    // Resolution — both the cached column and a fresh tribe_identities lookup
+    // — no longer returns the deleted person.
+    expect(await beeperTribe.resolveParticipantPerson({ conversationId, sourceUserId: 'deleted-user-1' })).toBeNull();
+
+    const before = await tribe.listTouchpoints(person.id);
+    const result = await beeperTribe.logSenderTouchpoints([
+      { conversationId, senderId: 'deleted-user-1', sentAt: new Date().toISOString(), network: 'discord' },
+    ]);
+    expect(result.matched).toBe(0);
+    expect(result.created).toBe(0);
+    const after = await tribe.listTouchpoints(person.id);
+    expect(after).toHaveLength(before.length);
   });
 
   it('a group conversation creates touchpoints for senders only, never for a truncated roster', async () => {

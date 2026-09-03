@@ -71,9 +71,14 @@ export const tribeDdl = [
     // this table without a second schema decision (deferred, #10 decision 7 —
     // not done here). A handle is lowercased, trimmed, leading '@' stripped
     // before it reaches this table (see server/lib/tribeMatch.js).
-    // ON DELETE CASCADE: removing a Tribe person also removes their claimed
-    // identities, so a later re-link starts clean rather than colliding on
-    // UNIQUE (kind, network, handle) with a stale row.
+    // ON DELETE CASCADE: a HARD delete of a Tribe person also removes their
+    // claimed identities, so a later re-link starts clean rather than
+    // colliding on UNIQUE (kind, network, handle) with a stale row. The app's
+    // only delete path (tribe.deletePerson) is a SOFT delete (`deleted =
+    // TRUE`), which this cascade does NOT fire on — resolvePersonByIdentity
+    // and resolveParticipantPerson (server/services/beeperTribe.js) instead
+    // filter `tribe_people.deleted = FALSE` explicitly, and linkIdentity /
+    // linkParticipant refuse to claim/link a soft-deleted personId.
     `CREATE TABLE IF NOT EXISTS tribe_identities (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       person_id UUID NOT NULL REFERENCES tribe_people(id) ON DELETE CASCADE,

@@ -158,10 +158,11 @@ export function normalizeNetworkHandle(value) {
 // normalizePhone's bare "strip everything but digits" behavior blind to
 // letters.
 const PHONE_SHAPE_RE = /^\+?[0-9]+$/;
-// Real-world E.164 numbers run roughly 8-15 digits. A short all-digit token
-// (a Discord snowflake fragment, a PIN-like username) is refused as a phone
-// rather than fabricating an implausible key — residual ambiguity for a
-// genuinely long all-digit non-phone id (a full snowflake) is an accepted,
+// Real-world E.164 numbers run roughly 7-15 digits (a handful of short-country
+// numbers, e.g. some Pacific island plans, are as short as 7). A shorter
+// all-digit token (a PIN-like username) is refused as a phone rather than
+// fabricating an implausible key — residual ambiguity for a genuinely long
+// all-digit non-phone id (a full Discord snowflake) is an accepted,
 // documented limit: nothing upstream is expected to feed one through `handle`
 // (source_user_id carries those, and is never routed through this function).
 const MIN_PHONE_DIGITS = 7;

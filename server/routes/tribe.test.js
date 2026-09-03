@@ -339,21 +339,37 @@ describe('Tribe Routes', () => {
   describe('Beeper participant linking (#34)', () => {
     it('links a Beeper participant to an existing person', async () => {
       beeperTribe.linkParticipant.mockResolvedValue({
-        conversationId: CONVERSATION_ID, sourceUserId: 'user-1', tribePersonId: PERSON_ID,
+        conversationId: CONVERSATION_ID, sourceUserId: 'user-1', tribePersonId: PERSON_ID, displacedPersonId: null,
       });
 
       const response = await request(app)
         .post('/api/tribe/beeper/link')
-        .send({
-          conversationId: CONVERSATION_ID, sourceUserId: 'user-1', personId: PERSON_ID, network: 'whatsapp',
-        });
+        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'user-1', personId: PERSON_ID });
 
       expect(response.status).toBe(200);
       expect(response.body.participant.tribePersonId).toBe(PERSON_ID);
+      expect(response.body.displacedPersonId).toBeNull();
+      // No `network` — it's derived server-side from the participant's own
+      // conversation, never accepted from the request body (#34 review).
       expect(beeperTribe.linkParticipant).toHaveBeenCalledWith({
-        conversationId: CONVERSATION_ID, sourceUserId: 'user-1', personId: PERSON_ID, network: 'whatsapp',
+        conversationId: CONVERSATION_ID, sourceUserId: 'user-1', personId: PERSON_ID,
       });
       expect(emit).toHaveBeenCalledWith('tribe:changed', { personId: PERSON_ID });
+    });
+
+    it('surfaces a displaced person when the handle was already claimed by someone else', async () => {
+      const OTHER_PERSON_ID = '66666666-6666-4666-8666-666666666666';
+      beeperTribe.linkParticipant.mockResolvedValue({
+        conversationId: CONVERSATION_ID, sourceUserId: 'user-1', tribePersonId: PERSON_ID, displacedPersonId: OTHER_PERSON_ID,
+      });
+
+      const response = await request(app)
+        .post('/api/tribe/beeper/link')
+        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'user-1', personId: PERSON_ID });
+
+      expect(response.status).toBe(200);
+      expect(response.body.displacedPersonId).toBe(OTHER_PERSON_ID);
+      expect(response.body.participant.displacedPersonId).toBeUndefined();
     });
 
     it('rejects a link request with a non-UUID personId', async () => {
@@ -370,17 +386,24 @@ describe('Tribe Routes', () => {
         person: { id: PERSON_ID, name: 'Example Person' },
         participant: { conversationId: CONVERSATION_ID, sourceUserId: 'user-2', tribePersonId: PERSON_ID },
         created: true,
+        displacedPersonId: null,
       });
 
       const response = await request(app)
         .post('/api/tribe/beeper/link-new')
-        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'user-2', name: 'Example Person', network: 'discord' });
+        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'user-2', name: 'Example Person' });
 
       expect(response.status).toBe(201);
       expect(response.body.person.id).toBe(PERSON_ID);
+      expect(response.body.displacedPersonId).toBeNull();
+      // No `network` — it's derived server-side, never accepted from the
+      // request body (#34 review).
       expect(beeperTribe.createPersonAndLinkParticipant).toHaveBeenCalledWith(expect.objectContaining({
-        conversationId: CONVERSATION_ID, sourceUserId: 'user-2', name: 'Example Person', network: 'discord',
+        conversationId: CONVERSATION_ID, sourceUserId: 'user-2', name: 'Example Person',
       }));
+      expect(beeperTribe.createPersonAndLinkParticipant).toHaveBeenCalledWith(
+        expect.not.objectContaining({ network: expect.anything() }),
+      );
       expect(emit).toHaveBeenCalledWith('tribe:changed', { personId: PERSON_ID });
     });
 
