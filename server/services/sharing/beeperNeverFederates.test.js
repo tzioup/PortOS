@@ -23,6 +23,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { basename } from 'path';
 import { PEER_SUBSCRIBABLE_KINDS } from './peerSyncShared.js';
 import { PORTOS_SCHEMA_VERSIONS, NON_RECORD_SCHEMA_CATEGORIES } from '../../lib/schemaVersions.js';
 import { beeperDdl } from '../../lib/db/schema/beeper.js';
@@ -40,12 +41,17 @@ const FEDERATION_COLUMNS = ['sync_sequence'];
 
 /**
  * A media-library walk entry that would carry a beeper directory to a peer.
- * The kind is matched broadly (a `beeperAttachments` kind trips it); the path
- * is anchored on a whole `beeper` segment so a checkout, worktree, or data
- * root that merely contains the word cannot false-positive.
+ * The kind is matched broadly (a `beeperAttachments` kind trips it); the dir is
+ * matched on its BASENAME only, because `mediaLibraryDirs()` entries are always
+ * `<installRoot>/data/<kind>` — the last segment is the only part that names
+ * the media kind. Matching any path segment instead would also fire on an
+ * ANCESTOR directory that merely happens to be called `beeper` (a
+ * `beeper/integration` worktree checked out under one), a false red that says
+ * nothing about what federates. A `beeper`-prefixed basename still trips, so a
+ * future `data/beeper-attachments` cannot slip in under a non-beeper kind.
  */
 const namesBeeperMedia = ({ kind, dir }) => mentionsBeeper(kind)
-  || /(^|[/\\])beeper([/\\]|$)/i.test(String(dir));
+  || /^beeper/i.test(basename(String(dir)));
 
 /** The `CREATE TABLE beeper_*` statements, each a complete balanced string. */
 const beeperCreateTableStatements = beeperDdl.filter(
@@ -106,9 +112,15 @@ describe('beeper conversation mirror never federates (#27)', () => {
       ['CREATE TABLE IF NOT EXISTS beeper_conversations (id UUID, sync_sequence BIGINT)']
         .filter((s) => FEDERATION_COLUMNS.some((c) => s.includes(c))),
     ).toHaveLength(1);
+    // The planted dir entry carries a NON-beeper kind, so only the basename
+    // branch can catch it; the trailing entry pins that an ancestor named
+    // `beeper` is not itself a violation.
     expect(
-      [{ kind: 'image', dir: '/data/images' }, { kind: 'beeper', dir: '/data/beeper' }]
-        .filter(namesBeeperMedia),
-    ).toEqual([{ kind: 'beeper', dir: '/data/beeper' }]);
+      [
+        { kind: 'image', dir: '/data/images' },
+        { kind: 'attachments', dir: '/data/beeper' },
+        { kind: 'image', dir: '/beeper/integration/data/images' },
+      ].filter(namesBeeperMedia),
+    ).toEqual([{ kind: 'attachments', dir: '/data/beeper' }]);
   });
 });
