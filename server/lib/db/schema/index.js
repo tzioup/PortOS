@@ -29,6 +29,7 @@ import { loraDdl } from './lora.js';
 import { privacyDdl } from './privacy.js';
 import { stackerNewsDdl } from './stackerNews.js';
 import { xDdl } from './x.js';
+import { beeperDdl } from './beeper.js';
 import { auditDdl, auditedTables, buildAuditTriggers } from './audit.js';
 
 export {
@@ -49,6 +50,7 @@ export {
   privacyDdl,
   stackerNewsDdl,
   xDdl,
+  beeperDdl,
   auditDdl,
   auditedTables,
   buildAuditTriggers,
@@ -71,6 +73,8 @@ export function buildUpgradeDdl() {
 // Phase 2 — the `catalogDDL` list: catalog + all creative-app tables, then the
 // record_audit table/function, then the per-table audit triggers. catalog_user_types
 // is threaded in AFTER the media block to match its original position (see catalog.js).
+// `beeperDdl` is appended after `xDdl` (#27) — same external-mirror shape as
+// stackerNews/x, added last of that group, before the audit block.
 export function buildCatalogDdl() {
   return [
     ...catalogDdl,
@@ -84,6 +88,7 @@ export function buildCatalogDdl() {
     ...privacyDdl,
     ...stackerNewsDdl,
     ...xDdl,
+    ...beeperDdl,
     ...auditDdl,
     ...buildAuditTriggers(),
   ];

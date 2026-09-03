@@ -1629,6 +1629,97 @@ CREATE TABLE IF NOT EXISTS x_drafts (
 );
 CREATE INDEX IF NOT EXISTS idx_x_drafts_account_state ON x_drafts (account_id, state, created_at DESC);
 
+-- Beeper conversation mirror (#27). Machine-local mirror of the Beeper Desktop
+-- API — accounts, conversations, messages, participants, attachment metadata,
+-- and per-chat sync cursors. NEVER FEDERATED: no sync_sequence column, no
+-- PEER_SUBSCRIBABLE_KINDS entry, no dataSync category, no PORTOS_SCHEMA_VERSIONS
+-- entry (guarded by server/services/sharing/beeperNeverFederates.test.js).
+-- Deletions from the source are tombstones, not removals — a message the
+-- source unsends keeps its row/body/attachments and gains `unsent_at` (never
+-- `deleted_at`, which collides with the federation guard's column list).
+-- Mirrors the beeper.js block in server/lib/db/schema/.
+CREATE TABLE IF NOT EXISTS beeper_accounts (
+  account_id TEXT PRIMARY KEY,
+  network TEXT NOT NULL DEFAULT '',
+  display_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT '',
+  bridge_id TEXT NOT NULL DEFAULT '',
+  last_seen_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS beeper_conversations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id TEXT NOT NULL REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,
+  network TEXT NOT NULL DEFAULT '',
+  source_chat_id TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  type TEXT NOT NULL DEFAULT 'single',
+  is_group BOOLEAN NOT NULL DEFAULT FALSE,
+  is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+  is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+  is_low_priority BOOLEAN NOT NULL DEFAULT FALSE,
+  is_muted BOOLEAN NOT NULL DEFAULT FALSE,
+  last_activity TIMESTAMPTZ,
+  unread_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (account_id, source_chat_id)
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_conversations_account_activity ON beeper_conversations (account_id, last_activity DESC);
+CREATE TABLE IF NOT EXISTS beeper_messages (
+  id TEXT PRIMARY KEY,
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  sender_id TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL DEFAULT '',
+  sent_at TIMESTAMPTZ,
+  edited_at TIMESTAMPTZ,
+  unsent_at TIMESTAMPTZ,
+  sort_key TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_sort ON beeper_messages (conversation_id, sort_key);
+CREATE TABLE IF NOT EXISTS beeper_participants (
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  source_user_id TEXT NOT NULL,
+  display_name TEXT NOT NULL DEFAULT '',
+  handle TEXT NOT NULL DEFAULT '',
+  tribe_person_id UUID REFERENCES tribe_people (id) ON DELETE SET NULL,
+  observed_via TEXT NOT NULL CHECK (observed_via IN ('participant-list','message-sender')),
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, source_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_participants_tribe_person ON beeper_participants (tribe_person_id) WHERE tribe_person_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS beeper_attachments (
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  message_id TEXT NOT NULL REFERENCES beeper_messages (id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  mxc_id TEXT,
+  sha256 TEXT,
+  mime_type TEXT NOT NULL DEFAULT '',
+  byte_length BIGINT,
+  file_name TEXT NOT NULL DEFAULT '',
+  width INTEGER,
+  height INTEGER,
+  last_viewed_at TIMESTAMPTZ,
+  keep BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, message_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction ON beeper_attachments (last_viewed_at) WHERE keep = FALSE;
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_sha256 ON beeper_attachments (sha256) WHERE sha256 IS NOT NULL;
+CREATE TABLE IF NOT EXISTS beeper_sync_cursors (
+  account_id TEXT NOT NULL REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL,
+  cursor TEXT,
+  last_activity TIMESTAMPTZ,
+  last_swept_at TIMESTAMPTZ,
+  PRIMARY KEY (account_id, chat_id)
+);
+
 -- Deletion audit log (incident #1248-follow-up). Append-only forensic trail of
 -- every tombstone / un-tombstone / hard-delete of user-authored records, written
 -- by a DB trigger so it captures deletions from ANY source (app, a test suite's
