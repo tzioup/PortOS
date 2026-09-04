@@ -10,6 +10,7 @@ import ConnectionStatusDot from '../../ui/ConnectionStatusDot';
 import toast from '../../ui/Toast';
 import useMounted from '../../../hooks/useMounted';
 import useBeeperOutbox from '../../../hooks/useBeeperOutbox';
+import { messagePreviewText } from '../../../lib/beeperMessageBody';
 import { safeReadJsonStorage, safeWriteJsonStorage } from '../../../lib/safeStorage';
 import * as api from '../../../services/api';
 
@@ -245,8 +246,10 @@ function PinnedGrid({ conversations, unified, onSelect }) {
 
 function ConversationRow({ conversation, unified, selected, onSelect }) {
   const preview = conversation.lastMessage;
+  // The same body the thread renders, flattened to one line: some networks
+  // deliver HTML, and this row used to show the tags literally.
   const previewText = preview
-    ? (preview.isUnsent ? 'Message unsent' : preview.body)
+    ? (preview.isUnsent ? 'Message unsent' : messagePreviewText(preview.body))
     : 'No messages mirrored yet';
   // The reference's leading state chip. Direction is the mirrored `isSender`,
   // never a comparison against the local user — there is nothing to compare

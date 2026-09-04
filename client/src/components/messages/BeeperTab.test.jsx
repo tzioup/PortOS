@@ -772,6 +772,40 @@ describe('purging one conversation mirror', () => {
   });
 });
 
+// Final live pass: some networks deliver HTML message bodies (Discord, Matrix)
+// and the mirror stores what the source sent, so the rail row rendered the tags
+// as literal text under the conversation title.
+describe('the rail preview', () => {
+  it('shows an HTML last message as text, with no tags', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [conversation({
+        lastMessage: {
+          id: 'm1', body: '<p>hello <strong>there</strong></p>', isSender: false, isUnsent: false,
+        },
+      })],
+      nextCursor: null,
+    });
+
+    renderTab();
+
+    expect(await screen.findByText('hello there')).toBeInTheDocument();
+    expect(screen.queryByText(/<strong>/)).not.toBeInTheDocument();
+  });
+
+  it('leaves a plain last message alone but decodes its entities', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [conversation({
+        lastMessage: { id: 'm1', body: 'salt &amp; pepper', isSender: false, isUnsent: false },
+      })],
+      nextCursor: null,
+    });
+
+    renderTab();
+
+    expect(await screen.findByText('salt & pepper')).toBeInTheDocument();
+  });
+});
+
 // A guard, not a formality: this file is the one place a real conversation,
 // handle or contact name could slip into a PUBLIC repo while developing against
 // a live install (root AGENTS.md, Sensitive Data & Privacy).
