@@ -88,9 +88,15 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
   const [row, setRow] = useState(attachment);
   const [fetching, setFetching] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  // Tracks the in-flight image fetch (#37): the mirror can take up to the 60s
+  // server timeout on first view, and an `<img>` with no bytes yet collapses to
+  // a 2x2px box for the whole wait — this drives the reserved-space skeleton
+  // below instead.
+  const [imgLoaded, setImgLoaded] = useState(false);
   useEffect(() => {
     setRow(attachment);
     setLoadFailed(false);
+    setImgLoaded(false);
   }, [attachment]);
 
   const applyUpdate = (updated) => {
@@ -177,15 +183,38 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
   }
 
   if (isImage(row.mimeType)) {
+    // Attachments carry size.width/size.height from the sweep (`beeperSync.js`
+    // normalizeAttachment) as plain `width`/`height` fields once persisted.
+    // With those, the native width/height attributes reserve the image's real
+    // aspect ratio before the first byte arrives; without them (older rows, or
+    // a network that never reported size), the skeleton falls back to a fixed
+    // neutral box so the layout still doesn't collapse to nothing.
+    const hasDims = Number.isFinite(row.width) && row.width > 0
+      && Number.isFinite(row.height) && row.height > 0;
     return (
       <div className="mt-1">
-        <img
-          src={url}
-          alt={row.fileName || 'Attachment'}
-          loading="lazy"
-          onError={() => setLoadFailed(true)}
-          className="max-h-64 w-auto max-w-full rounded-lg border border-port-border object-contain"
-        />
+        <div
+          className="relative max-w-full overflow-hidden rounded-lg border border-port-border"
+          style={!imgLoaded && !hasDims ? { width: '8rem', height: '8rem' } : undefined}
+        >
+          {!imgLoaded && (
+            <div
+              data-testid="attachment-skeleton"
+              aria-hidden="true"
+              className="absolute inset-0 animate-pulse bg-port-bg/60"
+            />
+          )}
+          <img
+            src={url}
+            alt={row.fileName || 'Attachment'}
+            loading="lazy"
+            width={hasDims ? row.width : undefined}
+            height={hasDims ? row.height : undefined}
+            onLoad={() => setImgLoaded(true)}
+            onError={() => setLoadFailed(true)}
+            className={`block max-h-64 w-auto max-w-full rounded-lg object-contain transition-opacity duration-150 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+          />
+        </div>
         <div className="flex items-center gap-1.5 pt-0.5 text-[10px] text-gray-500">
           <span className="min-w-0 flex-1 truncate">{row.fileName || row.mimeType}</span>
           <span className="shrink-0">{sizeLabel(row.byteLength)}</span>
