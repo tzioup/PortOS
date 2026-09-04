@@ -28,7 +28,7 @@
  * `beeperTribe`, `tribe`, `db` — is real.
  */
 import {
-  it, expect, beforeAll, afterAll, vi,
+  describe, it, expect, beforeAll, afterAll, vi,
 } from 'vitest';
 import { checkHealth, ensureSchema, close, query } from '../lib/db.js';
 import { requireDbOrSkip } from '../lib/dbTestGate.js';
@@ -150,7 +150,7 @@ afterAll(async () => {
   }
 });
 
-runDb('beeperSync against Postgres', () => {
+describe.skipIf(!runDb)('beeperSync against Postgres', () => {
   it('writes account, conversation, message, attachment and cursor rows in one sweep', async () => {
     installFetch({
       chats: { items: [chatFixture('2026-09-02T10:00:00.000Z')], hasMore: false },
