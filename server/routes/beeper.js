@@ -1,9 +1,18 @@
 import { Router } from 'express';
+import { z } from 'zod';
 import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
 import { beeperOAuthCallbackSchema, beeperPastedTokenSchema, validateRequest } from '../lib/validation.js';
 import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus.js';
 import { completeBeeperOAuth, connectWithPastedToken, disconnectBeeper, startBeeperOAuth } from '../services/beeperOAuth.js';
 import { runBeeperSweep } from '../services/beeperSync.js';
+import {
+  listConversations,
+  getConversation,
+  listMessages,
+  listNetworks,
+  setConversationArchived,
+  setConversationLowPriority,
+} from '../services/beeperConversations.js';
 
 const router = Router();
 
@@ -42,7 +51,22 @@ const mapBeeperError = createServiceErrorMapper(BEEPER_ERROR_STATUS);
 // burns a single-use code, so a client that auto-retried either would do real
 // damage — the flag is the contract the client keys on rather than re-deriving
 // "is a 502 transient" for itself.
-const mapBeeperWriteError = createServiceErrorMapper(BEEPER_ERROR_STATUS, () => ({ retryable: false }));
+// The chat-surface writes (#35) go through the same mapper, so its table also
+// carries every HTTP-derived code beeperClient's STATUS_TABLE can raise on a
+// PATCH — an unmapped code would fall through as a raw BeeperApiError whose
+// `status` can be 0.
+const mapBeeperWriteError = createServiceErrorMapper({
+  ...BEEPER_ERROR_STATUS,
+  BAD_REQUEST: 400,
+  FORBIDDEN: 403,
+  NOT_FOUND: 404,
+  CONFLICT: 409,
+  VALIDATION_ERROR: 422,
+  RATE_LIMITED: 429,
+  INTERNAL_ERROR: 502,
+  UPSTREAM_ERROR: 502,
+  UNKNOWN_ERROR: 502,
+}, () => ({ retryable: false }));
 
 // OAuth must use the same public origin the browser used to reach this request,
 // so the flow works over HTTPS, on a Tailscale hostname, or behind a proxy —
@@ -90,6 +114,94 @@ router.post('/status/check', asyncHandler(async (_req, res) => {
 router.post('/sync', asyncHandler(async (_req, res) => {
   const result = await runBeeperSweep({ reason: 'manual' }).catch((err) => { throw mapBeeperError(err); });
   res.json(result);
+}));
+
+// ---------------------------------------------------------------------------
+// Chat surface read model (#35) — served from the MIRROR, never from Beeper.
+// ---------------------------------------------------------------------------
+
+// A query-string boolean is a STRING, so `z.coerce.boolean()` is wrong here:
+// it maps the literal "false" to `true`. Omission stays `undefined`, which the
+// service reads as "do not filter on this at all" — a different query from
+// `false` (root AGENTS.md, absent-vs-empty).
+const queryBoolean = z.enum(['true', 'false']).transform((value) => value === 'true').optional();
+
+const conversationListQuerySchema = z.object({
+  network: z.string().min(1).max(100).optional(),
+  unreadOnly: queryBoolean,
+  archived: queryBoolean,
+  lowPriority: queryBoolean,
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  cursor: z.string().max(500).optional(),
+}).strict();
+
+const messageListQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  cursor: z.string().max(500).optional(),
+}).strict();
+
+const conversationParamsSchema = z.object({ id: z.string().guid() });
+
+const archiveSchema = z.object({ archived: z.boolean() }).strict();
+const lowPrioritySchema = z.object({ lowPriority: z.boolean() }).strict();
+
+// GET /api/beeper/conversations — the rail's list for one scope. Filters are
+// per-network and unread-only (#9's MVP scoping) plus the two system scopes
+// the wired rail controls produce, archived and low-priority.
+router.get('/conversations', asyncHandler(async (req, res) => {
+  const filters = validateRequest(conversationListQuerySchema, req.query);
+  res.json(await listConversations(filters));
+}));
+
+// GET /api/beeper/networks — the rail's scope list, derived from the mirror.
+// Never a hardcoded network roster: #9 records that the development machine's
+// account shape is an outlier, so the rail renders whatever data holds.
+router.get('/networks', asyncHandler(async (_req, res) => {
+  res.json({ networks: await listNetworks() });
+}));
+
+// GET /api/beeper/conversations/:id — one conversation with its full mirrored
+// participant set. 404 when the id is unknown, so a stale deep link degrades to
+// the surface's not-found state instead of an empty thread that looks live.
+router.get('/conversations/:id', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(conversationParamsSchema, req.params);
+  const conversation = await getConversation(id);
+  if (!conversation) {
+    res.status(404).json({ error: 'Conversation not found', code: 'NOT_FOUND' });
+    return;
+  }
+  res.json(conversation);
+}));
+
+// GET /api/beeper/conversations/:id/messages — cursor-paginated, newest first.
+// An empty page is a legitimate answer, not an error: history depth varies
+// enormously per network (#3), so the surface says so rather than spinning.
+router.get('/conversations/:id/messages', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(conversationParamsSchema, req.params);
+  const options = validateRequest(messageListQuerySchema, req.query);
+  res.json(await listMessages(id, options));
+}));
+
+// POST /api/beeper/conversations/:id/archive — one of the two rail controls #9
+// wired. Beeper owns `isArchived`, so this PATCHes Beeper first and mirrors the
+// answer second; a failure leaves the mirror untouched.
+router.post('/conversations/:id/archive', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(conversationParamsSchema, req.params);
+  const { archived } = validateRequest(archiveSchema, req.body);
+  const conversation = await setConversationArchived(id, archived)
+    .catch((err) => { throw mapBeeperWriteError(err); });
+  res.json(conversation);
+}));
+
+// POST /api/beeper/conversations/:id/low-priority — the other wired control.
+// `isPinned` deliberately has no route: the pinned set is Beeper's own state,
+// mirrored (#27), and a PortOS-local pin would be a second source of truth.
+router.post('/conversations/:id/low-priority', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(conversationParamsSchema, req.params);
+  const { lowPriority } = validateRequest(lowPrioritySchema, req.body);
+  const conversation = await setConversationLowPriority(id, lowPriority)
+    .catch((err) => { throw mapBeeperWriteError(err); });
+  res.json(conversation);
 }));
 
 // POST /api/beeper/oauth/start — discover, dynamically register PortOS as a

@@ -148,7 +148,16 @@ const RAW_NAV_COMMANDS = [
   // WhatsApp/Discord/Telegram/Instagram/X/Slack and more, joining the Comms
   // group #40 stood up. Off by default (no detector — #11) — the route keeps
   // resolving with the feature off, so bookmarks and voice ui_navigate still land.
-  { id: 'nav.messages.beeper', path: '/messages/beeper', label: 'Beeper', section: 'Comms', feature: 'beeper', aliases: ['beeper', 'beeper-chat', 'comms-beeper', 'beeper-settings'], keywords: ['comms', 'beeper', 'bridge', 'whatsapp', 'discord', 'telegram', 'instagram', 'slack', 'chat', 'unified inbox'] },
+  { id: 'nav.messages.beeper', path: '/messages/beeper', label: 'Beeper', section: 'Comms', feature: 'beeper', aliases: ['beeper', 'beeper-chat', 'comms-beeper'], keywords: ['comms', 'beeper', 'bridge', 'whatsapp', 'discord', 'telegram', 'instagram', 'slack', 'chat', 'unified inbox'] },
+  // #35 turned /messages/beeper into the chat surface itself, so the ingestion
+  // settings + status card moved into a drawer over it (?settings=1) — the same
+  // shape iMessage uses. The entry exists so "open beeper settings" still lands
+  // on the card rather than on the conversation list. The open CONVERSATION is
+  // /messages/beeper/:conversationId and deliberately has no entry of its own:
+  // NAV_COMMANDS enumerates navigable PAGES, and a per-record path would need a
+  // parameter the fuzzy resolver has no way to supply (iMessage's :chatKey is
+  // absent for the same reason).
+  { id: 'nav.messages.beeper-settings', path: '/messages/beeper?settings=1', label: 'Beeper Settings', section: 'Comms', feature: 'beeper', aliases: ['beeper-settings', 'settings-beeper', 'beeper-sync'], keywords: ['beeper', 'settings', 'token', 'sync', 'bridge', 'status', 'connection', 'interval'] },
   { id: 'nav.messages.contacts', path: '/messages/contacts', label: 'Contacts', section: 'Comms', previousPaths: ['/settings/contacts'], aliases: ['contacts', 'address-book', 'comms-contacts', 'settings-contacts'], keywords: ['comms', 'contacts', 'address book', 'phone', 'email', 'tribe', 'imessage', 'names', 'resolve'] },
   // Ingestion config is a drawer over the iMessage manager (?settings=1), not a
   // Settings page — the settings-* aliases stay so "open iMessage settings" still lands.
