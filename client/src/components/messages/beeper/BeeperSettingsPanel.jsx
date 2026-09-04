@@ -33,7 +33,7 @@ import {
 // emits `beeper:unsubscribe` on unmount, so another instance inside a drawer
 // would tear the surface's subscription down every time the drawer closed.
 // One subscriber per page; the page owns it.
-export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onRealtimeSeed }) {
+export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onRealtimeSeed, onBreakerCleared }) {
   const {
     loading: settingsLoading, form, setForm, saving, dirty, save,
   } = useBeeperSettings();
@@ -250,8 +250,14 @@ export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onR
       {/* The outbound runaway breaker (#36) — an actionable fault, so it renders
           on this settings surface with the other actionable faults rather than
           on the chat surface or as a global banner. Absent entirely unless it
-          has actually tripped. */}
-      <BeeperOutboxBreakerBanner breaker={status?.outbox?.breaker} onCleared={loadStatus} />
+          has actually tripped. `onBreakerCleared` (from `BeeperTab`) refreshes
+          the page-level snapshot the composer reads, so Send re-enables the
+          moment this clears rather than waiting on the composer's own next
+          status fetch. */}
+      <BeeperOutboxBreakerBanner
+        breaker={status?.outbox?.breaker}
+        onCleared={() => { loadStatus(); onBreakerCleared?.(); }}
+      />
 
       <AttachmentMirrorCard budgetGb={form.attachmentBudgetGb} settingsDirty={dirty || saving} />
 
