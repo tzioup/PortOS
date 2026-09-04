@@ -475,6 +475,8 @@ export default function BeeperChatSurface({
     submit: sendOutboxMessage,
     confirmAndSend: confirmOutboxSend,
     cancelConfirmation: cancelOutboxConfirmation,
+    retry: retryOutboxEntry,
+    dismiss: dismissOutboxEntry,
   } = useBeeperOutbox(conversationId, { onSent: () => setDraft('') });
 
   const loadMoreMessages = useCallback(async () => {
@@ -736,6 +738,8 @@ export default function BeeperChatSurface({
             onSend={sendOutboxMessage}
             confirmAndSend={confirmOutboxSend}
             cancelConfirmation={cancelOutboxConfirmation}
+            retryOutboxEntry={retryOutboxEntry}
+            dismissOutboxEntry={dismissOutboxEntry}
             breaker={breaker}
             people={people}
             linkingId={linkingId}

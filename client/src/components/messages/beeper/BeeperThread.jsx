@@ -24,15 +24,21 @@ import { formatBytes } from '../../../utils/formatters';
  *    at the network rather than inventing one.
  *
  * Sending itself (#53, wired on the durable outbox from #36) is a thin layer
- * over `onSend`/`confirmAndSend`/`cancelConfirmation`, which the surface
- * supplies from `useBeeperOutbox`. This component owns none of the send
- * lifecycle — it only renders what the hook reports: the pending/failed rows
- * in `outboxEntries` (filtered against `messages` so a confirmed send shows
- * once, as the real mirrored message, not twice), and the inline first-contact
- * question when `confirmation` is set. Nothing here ever retries a send on its
- * own; a failed row's "Retry" composes a NEW outbox entry with the same text,
- * exactly like typing it again, because Beeper has no idempotency key and a
- * client-driven resend of the same row would risk a duplicate real message.
+ * over `onSend`/`confirmAndSend`/`cancelConfirmation`/`retryOutboxEntry`/
+ * `dismissOutboxEntry`, which the surface supplies from `useBeeperOutbox`.
+ * This component owns none of the send lifecycle — it only renders what the
+ * hook reports: the pending/failed/stalled rows in `outboxEntries` (filtered
+ * against `messages` so a confirmed send shows once, as the real mirrored
+ * message, not twice), and the inline first-contact question when
+ * `confirmation` is set. Nothing here ever retries a send that touched the
+ * wire on its own; a `failed` row's "Retry" composes a NEW outbox entry with
+ * the same text, exactly like typing it again, because Beeper has no
+ * idempotency key and a client-driven resend of the same row would risk a
+ * duplicate real message. A stalled `approved` row (PR #60 blocker 1 — a
+ * send refused before the server could even claim the row, most often
+ * `OUTBOX_BREAKER_OPEN`) is the opposite case: nothing touched the wire, so
+ * its "Retry" re-dispatches the SAME row, and it also gets a "Dismiss" to
+ * give up on it — the original bug was this state having neither.
  *
  * Direction comes from the mirrored `isSender`, never from comparing
  * `senderId` against the local user — `accounts[].user.id` differs from
@@ -174,10 +180,24 @@ function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
  * one that failed. Always outbound (right-aligned, no avatar), matching the
  * bubble a mirrored `isSender` message renders, so a pending send does not
  * visually jump when it swaps for the real thing.
+ *
+ * `approved` is normally in flight for the moment between the create and
+ * send requests (`sending` is true). If it is STILL `approved` once nothing
+ * is actively sending — and it is not the row a first-contact confirmation
+ * is currently asking about — the send was refused before the server could
+ * even claim the row, most often `OUTBOX_BREAKER_OPEN` (#36). Left alone
+ * that renders as a permanent "Sending…" phantom that survives reload (PR
+ * #60 blocker 1), so it gets the same "stalled" treatment as `failed`: a
+ * reason, a Retry, and — since nothing here was ever posted to Beeper — a
+ * Dismiss that gives up on it outright.
  */
-function OutboxRow({ entry, onRetry }) {
+function OutboxRow({
+  entry, sending, isConfirming, onRetry, onDismiss,
+}) {
   const failed = entry.state === 'failed';
   const confirming = entry.state === 'awaiting-confirmation' || entry.state === 'sent';
+  const stalled = entry.state === 'approved' && !sending && !isConfirming;
+  const blocked = failed || stalled;
   return (
     <div
       data-testid="beeper-outbox-row"
@@ -186,14 +206,18 @@ function OutboxRow({ entry, onRetry }) {
     >
       <div
         className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm text-gray-100 ${
-          failed ? 'border border-port-error/40 bg-port-error/10' : 'bg-port-accent/25'
+          blocked ? 'border border-port-error/40 bg-port-error/10' : 'bg-port-accent/25'
         }`}
       >
         <p className="whitespace-pre-wrap break-words">{entry.body}</p>
         <span className="mt-0.5 flex items-center justify-end gap-1.5 text-[10px]">
-          {failed ? (
+          {blocked ? (
             <>
-              <span className="text-port-error">Not delivered{entry.errorMessage ? ` — ${entry.errorMessage}` : ''}</span>
+              <span className="text-port-error">
+                {failed
+                  ? `Not delivered${entry.errorMessage ? ` — ${entry.errorMessage}` : ''}`
+                  : 'Not sent — the send was refused'}
+              </span>
               <button
                 type="button"
                 onClick={() => onRetry(entry)}
@@ -201,6 +225,15 @@ function OutboxRow({ entry, onRetry }) {
               >
                 Retry
               </button>
+              {stalled && (
+                <button
+                  type="button"
+                  onClick={() => onDismiss(entry)}
+                  className="rounded px-1 py-0.5 text-gray-400 transition-colors hover:underline"
+                >
+                  Dismiss
+                </button>
+              )}
             </>
           ) : (
             <span className="flex items-center gap-1 text-gray-400">
@@ -230,6 +263,8 @@ export default function BeeperThread({
   onSend,
   confirmAndSend,
   cancelConfirmation,
+  retryOutboxEntry,
+  dismissOutboxEntry,
   breaker = null,
   people,
   linkingId,
@@ -292,7 +327,15 @@ export default function BeeperThread({
   };
   // A failed row's only recovery: compose the SAME text again as a brand new
   // outbox entry. Never a resend of the failed row — see the file docstring.
-  const handleRetry = (entry) => { if (!breakerTripped) onSend(entry.body); };
+  // A stalled `approved` row (PR #60 blocker 1) is the opposite case: nothing
+  // ever reached Beeper for it, so retrying re-sends the SAME row instead —
+  // composing a new one on every click would just manufacture more phantoms
+  // while the breaker stays tripped.
+  const handleRetry = (entry) => {
+    if (entry.state === 'approved') { retryOutboxEntry?.(entry); return; }
+    if (!breakerTripped) onSend(entry.body);
+  };
+  const handleDismiss = (entry) => { dismissOutboxEntry?.(entry); };
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
@@ -598,7 +641,14 @@ export default function BeeperThread({
         {/* Pending/failed sends. Not yet in `messages` — that arrives only
             once the mirror has caught up (#53, on the outbox from #36). */}
         {visibleOutbox.map((entry) => (
-          <OutboxRow key={entry.id} entry={entry} onRetry={handleRetry} />
+          <OutboxRow
+            key={entry.id}
+            entry={entry}
+            sending={sending}
+            isConfirming={confirmation?.entry?.id === entry.id}
+            onRetry={handleRetry}
+            onDismiss={handleDismiss}
+          />
         ))}
 
         <div ref={bottomRef} />

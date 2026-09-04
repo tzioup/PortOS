@@ -182,4 +182,69 @@ describe('useBeeperOutbox', () => {
     expect(listOutboxEntries.mock.calls.length).toBeGreaterThan(before);
     await waitFor(() => expect(result.current.entries[0].state).toBe('sent'));
   });
+
+  // PR #60 blocker 1: `assertBreakerClosed()` runs before the row is claimed,
+  // so a 429 `OUTBOX_BREAKER_OPEN` leaves the row `approved` by design (#36)
+  // — the same shape as the first-contact refusal, but with no `confirmation`
+  // to hang a Cancel off. The row must stay `approved` and visible (never
+  // fabricated as failed) so `retry()`/`dismiss()` have something to act on.
+  it('leaves a breaker-refused row `approved` rather than `failed`, ready to retry or dismiss', async () => {
+    sendOutboxEntry.mockRejectedValueOnce(new ApiError(
+      'Beeper sending is blocked by the runaway breaker',
+      'OUTBOX_BREAKER_OPEN',
+    ));
+    listOutboxEntries.mockResolvedValue({ entries: [ENTRY] });
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID));
+
+    await act(async () => { await result.current.submit('hello there'); });
+
+    expect(toastError).toHaveBeenCalled();
+    await waitFor(() => expect(result.current.entries).toHaveLength(1));
+    expect(result.current.entries[0].state).toBe('approved');
+    expect(result.current.confirmation).toBeNull();
+  });
+
+  // `retry()` is the one exception to "nothing here ever retries in place":
+  // legal only because a still-`approved` row never reached `sendMessage`, so
+  // re-dispatching it is exactly as safe as sending it the first time. It
+  // must NOT compose a new row — that would manufacture a second phantom on
+  // every click while the breaker stays tripped, the exact failure the
+  // reviewer flagged.
+  it('retries a stalled approved row in place, without composing a new one', async () => {
+    sendOutboxEntry.mockRejectedValueOnce(new ApiError(
+      'Beeper sending is blocked by the runaway breaker',
+      'OUTBOX_BREAKER_OPEN',
+    ));
+    listOutboxEntries.mockResolvedValue({ entries: [ENTRY] });
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID));
+    await act(async () => { await result.current.submit('hello there'); });
+    await waitFor(() => expect(result.current.entries[0].state).toBe('approved'));
+
+    sendOutboxEntry.mockResolvedValueOnce({ ...ENTRY, state: 'awaiting-confirmation' });
+    await act(async () => { await result.current.retry(result.current.entries[0]); });
+
+    expect(createOutboxEntry).toHaveBeenCalledTimes(1);
+    expect(sendOutboxEntry).toHaveBeenCalledTimes(2);
+    expect(sendOutboxEntry).toHaveBeenLastCalledWith('outbox-1', { confirmFirstContact: false }, { silent: true });
+    expect(result.current.entries).toHaveLength(1);
+    expect(result.current.entries[0].state).toBe('awaiting-confirmation');
+  });
+
+  // `dismiss()` is the general form of Cancel: giving up on a stalled
+  // `approved` row that is not part of any pending first-contact question.
+  it('dismisses a stalled approved row on request, discarding it server-side', async () => {
+    sendOutboxEntry.mockRejectedValueOnce(new ApiError(
+      'Beeper sending is blocked by the runaway breaker',
+      'OUTBOX_BREAKER_OPEN',
+    ));
+    listOutboxEntries.mockResolvedValue({ entries: [ENTRY] });
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID));
+    await act(async () => { await result.current.submit('hello there'); });
+    await waitFor(() => expect(result.current.entries[0].state).toBe('approved'));
+
+    await act(async () => { await result.current.dismiss(result.current.entries[0]); });
+
+    expect(discardOutboxEntry).toHaveBeenCalledWith('outbox-1', { silent: true });
+    expect(result.current.entries).toHaveLength(0);
+  });
 });

@@ -16,9 +16,15 @@ import useMounted from './useMounted';
  *
  * Three rules it exists to keep:
  *
- *  - **Nothing here ever retries.** Beeper has no idempotency key on send, so a
- *    retry is a second real message. A failed send stays failed and visible in
- *    `entries`; sending again means composing again, which creates a NEW row.
+ *  - **A send that touched the wire never retries in place.** Beeper has no
+ *    idempotency key on send, so retrying an attempt that reached
+ *    `sendMessage` is a second real message. A `failed` row stays failed and
+ *    visible in `entries`; sending again means composing again, via
+ *    `submit()`, which creates a NEW row. `retry()` is the narrow exception:
+ *    it only ever re-dispatches a row still `approved` — refused before the
+ *    server could claim it (`OUTBOX_BREAKER_OPEN` is the practical case) —
+ *    where nothing has touched the wire yet, so re-sending the same row is
+ *    exactly as safe as sending it the first time.
  *  - **First contact confirms inline.** The server refuses the first outbound
  *    message to a conversation with `FIRST_CONTACT_CONFIRMATION_REQUIRED`;
  *    that answer is surfaced as `confirmation`, NOT as an error toast, so the
@@ -146,19 +152,20 @@ export default function useBeeperOutbox(conversationId, { onSent } = {}) {
   }, [confirmation, dispatch]);
 
   /**
-   * The inline confirmation's "Cancel". Nothing has POSTed to Beeper for this
-   * row — it is still `approved`, never sent — so cancelling discards it
-   * outright rather than leaving it behind. Leaving it `approved` was the
-   * original design, but the composer has no way to render or dismiss that
-   * state distinctly from "sending": it fell into `OutboxRow`'s default
-   * branch and rendered as a permanent "Sending…" bubble, including across a
-   * reload, because `GET /outbox` returns every approved row (#53's fix).
-   * A discard failure (e.g. a network hiccup) refetches instead of silently
-   * dropping the row from just the client's view — the truth is the server's.
+   * Discard a row the human has given up on. Legal only while the row is
+   * still `approved` — the server enforces that, and this mirrors it exactly
+   * — because that is the only state meaning nothing has POSTed to Beeper
+   * for it yet. Leaving an unwanted `approved` row behind was the original
+   * design, but the composer had no way to render or dismiss it distinctly
+   * from "sending": it fell into `OutboxRow`'s default branch and rendered
+   * as a permanent "Sending…" bubble, including across a reload, because
+   * `GET /outbox` returns every approved row (#53's Cancel fix; #60 blocker
+   * 1 closed the other way in — a refused send, e.g. `OUTBOX_BREAKER_OPEN`
+   * — into the same phantom). A discard failure (e.g. a network hiccup)
+   * refetches instead of silently dropping the row from just the client's
+   * view — the truth is the server's.
    */
-  const cancelConfirmation = useCallback(async () => {
-    const entry = confirmation?.entry;
-    setConfirmation(null);
+  const discardEntry = useCallback(async (entry) => {
     if (!entry) return;
     const [, err] = await discardOutboxEntry(entry.id, { silent: true })
       .then(() => [true, null])
@@ -170,7 +177,29 @@ export default function useBeeperOutbox(conversationId, { onSent } = {}) {
       return;
     }
     setEntries((prev) => prev.filter((row) => row.id !== entry.id));
-  }, [confirmation, refresh]);
+  }, [refresh]);
+
+  /** The inline confirmation's "Cancel" — see `discardEntry`. */
+  const cancelConfirmation = useCallback(async () => {
+    const entry = confirmation?.entry;
+    setConfirmation(null);
+    if (!entry) return;
+    await discardEntry(entry);
+  }, [confirmation, discardEntry]);
+
+  /**
+   * Retry a row that never reached Beeper — a stalled `approved` entry
+   * refused before the server could claim it (`OUTBOX_BREAKER_OPEN` is the
+   * practical case, #60 blocker 1). Re-dispatches the SAME row rather than
+   * composing a new one: nothing has touched the wire for it, so this is as
+   * safe as sending it the first time, and it means a stuck breaker does not
+   * manufacture a fresh phantom on every click the way retrying via `submit`
+   * would.
+   */
+  const retry = useCallback((entry) => dispatch(entry, false), [dispatch]);
+
+  /** Give up on a stalled `approved` row outright — see `discardEntry`. */
+  const dismiss = useCallback((entry) => discardEntry(entry), [discardEntry]);
 
   return {
     entries,
@@ -180,6 +209,8 @@ export default function useBeeperOutbox(conversationId, { onSent } = {}) {
     submit,
     confirmAndSend,
     cancelConfirmation,
+    retry,
+    dismiss,
     refresh,
   };
 }
