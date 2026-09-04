@@ -1,4 +1,6 @@
-import { useEffect, useState } from 'react';
+import {
+  useEffect, useRef, useState,
+} from 'react';
 import { Download, FileText, Loader2, Lock, LockOpen, Paperclip, Video } from 'lucide-react';
 import toast from '../../ui/Toast';
 import { useLockToggle } from '../../../hooks/useLockToggle';
@@ -93,11 +95,35 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
   // a 2x2px box for the whole wait — this drives the reserved-space skeleton
   // below instead.
   const [imgLoaded, setImgLoaded] = useState(false);
+  const imgRef = useRef(null);
+  // The image identity, not the attachment object's identity. A thread
+  // refetch (BeeperChatSurface.jsx) and the keep toggle (onUpdated ->
+  // applyAttachmentUpdate) both hand down a new-but-equal attachment object
+  // for the SAME image. `<img>` keeps its key and `src` across that, so React
+  // reuses the same DOM node and no second `load` event fires — resetting
+  // `imgLoaded` on every attachment change left the image stuck at
+  // `opacity-0` behind a permanent skeleton. Only reset the load state when
+  // the image itself changes.
+  const identityRef = useRef(null);
+  const identity = `${attachment.messageId}:${attachment.idx}`;
   useEffect(() => {
     setRow(attachment);
-    setLoadFailed(false);
-    setImgLoaded(false);
-  }, [attachment]);
+    if (identityRef.current !== identity) {
+      identityRef.current = identity;
+      setLoadFailed(false);
+      setImgLoaded(false);
+    }
+  }, [attachment, identity]);
+
+  // Resync from the `<img>` element's own load state rather than trusting
+  // React state alone: seeds `imgLoaded` back to true for a reused node whose
+  // image was already loaded (the reset above deliberately skips it), and
+  // covers a new node whose image happens to finish before this effect runs.
+  useEffect(() => {
+    if (imgRef.current?.complete && imgRef.current.naturalWidth > 0) {
+      setImgLoaded(true);
+    }
+  }, [row]);
 
   const applyUpdate = (updated) => {
     setRow(updated);
@@ -205,6 +231,7 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
             />
           )}
           <img
+            ref={imgRef}
             src={url}
             alt={row.fileName || 'Attachment'}
             loading="lazy"

@@ -61,6 +61,25 @@ describe('BeeperAttachment — image load lifecycle', () => {
     expect(img).not.toHaveAttribute('height');
   });
 
+  it('keeps the loaded image visible when the attachment object is replaced but the image identity is unchanged', () => {
+    // A thread refetch or the keep toggle's applyAttachmentUpdate hands down a
+    // new-but-equal attachment object for the same messageId/idx. The `<img>`
+    // keeps its key and `src`, so React reuses the same DOM node and no
+    // second `load` event fires — the load state must survive the swap.
+    const { rerender } = render(<BeeperAttachment attachment={{ ...baseAttachment, width: 800, height: 600 }} />);
+
+    const img = screen.getByRole('img', { name: 'photo.png' });
+    fireEvent.load(img);
+    expect(img.className).toContain('opacity-100');
+
+    rerender(<BeeperAttachment attachment={{ ...baseAttachment, width: 800, height: 600, keep: true }} />);
+
+    const after = screen.getByRole('img', { name: 'photo.png' });
+    expect(after).toBe(img);
+    expect(screen.queryByTestId('attachment-skeleton')).toBeNull();
+    expect(after.className).toContain('opacity-100');
+  });
+
   it('swaps the skeleton for the image once it loads', () => {
     render(<BeeperAttachment attachment={{ ...baseAttachment, width: 800, height: 600 }} />);
 
