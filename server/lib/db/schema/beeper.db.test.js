@@ -7,6 +7,8 @@
  *   - `UNIQUE (account_id, source_chat_id)` holds on beeper_conversations
  *   - `beeper_credentials` (#31) stores one row keyed on a fixed id, accepts a
  *     NULL expiry (the no-expiry pasted token), and rejects an unknown `source`
+ *   - `beeper_outbox` (#36) accepts every state of PortOS's own send machine,
+ *     rejects one outside it, and cascade-deletes with its conversation
  *
  * `*.db.test.js` → runs ONLY via `npm run test:db` against `portos_test`, never
  * the real `portos` DB (the db.js runner guard + the suite skip below enforce
@@ -61,6 +63,7 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
       'beeper_conversations',
       'beeper_credentials',
       'beeper_messages',
+      'beeper_outbox',
       'beeper_participants',
       'beeper_sync_cursors',
     ]);
@@ -160,6 +163,49 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
     ).rejects.toThrow();
 
     await query('DELETE FROM beeper_credentials WHERE id = $1', [credentialId]);
+  });
+
+  // #36's outbound outbox. The CHECK is the schema's half of "a failed send is
+  // never re-sent in place": every state the send path can reach is in the set,
+  // and anything else — including a hopeful `queued` from a later refactor —
+  // fails loudly at the boundary instead of quietly bypassing the send gate.
+  it('accepts every outbox state, rejects one outside the set, and cascades with its conversation', async () => {
+    await query(
+      `INSERT INTO beeper_accounts (account_id, network, display_name, status, bridge_id)
+       VALUES ($1, 'Example Network', 'Example Account', 'connected', 'example-bridge')`,
+      [ACCOUNT_ID],
+    );
+    const { rows: convRows } = await query(
+      `INSERT INTO beeper_conversations (account_id, network, source_chat_id, title, type)
+       VALUES ($1, 'Example Network', 'chat-outbox', 'Example Chat', 'single')
+       RETURNING id`,
+      [ACCOUNT_ID],
+    );
+    const conversationId = convRows[0].id;
+
+    for (const state of ['draft', 'approved', 'sending', 'awaiting-confirmation', 'sent', 'failed']) {
+      // eslint-disable-next-line no-await-in-loop -- ordered inserts, one per state
+      await query(
+        `INSERT INTO beeper_outbox (conversation_id, chat_id, body, state)
+         VALUES ($1, 'chat-outbox', 'placeholder body', $2)`,
+        [conversationId, state],
+      );
+    }
+
+    await expect(
+      query(
+        `INSERT INTO beeper_outbox (conversation_id, chat_id, body, state)
+         VALUES ($1, 'chat-outbox', 'placeholder body', 'queued')`,
+        [conversationId],
+      ),
+    ).rejects.toThrow();
+
+    const before = await query('SELECT COUNT(*)::int AS n FROM beeper_outbox WHERE conversation_id = $1', [conversationId]);
+    expect(before.rows[0].n).toBe(6);
+
+    await query('DELETE FROM beeper_accounts WHERE account_id = $1', [ACCOUNT_ID]);
+    const after = await query('SELECT COUNT(*)::int AS n FROM beeper_outbox WHERE conversation_id = $1', [conversationId]);
+    expect(after.rows[0].n).toBe(0);
   });
 
   it('rejects a participant observed_via outside the participant-list/message-sender set', async () => {

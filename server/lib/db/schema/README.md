@@ -34,7 +34,7 @@ Parity with `server/scripts/init-db.sql` (the fresh-install path) is locked by
 | `privacy.js` | `privacyDdl` | Privacy suite — vault, consents, orgs, brokers, change events |
 | `stackerNews.js` | `stackerNewsDdl` | Stacker News accounts, territories, untrusted-content analyses, and review-gated actions |
 | `x.js` | `xDdl` | X account diagnostics, public post metrics, and review-gated drafts |
-| `beeper.js` | `beeperDdl` | Beeper conversation mirror — accounts, the vault-encrypted access credential, conversations, messages, participants, attachment metadata, sync cursors (machine-local, never federated) |
+| `beeper.js` | `beeperDdl` | Beeper conversation mirror — accounts, the vault-encrypted access credential, conversations, messages, participants, attachment metadata, sync cursors, and the outbound send outbox (machine-local, never federated) |
 | `audit.js` | `auditDdl`, `auditedTables`, `buildAuditTriggers()` | `record_audit` table/function + per-table audit triggers |
 
 ### Composer (`index.js`)

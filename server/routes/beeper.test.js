@@ -13,6 +13,12 @@ vi.mock('../services/beeperOAuth.js', () => ({
   disconnectBeeper: vi.fn(),
 }));
 vi.mock('../services/beeperSync.js', () => ({ runBeeperSweep: vi.fn() }));
+vi.mock('../services/beeperOutbox.js', () => ({
+  createOutboxEntry: vi.fn(),
+  sendOutboxEntry: vi.fn(),
+  listOutboxEntries: vi.fn(),
+  clearOutboxBreaker: vi.fn(),
+}));
 vi.mock('../services/beeperConversations.js', () => ({
   listConversations: vi.fn(),
   getConversation: vi.fn(),
@@ -46,6 +52,9 @@ import {
   completeBeeperOAuth, connectWithPastedToken, disconnectBeeper, startBeeperOAuth,
 } from '../services/beeperOAuth.js';
 import { runBeeperSweep } from '../services/beeperSync.js';
+import {
+  clearOutboxBreaker, createOutboxEntry, listOutboxEntries, sendOutboxEntry,
+} from '../services/beeperOutbox.js';
 import {
   listConversations,
   getConversation,
@@ -358,6 +367,103 @@ describe('the token value never reaches a response or a log line', () => {
     expect(written.join('\n')).not.toContain(TOKEN);
     // The service DID receive it — this is a leak test, not a plumbing bug.
     expect(connectWithPastedToken).toHaveBeenCalledWith(TOKEN);
+  });
+});
+
+// The outbox routes (#36). The service's own gates are covered in
+// `services/beeperOutbox.test.js`; this pins the HTTP contract the composer
+// codes against — validation, the coded 4xx map, and `retryable: false` on
+// every write path so a client can never turn one refusal into two messages.
+describe('POST /api/beeper/outbox — step one, create the entry', () => {
+  beforeEach(() => vi.clearAllMocks());
+  const CONVERSATION_ID = '11111111-1111-4111-8111-111111111111';
+
+  it('creates an approved entry and answers 201', async () => {
+    vi.mocked(createOutboxEntry).mockResolvedValue({ id: 'outbox-1', state: 'approved' });
+    const res = await request(buildApp())
+      .post('/api/beeper/outbox')
+      .send({ conversationId: CONVERSATION_ID, body: 'hello there' });
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({ id: 'outbox-1', state: 'approved' });
+    expect(createOutboxEntry).toHaveBeenCalledWith({ conversationId: CONVERSATION_ID, body: 'hello there' });
+  });
+
+  it('400s a malformed body without touching the service', async () => {
+    const res = await request(buildApp()).post('/api/beeper/outbox').send({ body: 'no conversation' });
+    expect(res.status).toBe(400);
+    expect(createOutboxEntry).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/beeper/outbox/:id/send — step two, the send', () => {
+  beforeEach(() => vi.clearAllMocks());
+  const ENTRY_ID = '44444444-4444-4444-8444-444444444444';
+
+  it('400s a malformed entry id before it reaches a query', async () => {
+    const res = await request(buildApp()).post('/api/beeper/outbox/not-a-uuid/send').send({});
+    expect(res.status).toBe(400);
+    expect(sendOutboxEntry).not.toHaveBeenCalled();
+  });
+
+  it('passes the first-contact confirmation through explicitly', async () => {
+    vi.mocked(sendOutboxEntry).mockResolvedValue({ id: 'outbox-1', state: 'awaiting-confirmation' });
+    const res = await request(buildApp())
+      .post(`/api/beeper/outbox/${ENTRY_ID}/send`)
+      .send({ confirmFirstContact: true });
+    expect(res.status).toBe(200);
+    expect(sendOutboxEntry).toHaveBeenCalledWith(ENTRY_ID, { confirmFirstContact: true });
+  });
+
+  it('defaults the confirmation to false when the field is absent', async () => {
+    vi.mocked(sendOutboxEntry).mockResolvedValue({ id: 'outbox-1', state: 'awaiting-confirmation' });
+    await request(buildApp()).post(`/api/beeper/outbox/${ENTRY_ID}/send`).send({});
+    expect(sendOutboxEntry).toHaveBeenCalledWith(ENTRY_ID, { confirmFirstContact: false });
+  });
+
+  it('maps FIRST_CONTACT_CONFIRMATION_REQUIRED to a non-retryable 409', async () => {
+    vi.mocked(sendOutboxEntry).mockRejectedValue(new BeeperApiError('confirm first contact', {
+      status: 409, code: 'FIRST_CONTACT_CONFIRMATION_REQUIRED', retryable: false,
+    }));
+    const res = await request(buildApp()).post(`/api/beeper/outbox/${ENTRY_ID}/send`).send({});
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('FIRST_CONTACT_CONFIRMATION_REQUIRED');
+    expect(res.body.context.retryable).toBe(false);
+  });
+
+  it('maps the open breaker to 429 and a transport failure to a non-retryable 503', async () => {
+    vi.mocked(sendOutboxEntry).mockRejectedValue(new BeeperApiError('breaker open', {
+      status: 429, code: 'OUTBOX_BREAKER_OPEN', retryable: false,
+    }));
+    const blocked = await request(buildApp()).post(`/api/beeper/outbox/${ENTRY_ID}/send`).send({});
+    expect(blocked.status).toBe(429);
+
+    // status:0 on the source error — the mapper must never pass it through.
+    vi.mocked(sendOutboxEntry).mockRejectedValue(new BeeperApiError('Beeper request failed', {
+      status: 0, code: 'NETWORK_ERROR', retryable: false,
+    }));
+    const failed = await request(buildApp()).post(`/api/beeper/outbox/${ENTRY_ID}/send`).send({});
+    expect(failed.status).toBe(503);
+    expect(failed.body.context.retryable).toBe(false);
+  });
+});
+
+describe('GET /api/beeper/outbox and the breaker reset', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('lists one conversation\'s entries', async () => {
+    vi.mocked(listOutboxEntries).mockResolvedValue([{ id: 'outbox-1', state: 'failed' }]);
+    const res = await request(buildApp())
+      .get('/api/beeper/outbox?conversationId=11111111-1111-4111-8111-111111111111');
+    expect(res.status).toBe(200);
+    expect(res.body.entries).toHaveLength(1);
+  });
+
+  it('clears the breaker on an explicit human POST', async () => {
+    vi.mocked(clearOutboxBreaker).mockReturnValue({ tripped: false, reason: null });
+    const res = await request(buildApp()).post('/api/beeper/outbox/breaker/clear');
+    expect(res.status).toBe(200);
+    expect(res.body.tripped).toBe(false);
+    expect(clearOutboxBreaker).toHaveBeenCalledTimes(1);
   });
 });
 
