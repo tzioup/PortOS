@@ -220,7 +220,7 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
     return (
       <div className="mt-1">
         <div
-          className="relative max-w-full overflow-hidden rounded-lg border border-port-border"
+          className="relative w-fit max-w-full overflow-hidden rounded-lg border border-port-border"
           style={!imgLoaded && !hasDims ? { width: '8rem', height: '8rem' } : undefined}
         >
           {!imgLoaded && (

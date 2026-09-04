@@ -61,6 +61,14 @@ describe('BeeperAttachment — image load lifecycle', () => {
     expect(img).not.toHaveAttribute('height');
   });
 
+  it('hugs the image with a w-fit wrapper rather than stretching to the bubble width', () => {
+    render(<BeeperAttachment attachment={{ ...baseAttachment, width: 800, height: 600 }} />);
+
+    const skeleton = screen.getByTestId('attachment-skeleton');
+    const wrapper = skeleton.parentElement;
+    expect(wrapper.className).toContain('w-fit');
+  });
+
   it('keeps the loaded image visible when the attachment object is replaced but the image identity is unchanged', () => {
     // A thread refetch or the keep toggle's applyAttachmentUpdate hands down a
     // new-but-equal attachment object for the same messageId/idx. The `<img>`
