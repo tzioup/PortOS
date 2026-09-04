@@ -258,6 +258,33 @@ async function markFailed(id, code, message) {
   );
 }
 
+/**
+ * Discard a row the human declined to send — the first-contact confirmation's
+ * "Cancel" (#53's fix; the original design deliberately left the row
+ * `approved` and visible, which the client had no way to render or dismiss,
+ * so it surfaced as a permanent phantom "Sending…" bubble). Reachable only
+ * while the row is `approved`: nothing has POSTed to Beeper for it yet, so
+ * removing it is a pure local record change, never an unsend. Anything past
+ * `approved` is a record of a real send attempt and stays — the client
+ * composes a new entry rather than discarding one that already touched the
+ * wire.
+ */
+export async function discardOutboxEntry(id) {
+  const entry = await readEntry(id);
+  if (!entry) {
+    throw new BeeperApiError('Outbox entry not found', {
+      status: 404, code: 'OUTBOX_ENTRY_NOT_FOUND', retryable: false,
+    });
+  }
+  if (entry.state !== 'approved') {
+    throw new BeeperApiError(
+      `Outbox entry is "${entry.state}", must be "approved" to discard — it has already been sent or attempted.`,
+      { status: 409, code: 'OUTBOX_INVALID_STATE', retryable: false },
+    );
+  }
+  await query("DELETE FROM beeper_outbox WHERE id = $1 AND state = 'approved'", [id]);
+}
+
 // ---------------------------------------------------------------------------
 // Send
 // ---------------------------------------------------------------------------

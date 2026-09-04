@@ -140,3 +140,10 @@ export const sendOutboxEntry = (id, { confirmFirstContact = false } = {}, option
   ...options,
 });
 export const clearOutboxBreaker = (options = {}) => request('/beeper/outbox/breaker/clear', { method: 'POST', ...options });
+// Discard a row the human declined to send — the first-contact confirmation's
+// "Cancel" (#53). Only an `approved` row (nothing has POSTed to Beeper for it
+// yet) is discardable.
+export const discardOutboxEntry = (id, options = {}) => request(`/beeper/outbox/${encodeURIComponent(id)}`, {
+  method: 'DELETE',
+  ...options,
+});

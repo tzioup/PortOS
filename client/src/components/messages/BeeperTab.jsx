@@ -40,13 +40,25 @@ export default function BeeperTab() {
   const onInvalidate = useCallback(() => setInvalidationSeq((seq) => seq + 1), []);
   const { realtime, seedRealtime } = useBeeperRealtime({ onInvalidate });
 
+  // The outbound runaway breaker's read model (#36, decided on #8). The
+  // composer disables Send off this — the SAME status the settings drawer's
+  // `BeeperOutboxBreakerBanner` already reads — rather than a second banner on
+  // the chat surface, which #12 decision 4 reserves for the settings card.
+  const [breaker, setBreaker] = useState(null);
+
   // Seeded from the page, not from the settings drawer: `beeper:subscribe`
   // does not push the current transport state, and the drawer's own status
   // fetch only runs once it is opened — so without this the rail's dot would
-  // stay blank on a healthy install until something changed.
+  // stay blank on a healthy install until something changed. The breaker flag
+  // rides the same fetch for the same reason: the composer needs it before the
+  // user has ever opened the settings drawer.
   const seedStatus = useCallback(() => {
     getBeeperStatus({ silent: true })
-      .then((status) => { if (mountedRef.current && status?.realtime) seedRealtime(status.realtime); })
+      .then((status) => {
+        if (!mountedRef.current) return;
+        if (status?.realtime) seedRealtime(status.realtime);
+        setBreaker(status?.outbox?.breaker || null);
+      })
       .catch(() => {});
   }, [seedRealtime, mountedRef]);
 
@@ -85,6 +97,7 @@ export default function BeeperTab() {
         conversationId={chatKey || null}
         realtime={realtime}
         invalidationSeq={invalidationSeq}
+        breaker={breaker}
         onOpenSettings={() => setSettingsParam('1')}
       />
 
@@ -94,7 +107,7 @@ export default function BeeperTab() {
         title="Beeper Settings"
         size="md"
       >
-        <BeeperSettingsPanel realtime={realtime} onRealtimeSeed={seedRealtime} />
+        <BeeperSettingsPanel realtime={realtime} onRealtimeSeed={seedRealtime} onBreakerCleared={seedStatus} />
       </Drawer>
     </div>
   );

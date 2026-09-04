@@ -11,7 +11,7 @@ import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus
 import { completeBeeperOAuth, connectWithPastedToken, disconnectBeeper, startBeeperOAuth } from '../services/beeperOAuth.js';
 import { runBeeperSweep } from '../services/beeperSync.js';
 import {
-  clearOutboxBreaker, createOutboxEntry, listOutboxEntries, sendOutboxEntry,
+  clearOutboxBreaker, createOutboxEntry, discardOutboxEntry, listOutboxEntries, sendOutboxEntry,
 } from '../services/beeperOutbox.js';
 import {
   listConversations,
@@ -443,6 +443,16 @@ router.post('/outbox/:id/send', asyncHandler(async (req, res) => {
   const entry = await sendOutboxEntry(id, { confirmFirstContact: confirmFirstContact === true })
     .catch((err) => { throw mapBeeperWriteError(err); });
   res.json(entry);
+}));
+
+// DELETE /api/beeper/outbox/:id — discard a row the human declined to send:
+// the first-contact confirmation's "Cancel" (#53). Only an `approved` row can
+// be discarded — nothing has POSTed to Beeper for it yet, so this is a pure
+// local record removal, never an unsend. Anything further along answers 409.
+router.delete('/outbox/:id', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(beeperOutboxParamsSchema, req.params);
+  await discardOutboxEntry(id).catch((err) => { throw mapBeeperWriteError(err); });
+  res.status(204).send();
 }));
 
 // POST /api/beeper/outbox/breaker/clear — the runaway breaker's only reset.

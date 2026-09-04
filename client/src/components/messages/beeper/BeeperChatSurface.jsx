@@ -9,6 +9,7 @@ import BeeperThread from './BeeperThread';
 import ConnectionStatusDot from '../../ui/ConnectionStatusDot';
 import toast from '../../ui/Toast';
 import useMounted from '../../../hooks/useMounted';
+import useBeeperOutbox from '../../../hooks/useBeeperOutbox';
 import { safeReadJsonStorage, safeWriteJsonStorage } from '../../../lib/safeStorage';
 import * as api from '../../../services/api';
 
@@ -292,7 +293,7 @@ function ConversationRow({ conversation, unified, selected, onSelect }) {
 /* ---------------------------------------------------------------- surface -- */
 
 export default function BeeperChatSurface({
-  conversationId = null, realtime = null, invalidationSeq = 0, onOpenSettings,
+  conversationId = null, realtime = null, invalidationSeq = 0, breaker = null, onOpenSettings,
 }) {
   const navigate = useNavigate();
   const mountedRef = useMounted();
@@ -461,6 +462,22 @@ export default function BeeperChatSurface({
       return next;
     });
   }, [conversationId]);
+
+  // The composer's send lifecycle (#36, wired here on #53). `onSent` clears
+  // the PortOS-side draft buffer the same way any other draft edit does —
+  // through `setDraft`, so it also drops the persisted `drafts` entry rather
+  // than leaving a stale one in localStorage under a conversation that no
+  // longer needs it.
+  const {
+    entries: outboxEntries,
+    sending: outboxSending,
+    confirmation: outboxConfirmation,
+    submit: sendOutboxMessage,
+    confirmAndSend: confirmOutboxSend,
+    cancelConfirmation: cancelOutboxConfirmation,
+    retry: retryOutboxEntry,
+    dismiss: dismissOutboxEntry,
+  } = useBeeperOutbox(conversationId, { onSent: () => setDraft('') });
 
   const loadMoreMessages = useCallback(async () => {
     if (!conversationId || !messageCursor) return;
@@ -715,6 +732,15 @@ export default function BeeperChatSurface({
             onLoadMore={loadMoreMessages}
             draft={drafts[conversationId] || ''}
             onDraftChange={setDraft}
+            outboxEntries={outboxEntries}
+            sending={outboxSending}
+            confirmation={outboxConfirmation}
+            onSend={sendOutboxMessage}
+            confirmAndSend={confirmOutboxSend}
+            cancelConfirmation={cancelOutboxConfirmation}
+            retryOutboxEntry={retryOutboxEntry}
+            dismissOutboxEntry={dismissOutboxEntry}
+            breaker={breaker}
             people={people}
             linkingId={linkingId}
             onLinkParticipant={linkParticipant}
