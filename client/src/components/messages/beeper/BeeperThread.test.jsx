@@ -35,6 +35,16 @@ describe('decodeHtmlEntities', () => {
     expect(decodeHtmlEntities('&#99999999;')).toBe('&#99999999;');
   });
 
+  it('does not resolve inherited Object.prototype properties as entities', () => {
+    // Untrusted remote chat text can contain literally anything. A lookup of
+    // `NAMED_ENTITIES[code]` walks the prototype chain, so `&constructor;` and
+    // `&toString;` used to render as the stringified built-in functions
+    // instead of being left as unknown entities.
+    expect(decodeHtmlEntities('&constructor;')).toBe('&constructor;');
+    expect(decodeHtmlEntities('&toString;')).toBe('&toString;');
+    expect(decodeHtmlEntities('&hasOwnProperty;')).toBe('&hasOwnProperty;');
+  });
+
   it('passes through non-string and empty input unchanged', () => {
     expect(decodeHtmlEntities(undefined)).toBe(undefined);
     expect(decodeHtmlEntities(null)).toBe(null);

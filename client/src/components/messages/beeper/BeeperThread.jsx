@@ -61,7 +61,7 @@ export const decodeHtmlEntities = (str) => {
         : parseInt(code.slice(1), 10);
       return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : match;
     }
-    return NAMED_ENTITIES[code] ?? match;
+    return Object.hasOwn(NAMED_ENTITIES, code) ? NAMED_ENTITIES[code] : match;
   });
 };
 
