@@ -65,6 +65,7 @@ const allFeaturesOn = () => [
   { id: 'gsd', label: 'GSD', enabled: true },
   { id: 'openclaw', label: 'OpenClaw', enabled: true },
   { id: 'health', label: 'Health tracking', enabled: true },
+  { id: 'beeper', label: 'Beeper', enabled: true },
 ];
 const featureMock = vi.hoisted(() => ({ features: null }));
 
@@ -156,7 +157,7 @@ describe('Layout — manifest-derived sidebar structure', () => {
       expect(NAV_PRESENTATION[p], `missing NAV_PRESENTATION for digital twin tab ${p}`).toBeDefined();
     }
 
-    const messageTabs = ['inbox', 'drafts', 'imessage', 'signal', 'contacts', 'sync', 'config'];
+    const messageTabs = ['inbox', 'drafts', 'imessage', 'signal', 'beeper', 'contacts', 'sync', 'config'];
     for (const tab of messageTabs) {
       const p = `/messages/${tab}`;
       expect(NAV_PRESENTATION[p], `missing NAV_PRESENTATION for message tab ${p}`).toBeDefined();
@@ -316,6 +317,36 @@ describe('Layout — instance feature gating', () => {
 
     expect(screen.getByRole('link', { name: 'DataDog' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'POST' })).toBeTruthy();
+  });
+});
+
+describe('Layout — Comms section (Beeper)', () => {
+  // #30 / real-browser pass: the Beeper row never rendered in the sidebar Comms
+  // section, feature on or off, because NAV_PRESENTATION had no '/messages/beeper'
+  // key — navRowForPath() throws for any manifest path missing from that map, so
+  // the row was silently absent (in Vitest's jsdom that surfaces as the row never
+  // appearing rather than a crash, since the throwing path is only ever reached
+  // for paths that exist in NAV_PRESENTATION).
+  it('lists Beeper in the Comms section alongside the other messaging rows when the feature is on', async () => {
+    await renderLayout('/messages/inbox');
+
+    const beeper = screen.getByRole('link', { name: 'Beeper' });
+    expect(beeper).toHaveAttribute('href', '/messages/beeper');
+    // Same section as its siblings, not a stray top-level row.
+    expect(screen.getByRole('link', { name: 'Signal' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'iMessage' })).toBeTruthy();
+  });
+
+  it('drops only the Beeper row when the beeper feature is off, keeping the rest of Comms', async () => {
+    featureMock.features = allFeaturesOn()
+      .map((f) => (f.id === 'beeper' ? { ...f, enabled: false } : f));
+
+    await renderLayout('/messages/inbox');
+
+    expect(screen.queryByRole('link', { name: 'Beeper' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Signal' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'iMessage' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Inbox' })).toBeTruthy();
   });
 });
 
