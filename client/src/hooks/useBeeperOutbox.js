@@ -100,22 +100,41 @@ export default function useBeeperOutbox(conversationId, { onSent } = {}) {
     return true;
   }, [refresh]);
 
+  // `sending` is React state, so it only reflects a send that has already
+  // re-rendered. Two `submit()` calls inside ONE render — a double-fired Send
+  // button, an Enter keydown racing the click — both read it as false, both
+  // create a durable row, and both dispatch a real message. Beeper has no
+  // idempotency key, so that second message is unrecallable. This ref latches
+  // synchronously, before the first await, and is the actual guard; `sending`
+  // stays as the RENDER signal it already is.
+  const submittingRef = useRef(false);
+
   /** Step one + step two, from the composer's Send action. */
   const submit = useCallback(async (body) => {
     const text = typeof body === 'string' ? body.trim() : '';
-    if (!conversationId || !text || sending) return false;
-    setError(null);
-    const [entry, err] = await createOutboxEntry(conversationId, text, { silent: true })
-      .then((value) => [value, null])
-      .catch((createError) => [null, createError]);
-    if (!mountedRef.current) return false;
-    if (err) {
-      setError(err.message || 'Could not queue the message');
-      toast.error(err.message || 'Could not queue the message');
-      return false;
+    if (!conversationId || !text || sending || submittingRef.current) return false;
+    submittingRef.current = true;
+    try {
+      setError(null);
+      const [entry, err] = await createOutboxEntry(conversationId, text, { silent: true })
+        .then((value) => [value, null])
+        .catch((createError) => [null, createError]);
+      if (!mountedRef.current) return false;
+      if (err) {
+        setError(err.message || 'Could not queue the message');
+        toast.error(err.message || 'Could not queue the message');
+        return false;
+      }
+      setEntries((prev) => [entry, ...prev]);
+      // Awaited into a local rather than returned bare: `return dispatch(...)`
+      // would run the `finally` and drop the latch before the send resolved.
+      const dispatched = await dispatch(entry, false);
+      return dispatched;
+    } finally {
+      // `finally`, not a catch: nothing is swallowed, but the latch must not
+      // survive a throw or the composer is wedged shut for the session.
+      submittingRef.current = false;
     }
-    setEntries((prev) => [entry, ...prev]);
-    return dispatch(entry, false);
   }, [conversationId, dispatch, sending]);
 
   /** The inline confirmation's "Send" — the same row, now explicitly confirmed. */

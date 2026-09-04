@@ -67,6 +67,32 @@ describe('useBeeperOutbox', () => {
     expect(result.current.entries[0].state).toBe('awaiting-confirmation');
   });
 
+  // `sending` is React state and does not update until a re-render, so it
+  // cannot stop two calls made inside one render — a double-fired Send button,
+  // or Enter racing the click. Beeper has no idempotency key, so the second row
+  // would be a second unrecallable message.
+  it('latches submit so two calls in one render create and send exactly one row', async () => {
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID));
+
+    let outcomes;
+    await act(async () => {
+      outcomes = await Promise.all([
+        result.current.submit('hello there'),
+        result.current.submit('hello there'),
+      ]);
+    });
+
+    expect(createOutboxEntry).toHaveBeenCalledTimes(1);
+    expect(sendOutboxEntry).toHaveBeenCalledTimes(1);
+    // The loser is refused, not queued behind the winner.
+    expect(outcomes).toEqual([true, false]);
+    expect(result.current.entries).toHaveLength(1);
+
+    // And the latch releases: a later, deliberate send still goes through.
+    await act(async () => { await result.current.submit('hello again'); });
+    expect(createOutboxEntry).toHaveBeenCalledTimes(2);
+  });
+
   it('surfaces a first-contact refusal as an inline confirmation, then re-sends the SAME row', async () => {
     sendOutboxEntry.mockRejectedValueOnce(new ApiError(
       'This is the first message PortOS has ever sent to this conversation',

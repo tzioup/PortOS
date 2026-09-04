@@ -60,6 +60,7 @@ vi.mock('./beeperSync.js', () => ({
 const outbox = new Map();
 const conversations = new Map();
 const mirrored = [];
+const mirroredSql = [];
 let nextId = 1;
 
 const entryView = (row) => ({ ...row });
@@ -135,6 +136,7 @@ const query = vi.fn(async (sql, params = []) => {
     return { rows: [], rowCount: 1 };
   }
   if (/INSERT INTO beeper_messages/.test(sql)) {
+    mirroredSql.push(sql);
     mirrored.push(params);
     return { rows: [], rowCount: 1 };
   }
@@ -220,6 +222,7 @@ beforeEach(() => {
   outbox.clear();
   conversations.clear();
   mirrored.length = 0;
+  mirroredSql.length = 0;
   nextId = 1;
   conversations.set(CONVERSATION_ID, CHAT_ID);
   conversations.set(OTHER_CONVERSATION_ID, 'example-chat-2');
@@ -348,6 +351,14 @@ describe('confirmation — socket first, 30s GET fallback', () => {
     expect(mirrored).toHaveLength(1);
     expect(mirrored[0][0]).toBe('msg-final-1');
     expect(mirrored[0][1]).toBe(CONVERSATION_ID);
+    // The mirrored row is OUTBOUND. `is_sender` is written as a literal TRUE
+    // rather than read off the confirming payload — the field is optional on
+    // the API's own Message, and PortOS knows it sent this one — and the
+    // conflict arm keeps the sweep's never-downgrade rule so a later inbound
+    // page that omits the field cannot flip it back to the other side.
+    expect(mirroredSql[0]).toMatch(/INSERT INTO beeper_messages \([^)]*, is_sender\)/);
+    expect(mirroredSql[0]).toMatch(/VALUES \(\$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8, TRUE\)/);
+    expect(mirroredSql[0]).toMatch(/is_sender = beeper_messages\.is_sender OR EXCLUDED\.is_sender/);
     // The frame this service emits carries ids only — never the body.
     const emitted = frames.find((frame) => frame.ids?.includes('msg-final-1') && frame.ts);
     expect(emitted).toBeTruthy();
