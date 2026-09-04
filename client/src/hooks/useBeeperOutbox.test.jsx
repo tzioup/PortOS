@@ -247,4 +247,39 @@ describe('useBeeperOutbox', () => {
     expect(discardOutboxEntry).toHaveBeenCalledWith('outbox-1', { silent: true });
     expect(result.current.entries).toHaveLength(0);
   });
+
+  // `onSent` exists for exactly one purpose: clearing the composer. A send
+  // whose text did NOT come from the composer must not fire it, or a message
+  // typed while a failed row sat above it is thrown away unsent — the
+  // composer clears through `setDraft('')`, which also drops the persisted
+  // draft.
+  it('only clears the draft for the composer\'s own send, not a failed row\'s retry', async () => {
+    const onSent = vi.fn();
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID, { onSent }));
+
+    await act(async () => { await result.current.submit('older text', { clearsDraft: false }); });
+    expect(sendOutboxEntry).toHaveBeenCalledTimes(1);
+    expect(onSent).not.toHaveBeenCalled();
+
+    await act(async () => { await result.current.submit('freshly typed'); });
+    expect(onSent).toHaveBeenCalledTimes(1);
+  });
+
+  // The same rule has to survive the first-contact question: the origin rides
+  // on the confirmation, so answering "Send anyway" for a failed row's retry
+  // still leaves the composer alone.
+  it('carries the no-clear origin through a first-contact confirmation', async () => {
+    sendOutboxEntry.mockRejectedValueOnce(new ApiError(
+      'This is the first message PortOS has ever sent to this conversation',
+      'FIRST_CONTACT_CONFIRMATION_REQUIRED',
+    ));
+    const onSent = vi.fn();
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID, { onSent }));
+
+    await act(async () => { await result.current.submit('older text', { clearsDraft: false }); });
+    await act(async () => { await result.current.confirmAndSend(); });
+
+    expect(sendOutboxEntry).toHaveBeenLastCalledWith('outbox-1', { confirmFirstContact: true }, { silent: true });
+    expect(onSent).not.toHaveBeenCalled();
+  });
 });

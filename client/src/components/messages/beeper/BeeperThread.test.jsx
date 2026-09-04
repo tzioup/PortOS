@@ -58,6 +58,10 @@ describe('decodeHtmlEntities', () => {
  * `failed` and `awaiting-confirmation`/`sent` — so a row left `approved` by a
  * refused send (most often `OUTBOX_BREAKER_OPEN`, #36) rendered as a
  * permanent spinner-plus-"Sending…" bubble with no Retry and no dismiss.
+ * PR #60 blocker 2: with the breaker tripped, a `failed` row's Retry stayed
+ * enabled and did nothing at all — that path composes a new entry through the
+ * same send the breaker blocks.
+ *
  * These tests exercise `OutboxRow` through the real component rather than in
  * isolation, since the "stalled vs. actively sending" distinction is read
  * off sibling props (`sending`, `confirmation`) it does not own itself.
@@ -104,6 +108,10 @@ const BASE_PROPS = {
 };
 
 const OUTBOX_ENTRY = { id: 'outbox-1', state: 'approved', body: 'hello there' };
+const FAILED_ENTRY = {
+  id: 'outbox-2', state: 'failed', body: 'hello there', errorMessage: 'Network error',
+};
+const TRIPPED_BREAKER = { tripped: true, reason: 'too many sends' };
 
 const renderThread = (overrides = {}) => render(<BeeperThread {...BASE_PROPS} {...overrides} />);
 
@@ -166,19 +174,49 @@ describe('BeeperThread — outbox row states', () => {
     expect(dismissOutboxEntry).toHaveBeenCalledWith(OUTBOX_ENTRY);
   });
 
-  it('still composes a new entry via onSend when retrying a failed row (unchanged behaviour)', () => {
+  // The failed row's text is NOT the composer's draft, so this send must not
+  // clear the composer on success — a message typed while the failed row sat
+  // above it would be discarded, and dropped from storage with it.
+  it('composes a new entry via onSend when retrying a failed row, without clearing the draft', () => {
     const onSend = vi.fn();
     const retryOutboxEntry = vi.fn();
-    renderThread({
-      outboxEntries: [{ id: 'outbox-2', state: 'failed', body: 'hello there', errorMessage: 'Network error' }],
-      onSend,
-      retryOutboxEntry,
-    });
+    renderThread({ outboxEntries: [FAILED_ENTRY], onSend, retryOutboxEntry });
 
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
 
-    expect(onSend).toHaveBeenCalledWith('hello there');
+    expect(onSend).toHaveBeenCalledWith('hello there', { clearsDraft: false });
     expect(retryOutboxEntry).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+  });
+
+  // A failed row's Retry composes a new entry through the same send path the
+  // breaker blocks, so with the breaker tripped it can only fail. It used to
+  // stay enabled and silently do nothing (PR #60 blocker 2).
+  it("disables a failed row's Retry while the breaker is tripped, with the Send button's reason", () => {
+    const onSend = vi.fn();
+    renderThread({ outboxEntries: [FAILED_ENTRY], breaker: TRIPPED_BREAKER, onSend });
+
+    const retry = screen.getByRole('button', { name: 'Retry' });
+    const sendTitle = screen.getByRole('button', { name: 'Send' }).getAttribute('title');
+    expect(retry).toBeDisabled();
+    expect(retry).toHaveAttribute('title', sendTitle);
+    expect(sendTitle).toContain('too many sends');
+
+    fireEvent.click(retry);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  // The stalled row is the opposite case: nothing has reached Beeper for it,
+  // the server decides whether to refuse it again, and its 429 toasts. So
+  // that Retry stays live even with the breaker tripped.
+  it("leaves a stalled row's Retry enabled while the breaker is tripped", () => {
+    const retryOutboxEntry = vi.fn();
+    renderThread({ outboxEntries: [OUTBOX_ENTRY], breaker: TRIPPED_BREAKER, retryOutboxEntry });
+
+    const retry = screen.getByRole('button', { name: 'Retry' });
+    expect(retry).toBeEnabled();
+
+    fireEvent.click(retry);
+    expect(retryOutboxEntry).toHaveBeenCalledWith(OUTBOX_ENTRY);
   });
 });

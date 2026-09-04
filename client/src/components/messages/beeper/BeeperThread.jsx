@@ -190,14 +190,23 @@ function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
  * #60 blocker 1), so it gets the same "stalled" treatment as `failed`: a
  * reason, a Retry, and — since nothing here was ever posted to Beeper — a
  * Dismiss that gives up on it outright.
+ *
+ * The two Retries are not the same action, and the breaker splits them (PR
+ * #60 blocker 2). A `failed` row's Retry composes a NEW entry through the
+ * composer's own send path, which the breaker blocks exactly as it blocks
+ * Send — so with the breaker tripped that button is disabled and carries the
+ * same reason as the Send button, rather than staying live and doing nothing.
+ * A `stalled` row's Retry re-dispatches the existing row: the server decides,
+ * and its 429 toasts, so it stays enabled.
  */
 function OutboxRow({
-  entry, sending, isConfirming, onRetry, onDismiss,
+  entry, sending, isConfirming, onRetry, onDismiss, breakerTripped, breakerReason,
 }) {
   const failed = entry.state === 'failed';
   const confirming = entry.state === 'awaiting-confirmation' || entry.state === 'sent';
   const stalled = entry.state === 'approved' && !sending && !isConfirming;
   const blocked = failed || stalled;
+  const retryBlocked = breakerTripped && !stalled;
   return (
     <div
       data-testid="beeper-outbox-row"
@@ -221,7 +230,9 @@ function OutboxRow({
               <button
                 type="button"
                 onClick={() => onRetry(entry)}
-                className="rounded px-1 py-0.5 text-port-accent transition-colors hover:underline"
+                disabled={retryBlocked}
+                title={retryBlocked ? breakerReason : undefined}
+                className="rounded px-1 py-0.5 text-port-accent transition-colors hover:underline disabled:cursor-not-allowed disabled:text-gray-500 disabled:no-underline disabled:hover:no-underline"
               >
                 Retry
               </button>
@@ -331,9 +342,15 @@ export default function BeeperThread({
   // ever reached Beeper for it, so retrying re-sends the SAME row instead —
   // composing a new one on every click would just manufacture more phantoms
   // while the breaker stays tripped.
+  //
+  // `clearsDraft: false` on the failed-row path: that send is the OLD row's
+  // text, not what is in the composer. Clearing on its success would throw
+  // away a message typed while the failed row sat above it — and drop it from
+  // storage too, since the surface's `setDraft('')` deletes the persisted
+  // entry. Only the composer's own Send clears the composer.
   const handleRetry = (entry) => {
     if (entry.state === 'approved') { retryOutboxEntry?.(entry); return; }
-    if (!breakerTripped) onSend(entry.body);
+    if (!breakerTripped) onSend(entry.body, { clearsDraft: false });
   };
   const handleDismiss = (entry) => { dismissOutboxEntry?.(entry); };
 
@@ -648,6 +665,8 @@ export default function BeeperThread({
             isConfirming={confirmation?.entry?.id === entry.id}
             onRetry={handleRetry}
             onDismiss={handleDismiss}
+            breakerTripped={breakerTripped}
+            breakerReason={sendDisabledReason}
           />
         ))}
 
