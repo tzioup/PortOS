@@ -131,13 +131,37 @@ describe('beeperClient', () => {
       expect(err.retryable).toBe(false);
     });
 
-    it('downloadAsset end-to-end surfaces ASSET_UNAVAILABLE on a live 502', async () => {
+    // Live-verified: POST /v1/assets/download answers HTTP 200 for an
+    // unresolvable mxc:// reference, with an `{ error }` body and no `srcURL`
+    // — never a 502. beeperRequest treats any `response.ok` body as success,
+    // so downloadAsset itself must reject a 200 body shaped like a failure.
+    it('downloadAsset end-to-end surfaces ASSET_UNAVAILABLE on a live 200-with-error body', async () => {
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
-        jsonResponse(502, { message: 'Failed to download asset: Transfer failed for mxc://gone', code: 'BRIDGE_ERROR' }),
+        jsonResponse(200, { error: 'Failed to download asset: Transfer failed for mxc://gone' }),
       ));
       await expect(downloadAsset('mxc://gone', { baseUrl: DEFAULT_BASE_URL, token: 't' }))
         .rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', retryable: false });
     });
+
+    it('downloadAsset also rejects a 200 body with neither an error nor a srcURL', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(200, {})));
+      await expect(downloadAsset('mxc://odd', { baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .rejects.toMatchObject({ code: 'ASSET_UNAVAILABLE', retryable: false });
+    });
+
+    it('downloadAsset resolves with the body when srcURL is a non-empty string', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+        jsonResponse(200, { srcURL: 'file:///tmp/example.png' }),
+      ));
+      await expect(downloadAsset('mxc://ok', { baseUrl: DEFAULT_BASE_URL, token: 't' }))
+        .resolves.toEqual({ srcURL: 'file:///tmp/example.png' });
+    });
+
+    // The mapper's asset-502 branch above still applies to GET/HEAD
+    // /v1/assets/serve — the byte-streaming half of the asset surface — which
+    // really does answer 502 for a missing/expired asset (live-verified).
+    // downloadAsset (POST /v1/assets/download) is the one caller that never
+    // reaches this branch, per the two tests above.
   });
 
   // -------------------------------------------------------------------------

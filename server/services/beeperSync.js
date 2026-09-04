@@ -146,7 +146,15 @@ export function normalizeAccountRow(account) {
     network: String(account?.network ?? ''),
     displayName: String(account?.user?.fullName || account?.user?.username || account?.network || accountId || ''),
     status: String(account?.status || account?.bridgeStatus || ''),
-    bridgeId: String(account?.bridgeId || account?.bridge || ''),
+    // account.bridgeId is the join result from getJoinedAccounts (see
+    // beeperClient.js joinAccountsWithBridges). account?.bridge is the RAW
+    // field /v1/accounts itself carries — live, it is an object
+    // { id, type, provider }, never a string, so it must be narrowed to
+    // `.id` rather than coerced whole (String() on the object stringifies to
+    // the literal text "[object Object]"). The join can also legitimately
+    // miss (an account absent from every /v1/bridges items[].accounts[]),
+    // which is when this raw fallback is needed at all.
+    bridgeId: String(account?.bridgeId || account?.bridge?.id || ''),
   };
 }
 

@@ -48,6 +48,17 @@ const METADATA = {
 };
 
 const INFO = { app: { name: 'Beeper', version: '4.3.73' }, server: { status: 'running' } };
+// A live install's /v1/info also has no oauth endpoints block — used to test
+// the FINAL fallback (authenticated call), when neither source advertises
+// introspection.
+const INFO_NO_OAUTH_ENDPOINTS = INFO;
+// The shape live-verified on Beeper Desktop 4.3.89: the metadata document
+// omits `introspection_endpoint`, but `/v1/info` advertises it under
+// `endpoints.oauth.introspection_endpoint`.
+const INFO_WITH_INTROSPECTION = {
+  ...INFO,
+  endpoints: { oauth: { introspection_endpoint: '/oauth/introspect' } },
+};
 
 const urlOf = (call) => String(call[0]);
 const bodyOf = (call) => String(call[1]?.body ?? '');
@@ -124,6 +135,47 @@ describe('discoverAuthorizationServer', () => {
   it('maps an unreachable Beeper Desktop to NETWORK_ERROR rather than a discovery fault', async () => {
     vi.mocked(fetchWithTimeout).mockRejectedValue(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
     await expect(discoverAuthorizationServer()).rejects.toMatchObject({ code: 'NETWORK_ERROR', status: 0 });
+  });
+
+  // A live Beeper Desktop's metadata document (verified against 4.3.89)
+  // omits `introspection_endpoint` entirely. This is the fallback that keeps
+  // the paste path's introspection branch alive on a real install instead of
+  // silently landing every pasted token on the authenticated-call path with
+  // no expiry/scopes.
+  describe('the /v1/info introspection-endpoint fallback', () => {
+    it("reads endpoints.oauth.introspection_endpoint off /v1/info when the metadata document omits it", async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse(INFO_WITH_INTROSPECTION));
+
+      const discovery = await discoverAuthorizationServer();
+
+      expect(urlOf(vi.mocked(fetchWithTimeout).mock.calls[1])).toBe(`${BASE_URL}/v1/info`);
+      expect(discovery.introspectionEndpoint).toBe(`${BASE_URL}/oauth/introspect`);
+    });
+
+    it('refuses a /v1/info fallback endpoint that points at a different host', async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse({
+          ...INFO, endpoints: { oauth: { introspection_endpoint: 'https://example.com/oauth/introspect' } },
+        }));
+      await expect(discoverAuthorizationServer()).rejects.toMatchObject({ code: 'OAUTH_DISCOVERY_INVALID' });
+    });
+
+    it('stays null when /v1/info also carries no oauth introspection endpoint', async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse(INFO_NO_OAUTH_ENDPOINTS));
+      await expect(discoverAuthorizationServer()).resolves.toMatchObject({ introspectionEndpoint: null });
+    });
+
+    it('stays null rather than failing discovery when the /v1/info fallback request itself errors', async () => {
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockRejectedValueOnce(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } }));
+      await expect(discoverAuthorizationServer()).resolves.toMatchObject({ introspectionEndpoint: null });
+    });
   });
 });
 
@@ -332,15 +384,19 @@ describe('connectWithPastedToken', () => {
     expect(saveBeeperCredential).not.toHaveBeenCalled();
   });
 
-  describe('without an introspection endpoint', () => {
-    it('falls back to an authenticated call (never /v1/info) and stores on success', async () => {
+  // Metadata omits introspection_endpoint AND /v1/info's fallback (see the
+  // `discoverAuthorizationServer` suite above) also has no oauth endpoints —
+  // the FINAL fallback, an authenticated call, is what's under test here.
+  describe('without an introspection endpoint anywhere', () => {
+    it('falls back to an authenticated call and stores on success', async () => {
       vi.mocked(fetchWithTimeout)
         .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse(INFO_NO_OAUTH_ENDPOINTS))
         .mockResolvedValueOnce(mockJsonResponse([{ accountID: 'acct-1', network: 'Example Network' }]));
 
       const result = await connectWithPastedToken(TOKEN);
 
-      const probe = vi.mocked(fetchWithTimeout).mock.calls[1];
+      const probe = vi.mocked(fetchWithTimeout).mock.calls[2];
       expect(urlOf(probe)).toBe(`${BASE_URL}/v1/accounts`);
       expect(probe[1].headers.Authorization).toBe(`Bearer ${TOKEN}`);
       expect(saveBeeperCredential).toHaveBeenCalledWith({
@@ -352,6 +408,7 @@ describe('connectWithPastedToken', () => {
     it('stores nothing when the authenticated call rejects the token', async () => {
       vi.mocked(fetchWithTimeout)
         .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse(INFO_NO_OAUTH_ENDPOINTS))
         .mockResolvedValue(mockJsonResponse({ message: 'unauthorized' }, { ok: false, status: 401 }));
       await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
       expect(saveBeeperCredential).not.toHaveBeenCalled();
@@ -360,9 +417,33 @@ describe('connectWithPastedToken', () => {
     it('stores nothing when the base URL answers 200 with something that is not Beeper', async () => {
       vi.mocked(fetchWithTimeout)
         .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse(INFO_NO_OAUTH_ENDPOINTS))
         .mockResolvedValueOnce(mockJsonResponse({ hello: 'other service' }));
       await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'MALFORMED_RESPONSE' });
       expect(saveBeeperCredential).not.toHaveBeenCalled();
+    });
+  });
+
+  // The shape actually observed on a live install (Beeper Desktop 4.3.89):
+  // the metadata document is silent, but /v1/info fills in the endpoint, so
+  // the paste path introspects instead of falling all the way back to an
+  // authenticated call — and gets real expiry/scopes out of it.
+  describe('when /v1/info advertises an introspection endpoint the metadata omitted', () => {
+    it('introspects through the /v1/info fallback endpoint', async () => {
+      const exp = Math.floor(Date.parse('2026-12-01T00:00:00.000Z') / 1000);
+      vi.mocked(fetchWithTimeout)
+        .mockResolvedValueOnce(mockJsonResponse(METADATA_NO_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse(INFO_WITH_INTROSPECTION))
+        .mockResolvedValueOnce(mockJsonResponse({ active: true, scope: 'read write', exp }));
+
+      const result = await connectWithPastedToken(TOKEN);
+
+      const introspect = vi.mocked(fetchWithTimeout).mock.calls[2];
+      expect(urlOf(introspect)).toBe(`${BASE_URL}/oauth/introspect`);
+      expect(saveBeeperCredential).toHaveBeenCalledWith({
+        token: TOKEN, expiresAt: '2026-12-01T00:00:00.000Z', scopes: ['read', 'write'], source: 'pasted',
+      });
+      expect(result).toMatchObject({ tokenConfigured: true, tokenSource: 'pasted' });
     });
   });
 

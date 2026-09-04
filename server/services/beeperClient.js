@@ -132,12 +132,15 @@ export async function resolveBeeperConfig({ baseUrl, token } = {}) {
  * since that mapping is `retryable: false` unconditionally regardless of
  * retry eligibility.
  *
- * The one non-conventional case: a missing/expired asset answers `502`
- * ("Failed to download asset: Transfer failed for mxc://…"), not `404`. A
+ * The one non-conventional case: `GET`/`HEAD /v1/assets/serve` answers `502`
+ * for a missing/expired asset, not `404` (live-verified on both methods). A
  * generic "5xx is transient" retry policy loops forever on media the network
  * has aged out, so an asset-endpoint `502` maps to a TERMINAL
  * `ASSET_UNAVAILABLE` rather than the ordinarily-retryable `UPSTREAM_ERROR`.
- * Every other status follows the spec's documented meaning (see the
+ * `POST /v1/assets/download` does NOT share this — it answers `200` with an
+ * `{ error }` body instead, so this `502` branch never fires for it; that
+ * shape is validated separately in `downloadAsset` below. Every other status
+ * follows the spec's documented meaning (see the
  * API-surface research note, `docs/research/2026-08-31-beeper-api-surface.md`
  * §7, on the `research/beeper` branch); `code` is never a published enum, so
  * it rides along under `details` for logging only.
@@ -547,18 +550,38 @@ export async function markUnread(chatId, { messageID } = {}, { baseUrl, token, t
 
 /**
  * `POST /v1/assets/download` — resolves an `mxc://`/`localmxc://` reference to
- * a local file URL. A missing/expired asset answers `502` (not `404`); that
- * maps to the terminal `ASSET_UNAVAILABLE`, never a retryable error (see
- * `mapBeeperResponseError`). Byte streaming (`GET /v1/assets/serve`) and disk
- * mirroring are #37's scope, not implemented here.
+ * a local file URL, returned as `{ srcURL }`. A missing/expired asset answers
+ * HTTP `200` here — NOT `502` — with `{ error: '<message>' }` and no `srcURL`
+ * (`AssetDownloadResponse` documents both fields as optional siblings on the
+ * one 200 shape; live-verified against an unresolvable `mxc://` reference).
+ * `beeperRequest` only maps non-2xx statuses, so a 200-with-`error` body would
+ * otherwise pass through as a "success" carrying no file to read. Validate the
+ * body here instead: an `error` string, or a response missing a non-empty
+ * `srcURL`, is the same terminal condition the 502 branch of
+ * `mapBeeperResponseError` exists for — `ASSET_UNAVAILABLE`, never retryable
+ * — so both failure shapes converge on the same caller-facing error. The
+ * `502`-on-`assets/serve` case (`GET`/`HEAD`, see below) is unrelated and
+ * still goes through `mapBeeperResponseError`'s status branch. Byte streaming
+ * (`GET /v1/assets/serve`) and disk mirroring are #37's scope, not
+ * implemented here.
  */
 export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
-  return beeperRequest('/v1/assets/download', {
+  const data = await beeperRequest('/v1/assets/download', {
     method: 'POST',
     body: { url },
     baseUrl, token, timeoutMs,
     isAssetEndpoint: true,
   });
+  const srcURL = typeof data?.srcURL === 'string' ? data.srcURL : '';
+  if (typeof data?.error === 'string' && data.error) {
+    throw new BeeperApiError(data.error, { status: 200, code: 'ASSET_UNAVAILABLE', retryable: false });
+  }
+  if (!srcURL) {
+    throw new BeeperApiError('Beeper /v1/assets/download returned no srcURL', {
+      status: 200, code: 'ASSET_UNAVAILABLE', retryable: false,
+    });
+  }
+  return data;
 }
 
 /**
