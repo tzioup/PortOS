@@ -75,14 +75,47 @@ describe('BeeperSettingsPanel — status card states', () => {
     expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
   });
 
-  it('renders the connected state with "No accounts synced yet" when the mirror is empty', async () => {
+  it('renders the connected state with an empty roster when the mirror holds no accounts', async () => {
     api.getBeeperStatus.mockResolvedValue({
       tokenConfigured: true, reachable: true, lastProbeError: null, appVersion: '4.3.73', accounts: [],
     });
     renderPanel();
 
     expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
-    expect(screen.getByText('No accounts synced yet.')).toBeInTheDocument();
+    expect(screen.getByTestId('beeper-roster-empty')).toBeInTheDocument();
+  });
+
+  // The mirrored roster comes from `beeper_accounts`, not from a live call —
+  // which is why #27 stores it. Hiding it whenever the probe fails threw away
+  // what the install already knew and made an unreachable app look like an
+  // empty one, so reachability is stated on its own line and the roster stands
+  // beside it in every reachability state.
+  it('keeps the mirrored roster on screen while Beeper Desktop is unreachable', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true,
+      reachable: false,
+      lastProbeError: 'Beeper request failed: connection refused',
+      baseUrl: 'http://127.0.0.1:23373',
+      accounts: [{ accountId: 'acc1', displayName: 'Example WhatsApp', network: 'whatsapp' }],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop unreachable')).toBeInTheDocument();
+    expect(screen.getByText('Example WhatsApp')).toBeInTheDocument();
+    expect(screen.getByText('whatsapp')).toBeInTheDocument();
+  });
+
+  it('keeps the mirrored roster on screen while the probe has not run yet', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true,
+      reachable: null,
+      lastProbeError: null,
+      accounts: [{ accountId: 'acc1', displayName: 'Example WhatsApp', network: 'whatsapp' }],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Checking Beeper Desktop…')).toBeInTheDocument();
+    expect(screen.getByText('Example WhatsApp')).toBeInTheDocument();
   });
 
   it('renders the connected state with the account roster when accounts are mirrored', async () => {
