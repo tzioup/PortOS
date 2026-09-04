@@ -61,6 +61,33 @@ describe('BeeperAttachment — image load lifecycle', () => {
     expect(img).not.toHaveAttribute('height');
   });
 
+  // The real-browser follow-up to the test above: the width/height attributes
+  // alone reserve nothing, because the image carries `w-auto` and preflight's
+  // `height: auto`, and an explicit CSS width beats a presentational attribute
+  // — so an unloaded image is 0x0 and the absolute skeleton has nothing to
+  // fill. jsdom cannot measure layout, so what is asserted here is that the
+  // wrapper declares the box: an aspect-ratio and a width capped by the
+  // `max-h-64` the image is bound to.
+  it('reserves the box on the wrapper with an explicit aspect-ratio when dimensions are known', () => {
+    render(<BeeperAttachment attachment={{ ...baseAttachment, width: 800, height: 600 }} />);
+
+    const wrapper = screen.getByTestId('attachment-skeleton').parentElement;
+    const style = wrapper.getAttribute('style') || '';
+    expect(style).toContain('aspect-ratio: 800 / 600');
+    // The natural width, capped by the image's own `max-h-64` (16rem) so a
+    // tall image reserves the height it will really take.
+    expect(style).toMatch(/width: min\(800px, [\d.]+rem\)/);
+    expect(style).toContain('max-width: 100%');
+  });
+
+  it('keeps the fixed neutral box, and no aspect-ratio, when dimensions are unknown', () => {
+    render(<BeeperAttachment attachment={{ ...baseAttachment, width: null, height: null }} />);
+
+    const style = screen.getByTestId('attachment-skeleton').parentElement.getAttribute('style') || '';
+    expect(style).not.toContain('aspect-ratio');
+    expect(style).toContain('8rem');
+  });
+
   it('hugs the image with a w-fit wrapper rather than stretching to the bubble width', () => {
     render(<BeeperAttachment attachment={{ ...baseAttachment, width: 800, height: 600 }} />);
 
