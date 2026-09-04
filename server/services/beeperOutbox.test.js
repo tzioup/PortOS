@@ -95,7 +95,7 @@ const query = vi.fn(async (sql, params = []) => {
   if (/FROM beeper_outbox\s+WHERE conversation_id = \$1 ORDER BY/.test(sql)) {
     return { rows: [...outbox.values()].filter((row) => row.conversationId === params[0]).map(entryView) };
   }
-  if (/FROM beeper_outbox WHERE id = \$1/.test(sql)) {
+  if (/^SELECT[\s\S]*FROM beeper_outbox WHERE id = \$1/.test(sql)) {
     const row = outbox.get(params[0]);
     return { rows: row ? [entryView(row)] : [], rowCount: row ? 1 : 0 };
   }
@@ -135,6 +135,12 @@ const query = vi.fn(async (sql, params = []) => {
     row.errorMessage = params[1];
     return { rows: [], rowCount: 1 };
   }
+  if (/DELETE FROM beeper_outbox WHERE id = \$1 AND state = 'approved'/.test(sql)) {
+    const row = outbox.get(params[0]);
+    if (!row || row.state !== 'approved') return { rows: [], rowCount: 0 };
+    outbox.delete(params[0]);
+    return { rows: [], rowCount: 1 };
+  }
   if (/INSERT INTO beeper_messages/.test(sql)) {
     mirroredSql.push(sql);
     mirrored.push(params);
@@ -148,8 +154,8 @@ vi.mock('../lib/db.js', () => ({ query: (...args) => query(...args) }));
 const {
   BREAKER_MAX_CONSECUTIVE_FAILURES, BREAKER_MAX_SENDS_IN_WINDOW, CONFIRMATION_TIMEOUT_MS,
   cancelPendingConfirmations, clearOutboxBreaker, configureOutboxRuntime, createOutboxEntry,
-  getOutboxBreakerState, getOutboxStatus, isFirstContact, listOutboxEntries, resetOutboxRuntime,
-  sendOutboxEntry,
+  discardOutboxEntry, getOutboxBreakerState, getOutboxStatus, isFirstContact, listOutboxEntries,
+  resetOutboxRuntime, sendOutboxEntry,
 } = await import('./beeperOutbox.js');
 const { beeperSocketEvents } = await import('./beeperSocketEvents.js');
 
@@ -268,6 +274,45 @@ describe('createOutboxEntry — step one, the durable row', () => {
     const entries = await listOutboxEntries({ conversationId: CONVERSATION_ID });
     expect(entries).toHaveLength(2);
     expect(entries.map((e) => e.state).sort()).toEqual(['approved', 'failed']);
+  });
+});
+
+// The reviewer's blocker on #53: cancelling the first-contact confirmation
+// left the row `approved` forever, with no way to remove it — a phantom
+// pending send the client rendered as a permanent "Sending…" bubble. This is
+// the discard the "Cancel" action now calls.
+describe('discardOutboxEntry — the "Cancel" path', () => {
+  it('removes an approved row that was never sent', async () => {
+    const entry = await approvedEntry();
+    await discardOutboxEntry(entry.id);
+    expect(outbox.has(entry.id)).toBe(false);
+    expect(await listOutboxEntries({ conversationId: CONVERSATION_ID })).toHaveLength(0);
+  });
+
+  it('404s an unknown entry', async () => {
+    await expect(discardOutboxEntry('outbox-missing')).rejects.toMatchObject({
+      code: 'OUTBOX_ENTRY_NOT_FOUND', status: 404,
+    });
+  });
+
+  it('refuses to discard a row that already left "approved" — sent, failed, or in flight', async () => {
+    const sending = await approvedEntry();
+    outbox.get(sending.id).state = 'sending';
+    await expect(discardOutboxEntry(sending.id)).rejects.toMatchObject({ code: 'OUTBOX_INVALID_STATE', status: 409 });
+
+    const sent = await approvedEntry();
+    outbox.get(sent.id).state = 'sent';
+    await expect(discardOutboxEntry(sent.id)).rejects.toMatchObject({ code: 'OUTBOX_INVALID_STATE', status: 409 });
+
+    const failed = await approvedEntry();
+    outbox.get(failed.id).state = 'failed';
+    await expect(discardOutboxEntry(failed.id)).rejects.toMatchObject({ code: 'OUTBOX_INVALID_STATE', status: 409 });
+
+    // None of those rows were touched.
+    expect(outbox.has(sending.id)).toBe(true);
+    expect(outbox.has(sent.id)).toBe(true);
+    expect(outbox.has(failed.id)).toBe(true);
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });
 

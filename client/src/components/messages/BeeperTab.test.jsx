@@ -54,6 +54,7 @@ const apiBeeper = vi.hoisted(() => ({
   listOutboxEntries: vi.fn(),
   createOutboxEntry: vi.fn(),
   sendOutboxEntry: vi.fn(),
+  discardOutboxEntry: vi.fn(),
 }));
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn() }));
 const socketMock = vi.hoisted(() => {
@@ -129,6 +130,7 @@ beforeEach(() => {
   api.getBeeperMessages.mockResolvedValue({ messages: [], nextCursor: null });
   api.getTribePeople.mockResolvedValue([]);
   apiBeeper.listOutboxEntries.mockResolvedValue({ entries: [] });
+  apiBeeper.discardOutboxEntry.mockResolvedValue(undefined);
   api.getSettings.mockResolvedValue({ beeper: { enabled: false, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 } });
   api.getBeeperAttachmentSummary.mockResolvedValue({
     budgetBytes: 5 * 1024 * 1024 * 1024, usedBytes: 0, storedFiles: 0, pendingCount: 0, pendingBytes: 0,
@@ -444,6 +446,38 @@ describe('the composer sends', () => {
     ));
     expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledTimes(2);
     await waitFor(() => expect(screen.queryByText(/send it\?/)).toBeNull());
+  });
+
+  // The reviewer's blocker on #53: repro was open a conversation PortOS has
+  // never sent to, type, Send, then Cancel on the inline confirmation. The row
+  // used to stay `approved` and unrendered-as-cancelled, so it fell into
+  // OutboxRow's default branch and rendered a permanent "Sending…" bubble —
+  // reappearing on every reload because GET /outbox returns approved rows, with
+  // no dismiss control and no way back. Cancel must discard the row outright.
+  it('discards the pending bubble on Cancel — no phantom "Sending…" row left behind', async () => {
+    apiBeeper.createOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'approved' });
+    apiBeeper.sendOutboxEntry.mockRejectedValueOnce(Object.assign(
+      new Error('This is the first message PortOS has ever sent to this conversation'),
+      { code: 'FIRST_CONTACT_CONFIRMATION_REQUIRED' },
+    ));
+    const composer = await openComposer();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(await screen.findByText(/first message PortOS has sent to Example Contact on WhatsApp/)).toBeInTheDocument();
+    expect(await screen.findByTestId('beeper-outbox-row')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    await waitFor(() => expect(apiBeeper.discardOutboxEntry).toHaveBeenCalledWith('outbox-1', { silent: true }));
+    // The question closes, the phantom bubble is gone, and the composer text is
+    // untouched — Cancel only withdraws the send, it does not clear the draft.
+    await waitFor(() => expect(screen.queryByText(/send it\?/)).toBeNull());
+    expect(screen.queryByTestId('beeper-outbox-row')).toBeNull();
+    expect(composer).toHaveValue(OUTBOUND_TEXT);
+
+    // A GET /outbox after the cancel (e.g. a reload) no longer returns the row.
+    apiBeeper.listOutboxEntries.mockResolvedValue({ entries: [] });
+    expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledTimes(1);
   });
 
   it('submits once from ⌘/Ctrl+Enter and once from a click inside the same render — the hook latch', async () => {

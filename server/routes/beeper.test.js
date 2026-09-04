@@ -16,6 +16,7 @@ vi.mock('../services/beeperSync.js', () => ({ runBeeperSweep: vi.fn() }));
 vi.mock('../services/beeperOutbox.js', () => ({
   createOutboxEntry: vi.fn(),
   sendOutboxEntry: vi.fn(),
+  discardOutboxEntry: vi.fn(),
   listOutboxEntries: vi.fn(),
   clearOutboxBreaker: vi.fn(),
 }));
@@ -53,7 +54,7 @@ import {
 } from '../services/beeperOAuth.js';
 import { runBeeperSweep } from '../services/beeperSync.js';
 import {
-  clearOutboxBreaker, createOutboxEntry, listOutboxEntries, sendOutboxEntry,
+  clearOutboxBreaker, createOutboxEntry, discardOutboxEntry, listOutboxEntries, sendOutboxEntry,
 } from '../services/beeperOutbox.js';
 import {
   listConversations,
@@ -444,6 +445,47 @@ describe('POST /api/beeper/outbox/:id/send — step two, the send', () => {
     const failed = await request(buildApp()).post(`/api/beeper/outbox/${ENTRY_ID}/send`).send({});
     expect(failed.status).toBe(503);
     expect(failed.body.context.retryable).toBe(false);
+  });
+});
+
+// The reviewer's blocker on #53: cancelling the first-contact confirmation
+// left the row `approved` and rendered forever — a phantom pending-send
+// bubble with no route to remove it. This is the discard "Cancel" now calls.
+describe('DELETE /api/beeper/outbox/:id — discard the "Cancel" path', () => {
+  beforeEach(() => vi.clearAllMocks());
+  const ENTRY_ID = '44444444-4444-4444-8444-444444444444';
+
+  it('400s a malformed entry id before it reaches the service', async () => {
+    const res = await request(buildApp()).delete('/api/beeper/outbox/not-a-uuid');
+    expect(res.status).toBe(400);
+    expect(discardOutboxEntry).not.toHaveBeenCalled();
+  });
+
+  it('discards and answers 204 with no content', async () => {
+    vi.mocked(discardOutboxEntry).mockResolvedValue(undefined);
+    const res = await request(buildApp()).delete(`/api/beeper/outbox/${ENTRY_ID}`);
+    expect(res.status).toBe(204);
+    expect(res.text).toBe('');
+    expect(discardOutboxEntry).toHaveBeenCalledWith(ENTRY_ID);
+  });
+
+  it('maps an unknown entry to a non-retryable 404', async () => {
+    vi.mocked(discardOutboxEntry).mockRejectedValue(new BeeperApiError('Outbox entry not found', {
+      status: 404, code: 'OUTBOX_ENTRY_NOT_FOUND', retryable: false,
+    }));
+    const res = await request(buildApp()).delete(`/api/beeper/outbox/${ENTRY_ID}`);
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('OUTBOX_ENTRY_NOT_FOUND');
+    expect(res.body.context.retryable).toBe(false);
+  });
+
+  it('maps a row that has already left "approved" to a non-retryable 409', async () => {
+    vi.mocked(discardOutboxEntry).mockRejectedValue(new BeeperApiError('already sent', {
+      status: 409, code: 'OUTBOX_INVALID_STATE', retryable: false,
+    }));
+    const res = await request(buildApp()).delete(`/api/beeper/outbox/${ENTRY_ID}`);
+    expect(res.status).toBe(409);
+    expect(res.body.context.retryable).toBe(false);
   });
 });
 

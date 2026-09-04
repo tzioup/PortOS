@@ -12,11 +12,13 @@ import { renderHook, act, cleanup, waitFor } from '@testing-library/react';
 const listOutboxEntries = vi.fn();
 const createOutboxEntry = vi.fn();
 const sendOutboxEntry = vi.fn();
+const discardOutboxEntry = vi.fn();
 
 vi.mock('../services/apiBeeper', () => ({
   listOutboxEntries: (...args) => listOutboxEntries(...args),
   createOutboxEntry: (...args) => createOutboxEntry(...args),
   sendOutboxEntry: (...args) => sendOutboxEntry(...args),
+  discardOutboxEntry: (...args) => discardOutboxEntry(...args),
 }));
 
 const invalidateHandlers = new Set();
@@ -49,6 +51,7 @@ describe('useBeeperOutbox', () => {
     listOutboxEntries.mockReset().mockResolvedValue({ entries: [] });
     createOutboxEntry.mockReset().mockResolvedValue(ENTRY);
     sendOutboxEntry.mockReset().mockResolvedValue({ ...ENTRY, state: 'awaiting-confirmation' });
+    discardOutboxEntry.mockReset().mockResolvedValue(undefined);
     toastError.mockReset();
     invalidateHandlers.clear();
   });
@@ -109,6 +112,48 @@ describe('useBeeperOutbox', () => {
     expect(createOutboxEntry).toHaveBeenCalledTimes(1);
     expect(sendOutboxEntry).toHaveBeenLastCalledWith('outbox-1', { confirmFirstContact: true }, { silent: true });
     expect(result.current.confirmation).toBeNull();
+  });
+
+  // The reviewer's blocker on #53: a cancelled first-contact confirmation used
+  // to leave the row `approved` and in `entries` forever, with no server call
+  // and no way to dismiss it — a phantom "Sending…" bubble that survived
+  // reloads. Cancel must discard the row, not just clear the local question.
+  it('discards the row on Cancel, so it does not linger as a phantom pending send', async () => {
+    sendOutboxEntry.mockRejectedValueOnce(new ApiError(
+      'This is the first message PortOS has ever sent to this conversation',
+      'FIRST_CONTACT_CONFIRMATION_REQUIRED',
+    ));
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID));
+
+    await act(async () => { await result.current.submit('hello there'); });
+    expect(result.current.confirmation?.entry.id).toBe('outbox-1');
+    expect(result.current.entries).toHaveLength(1);
+
+    await act(async () => { await result.current.cancelConfirmation(); });
+
+    expect(discardOutboxEntry).toHaveBeenCalledWith('outbox-1', { silent: true });
+    expect(result.current.confirmation).toBeNull();
+    expect(result.current.entries).toHaveLength(0);
+    // Cancel never re-sends — it never even reaches the send path a second time.
+    expect(sendOutboxEntry).toHaveBeenCalledTimes(1);
+  });
+
+  it('refetches rather than silently hiding the row when the discard itself fails', async () => {
+    sendOutboxEntry.mockRejectedValueOnce(new ApiError(
+      'This is the first message PortOS has ever sent to this conversation',
+      'FIRST_CONTACT_CONFIRMATION_REQUIRED',
+    ));
+    discardOutboxEntry.mockRejectedValueOnce(new ApiError('Beeper request failed', 'NETWORK_ERROR'));
+    listOutboxEntries.mockResolvedValue({ entries: [ENTRY] });
+    const { result } = renderHook(() => useBeeperOutbox(CONVERSATION_ID));
+
+    await act(async () => { await result.current.submit('hello there'); });
+    await act(async () => { await result.current.cancelConfirmation(); });
+
+    expect(result.current.confirmation).toBeNull();
+    expect(toastError).toHaveBeenCalled();
+    // The row is not fabricated as removed — it stays, reflecting the server.
+    await waitFor(() => expect(result.current.entries).toHaveLength(1));
   });
 
   it('never re-sends after a transport failure — it reports it and refetches the failed row', async () => {

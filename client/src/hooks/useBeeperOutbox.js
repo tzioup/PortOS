@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import toast from '../components/ui/Toast';
-import { createOutboxEntry, listOutboxEntries, sendOutboxEntry } from '../services/apiBeeper';
+import {
+  createOutboxEntry, discardOutboxEntry, listOutboxEntries, sendOutboxEntry,
+} from '../services/apiBeeper';
 import useBeeperRealtime from './useBeeperRealtime';
 import useMounted from './useMounted';
 
@@ -144,11 +146,31 @@ export default function useBeeperOutbox(conversationId, { onSent } = {}) {
   }, [confirmation, dispatch]);
 
   /**
-   * The inline confirmation's "Cancel". The row stays `approved` and visible
-   * rather than being deleted: it is a record of an intent the user paused on,
-   * and re-sending it is a deliberate act, not a leftover.
+   * The inline confirmation's "Cancel". Nothing has POSTed to Beeper for this
+   * row — it is still `approved`, never sent — so cancelling discards it
+   * outright rather than leaving it behind. Leaving it `approved` was the
+   * original design, but the composer has no way to render or dismiss that
+   * state distinctly from "sending": it fell into `OutboxRow`'s default
+   * branch and rendered as a permanent "Sending…" bubble, including across a
+   * reload, because `GET /outbox` returns every approved row (#53's fix).
+   * A discard failure (e.g. a network hiccup) refetches instead of silently
+   * dropping the row from just the client's view — the truth is the server's.
    */
-  const cancelConfirmation = useCallback(() => setConfirmation(null), []);
+  const cancelConfirmation = useCallback(async () => {
+    const entry = confirmation?.entry;
+    setConfirmation(null);
+    if (!entry) return;
+    const [, err] = await discardOutboxEntry(entry.id, { silent: true })
+      .then(() => [true, null])
+      .catch((discardError) => [null, discardError]);
+    if (!mountedRef.current) return;
+    if (err) {
+      toast.error(err.message || 'Could not discard the message');
+      await refresh();
+      return;
+    }
+    setEntries((prev) => prev.filter((row) => row.id !== entry.id));
+  }, [confirmation, refresh]);
 
   return {
     entries,
