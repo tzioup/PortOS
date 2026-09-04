@@ -4,6 +4,7 @@ import {
 } from 'lucide-react';
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
 import BeeperAttachment from './BeeperAttachment';
+import InlineConfirmRow from '../../ui/InlineConfirmRow';
 import { formatBytes } from '../../../utils/formatters';
 
 /**
@@ -12,13 +13,8 @@ import { formatBytes } from '../../../utils/formatters';
  * date-separator pills, sender avatars, deleted-message placeholders, and a
  * composer that names the network it would send on.
  *
- * Three things this deliberately does NOT do:
+ * Two things this deliberately does NOT do:
  *
- *  - **It does not send.** The composer is a draft buffer plus UI; the durable
- *    outbox, the runaway breaker and the socket/GET confirmation are their own
- *    slice, because a Beeper send is asynchronous with no idempotency key and a
- *    half-built send path is the one failure that cannot be undone without an
- *    unsend-for-everyone. The action is disabled and says so.
  *  - **It does not treat an empty thread as an error or as loading.** History
  *    depth varies enormously per network (#3), so a mirrored conversation with
  *    no messages is frequently the true answer. It says that, rather than
@@ -26,6 +22,17 @@ import { formatBytes } from '../../../utils/formatters';
  *  - **It does not name the transport.** #9 wants "… on Google Messages (RCS)";
  *    the mirror carries `network` but not `transport` (#27), so the label stops
  *    at the network rather than inventing one.
+ *
+ * Sending itself (#53, wired on the durable outbox from #36) is a thin layer
+ * over `onSend`/`confirmAndSend`/`cancelConfirmation`, which the surface
+ * supplies from `useBeeperOutbox`. This component owns none of the send
+ * lifecycle — it only renders what the hook reports: the pending/failed rows
+ * in `outboxEntries` (filtered against `messages` so a confirmed send shows
+ * once, as the real mirrored message, not twice), and the inline first-contact
+ * question when `confirmation` is set. Nothing here ever retries a send on its
+ * own; a failed row's "Retry" composes a NEW outbox entry with the same text,
+ * exactly like typing it again, because Beeper has no idempotency key and a
+ * client-driven resend of the same row would risk a duplicate real message.
  *
  * Direction comes from the mirrored `isSender`, never from comparing
  * `senderId` against the local user — `accounts[].user.id` differs from
@@ -162,6 +169,51 @@ function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
   );
 }
 
+/**
+ * One outbox row — a send that has not yet been confirmed by the mirror, or
+ * one that failed. Always outbound (right-aligned, no avatar), matching the
+ * bubble a mirrored `isSender` message renders, so a pending send does not
+ * visually jump when it swaps for the real thing.
+ */
+function OutboxRow({ entry, onRetry }) {
+  const failed = entry.state === 'failed';
+  const confirming = entry.state === 'awaiting-confirmation' || entry.state === 'sent';
+  return (
+    <div
+      data-testid="beeper-outbox-row"
+      data-state={entry.state}
+      className="flex items-end justify-end gap-2"
+    >
+      <div
+        className={`max-w-[75%] rounded-2xl px-3 py-2 text-sm text-gray-100 ${
+          failed ? 'border border-port-error/40 bg-port-error/10' : 'bg-port-accent/25'
+        }`}
+      >
+        <p className="whitespace-pre-wrap break-words">{entry.body}</p>
+        <span className="mt-0.5 flex items-center justify-end gap-1.5 text-[10px]">
+          {failed ? (
+            <>
+              <span className="text-port-error">Not delivered{entry.errorMessage ? ` — ${entry.errorMessage}` : ''}</span>
+              <button
+                type="button"
+                onClick={() => onRetry(entry)}
+                className="rounded px-1 py-0.5 text-port-accent transition-colors hover:underline"
+              >
+                Retry
+              </button>
+            </>
+          ) : (
+            <span className="flex items-center gap-1 text-gray-400">
+              <Loader2 size={10} className="animate-spin" />
+              {confirming ? 'Confirming…' : 'Sending…'}
+            </span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function BeeperThread({
   conversation,
   messages,
@@ -172,6 +224,13 @@ export default function BeeperThread({
   onLoadMore,
   draft,
   onDraftChange,
+  outboxEntries = [],
+  sending = false,
+  confirmation = null,
+  onSend,
+  confirmAndSend,
+  cancelConfirmation,
+  breaker = null,
   people,
   linkingId,
   onLinkParticipant,
@@ -202,9 +261,42 @@ export default function BeeperThread({
     return map;
   }, [conversation?.participants]);
 
+  // Outbox rows still worth showing: anything the mirror has not caught up
+  // with yet. Once a `sent` entry's `messageId` shows up in `messages` (the
+  // real message, arrived via the invalidation-driven refetch), it is dropped
+  // here rather than rendered twice — the mirrored message IS the confirmation.
+  // `entries` arrives newest-first (the server's own order, preserved through
+  // every client-side prepend); reversed to read oldest-first like `ordered`.
+  const visibleOutbox = useMemo(() => {
+    const mirroredIds = new Set(messages.map((message) => message.id));
+    return [...outboxEntries]
+      .filter((entry) => !(entry.messageId && mirroredIds.has(entry.messageId)))
+      .reverse();
+  }, [outboxEntries, messages]);
+
+  const trimmedDraft = draft.trim();
+  const breakerTripped = Boolean(breaker?.tripped);
+  const canSend = trimmedDraft.length > 0 && !sending && !breakerTripped;
+  const sendDisabledReason = breakerTripped
+    ? `Beeper sending is blocked by the runaway breaker (${breaker?.reason || 'unexpected send rate'}) — clear it in Beeper settings.`
+    : (trimmedDraft.length === 0 ? 'Type a message to send' : undefined);
+
+  const handleSendClick = () => { if (canSend) onSend(draft); };
+  // Bare Enter stays a newline (the textarea is multi-line); ⌘/Ctrl+Enter is
+  // the send shortcut, matching the reference interface and #53's spec.
+  const handleComposerKeyDown = (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      event.preventDefault();
+      handleSendClick();
+    }
+  };
+  // A failed row's only recovery: compose the SAME text again as a brand new
+  // outbox entry. Never a resend of the failed row — see the file docstring.
+  const handleRetry = (entry) => { if (!breakerTripped) onSend(entry.body); };
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
-  }, [conversation?.id, ordered.length]);
+  }, [conversation?.id, ordered.length, visibleOutbox.length]);
 
   // A typed confirmation must never survive the conversation it was typed for:
   // switching threads with the panel open would otherwise leave a primed Purge
@@ -440,8 +532,11 @@ export default function BeeperThread({
         )}
 
         {/* An empty thread is a legitimate steady state, not a spinner and not
-            an error — history depth varies enormously per network. */}
-        {!loading && !error && ordered.length === 0 && (
+            an error — history depth varies enormously per network. Gated on
+            `visibleOutbox` too: the very first message to a brand-new,
+            genuinely-empty conversation is itself a pending outbox row, and
+            that is not "no messages mirrored yet" either. */}
+        {!loading && !error && ordered.length === 0 && visibleOutbox.length === 0 && (
           <div className="flex h-full flex-col items-center justify-center gap-1 p-6 text-center">
             <p className="text-sm text-gray-300">No messages mirrored yet</p>
             <p className="max-w-sm text-[11px] text-gray-500">
@@ -499,8 +594,30 @@ export default function BeeperThread({
             </div>
           );
         })}
+
+        {/* Pending/failed sends. Not yet in `messages` — that arrives only
+            once the mirror has caught up (#53, on the outbox from #36). */}
+        {visibleOutbox.map((entry) => (
+          <OutboxRow key={entry.id} entry={entry} onRetry={handleRetry} />
+        ))}
+
         <div ref={bottomRef} />
       </div>
+
+      {/* First-contact confirmation (#8 decision 5, wired on #53): PortOS has
+          never completed a send to this conversation, so the server refused
+          and asked. Inline, never `window.confirm` — client conventions. */}
+      {confirmation && (
+        <InlineConfirmRow
+          variant="separator"
+          tone="warning"
+          question={`This is the first message PortOS has sent to ${conversation.title || 'this contact'} on ${networkLabel(conversation.network)} — send it?`}
+          confirmText="Send anyway"
+          cancelText="Cancel"
+          onConfirm={confirmAndSend}
+          onCancel={cancelConfirmation}
+        />
+      )}
 
       <div className="flex shrink-0 items-center gap-2 border-t border-port-border p-2.5">
         <button
@@ -522,18 +639,20 @@ export default function BeeperThread({
             rows={1}
             value={draft}
             onChange={(event) => onDraftChange(event.target.value)}
+            onKeyDown={handleComposerKeyDown}
             placeholder={`Message ${conversation.title || 'this chat'} on ${networkLabel(conversation.network)}`}
             className="min-w-0 flex-1 resize-none bg-transparent text-sm text-white placeholder:text-gray-500 focus:outline-none"
           />
         </div>
         <button
           type="button"
-          disabled
+          onClick={handleSendClick}
+          disabled={!canSend}
           aria-label="Send"
-          title="Sending from PortOS is not wired yet — the durable outbox is issue #36. Your draft is kept."
-          className="shrink-0 rounded-full bg-port-accent/40 p-2 text-port-bg disabled:cursor-not-allowed disabled:opacity-50"
+          title={sendDisabledReason}
+          className="shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 disabled:cursor-not-allowed disabled:bg-port-accent/40 disabled:hover:bg-port-accent/40"
         >
-          <Send size={15} />
+          {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
         </button>
       </div>
     </div>
