@@ -46,6 +46,15 @@ const api = vi.hoisted(() => ({
   backfillBeeperAttachments: vi.fn(),
   purgeBeeperConversation: vi.fn(),
 }));
+// The composer's send lifecycle (#36) reaches the server through
+// `apiBeeper.js` directly — a DIFFERENT module specifier than the `api.js`
+// barrel every other call in this file goes through — so `useBeeperOutbox`
+// needs its own mock rather than riding along on `api` above.
+const apiBeeper = vi.hoisted(() => ({
+  listOutboxEntries: vi.fn(),
+  createOutboxEntry: vi.fn(),
+  sendOutboxEntry: vi.fn(),
+}));
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn() }));
 const socketMock = vi.hoisted(() => {
   const handlers = new Map();
@@ -65,6 +74,7 @@ const socketMock = vi.hoisted(() => {
 });
 
 vi.mock('../../services/api', () => api);
+vi.mock('../../services/apiBeeper', () => apiBeeper);
 vi.mock('../ui/Toast', () => ({ default: toast }));
 vi.mock('../../services/socket', () => ({ default: socketMock.socket }));
 
@@ -118,6 +128,7 @@ beforeEach(() => {
   api.getBeeperConversation.mockResolvedValue(conversation());
   api.getBeeperMessages.mockResolvedValue({ messages: [], nextCursor: null });
   api.getTribePeople.mockResolvedValue([]);
+  apiBeeper.listOutboxEntries.mockResolvedValue({ entries: [] });
   api.getSettings.mockResolvedValue({ beeper: { enabled: false, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 } });
   api.getBeeperAttachmentSummary.mockResolvedValue({
     budgetBytes: 5 * 1024 * 1024 * 1024, usedBytes: 0, storedFiles: 0, pendingCount: 0, pendingBytes: 0,
@@ -310,27 +321,186 @@ describe('deferred controls render inert rather than absent', () => {
 });
 
 describe('the composer', () => {
-  it('names the network it would send on, keeps the draft, and cannot send', async () => {
+  it('names the network it would send on and keeps the draft buffer', async () => {
     api.getBeeperConversation.mockResolvedValue(conversation({ network: 'whatsapp', title: 'Example Contact' }));
     renderTab(`/messages/beeper/${CONV_A}`);
 
     const composer = await screen.findByLabelText('Message Example Contact on WhatsApp');
     expect(composer).toHaveAttribute('placeholder', 'Message Example Contact on WhatsApp');
+  });
+
+  it('disables Send while the draft is empty', async () => {
+    api.getBeeperConversation.mockResolvedValue(conversation({ network: 'whatsapp', title: 'Example Contact' }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const send = await screen.findByRole('button', { name: 'Send' });
+    expect(send).toBeDisabled();
+    expect(send.getAttribute('title')).toBe('Type a message to send');
+  });
+});
+
+// The composer's send lifecycle (#53, wired on the durable outbox from #36).
+// `useBeeperOutbox` has its own thorough unit coverage
+// (`hooks/useBeeperOutbox.test.jsx`) — what matters HERE is that the composer
+// wires the right props to it and renders what it reports, at the same page
+// boundary the rest of this file tests through.
+describe('the composer sends', () => {
+  const OUTBOUND_TEXT = 'Placeholder outbound text';
+
+  const openComposer = async (overrides = {}) => {
+    api.getBeeperConversation.mockResolvedValue(conversation({ network: 'whatsapp', title: 'Example Contact', ...overrides }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+    const composer = await screen.findByLabelText('Message Example Contact on WhatsApp');
+    fireEvent.change(composer, { target: { value: OUTBOUND_TEXT } });
+    return composer;
+  };
+
+  it('enqueues a send through the outbox with the right payload — one row, one send call', async () => {
+    apiBeeper.createOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'approved' });
+    apiBeeper.sendOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'awaiting-confirmation' });
+    const composer = await openComposer();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() => expect(apiBeeper.createOutboxEntry).toHaveBeenCalledWith(CONV_A, OUTBOUND_TEXT, { silent: true }));
+    expect(apiBeeper.createOutboxEntry).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledWith('outbox-1', { confirmFirstContact: false }, { silent: true }));
+    expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledTimes(1);
+    // `onSent` clears the draft buffer once the send is accepted.
+    await waitFor(() => expect(composer).toHaveValue(''));
+  });
+
+  it('renders the pending row while the send is in flight', async () => {
+    apiBeeper.createOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'approved' });
+    apiBeeper.sendOutboxEntry.mockReturnValue(new Promise(() => {})); // never settles within this test
+    await openComposer();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    const row = await screen.findByTestId('beeper-outbox-row');
+    expect(row).toHaveAttribute('data-state', 'approved');
+    expect(within(row).getByText(OUTBOUND_TEXT)).toBeInTheDocument();
+    expect(within(row).getByText('Sending…')).toBeInTheDocument();
+  });
+
+  it('shows the real mirrored message once an entry is confirmed, with no duplicate pending row', async () => {
+    apiBeeper.listOutboxEntries.mockResolvedValue({
+      entries: [{ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'sent', messageId: 'msg-final-1' }],
+    });
+    api.getBeeperMessages.mockResolvedValue({
+      messages: [{
+        id: 'msg-final-1', conversationId: CONV_A, senderId: 'user-me', body: OUTBOUND_TEXT,
+        sentAt: '2026-09-01T10:00:00.000Z', isSender: true, attachments: [],
+      }],
+      nextCursor: null,
+    });
+    api.getBeeperConversation.mockResolvedValue(conversation({ network: 'whatsapp', title: 'Example Contact' }));
+
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    await screen.findByText(OUTBOUND_TEXT);
+    expect(screen.queryByTestId('beeper-outbox-row')).toBeNull();
+    expect(screen.getAllByText(OUTBOUND_TEXT)).toHaveLength(1);
+  });
+
+  it('shows Retry on a failed send and leaves the composer text intact — never re-sent automatically', async () => {
+    apiBeeper.createOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'approved' });
+    apiBeeper.sendOutboxEntry.mockRejectedValue(Object.assign(new Error('Beeper request failed: connection refused'), { code: 'NETWORK_ERROR' }));
+    apiBeeper.listOutboxEntries.mockResolvedValue({
+      entries: [{ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'failed', errorCode: 'NETWORK_ERROR' }],
+    });
+    const composer = await openComposer();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    const row = await screen.findByTestId('beeper-outbox-row');
+    await waitFor(() => expect(row).toHaveAttribute('data-state', 'failed'));
+    expect(within(row).getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledTimes(1);
+    expect(composer).toHaveValue(OUTBOUND_TEXT);
+  });
+
+  it('surfaces a first-contact refusal as an inline confirmation naming the network and recipient, then resends the SAME row', async () => {
+    apiBeeper.createOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'approved' });
+    apiBeeper.sendOutboxEntry
+      .mockRejectedValueOnce(Object.assign(
+        new Error('This is the first message PortOS has ever sent to this conversation'),
+        { code: 'FIRST_CONTACT_CONFIRMATION_REQUIRED' },
+      ))
+      .mockResolvedValueOnce({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'awaiting-confirmation' });
+    await openComposer();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    // A question, not an error.
+    expect(await screen.findByText(/first message PortOS has sent to Example Contact on WhatsApp/)).toBeInTheDocument();
+    expect(toast.error).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send anyway' }));
+
+    expect(apiBeeper.createOutboxEntry).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(apiBeeper.sendOutboxEntry).toHaveBeenLastCalledWith(
+      'outbox-1', { confirmFirstContact: true }, { silent: true },
+    ));
+    expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.queryByText(/send it\?/)).toBeNull());
+  });
+
+  it('submits once from ⌘/Ctrl+Enter and once from a click inside the same render — the hook latch', async () => {
+    apiBeeper.createOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'approved' });
+    apiBeeper.sendOutboxEntry.mockResolvedValue({ id: 'outbox-1', conversationId: CONV_A, body: OUTBOUND_TEXT, state: 'awaiting-confirmation' });
+    const composer = await openComposer();
+    const send = screen.getByRole('button', { name: 'Send' });
+
+    await act(async () => {
+      fireEvent.keyDown(composer, { key: 'Enter', metaKey: true });
+      fireEvent.click(send);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(apiBeeper.createOutboxEntry).toHaveBeenCalledTimes(1));
+    expect(apiBeeper.sendOutboxEntry).toHaveBeenCalledTimes(1);
+  });
+
+  it('disables Send while the runaway breaker is tripped, even with a non-empty draft, and points at Settings', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true,
+      reachable: true,
+      accounts: [],
+      realtime: { state: 'connected' },
+      outbox: { breaker: { tripped: true, reason: 'synthetic loop', trippedAt: '2026-09-01T09:00:00.000Z' } },
+    });
+    const composer = await openComposer();
 
     const send = screen.getByRole('button', { name: 'Send' });
-    expect(send).toBeDisabled();
-    expect(send.getAttribute('title')).toMatch(/not wired yet/);
+    await waitFor(() => expect(send).toBeDisabled());
+    expect(send.getAttribute('title')).toMatch(/runaway breaker/);
+    expect(composer).toHaveValue(OUTBOUND_TEXT);
+
+    fireEvent.click(send);
+    expect(apiBeeper.createOutboxEntry).not.toHaveBeenCalled();
   });
 });
 
 describe('realtime', () => {
-  it('subscribes once and RE-SUBSCRIBES on every socket connect, so a reconnect is not silently dead', async () => {
+  // TWO subscriptions on the same shared socket, not one: the page's own
+  // `useBeeperRealtime` (drives the rail's liveness dot and invalidation
+  // refetches) and the one `useBeeperOutbox` opens internally (#53, wired on
+  // #36's design) so the composer's send confirmation reacts to
+  // `message.upserted` without waiting on the page's debounced refetch. Both
+  // emit `beeper:subscribe` at mount and on every reconnect. Server-side this
+  // is a no-op redundancy, not a bug: `beeperSubscribers` is a `Set` keyed on
+  // the physical socket, so a second subscribe from the same socket dedupes,
+  // and both hook instances share BeeperChatSurface's mount lifecycle, so
+  // there is no unmount race where one instance's `beeper:unsubscribe` could
+  // kill the other's subscription out from under it.
+  it('subscribes on both realtime hooks and RE-SUBSCRIBES on every socket connect, so a reconnect is not silently dead', async () => {
     renderTab();
     await screen.findByText('Nothing here');
-    expect(socketMock.emitted.filter(([event]) => event === 'beeper:subscribe')).toHaveLength(1);
+    expect(socketMock.emitted.filter(([event]) => event === 'beeper:subscribe')).toHaveLength(2);
 
     act(() => { for (const fn of socketMock.handlers.get('connect') || []) fn(); });
-    expect(socketMock.emitted.filter(([event]) => event === 'beeper:subscribe')).toHaveLength(2);
+    expect(socketMock.emitted.filter(([event]) => event === 'beeper:subscribe')).toHaveLength(4);
   });
 
   it('refetches the list and the open thread after an invalidation frame', async () => {
