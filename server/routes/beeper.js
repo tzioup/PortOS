@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
+import { resolveOAuthOrigin } from '../lib/beeperOAuthOrigin.js';
+import { PORTOS_API_URL, PORTOS_UI_URL } from '../lib/ports.js';
 import { serveLocalFile } from '../lib/fileUtils.js';
 import { basename, dirname } from 'path';
 import {
@@ -115,6 +117,12 @@ const mapBeeperWriteError = createServiceErrorMapper({
 // OAuth must use the same public origin the browser used to reach this request,
 // so the flow works over HTTPS, on a Tailscale hostname, or behind a proxy —
 // never a hardcoded localhost. Same derivation as routes/spotify.js.
+//
+// It is the FALLBACK rather than the answer, because it is wrong under the Vite
+// dev proxy: `changeOrigin: true` with no `x-forwarded-*` makes the server see
+// its own HTTPS origin on the API port, and the consent redirect then lands the
+// browser on a host the certificate does not cover. The browser sends its own
+// `window.location.origin` instead, validated by `resolveOAuthOrigin`.
 function requestOrigin(req) {
   const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http')
     .toString().split(',')[0].trim();
@@ -123,10 +131,11 @@ function requestOrigin(req) {
   return ['http', 'https'].includes(proto) && host ? `${proto}://${host}` : null;
 }
 
-const redirectUriFor = (req) => {
-  const origin = requestOrigin(req);
-  return origin ? `${origin}/api/beeper/oauth/callback` : null;
-};
+const redirectUriFrom = (origin) => (origin ? `${origin}/api/beeper/oauth/callback` : null);
+
+// The browser's own origin. Optional, so an older client (or a caller with no
+// window) still gets today's request-derived behaviour.
+const oauthStartSchema = z.object({ origin: z.string().min(1).max(2048).optional() }).strict();
 
 // GET /api/beeper/status — the status card's read model (#30): whether a
 // token is configured (never the token), how it was obtained, its expiry, a
@@ -346,8 +355,18 @@ router.delete('/conversations/:id', asyncHandler(async (req, res) => {
 // A POST because it registers a client and stores a pending authorization; the
 // PKCE verifier never leaves the server.
 router.post('/oauth/start', asyncHandler(async (req, res) => {
-  const origin = requestOrigin(req);
-  const result = await startBeeperOAuth({ redirectUri: redirectUriFor(req), clientUri: origin })
+  const { origin: clientOrigin } = validateRequest(oauthStartSchema, req.body ?? {});
+  const { origin, rejectedClientOrigin } = resolveOAuthOrigin({
+    clientOrigin,
+    requestOrigin: requestOrigin(req),
+    configuredOrigins: [PORTOS_UI_URL, PORTOS_API_URL],
+  });
+  // Never interpolate the value: it is a host off the user's own machine or
+  // tailnet, and this line can end up in a shared log.
+  if (rejectedClientOrigin) {
+    console.warn('⚠️ Beeper OAuth: browser origin is not one this install serves — using the request origin instead');
+  }
+  const result = await startBeeperOAuth({ redirectUri: redirectUriFrom(origin), clientUri: origin })
     .catch((err) => { throw mapBeeperWriteError(err); });
   res.json(result);
 }));
