@@ -701,6 +701,23 @@ describe('normalizers', () => {
     expect(JSON.stringify(row)).not.toContain('5550100001');
   });
 
+  // Live /v1/accounts items carry `bridge` as an OBJECT { id, type, provider
+  // }, never a string, and an account absent from every /v1/bridges
+  // items[].accounts[] entry leaves the join's `bridgeId` null — the object
+  // must be narrowed to `.id`, not coerced whole (String() on an object
+  // produces the literal text "[object Object]").
+  it('reads bridgeId off the raw bridge object when the bridge join has no match', () => {
+    const row = normalizeAccountRow({
+      accountID: 'acct-b',
+      network: 'Example Net',
+      status: 'connected',
+      bridgeId: null,
+      bridge: { id: 'bridge-2', type: 'example', provider: 'exampleprovider' },
+      user: { fullName: 'Example Owner' },
+    });
+    expect(row.bridgeId).toBe('bridge-2');
+  });
+
   it('records an unsend as an observation-time tombstone, never as a removal', () => {
     const row = normalizeMessageRow(
       { id: 'msg-1', senderID: 'user-1', isDeleted: true, text: '', timestamp: '2026-09-01T00:00:00.000Z', sortKey: '1' },
