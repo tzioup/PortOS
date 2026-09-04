@@ -90,7 +90,6 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `apiContacts.js` | macOS Contacts sync + identity resolve + Tribe enrich (#2415). |
 | `apiSignal.js` | Signal Desktop ingestion status / setup-check / sync. |
 | `apiBeeper.js` | Beeper Desktop bridge: status card and live connectivity check (#30), the connect flow (#31) — OAuth start, paste-a-token, disconnect — the mirrored chat surface (#35): conversations, thread pages, rail networks, archive/low-priority — and the attachment byte mirror (#37): `beeperAttachmentUrl` (a relative `/api/...` src, so an `<img loading="lazy">` IS the fetch-on-view), `fetchBeeperAttachment` ("fetch anyway"), `setBeeperAttachmentKeep`, the backfill census + run, and the per-conversation mirror purge. |
-| `apiBeeper.js` | Beeper Desktop bridge: status card and live connectivity check (#30), the connect flow (#31) — OAuth start, paste-a-token, disconnect — and the mirrored chat surface (#35): conversations, thread pages, rail networks, archive/low-priority. |
 | `apiSpotify.js` | Spotify OAuth + listening-history and playlist-library sync. |
 | `apiYoutube.js` | YouTube watch-history scrape, playlist/video library sync, and setup check. |
 | `apiPersonalities.js` | Agent personality profiles. |
