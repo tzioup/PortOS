@@ -22,9 +22,14 @@
  * client cannot invent a retry policy on top of an API with no idempotency key.
  */
 
-import { query } from '../lib/db.js';
+import { query, withTransaction } from '../lib/db.js';
 import { ServerError } from '../lib/errorHandler.js';
 import { updateChat } from './beeperClient.js';
+import {
+  getConversationAttachmentBytes,
+  purgeConversationAttachments,
+  shapeAttachment,
+} from './beeperAttachments.js';
 
 // The list endpoint returns a PARTICIPANT SUBSET, never a roster. Beeper's own
 // participant lists truncate at 20 (list) / 100 (single GET) with no
@@ -145,20 +150,11 @@ function shapeMessage(row) {
   };
 }
 
-function shapeAttachment(row) {
-  return {
-    messageId: row.message_id,
-    idx: Number(row.idx) || 0,
-    // Metadata only — the byte mirror is #13. `mxcId` is a REFERENCE the
-    // attachment slice resolves later, never a URL the browser can fetch.
-    mxcId: row.mxc_id || null,
-    mimeType: row.mime_type || '',
-    byteLength: row.byte_length === null || row.byte_length === undefined ? null : Number(row.byte_length),
-    fileName: row.file_name || '',
-    width: row.width === null || row.width === undefined ? null : Number(row.width),
-    height: row.height === null || row.height === undefined ? null : Number(row.height),
-  };
-}
+// Attachment rows are shaped by the mirror service that owns their lifecycle
+// (`beeperAttachments.shapeAttachment`), not by a second copy here: the thread
+// renders `stored` / `overCap` / `unavailable` / `keep` off the same payload
+// the attachment routes return, and two shapers would drift the moment one
+// gained a field.
 
 const clampLimit = (value, fallback, max) => {
   const n = Number(value);
@@ -295,7 +291,12 @@ export async function getConversation(conversationId) {
   const row = result?.rows?.[0];
   if (!row) return null;
   const [conversation] = await attachParticipants([shapeConversation(row)], { cap: null });
-  return conversation;
+  // The mirrored byte total rides on the SINGLE-conversation read only. It is
+  // what the purge confirmation names ("… and 41.2 MB of mirrored
+  // attachments"), and a typed confirmation that cannot state the cost is not
+  // a confirmation; the list endpoint does not pay for it per row.
+  const bytes = await getConversationAttachmentBytes(conversation.id);
+  return { ...conversation, attachmentBytes: bytes.bytes, attachmentFiles: bytes.files };
 }
 
 /**
@@ -329,7 +330,7 @@ export async function listMessages(conversationId, { limit, cursor } = {}) {
 
   if (messages.length > 0) {
     const attachments = await query(
-      `SELECT message_id, idx, mxc_id, mime_type, byte_length, file_name, width, height
+      `SELECT *
          FROM beeper_attachments
         WHERE conversation_id = $1 AND message_id = ANY($2::text[])
         ORDER BY message_id, idx`,
@@ -415,6 +416,67 @@ async function setConversationFlag(conversationId, field, column, value) {
   );
   console.log(`🫧 Beeper ${field}=${applied} on conversation ${conversationId}`);
   return getConversation(conversationId);
+}
+
+// ---------------------------------------------------------------------------
+// Purge (#37) — the ONE destructive path over the mirror
+// ---------------------------------------------------------------------------
+
+/**
+ * Delete one conversation's mirror: its messages, participants, attachment
+ * rows AND the mirrored bytes those rows were holding.
+ *
+ * This is a PortOS-local purge and nothing else. It never touches Beeper: the
+ * conversation stays exactly where it is on the source network, and the next
+ * sweep will mirror it again unless the user also removes it there. That is
+ * deliberate — "reclaim the disk this chat is using" and "delete this chat"
+ * are different intentions, and only the first one is undoable.
+ *
+ * Order matters. `purgeConversationAttachments` runs FIRST, while the rows it
+ * reference-checks against still exist: the store is content-addressed, so a
+ * photo forwarded into three other chats must survive this one being purged.
+ * The conversation row goes last and the FK cascade takes messages,
+ * participants and attachment rows with it.
+ */
+export async function purgeConversation(conversationId) {
+  const found = await query(
+    'SELECT id, title, account_id, source_chat_id FROM beeper_conversations WHERE id = $1',
+    [conversationId],
+  );
+  const row = found?.rows?.[0];
+  if (!row) throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
+
+  const bytes = await purgeConversationAttachments(conversationId);
+  const messages = await query(
+    'SELECT COUNT(*)::int AS count FROM beeper_messages WHERE conversation_id = $1',
+    [conversationId],
+  );
+  // The conversation row and its SYNC CURSOR go together, in one transaction.
+  //
+  // `beeper_sync_cursors` is keyed on Beeper's own `(account_id, chat_id)` and
+  // carries an FK onto `beeper_accounts` alone, so the conversation's cascade
+  // cannot reach it. Left behind, its `last_activity` watermark still says this
+  // chat has not moved: `chatNeedsSweep` skips it, and once it does move,
+  // `fetchNewMessages` walks forward from the surviving cursor and mirrors only
+  // what arrives next. The purged history would never come back — the opposite
+  // of what the typed confirmation promises the user before they confirm an
+  // irreversible delete. Deleting the cursor is also the only thing that ever
+  // removes one, so it stops orphan cursor rows accumulating.
+  await withTransaction(async (client) => {
+    await client.query('DELETE FROM beeper_conversations WHERE id = $1', [conversationId]);
+    await client.query(
+      'DELETE FROM beeper_sync_cursors WHERE account_id = $1 AND chat_id = $2',
+      [row.account_id, row.source_chat_id],
+    );
+  });
+  console.log(`🫧 Beeper conversation mirror purged: ${conversationId} (${bytes.removedFiles} file(s), ${bytes.freedBytes} bytes)`);
+  return {
+    purged: true,
+    conversationId,
+    messagesRemoved: Number(messages?.rows?.[0]?.count) || 0,
+    filesRemoved: bytes.removedFiles,
+    bytesFreed: bytes.freedBytes,
+  };
 }
 
 export const setConversationArchived = (conversationId, archived) =>

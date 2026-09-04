@@ -1740,10 +1740,20 @@ CREATE TABLE IF NOT EXISTS beeper_attachments (
   height INTEGER,
   last_viewed_at TIMESTAMPTZ,
   keep BOOLEAN NOT NULL DEFAULT FALSE,
+  -- Byte-mirror columns (#37). `local_path` is the store-relative path of the
+  -- mirrored bytes (`<sha256 prefix>/<sha256>.<ext>`), NULL while only the
+  -- reference is held — that NULL is the lazy mirror's state machine, never ''.
+  -- `unavailable_at`/`fetch_error` record a TERMINAL refusal from the source,
+  -- which both stops a re-fetch loop and exempts the row from eviction.
+  local_path TEXT,
+  fetched_at TIMESTAMPTZ,
+  unavailable_at TIMESTAMPTZ,
+  fetch_error TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (conversation_id, message_id, idx)
 );
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_local ON beeper_attachments (local_path) WHERE local_path IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction ON beeper_attachments (last_viewed_at) WHERE keep = FALSE;
 CREATE INDEX IF NOT EXISTS idx_beeper_attachments_sha256 ON beeper_attachments (sha256) WHERE sha256 IS NOT NULL;
 CREATE TABLE IF NOT EXISTS beeper_sync_cursors (

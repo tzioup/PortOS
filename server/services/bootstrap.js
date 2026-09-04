@@ -101,6 +101,7 @@ import { startOrphanShellGc } from './importerOrphanGc.js';
 import { startImageRefsGc } from './imageRefsGc.js';
 import { startImageCleanTmpGc } from './imageCleanTmpGc.js';
 import { startOrphanedPartialGc } from './orphanedPartialGc.js';
+import { startBeeperAttachmentGc } from './beeperAttachmentGc.js';
 import { initBridge as initBrainMemoryBridge } from './brainMemoryBridge.js';
 import { initDrillCache } from './meatspacePostDrillCache.js';
 import { registerPostReminderSchedule } from './meatspacePostReminder.js';
@@ -476,6 +477,14 @@ const startBackgroundServices = ({ spawnerReady, io }) => {
   // like the other GCs — not part of the awaited warmStores pruneLegacyFiles
   // chain, so a large sweep cannot stall listen().
   startOrphanedPartialGc();
+  // Periodically bound the Beeper attachment mirror: evict least-recently-viewed
+  // bytes down to `settings.beeper.attachmentBudgetGb` (never evicting a file
+  // Beeper can no longer re-supply, and never one the user locked with `keep`),
+  // and heal the store both ways — orphan files no row points at, rows whose
+  // file is gone, abandoned partials (fork issue #37). Housekeeping over local
+  // bytes, so it is NOT gated on the ingestion toggle: turning scheduled sync
+  // off does not make an over-budget mirror stop being over budget.
+  startBeeperAttachmentGc();
   // Warm the catalog user-type registry from the user-type store (Postgres as of
   // #1001; the settings.json slice under the escape hatch) before any catalog
   // request can land, so user-defined types validate + mint ids immediately on

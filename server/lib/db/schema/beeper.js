@@ -136,10 +136,11 @@ export const beeperDdl = [
 
   // `(conversation_id, message_id, idx)` addresses one attachment within a
   // message's attachment array. `mxc_id` is the source attachment identifier
-  // (typically an mxc:// URL); `srcURL` is NEVER persisted here — it carries
-  // its own documented decay warning and is only a cache-state hint, not a
-  // durable reference. `keep` exempts an attachment from the least-recently-
-  // viewed eviction that bounds the on-disk byte budget.
+  // (typically an mxc:// URL) and the DURABLE reference the byte mirror (#37)
+  // resolves against `GET /v1/assets/serve`; `srcURL` is NEVER persisted here —
+  // it carries its own documented decay warning and is only a cache-state hint,
+  // not a durable reference. `keep` exempts an attachment from the least-
+  // recently-viewed eviction that bounds the on-disk byte budget.
   `CREATE TABLE IF NOT EXISTS beeper_attachments (
     conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
     message_id TEXT NOT NULL REFERENCES beeper_messages (id) ON DELETE CASCADE,
@@ -153,10 +154,34 @@ export const beeperDdl = [
     height INTEGER,
     last_viewed_at TIMESTAMPTZ,
     keep BOOLEAN NOT NULL DEFAULT FALSE,
+    local_path TEXT,
+    fetched_at TIMESTAMPTZ,
+    unavailable_at TIMESTAMPTZ,
+    fetch_error TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (conversation_id, message_id, idx)
   )`,
+  // The byte-mirror columns (#37), declared inline above for a fresh install
+  // and added here for one whose `beeper_attachments` predates them —
+  // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, the same
+  // reason `beeper_messages.is_sender` carries an ALTER of its own.
+  //
+  // `local_path` is the store-relative path of the mirrored bytes
+  // (`<sha256 prefix>/<sha256>.<ext>`), NULL while only the reference is held;
+  // that NULL is the lazy mirror's whole state machine, so it is never
+  // defaulted to ''. `unavailable_at`/`fetch_error` record a TERMINAL refusal
+  // from the source (`GET /v1/assets/serve` answers 502 for media the network
+  // has aged out, mapped to ASSET_UNAVAILABLE) — it is what stops a re-fetch
+  // loop on every render AND what exempts the row from eviction, because bytes
+  // Beeper can no longer supply are the only copy left.
+  `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS local_path TEXT`,
+  `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ`,
+  `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS unavailable_at TIMESTAMPTZ`,
+  `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS fetch_error TEXT`,
+  // The budget sweep sums mirrored bytes and walks least-recently-viewed
+  // first; both only ever look at rows that HAVE bytes on disk.
+  `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_local ON beeper_attachments (local_path) WHERE local_path IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction ON beeper_attachments (last_viewed_at) WHERE keep = FALSE`,
   `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_sha256 ON beeper_attachments (sha256) WHERE sha256 IS NOT NULL`,
 

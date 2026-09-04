@@ -15,10 +15,12 @@
  * `fetchWithTimeout` instead, same as `ollamaManager.js` / `lmStudioManager.js`
  * for the other local-daemon integrations. `safeUrlFetch`'s `readBodyCapped`
  * two-stage byte cap (Content-Length early-out, then a streamed abort once
- * accumulated bytes exceed the ceiling) is NOT reused here — every response
- * this module reads is small JSON from a local trusted process, read via
- * `readResponseJson`. A future byte-streaming asset fetch (attachment mirror,
- * #37) is the caller that would want that pattern; it doesn't exist yet.
+ * accumulated bytes exceed the ceiling) is NOT reused here — every JSON
+ * response this module reads is small, from a local trusted process, read via
+ * `readResponseJson`. The byte-streaming asset fetch (attachment mirror, #37 —
+ * `headAsset` / `fetchAssetStream` below) is the one caller that wants that
+ * two-stage shape, and it enforces its own: a `HEAD` pre-flight plus a
+ * mid-stream abort, both against `BEEPER_ATTACHMENT_MAX_BYTES`.
  *
  * Auth and base URL: `settings.beeper.baseUrl` (default below) and, since #31,
  * the vault-backed credential store (`beeperCredentials.resolveBeeperToken` —
@@ -557,6 +559,99 @@ export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
     baseUrl, token, timeoutMs,
     isAssetEndpoint: true,
   });
+}
+
+/**
+ * The byte-streaming half of the asset surface (#37): `GET /v1/assets/serve`.
+ *
+ * `beeperRequest` cannot serve these — it reads every response through
+ * `readResponseJson`, which is right for the small local JSON the rest of this
+ * client speaks to and catastrophic for a 30 MB video (it would buffer the
+ * whole body in memory to hand back a `{ message: '<binary>' }`). These two
+ * functions therefore go to `fetchWithTimeout` directly and hand the caller
+ * the RAW `Response`, whose body the mirror streams to disk.
+ *
+ * What they do NOT skip is the error mapping. `serve` answers `502` for media
+ * the network has aged out, exactly like `assets/download` does, so both run
+ * through `mapBeeperResponseError` with `isAssetEndpoint: true` — a terminal
+ * `ASSET_UNAVAILABLE`, never the ordinarily-retryable `UPSTREAM_ERROR` a
+ * generic "5xx is transient" policy would loop on forever.
+ */
+// Time to the RESPONSE HEADERS, not to the last byte: `fetchWithTimeout` clears
+// its abort timer once `fetch` resolves, which is the moment the headers land.
+// Generous rather than the 15s a JSON call gets, because Beeper may have to
+// pull the media off the network before it can answer at all. The BODY is
+// bounded separately by the mirror's own idle-abort (`STREAM_IDLE_TIMEOUT_MS`
+// in `beeperAttachments.js`), which is what a caller passing `signal` here is
+// usually doing.
+const ASSET_REQUEST_TIMEOUT_MS = 60_000;
+
+function assetErrorFrom(response) {
+  // A `serve`/HEAD failure body is not reliably JSON (and a HEAD has no body
+  // at all), so the mapper is handed the status alone and builds its own
+  // message rather than inventing a `code` that never came from Beeper.
+  return mapBeeperResponseError(response.status, null, { isAssetEndpoint: true, retryEligible: false });
+}
+
+async function assetRequest(mxcId, { method, baseUrl, token, timeoutMs = ASSET_REQUEST_TIMEOUT_MS, signal } = {}) {
+  const resolved = await resolveBeeperConfig({ baseUrl, token });
+  if (!resolved.token) {
+    throw new BeeperApiError('Beeper access token is not configured', {
+      status: 401, code: 'NOT_CONFIGURED', retryable: false,
+    });
+  }
+  const reference = String(mxcId || '').trim();
+  if (!reference) {
+    throw new BeeperApiError('Beeper asset reference is empty', {
+      status: 400, code: 'BAD_REQUEST', retryable: false,
+    });
+  }
+  const url = `${resolved.baseUrl}/v1/assets/serve?url=${encodeURIComponent(reference)}`;
+  const response = await fetchWithTimeout(url, {
+    method,
+    headers: { Authorization: `Bearer ${resolved.token}` },
+    signal,
+  }, timeoutMs).catch((err) => {
+    throw new BeeperApiError(`Beeper asset request failed: ${describeFetchError(err)}`, {
+      status: 0, code: 'NETWORK_ERROR', retryable: false,
+    });
+  });
+  if (!response.ok) {
+    // Drain, so an error body cannot hold the socket open.
+    await response.body?.cancel?.().catch(() => {});
+    throw assetErrorFrom(response);
+  }
+  return response;
+}
+
+/**
+ * `HEAD /v1/assets/serve` — the pre-flight the size ceiling and the eviction
+ * guard both key on. Returns `{ bytes }`, with `bytes: null` when the server
+ * declines to say (the absent-vs-empty rule: "unknown size" must not read as
+ * "zero bytes", which would sail under any ceiling).
+ *
+ * A `502` here is the eviction guard's whole point: it means Beeper can no
+ * longer supply the file, so the local copy is the last one and must be kept
+ * regardless of age.
+ */
+export async function headAsset(mxcId, { baseUrl, token, timeoutMs, signal } = {}) {
+  const response = await assetRequest(mxcId, { method: 'HEAD', baseUrl, token, timeoutMs, signal });
+  const raw = response.headers?.get?.('content-length');
+  const bytes = Number(raw);
+  return { bytes: raw !== null && raw !== undefined && Number.isFinite(bytes) ? bytes : null };
+}
+
+/**
+ * `GET /v1/assets/serve` — the raw streaming response. The caller owns the
+ * body: it must consume or cancel it.
+ *
+ * `serve` sends NO `Content-Type` (probed live, #13), which is why the mirror
+ * stores Beeper's declared `mimeType` from the message payload and serves from
+ * that instead of sniffing anything here. `timeoutMs` covers the headers only;
+ * pass `signal` to bound the body.
+ */
+export async function fetchAssetStream(mxcId, { baseUrl, token, timeoutMs, signal } = {}) {
+  return assetRequest(mxcId, { method: 'GET', baseUrl, token, timeoutMs, signal });
 }
 
 // ---------------------------------------------------------------------------

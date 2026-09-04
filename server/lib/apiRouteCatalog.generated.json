@@ -1551,7 +1551,55 @@
     },
     {
       "method": "GET",
+      "path": "/api/beeper/attachments/:messageId/:idx",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/beeper/attachments/:messageId/:idx",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/attachments/:messageId/:idx/fetch",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/beeper/attachments/backfill",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/beeper/attachments/summary",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "GET",
       "path": "/api/beeper/conversations",
+      "mountPath": "/api/beeper",
+      "sources": [
+        "server/routes/beeper.js"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/beeper/conversations/:id",
       "mountPath": "/api/beeper",
       "sources": [
         "server/routes/beeper.js"
@@ -17576,8 +17624,8 @@
   ],
   "stats": {
     "mounts": 146,
-    "operations": 2177,
-    "declarations": 2185,
+    "operations": 2183,
+    "declarations": 2191,
     "sourceFiles": 229
   }
 }

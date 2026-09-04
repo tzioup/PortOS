@@ -37,6 +37,14 @@ const api = vi.hoisted(() => ({
   startBeeperOAuth: vi.fn(),
   saveBeeperToken: vi.fn(),
   disconnectBeeper: vi.fn(),
+  // Attachment byte mirror (#37). `beeperAttachmentUrl` is called during
+  // render, so it must return a string rather than a mock's `undefined`.
+  beeperAttachmentUrl: vi.fn((messageId, idx) => `/api/beeper/attachments/${messageId}/${idx}`),
+  fetchBeeperAttachment: vi.fn(),
+  setBeeperAttachmentKeep: vi.fn(),
+  getBeeperAttachmentSummary: vi.fn(),
+  backfillBeeperAttachments: vi.fn(),
+  purgeBeeperConversation: vi.fn(),
 }));
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn() }));
 const socketMock = vi.hoisted(() => {
@@ -111,6 +119,10 @@ beforeEach(() => {
   api.getBeeperMessages.mockResolvedValue({ messages: [], nextCursor: null });
   api.getTribePeople.mockResolvedValue([]);
   api.getSettings.mockResolvedValue({ beeper: { enabled: false, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 } });
+  api.getBeeperAttachmentSummary.mockResolvedValue({
+    budgetBytes: 5 * 1024 * 1024 * 1024, usedBytes: 0, storedFiles: 0, pendingCount: 0, pendingBytes: 0,
+    pendingUnknownCount: 0, overCapCount: 0, unavailableCount: 0, keptCount: 0, totalCount: 0, maxBytes: 32 * 1024 * 1024,
+  });
 });
 
 afterEach(cleanup);
@@ -436,6 +448,123 @@ describe('the OAuth outcome carried back on the URL', () => {
     renderTab('/messages/beeper?beeperOauthError=access_denied');
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect failed: access_denied'));
     expect(await screen.findByRole('heading', { name: 'Beeper Settings' })).toBeInTheDocument();
+  });
+});
+
+// The lazy attachment mirror (#37) at the page boundary: what the thread
+// renders, and what the purge confirmation demands before it deletes bytes.
+describe('attachment mirror', () => {
+  const imageAttachment = (overrides = {}) => ({
+    messageId: 'm1',
+    idx: 0,
+    mxcId: 'mxc://example.invalid/abc',
+    mimeType: 'image/png',
+    fileName: 'example.png',
+    byteLength: 2048,
+    width: null,
+    height: null,
+    stored: false,
+    keep: false,
+    unavailable: false,
+    overCap: false,
+    maxBytes: 32 * 1024 * 1024,
+    ...overrides,
+  });
+
+  const withAttachment = (attachment) => {
+    api.getBeeperConversations.mockResolvedValue({ conversations: [conversation()], nextCursor: null });
+    api.getBeeperMessages.mockResolvedValue({
+      messages: [{
+        id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder body',
+        sentAt: '2026-09-01T10:00:00.000Z', attachments: [attachment],
+      }],
+      nextCursor: null,
+    });
+  };
+
+  it('renders an image lazily against the mirror route — the request IS the fetch-on-view', async () => {
+    withAttachment(imageAttachment());
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const image = await screen.findByAltText('example.png');
+    expect(image).toHaveAttribute('src', '/api/beeper/attachments/m1/0');
+    expect(image).toHaveAttribute('loading', 'lazy');
+  });
+
+  it('renders an over-cap attachment as a placeholder naming the size, with "Fetch anyway"', async () => {
+    withAttachment(imageAttachment({ byteLength: 40 * 1024 * 1024, overCap: true }));
+    api.fetchBeeperAttachment.mockResolvedValue(imageAttachment({ byteLength: 40 * 1024 * 1024, overCap: true, stored: true }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    expect(await screen.findByText(/Larger than the 32 MB mirror limit/)).toBeInTheDocument();
+    // Nothing was downloaded on render — the placeholder is not an <img>.
+    expect(screen.queryByAltText('example.png')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Fetch anyway/i }));
+    await waitFor(() => expect(api.fetchBeeperAttachment).toHaveBeenCalledWith('m1', 0, { silent: true }));
+    expect(await screen.findByAltText('example.png')).toBeInTheDocument();
+  });
+
+  it('renders an unavailable attachment as a reference and never re-requests it', async () => {
+    withAttachment(imageAttachment({ unavailable: true, unavailableReason: 'Failed to download asset' }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    expect(await screen.findByText(/Beeper can no longer supply this file/)).toBeInTheDocument();
+    expect(screen.queryByAltText('example.png')).not.toBeInTheDocument();
+    expect(api.fetchBeeperAttachment).not.toHaveBeenCalled();
+  });
+
+  it('renders a video as a generic tile rather than an inline player', async () => {
+    withAttachment(imageAttachment({ mimeType: 'video/mp4', fileName: 'example.mp4' }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const link = await screen.findByRole('link', { name: 'example.mp4' });
+    expect(link).toHaveAttribute('href', '/api/beeper/attachments/m1/0');
+    expect(document.querySelector('video')).toBeNull();
+  });
+
+  it('locks one attachment against eviction through the keep toggle', async () => {
+    withAttachment(imageAttachment());
+    api.setBeeperAttachmentKeep.mockResolvedValue(imageAttachment({ keep: true }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    fireEvent.click(await screen.findByRole('button', { name: /Keep this attachment/i }));
+    await waitFor(() => expect(api.setBeeperAttachmentKeep).toHaveBeenCalledWith('m1', 0, true, { silent: true }));
+    expect(await screen.findByRole('button', { name: /Stop keeping this attachment/i })).toBeInTheDocument();
+  });
+});
+
+describe('purging one conversation mirror', () => {
+  const openThread = async () => {
+    api.getBeeperConversations.mockResolvedValue({ conversations: [conversation()], nextCursor: null });
+    api.getBeeperConversation.mockResolvedValue(conversation({ attachmentBytes: 4 * 1024 * 1024, attachmentFiles: 3 }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+    fireEvent.click(await screen.findByRole('button', { name: /^Purge$/ }));
+  };
+
+  it('names the conversation and the byte count, and demands the typed word first', async () => {
+    await openThread();
+    expect(await screen.findByText('Purge this mirror')).toBeInTheDocument();
+    expect(screen.getByText(/4 MB of mirrored attachment bytes/)).toBeInTheDocument();
+    expect(screen.getByText(/across 3 file\(s\)/)).toBeInTheDocument();
+
+    const confirm = screen.getByRole('button', { name: /Purge mirror/i });
+    expect(confirm).toBeDisabled();
+    fireEvent.change(screen.getByLabelText(/Type purge to confirm/i), { target: { value: 'nope' } });
+    expect(confirm).toBeDisabled();
+    expect(api.purgeBeeperConversation).not.toHaveBeenCalled();
+  });
+
+  it('purges on the typed confirmation and returns to the list', async () => {
+    api.purgeBeeperConversation.mockResolvedValue({
+      purged: true, conversationId: CONV_A, messagesRemoved: 12, filesRemoved: 3, bytesFreed: 4194304,
+    });
+    await openThread();
+    fireEvent.change(await screen.findByLabelText(/Type purge to confirm/i), { target: { value: 'purge' } });
+    fireEvent.click(screen.getByRole('button', { name: /Purge mirror/i }));
+
+    await waitFor(() => expect(api.purgeBeeperConversation).toHaveBeenCalledWith(CONV_A, { silent: true }));
+    expect(await screen.findByText('Pick a conversation')).toBeInTheDocument();
   });
 });
 

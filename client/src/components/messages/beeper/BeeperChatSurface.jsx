@@ -318,6 +318,7 @@ export default function BeeperChatSurface({
   const [people, setPeople] = useState([]);
   const [linkingId, setLinkingId] = useState(null);
   const [writePending, setWritePending] = useState(false);
+  const [purging, setPurging] = useState(false);
 
   // A PortOS-side draft buffer, keyed by conversation, so a half-written
   // message survives switching threads AND leaving the page. It is deliberately
@@ -506,6 +507,40 @@ export default function BeeperChatSurface({
     loadList();
   }, [conversationId, loadList, mountedRef]);
 
+  // Purging one conversation's mirror. Local state is updated from the result
+  // rather than refetched: the row is gone, the thread has nothing left to
+  // show, and the surface navigates back to the list it came from.
+  const purgeMirror = useCallback(async () => {
+    if (!conversationId) return;
+    setPurging(true);
+    const result = await api.purgeBeeperConversation(conversationId, { silent: true }).catch((err) => {
+      toast.error(err?.message || 'Could not purge this conversation');
+      return null;
+    });
+    if (!mountedRef.current) return;
+    setPurging(false);
+    if (!result) return;
+    setConversations((prev) => prev.filter((row) => row.id !== conversationId));
+    toast.success(`Mirror purged — ${result.messagesRemoved} message(s), ${result.filesRemoved} attachment file(s) removed`);
+    clearSelection();
+  }, [clearSelection, conversationId, mountedRef]);
+
+  // One attachment changed under the thread (a "fetch anyway", a keep toggle).
+  // Merge it into the message it belongs to instead of refetching the page —
+  // the rest of the thread has not moved.
+  const applyAttachmentUpdate = useCallback((messageId, updated) => {
+    setMessages((prev) => prev.map((message) => (
+      message.id === messageId
+        ? {
+          ...message,
+          attachments: (message.attachments || []).map((attachment) => (
+            attachment.idx === updated.idx ? { ...attachment, ...updated } : attachment
+          )),
+        }
+        : message
+    )));
+  }, []);
+
   const linkParticipant = useCallback(async (participant, personId) => {
     setLinkingId(participant.sourceUserId);
     const result = await api.linkBeeperParticipant({
@@ -689,6 +724,9 @@ export default function BeeperChatSurface({
             writePending={writePending}
             onArchive={(value) => applyFlag(api.setBeeperConversationArchived, value, 'archive')}
             onLowPriority={(value) => applyFlag(api.setBeeperConversationLowPriority, value, 'update')}
+            onPurge={purgeMirror}
+            purging={purging}
+            onAttachmentUpdated={applyAttachmentUpdate}
           />
         )}
       </div>
