@@ -31,10 +31,13 @@
  */
 
 import { createSyncScheduler } from './createSettingsGatedSyncScheduler.js';
+import { cancel, getEvent } from './eventScheduler.js';
 import { getBeeperSyncConfig, isBeeperIngestionArmed, runBeeperSweep } from './beeperSync.js';
 
+const SCHEDULER_EVENT_ID = 'beeper-sync';
+
 const registerBeeperScheduler = createSyncScheduler({
-  id: 'beeper-sync',
+  id: SCHEDULER_EVENT_ID,
   label: 'Beeper',
   icon: '🫧',
   source: 'beeperScheduler',
@@ -42,12 +45,33 @@ const registerBeeperScheduler = createSyncScheduler({
   runSync: () => runBeeperSweep({ reason: 'scheduler' }),
 });
 
+/** Whether `beeper-sync` is currently registered with the event scheduler. */
+export function isBeeperSchedulerRegistered() {
+  return Boolean(getEvent(SCHEDULER_EVENT_ID));
+}
+
 /**
  * Start the Beeper ingestion sweep scheduler. Returns without registering —
  * and without logging — when the instance feature is off or no token is
  * configured.
+ *
+ * Registering again while `beeper-sync` is already scheduled is a no-op rather
+ * than a re-`schedule()`: `eventScheduler.schedule` cancels and replaces an
+ * event with the same id, which resets `nextRunAt` to a whole interval away. A
+ * user toggling the Comms group twice would otherwise keep pushing the next
+ * sweep out.
  */
 export async function startBeeperScheduler() {
+  if (isBeeperSchedulerRegistered()) return;
   if (!await isBeeperIngestionArmed()) return;
   await registerBeeperScheduler();
+}
+
+/**
+ * Cancel the sweep scheduler — the disarm half (the feature turned off, the
+ * credential deleted). Returns whether an event was actually cancelled, so the
+ * caller can keep its logging to real transitions.
+ */
+export function stopBeeperScheduler() {
+  return cancel(SCHEDULER_EVENT_ID);
 }

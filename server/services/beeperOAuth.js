@@ -21,6 +21,11 @@
  *
  * The token value never leaves this module except into the vault: it is never
  * logged, never put into an error message, and never returned to a route.
+ *
+ * Every path that changes whether a credential exists ends in
+ * `reconcileBeeperIngestion()` — storing one arms the sweep and the realtime
+ * transport without waiting for a restart, and a disconnect stops the relay
+ * rather than leaving it running on a token that was just revoked.
  */
 
 import { createHash, randomBytes } from 'crypto';
@@ -32,6 +37,7 @@ import {
   BeeperApiError, getAccounts, getInfo, probeBeeperInfo, resolveBeeperBaseUrl,
 } from './beeperClient.js';
 import { deleteBeeperCredential, readBeeperCredential, saveBeeperCredential } from './beeperCredentials.js';
+import { reconcileBeeperIngestion } from './beeperArming.js';
 
 const METADATA_PATH = '/.well-known/oauth-authorization-server';
 export const BEEPER_OAUTH_SCOPES = ['read', 'write'];
@@ -346,6 +352,8 @@ export async function completeBeeperOAuth({ code, state } = {}) {
     clientId: pending.clientId,
   });
 
+  await armIngestion('oauth-connect');
+
   // Never throws (see beeperClient) — a token that stored fine while Beeper
   // Desktop happens to be closed is connected, not failed, and the status card
   // renders the unreachable state on its own.
@@ -384,7 +392,20 @@ export async function connectWithPastedToken(token) {
   const saved = await saveBeeperCredential({
     token: value, expiresAt: verified.expiresAt, scopes: verified.scopes, source: 'pasted',
   });
+  await armIngestion('token-pasted');
   return { ...saved, reachable: true, lastProbeError: null };
+}
+
+/**
+ * Reconcile the sweep + realtime transport against the credential that just
+ * changed. Isolated from the caller's verdict on purpose: the credential is
+ * already stored (or already gone), so a reconcile that fails must not turn a
+ * completed connect into a 500 — it is logged and the next trigger, or the next
+ * restart, picks it up.
+ */
+async function armIngestion(reason) {
+  await reconcileBeeperIngestion({ reason })
+    .catch((err) => console.error(`❌ Beeper ingestion reconcile (${reason}) failed: ${err.message}`));
 }
 
 async function verifyByIntrospection(token, { introspectionEndpoint }) {
@@ -418,7 +439,11 @@ export async function disconnectBeeper() {
       ? '🔓 Beeper token revoked at the authorization server'
       : '⚠️ Beeper token revocation was not accepted; deleting the local copy anyway');
   }
-  return deleteBeeperCredential();
+  const result = await deleteBeeperCredential();
+  // The credential is gone, so the gate is now shut: stop the relay rather than
+  // leaving a live WebSocket running on a token the user just revoked.
+  await armIngestion('disconnect');
+  return result;
 }
 
 async function revokeToken({ token, clientId }) {

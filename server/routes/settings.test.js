@@ -61,8 +61,16 @@ vi.mock('../services/eidoverseHost.js', () => ({
 vi.mock('../services/credentialInventory.js', () => ({
   getCredentialInventory: vi.fn(async () => ({ headline: 'Most of PortOS works with no key at all.', credentials: [] })),
 }));
+// The Beeper feature toggle now reconciles the sweep + realtime transport
+// against the gate it just moved (fork issue #1). Mocked here because the real
+// module reaches the whole Beeper service graph; what a reconcile actually does
+// is covered by services/beeperArming.test.js.
+vi.mock('../services/beeperArming.js', () => ({
+  reconcileBeeperIngestion: vi.fn(async () => ({ armed: false, changed: false })),
+}));
 
 import settingsRoutes from './settings.js';
+import { reconcileBeeperIngestion } from '../services/beeperArming.js';
 import { updateSettingsWith } from '../services/settings.js';
 import { hasConfiguredInstances as hasConfiguredDatadogInstances } from '../services/datadog.js';
 import { hasConfiguredInstances as hasConfiguredJiraInstances } from '../services/jira.js';
@@ -203,6 +211,31 @@ describe('Settings routes — instance feature participation', () => {
     expect(res.status).toBe(200);
     expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'post', enabled: false }));
     expect(store).toEqual({ theme: 'dark', instanceFeatures: { post: { enabled: false } } });
+    // Only Beeper's own gate is reconciled; an unrelated toggle must not reach
+    // into the Beeper service graph at all.
+    expect(reconcileBeeperIngestion).not.toHaveBeenCalled();
+  });
+
+  // Fork issue #1, final live pass: the Beeper sweep + realtime transport arm on
+  // the instance feature plus a token, and that gate was read at boot only — so
+  // turning the feature on left both down until the next restart.
+  it('reconciles Beeper ingestion when the Beeper feature is toggled', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings/features/beeper')
+      .send({ enabled: true });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'feature-toggle' });
+  });
+
+  // Beeper sits in the Comms group, so the group toggle moves the same gate.
+  it('reconciles Beeper ingestion when the Comms group is toggled', async () => {
+    const res = await request(buildApp())
+      .put('/api/settings/features/groups/comms')
+      .send({ enabled: false });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'feature-group-toggle' });
   });
 
   it('installs and explicitly enables Eidoverse from its consent endpoint', async () => {

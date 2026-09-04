@@ -508,8 +508,18 @@ export async function startBeeperSocket(overrides = {}) {
   return true;
 }
 
-/** Tear the transport down (shutdown, a token that disappeared, or a rejected one). */
+/** Whether the transport is armed (connected, connecting, or backing off). */
+export function isBeeperSocketRunning() {
+  return running;
+}
+
+/**
+ * Tear the transport down (shutdown, a token that disappeared, or a rejected
+ * one). Returns whether it was running, so a caller reconciling the arming gate
+ * can log a real transition rather than every pass.
+ */
 export function stopBeeperSocket() {
+  const wasRunning = running;
   running = false;
   stopGeneration += 1;
   clearReconnectTimer();
@@ -519,4 +529,5 @@ export function stopBeeperSocket() {
   hasEverConnected = false;
   setConnectionState('down');
   runtime = { ...DEFAULT_RUNTIME };
+  return wasRunning;
 }

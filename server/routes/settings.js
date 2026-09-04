@@ -225,20 +225,43 @@ router.post('/features/eidoverse/host', asyncHandler(async (_req, res) => {
   res.json(await ensureEidoverseHost());
 }));
 
+// The Beeper sweep scheduler and its realtime transport arm on the instance
+// feature plus a stored token, and that gate used to be read at boot only — so
+// turning the feature on left realtime down and no sweep registered until the
+// next restart (fork issue #1, final live pass). Reconciling here closes that
+// half; the credential paths close the other. Beeper sits in the `comms` group,
+// so the group toggle moves the same gate.
+//
+// Imported lazily inside the handler: a feature toggle is a rare path, and the
+// arming module reaches the whole Beeper service graph (`ws` included), which
+// has no business loading with every settings request.
+const BEEPER_FEATURE_GROUP = 'comms';
+async function reconcileBeeperArming(reason) {
+  const { reconcileBeeperIngestion } = await import('../services/beeperArming.js');
+  // The flag is already persisted, so a reconcile failure must not turn a saved
+  // toggle into a 500.
+  await reconcileBeeperIngestion({ reason })
+    .catch((err) => console.error(`❌ Beeper ingestion reconcile (${reason}) failed: ${err.message}`));
+}
+
 // PUT /api/settings/features/:featureId
 // `enabled` is nullable: null clears a grouped feature's override back to
 // "inherit" (see instanceFeatureUpdateSchema and updateInstanceFeature).
 router.put('/features/:featureId', asyncHandler(async (req, res) => {
   const featureId = validateRequest(instanceFeatureIdSchema, req.params.featureId);
   const { enabled } = validateRequest(instanceFeatureUpdateSchema, req.body || {});
-  res.json(await updateInstanceFeature(featureId, enabled));
+  const result = await updateInstanceFeature(featureId, enabled);
+  if (featureId === 'beeper') await reconcileBeeperArming('feature-toggle');
+  res.json(result);
 }));
 
 // PUT /api/settings/features/groups/:groupId (#40)
 router.put('/features/groups/:groupId', asyncHandler(async (req, res) => {
   const groupId = validateRequest(instanceFeatureGroupIdSchema, req.params.groupId);
   const { enabled } = validateRequest(instanceFeatureGroupUpdateSchema, req.body || {});
-  res.json(await updateInstanceFeatureGroup(groupId, enabled));
+  const result = await updateInstanceFeatureGroup(groupId, enabled);
+  if (groupId === BEEPER_FEATURE_GROUP) await reconcileBeeperArming('feature-group-toggle');
+  res.json(result);
 }));
 
 // PUT /api/settings/ai-assignments/:id
