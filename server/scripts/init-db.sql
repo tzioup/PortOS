@@ -1755,6 +1755,30 @@ CREATE TABLE IF NOT EXISTS beeper_sync_cursors (
   PRIMARY KEY (account_id, chat_id)
 );
 
+-- Outbound outbox (#36). A row is written BEFORE the send POST, so intent
+-- survives a crash between the click and the POST and one row is the
+-- serialization point that stops a double-click double-posting. `state` is
+-- PortOS's own machine (not a Beeper vocabulary), so the CHECK is deliberate;
+-- a failed row is never retried in place — a re-send is a NEW row, because
+-- Beeper has no idempotency key on send. Mirrors the beeper.js block in
+-- server/lib/db/schema/.
+CREATE TABLE IF NOT EXISTS beeper_outbox (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+  chat_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','approved','sending','awaiting-confirmation','sent','failed')),
+  pending_message_id TEXT,
+  message_id TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  approved_at TIMESTAMPTZ,
+  sent_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_beeper_outbox_conversation_state ON beeper_outbox (conversation_id, state, created_at DESC);
+
 -- Deletion audit log (incident #1248-follow-up). Append-only forensic trail of
 -- every tombstone / un-tombstone / hard-delete of user-authored records, written
 -- by a DB trigger so it captures deletions from ANY source (app, a test suite's

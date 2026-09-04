@@ -174,4 +174,44 @@ export const beeperDdl = [
     last_swept_at TIMESTAMPTZ,
     PRIMARY KEY (account_id, chat_id)
   )`,
+
+  // The outbound OUTBOX (#36, decided on #8). A row is written BEFORE the
+  // `POST /v1/chats/{chatID}/messages` that sends it, so intent survives a
+  // crash between the click and the POST, and one row is the serialization
+  // point that stops a double-click double-posting.
+  //
+  // `chat_id` is denormalized from `beeper_conversations.source_chat_id` at
+  // creation: the send addresses Beeper's own chat id, and the row must stay
+  // readable as a record of what was sent even if the mirror row is later
+  // resweep-replaced. `pending_message_id` is what the async send returns;
+  // `message_id` is the resolved id the confirmation (socket `message.upserted`
+  // or the 30s `GET` fallback) settles on. They are DISTINCT columns because a
+  // send that never confirms must stay distinguishable from one that did.
+  //
+  // The state CHECK is deliberate — unlike `beeper_conversations.type`, these
+  // values are PortOS's own state machine, not a Beeper vocabulary that can
+  // grow upstream, so a new state SHOULD cost a schema change. `draft` has no
+  // writer in the MVP (#8 decision 7 keeps the composer buffer client-side);
+  // it is the state a later persisted/AI-assisted draft would occupy, and the
+  // send gate keys on `approved` so nothing can send from it.
+  //
+  // A failed row is never retried and never mutated back into a sendable
+  // state: Beeper has no idempotency key on send, so re-sending is a NEW row
+  // and the failed one stays visible.
+  `CREATE TABLE IF NOT EXISTS beeper_outbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
+    chat_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK (state IN ('draft','approved','sending','awaiting-confirmation','sent','failed')),
+    pending_message_id TEXT,
+    message_id TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    approved_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_beeper_outbox_conversation_state ON beeper_outbox (conversation_id, state, created_at DESC)`,
 ];

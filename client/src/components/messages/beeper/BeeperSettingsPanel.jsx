@@ -5,6 +5,7 @@ import BrailleSpinner from '../../BrailleSpinner';
 import { useBeeperSettings } from '../../../hooks/useBeeperSettings';
 import useMounted from '../../../hooks/useMounted';
 import ConnectionStatusDot from '../../ui/ConnectionStatusDot';
+import BeeperOutboxBreakerBanner from './BeeperOutboxBreakerBanner';
 import {
   getBeeperStatus, checkBeeperConnection, startBeeperOAuth, saveBeeperToken, disconnectBeeper,
 } from '../../../services/api';
@@ -242,6 +243,12 @@ export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onR
           </div>
         </div>
       </div>
+
+      {/* The outbound runaway breaker (#36) — an actionable fault, so it renders
+          on this settings surface with the other actionable faults rather than
+          on the chat surface or as a global banner. Absent entirely unless it
+          has actually tripped. */}
+      <BeeperOutboxBreakerBanner breaker={status?.outbox?.breaker} onCleared={loadStatus} />
 
       {statusLoading ? (
         <BrailleSpinner text="Checking Beeper status" />
