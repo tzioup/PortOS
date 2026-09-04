@@ -501,6 +501,28 @@ export async function archiveChat(chatId, archived = true, { baseUrl, token, tim
   });
 }
 
+/**
+ * `PATCH /v1/chats/{chatID}` — the chat-state update endpoint, and the write
+ * path behind the two rail controls #9 wired (Archive, Low priority). The body
+ * is an explicit allowlist rather than a passthrough: `PATCH` also carries the
+ * draft field, and a spread of caller-supplied keys would let a route body
+ * clear a draft (or set one) as a side effect of archiving a chat.
+ *
+ * `archiveChat` above stays as the narrow archive-only spelling; this is the
+ * general form and returns the updated `Chat` either way. Retries are OFF
+ * (`beeperRequest`'s default) — a Beeper write has no idempotency key.
+ */
+export async function updateChat(chatId, patch = {}, { baseUrl, token, timeoutMs } = {}) {
+  const body = {};
+  if (typeof patch.isArchived === 'boolean') body.isArchived = patch.isArchived;
+  if (typeof patch.isLowPriority === 'boolean') body.isLowPriority = patch.isLowPriority;
+  return beeperRequest(`/v1/chats/${encodeURIComponent(chatId)}`, {
+    method: 'PATCH',
+    body,
+    baseUrl, token, timeoutMs,
+  });
+}
+
 export async function markRead(chatId, { messageID } = {}, { baseUrl, token, timeoutMs } = {}) {
   return beeperRequest(`/v1/chats/${encodeURIComponent(chatId)}/read`, {
     method: 'POST',

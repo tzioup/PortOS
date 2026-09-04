@@ -19,18 +19,23 @@ import ContactsTab from '../components/messages/ContactsTab';
 // Exported for the nav-manifest tab-coverage guard (server/lib/navManifest.test.js).
 // `fullBleed: true` — tab owns internal scroll/height; Messages skips padded overflow wrapper.
 // `needsAccounts: true` — tab renders the account list, so it waits for that fetch.
+// `recordParam: true` — tab uses the shared `/messages/:tab/:chatKey` second
+// segment to carry ITS open record in the URL (iMessage a chat key, Beeper a
+// conversation id). Declared here rather than as a hardcoded tab name below, so
+// a third tab that deep-links a record does not have to be remembered twice.
 export const TABS = [
   { id: 'inbox', label: 'Inbox', icon: Mail, needsAccounts: true },
   { id: 'drafts', label: 'Drafts', icon: Mail, needsAccounts: true },
-  { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true },
+  { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true, recordParam: true },
   { id: 'signal', label: 'Signal', icon: MessageSquare },
-  { id: 'beeper', label: 'Beeper', icon: MessageCircle },
+  { id: 'beeper', label: 'Beeper', icon: MessageCircle, fullBleed: true, recordParam: true },
   { id: 'contacts', label: 'Contacts', icon: Users },
   { id: 'sync', label: 'Sync', icon: RefreshCw, needsAccounts: true },
   { id: 'config', label: 'Config', icon: Settings, needsAccounts: true },
 ];
 
 const FULL_BLEED_TAB_IDS = new Set(TABS.filter((t) => t.fullBleed).map((t) => t.id));
+const RECORD_PARAM_TAB_IDS = new Set(TABS.filter((t) => t.recordParam).map((t) => t.id));
 
 // iMessage and Contacts read no account data, so gating them on the accounts
 // fetch would only serialize their own requests behind an unrelated one and
@@ -70,10 +75,11 @@ export default function Messages() {
     fetchAccounts();
   }, [fetchAccounts]);
 
-  // Deep-link cleanup: only the imessage tab uses :chatKey. Drop a stale second
-  // segment if the user lands on e.g. /messages/inbox/<something>.
+  // Deep-link cleanup: only the tabs that declare `recordParam` use the shared
+  // :chatKey segment. Drop a stale second segment if the user lands on e.g.
+  // /messages/inbox/<something>.
   useEffect(() => {
-    if (chatKey && activeTab !== 'imessage') {
+    if (chatKey && !RECORD_PARAM_TAB_IDS.has(activeTab)) {
       navigate(`/messages/${activeTab}`, { replace: true });
     }
   }, [chatKey, activeTab, navigate]);

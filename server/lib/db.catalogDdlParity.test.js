@@ -396,6 +396,48 @@ describe('catalog DDL parity (init-db.sql ↔ db.js ensureSchema)', () => {
     });
   }
 
+  // Beeper mirror (#27 + #35) — seven machine-local tables that ship in BOTH
+  // sources. `beeper_messages.is_sender` is the reason this block exists: a
+  // column present on one side only would leave every EXISTING install with a
+  // thread that has one side (init-db.sql runs on fresh provisioning alone),
+  // and the additive `ALTER TABLE … ADD COLUMN IF NOT EXISTS` that backfills it
+  // is asserted separately below, because a CREATE TABLE match alone would pass
+  // while pre-existing installs never got the column.
+  for (const { table, idxPrefix } of [
+    { table: 'beeper_accounts', idxPrefix: null },
+    { table: 'beeper_credentials', idxPrefix: null },
+    { table: 'beeper_conversations', idxPrefix: 'idx_beeper_conversations_' },
+    { table: 'beeper_participants', idxPrefix: 'idx_beeper_participants_' },
+    { table: 'beeper_messages', idxPrefix: 'idx_beeper_messages_' },
+    { table: 'beeper_attachments', idxPrefix: 'idx_beeper_attachments_' },
+    { table: 'beeper_sync_cursors', idxPrefix: null },
+  ]) {
+    it(`${table} has the same columns${idxPrefix ? ' and indexes' : ''} in both files`, () => {
+      const sqlBody = extractCreateTable(INIT_SQL, table);
+      const jsBody = extractCreateTable(DB_JS, table);
+      expect(sqlBody, `init-db.sql missing CREATE TABLE ${table}`).toBeTruthy();
+      expect(jsBody, `db/schema/beeper.js missing CREATE TABLE ${table}`).toBeTruthy();
+      expect([...new Set(extractColumnNames(sqlBody))].sort())
+        .toEqual([...new Set(extractColumnNames(jsBody))].sort());
+      if (!idxPrefix) return;
+      const sqlIdx = extractIndexNames(INIT_SQL, idxPrefix);
+      const jsIdx = extractIndexNames(DB_JS, idxPrefix);
+      expect([...sqlIdx].sort()).toEqual([...jsIdx].sort());
+      expect(sqlIdx.size).toBeGreaterThan(0);
+    });
+  }
+
+  // Every column beeper_messages gained after its first ship needs an additive
+  // ALTER on the upgrade path too — a fresh install gets it from the CREATE
+  // above, an existing one only from here.
+  it('beeper_messages additive columns carry an ALTER TABLE for existing installs', () => {
+    for (const column of ['is_sender']) {
+      const re = new RegExp(`ALTER TABLE beeper_messages ADD COLUMN IF NOT EXISTS ${column}\\b`, 'i');
+      expect(re.test(DB_JS), `db/schema/beeper.js missing the additive ALTER for ${column}`).toBe(true);
+      expect(extractCreateTable(INIT_SQL, 'beeper_messages')).toContain(column);
+    }
+  });
+
   // Versioned DB-migration tracker (#1029) — non-`catalog_`-prefixed table in
   // BOTH DDL sources (base schema), so it gets its own column parity assertion.
   // No secondary index, nothing to compare there.
