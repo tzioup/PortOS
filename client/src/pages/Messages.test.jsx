@@ -74,3 +74,24 @@ describe('Messages — Beeper tab gating', () => {
     expect(await screen.findByText('beeper panel')).toBeTruthy();
   });
 });
+
+describe('Messages — header account count scope (#30/#35)', () => {
+  // The header's "N accounts" reads the generic email-provider account list
+  // (Gmail/Outlook/Teams), not Beeper's own roster — it must not render on a
+  // tab that has nothing to do with that list, or it reads as a (wrong) Beeper
+  // account count. #35 real-browser pass: it showed "0 accounts" on the Beeper
+  // tab while the Beeper mirror held nine.
+  it('does not show the provider-account count on the Beeper tab', async () => {
+    renderAt('/messages/beeper');
+
+    await screen.findByText('beeper panel');
+    expect(screen.queryByText(/accounts?$/i)).toBeNull();
+  });
+
+  it('still shows the provider-account count on tabs that use it (Inbox)', async () => {
+    renderAt('/messages/inbox');
+
+    await screen.findByText('inbox panel');
+    expect(await screen.findByText('0 accounts')).toBeTruthy();
+  });
+});

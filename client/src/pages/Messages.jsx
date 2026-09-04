@@ -142,7 +142,16 @@ export default function Messages() {
         icon={Mail}
         title="Messages"
         subtitle="Unified email and messaging management"
-        actions={loading ? null : (
+        // #35 real-browser pass: this counts the email-style provider accounts
+        // (Gmail/Outlook/Teams — `api.getMessageAccounts()`) that Inbox/Drafts/
+        // Sync/Config act on. It is unrelated to Beeper's own account roster
+        // (`beeper_accounts`, shown inside its own settings drawer) or to any
+        // other bridge tab's accounts, so it read "0 accounts" while the Beeper
+        // mirror held nine — correct for what it measures, misleading shown on
+        // a tab it says nothing about. Scope it to the tabs that actually use
+        // this fetch, same `ACCOUNT_TAB_IDS` gate the loading skeleton already
+        // keys off, rather than teaching it a second "accounts" meaning.
+        actions={loading || !ACCOUNT_TAB_IDS.has(activeTab) ? null : (
           <span className="text-sm text-gray-500">
             {accounts === null ? 'Accounts unavailable' : `${accounts.length} accounts`}
           </span>
