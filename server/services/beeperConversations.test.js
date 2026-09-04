@@ -225,8 +225,15 @@ describe('listMessages', () => {
     const [sql] = vi.mocked(query).mock.calls[0];
     expect(flat(sql)).toContain('ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC');
     expect(page.messages.map((m) => m.id)).toEqual(['m2', 'm1']);
-    expect(page.messages[0].attachments).toEqual([
-      { messageId: 'm2', idx: 0, mxcId: 'mxc://example/abc', mimeType: 'image/png', byteLength: 1024, fileName: 'example.png', width: 10, height: 10 },
+    // Shaped by `beeperAttachments.shapeAttachment`, so the thread sees the
+    // mirror state (`stored` / `overCap` / `unavailable` / `keep`) on the same
+    // payload the attachment routes return, not a second metadata-only shape.
+    expect(page.messages[0].attachments).toMatchObject([
+      {
+        messageId: 'm2', idx: 0, mxcId: 'mxc://example/abc', mimeType: 'image/png',
+        byteLength: 1024, fileName: 'example.png', width: 10, height: 10,
+        stored: false, overCap: false, unavailable: false, keep: false,
+      },
     ]);
     expect(page.nextCursor).toBeNull();
   });

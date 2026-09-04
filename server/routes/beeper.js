@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
+import { serveLocalFile } from '../lib/fileUtils.js';
+import { basename, dirname } from 'path';
 import { beeperOAuthCallbackSchema, beeperPastedTokenSchema, validateRequest } from '../lib/validation.js';
 import { getBeeperStatus, checkBeeperConnection } from '../services/beeperStatus.js';
 import { completeBeeperOAuth, connectWithPastedToken, disconnectBeeper, startBeeperOAuth } from '../services/beeperOAuth.js';
@@ -10,9 +12,17 @@ import {
   getConversation,
   listMessages,
   listNetworks,
+  purgeConversation,
   setConversationArchived,
   setConversationLowPriority,
 } from '../services/beeperConversations.js';
+import {
+  backfillAttachments,
+  ensureAttachmentBytes,
+  getAttachment,
+  getAttachmentSummary,
+  setAttachmentKeep,
+} from '../services/beeperAttachments.js';
 
 const router = Router();
 
@@ -42,6 +52,14 @@ const BEEPER_ERROR_STATUS = {
   OAUTH_DISCOVERY_INVALID: 502,
   OAUTH_REGISTRATION_FAILED: 502,
   OAUTH_EXCHANGE_FAILED: 502,
+  // The attachment mirror (#37). An over-cap attachment is not an error the
+  // user can fix by retrying — it is a deliberate refusal with a named escape
+  // hatch ("fetch anyway"), so it gets its own status rather than riding on
+  // 400. ATTACHMENT_DOWNLOAD_FAILED/ATTACHMENT_STORE_FAILED are local-side
+  // failures of a fetch that Beeper itself answered.
+  ATTACHMENT_TOO_LARGE: 413,
+  ATTACHMENT_DOWNLOAD_FAILED: 502,
+  ATTACHMENT_STORE_FAILED: 500,
 };
 
 const mapBeeperError = createServiceErrorMapper(BEEPER_ERROR_STATUS);
@@ -202,6 +220,99 @@ router.post('/conversations/:id/low-priority', asyncHandler(async (req, res) => 
   const conversation = await setConversationLowPriority(id, lowPriority)
     .catch((err) => { throw mapBeeperWriteError(err); });
   res.json(conversation);
+}));
+
+// ---------------------------------------------------------------------------
+// Attachment byte mirror (#37)
+// ---------------------------------------------------------------------------
+
+// `messageId` is Beeper's own message id (TEXT — bridges do not promise a UUID
+// shape), so it is bounded and pattern-free rather than `.guid()`. It never
+// becomes a path: the file is addressed by the sha256 the mirror computed.
+const attachmentParamsSchema = z.object({
+  messageId: z.string().min(1).max(500),
+  idx: z.coerce.number().int().min(0).max(999),
+});
+const attachmentFetchQuerySchema = z.object({
+  // The over-cap placeholder's "fetch anyway". A query-string boolean is a
+  // string, so this is the literal "true" and nothing else — `z.coerce.boolean()`
+  // would read "false" as true.
+  force: z.literal('true').optional(),
+}).strict();
+const attachmentKeepSchema = z.object({ keep: z.boolean() }).strict();
+const backfillSchema = z.object({ limit: z.number().int().min(1).max(5000).optional() }).strict();
+
+// GET /api/beeper/attachments/summary — what the bulk-backfill consent step has
+// to state before it runs (how many attachments, how many bytes, how many of
+// unknown size) plus the budget picture the settings card renders. Declared
+// BEFORE the `:messageId/:idx` routes so "summary" can never be read as a
+// message id.
+router.get('/attachments/summary', asyncHandler(async (_req, res) => {
+  res.json(await getAttachmentSummary());
+}));
+
+// POST /api/beeper/attachments/backfill — mirror every reference-only
+// attachment. A USER action, never automatic: the client gates it behind a
+// consent modal naming the count and the byte size first (root AGENTS.md's
+// no-unbidden-work policy, applied to bytes rather than to LLM calls), and the
+// run stops at the disk budget instead of blowing through it.
+router.post('/attachments/backfill', asyncHandler(async (req, res) => {
+  const { limit } = validateRequest(backfillSchema, req.body ?? {});
+  const result = await backfillAttachments({ limit }).catch((err) => { throw mapBeeperError(err); });
+  res.json(result);
+}));
+
+// GET /api/beeper/attachments/:messageId/:idx — the BYTES, served from disk and
+// fetched from Beeper on a miss. This is the lazy mirror's whole trigger: the
+// thread renders the reference, the browser asks for it when it scrolls into
+// view, and only then does anything leave the machine.
+//
+// An authenticated `/api/` route on `serveLocalFile` rather than a `/data/`
+// static mount (#13): message media is PII, and the store is a content-addressed
+// pile of hashes that a directory mount would expose without the row-level check
+// this route does. `serveLocalFile` is handed an explicit `contentType` because
+// the file's own extension is cosmetic — `GET /v1/assets/serve` sends no
+// `Content-Type` at all, so Beeper's declared `mimeType` from the message
+// payload is the only real answer.
+router.get('/attachments/:messageId/:idx', asyncHandler(async (req, res) => {
+  const { messageId, idx } = validateRequest(attachmentParamsSchema, req.params);
+  const { force } = validateRequest(attachmentFetchQuerySchema, req.query);
+  const resolved = await ensureAttachmentBytes(messageId, idx, { force: force === 'true' })
+    .catch((err) => { throw mapBeeperError(err); });
+  await serveLocalFile(res, dirname(resolved.filePath), basename(resolved.filePath), {
+    contentType: resolved.mimeType,
+    missingError: { message: 'Attachment bytes are not on this machine', code: 'NOT_ON_THIS_MACHINE' },
+  });
+}));
+
+// POST /api/beeper/attachments/:messageId/:idx/fetch — the over-cap
+// placeholder's "fetch anyway", and the one path that also retries an
+// attachment the source previously refused. Returns the row rather than the
+// bytes, so the surface can swap the placeholder for the real thing and let the
+// GET above stream it.
+router.post('/attachments/:messageId/:idx/fetch', asyncHandler(async (req, res) => {
+  const { messageId, idx } = validateRequest(attachmentParamsSchema, req.params);
+  await ensureAttachmentBytes(messageId, idx, { force: true })
+    .catch((err) => { throw mapBeeperError(err); });
+  res.json(await getAttachment(messageId, idx));
+}));
+
+// PATCH /api/beeper/attachments/:messageId/:idx — the per-attachment `keep`
+// lock: exempt this one from least-recently-viewed eviction forever.
+router.patch('/attachments/:messageId/:idx', asyncHandler(async (req, res) => {
+  const { messageId, idx } = validateRequest(attachmentParamsSchema, req.params);
+  const { keep } = validateRequest(attachmentKeepSchema, req.body);
+  res.json(await setAttachmentKeep(messageId, idx, keep));
+}));
+
+// DELETE /api/beeper/conversations/:id — purge ONE conversation's mirror:
+// messages, participants, attachment rows and the bytes those rows were
+// holding. Local only — Beeper still has the chat, and the next sweep will
+// mirror it again. The client gates this behind a typed confirmation naming the
+// conversation and the byte count, never a `window.confirm`.
+router.delete('/conversations/:id', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(conversationParamsSchema, req.params);
+  res.json(await purgeConversation(id));
 }));
 
 // POST /api/beeper/oauth/start — discover, dynamically register PortOS as a

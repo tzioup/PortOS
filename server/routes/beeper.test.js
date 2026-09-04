@@ -18,8 +18,26 @@ vi.mock('../services/beeperConversations.js', () => ({
   getConversation: vi.fn(),
   listMessages: vi.fn(),
   listNetworks: vi.fn(),
+  purgeConversation: vi.fn(),
   setConversationArchived: vi.fn(),
   setConversationLowPriority: vi.fn(),
+}));
+vi.mock('../services/beeperAttachments.js', () => ({
+  backfillAttachments: vi.fn(),
+  ensureAttachmentBytes: vi.fn(),
+  getAttachment: vi.fn(),
+  getAttachmentSummary: vi.fn(),
+  setAttachmentKeep: vi.fn(),
+}));
+// The bytes themselves are served by the shared `serveLocalFile` pipeline,
+// whose behaviour (sanitize → containment → nosniff → sendFile) is covered by
+// its own suite. What this file pins is what the ROUTE hands it: the resolved
+// path, and the stored mimeType as an explicit `contentType` — because
+// `GET /v1/assets/serve` sends no Content-Type and a hash-named file has no
+// extension worth sniffing.
+vi.mock('../lib/fileUtils.js', async (importOriginal) => ({
+  ...(await importOriginal()),
+  serveLocalFile: vi.fn(async (res) => res.json({ served: true })),
 }));
 
 import beeperRoutes from './beeper.js';
@@ -33,9 +51,19 @@ import {
   getConversation,
   listMessages,
   listNetworks,
+  purgeConversation,
   setConversationArchived,
   setConversationLowPriority,
 } from '../services/beeperConversations.js';
+import {
+  backfillAttachments,
+  ensureAttachmentBytes,
+  getAttachment,
+  getAttachmentSummary,
+  setAttachmentKeep,
+} from '../services/beeperAttachments.js';
+import { serveLocalFile } from '../lib/fileUtils.js';
+import { ServerError } from '../lib/errorHandler.js';
 import { BeeperApiError } from '../services/beeperClient.js';
 
 const buildApp = () => {
@@ -471,5 +499,101 @@ describe('archive / low-priority write paths', () => {
       .post(`/api/beeper/conversations/${CONV_ID}/archive`)
       .send({ archived: false });
     expect(setConversationArchived).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('attachment mirror routes (#37)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('serves the bytes from disk with the STORED mime type, not the file extension', async () => {
+    vi.mocked(ensureAttachmentBytes).mockResolvedValue({
+      filePath: '/data/beeper/attachments/ab/abc.bin', mimeType: 'image/png', fileName: 'example.png', cached: true,
+    });
+    const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0');
+    expect(res.status).toBe(200);
+    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0, { force: false });
+    const [, dir, filename, options] = vi.mocked(serveLocalFile).mock.calls[0];
+    expect(dir).toBe('/data/beeper/attachments/ab');
+    expect(filename).toBe('abc.bin');
+    expect(options.contentType).toBe('image/png');
+  });
+
+  it('does not force a fetch unless the caller literally asks for it', async () => {
+    vi.mocked(ensureAttachmentBytes).mockResolvedValue({ filePath: '/x/y.bin', mimeType: '', fileName: '', cached: true });
+    await request(buildApp()).get('/api/beeper/attachments/msg-1/0?force=false');
+    // `force=false` is rejected outright rather than coerced — the literal
+    // "false" reads as true under z.coerce.boolean(), which is the bug this
+    // schema exists to prevent.
+    expect(vi.mocked(ensureAttachmentBytes)).not.toHaveBeenCalled();
+  });
+
+  it('answers an over-cap attachment with 413 and names the ceiling', async () => {
+    vi.mocked(ensureAttachmentBytes).mockRejectedValue(new ServerError('Attachment is 40000000 bytes, over the 33554432-byte mirror ceiling', {
+      status: 413, code: 'ATTACHMENT_TOO_LARGE',
+    }));
+    const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0');
+    expect(res.status).toBe(413);
+    expect(res.body.code).toBe('ATTACHMENT_TOO_LARGE');
+  });
+
+  it('maps a source that can no longer supply the asset to 404 ASSET_UNAVAILABLE, never a 502 retry', async () => {
+    vi.mocked(ensureAttachmentBytes).mockRejectedValue(
+      new BeeperApiError('Failed to download asset', { status: 502, code: 'ASSET_UNAVAILABLE', retryable: false }),
+    );
+    const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0');
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('ASSET_UNAVAILABLE');
+  });
+
+  it('forces the fetch on "fetch anyway" and answers with the refreshed row', async () => {
+    vi.mocked(ensureAttachmentBytes).mockResolvedValue({ filePath: '/x/y.png', mimeType: 'image/png', fileName: '', cached: false });
+    vi.mocked(getAttachment).mockResolvedValue({ messageId: 'msg-1', idx: 0, stored: true, overCap: true });
+    const res = await request(buildApp()).post('/api/beeper/attachments/msg-1/0/fetch');
+    expect(res.status).toBe(200);
+    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0, { force: true });
+    expect(res.body).toMatchObject({ stored: true, overCap: true });
+  });
+
+  it('toggles the keep lock', async () => {
+    vi.mocked(setAttachmentKeep).mockResolvedValue({ messageId: 'msg-1', idx: 0, keep: true });
+    const res = await request(buildApp())
+      .patch('/api/beeper/attachments/msg-1/0')
+      .send({ keep: true });
+    expect(res.status).toBe(200);
+    expect(vi.mocked(setAttachmentKeep)).toHaveBeenCalledWith('msg-1', 0, true);
+  });
+
+  it('rejects an unknown key on the keep body rather than ignoring it', async () => {
+    const res = await request(buildApp())
+      .patch('/api/beeper/attachments/msg-1/0')
+      .send({ keep: true, evict: true });
+    expect(res.status).toBe(400);
+    expect(vi.mocked(setAttachmentKeep)).not.toHaveBeenCalled();
+  });
+
+  it('reports the backfill census without starting anything', async () => {
+    vi.mocked(getAttachmentSummary).mockResolvedValue({
+      budgetBytes: 5368709120, usedBytes: 1024, pendingCount: 12, pendingBytes: 4096, pendingUnknownCount: 1,
+    });
+    const res = await request(buildApp()).get('/api/beeper/attachments/summary');
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ pendingCount: 12, pendingBytes: 4096, pendingUnknownCount: 1 });
+    expect(vi.mocked(backfillAttachments)).not.toHaveBeenCalled();
+  });
+
+  it('runs the bulk backfill only on an explicit POST', async () => {
+    vi.mocked(backfillAttachments).mockResolvedValue({ fetched: 3, failed: 1, bytes: 900, stoppedForBudget: false, requested: 4 });
+    const res = await request(buildApp()).post('/api/beeper/attachments/backfill').send({});
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ fetched: 3, failed: 1 });
+  });
+
+  it('purges one conversation mirror and reports the bytes it freed', async () => {
+    vi.mocked(purgeConversation).mockResolvedValue({
+      purged: true, conversationId: CONV_ID, messagesRemoved: 12, filesRemoved: 3, bytesFreed: 4096,
+    });
+    const res = await request(buildApp()).delete(`/api/beeper/conversations/${CONV_ID}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ purged: true, filesRemoved: 3, bytesFreed: 4096 });
   });
 });

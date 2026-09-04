@@ -9,6 +9,8 @@ const api = vi.hoisted(() => ({
   startBeeperOAuth: vi.fn(),
   saveBeeperToken: vi.fn(),
   disconnectBeeper: vi.fn(),
+  getBeeperAttachmentSummary: vi.fn(),
+  backfillBeeperAttachments: vi.fn(),
 }));
 const toast = vi.hoisted(() => Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn() }));
 
@@ -24,9 +26,24 @@ const BASE_SETTINGS = { beeper: { enabled: false, intervalMinutes: 5, baseUrl: '
 // own suite.
 const renderPanel = (props = {}) => render(<BeeperSettingsPanel {...props} />);
 
+const BASE_ATTACHMENT_SUMMARY = {
+  budgetBytes: 5 * 1024 * 1024 * 1024,
+  usedBytes: 1024 * 1024,
+  storedFiles: 2,
+  pendingCount: 0,
+  pendingBytes: 0,
+  pendingUnknownCount: 0,
+  overCapCount: 0,
+  unavailableCount: 0,
+  keptCount: 0,
+  totalCount: 2,
+  maxBytes: 32 * 1024 * 1024,
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   api.getSettings.mockResolvedValue(BASE_SETTINGS);
+  api.getBeeperAttachmentSummary.mockResolvedValue(BASE_ATTACHMENT_SUMMARY);
 });
 
 // The three states decided at fork issue #11 and carried into #30's
@@ -333,5 +350,59 @@ describe('BeeperSettingsPanel — disconnect', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByText('Forget this Beeper credential?')).toBeNull();
     expect(api.disconnectBeeper).not.toHaveBeenCalled();
+  });
+});
+
+// The attachment mirror card (#37). The bulk backfill is the one path here
+// that moves gigabytes, so what is pinned is that it cannot start without a
+// consent step that states the cost.
+describe('BeeperSettingsPanel — attachment mirror', () => {
+  beforeEach(() => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, tokenSource: 'pasted', reachable: true, lastProbeError: null, accounts: [],
+    });
+  });
+
+  it('renders the disk picture without starting anything', async () => {
+    renderPanel();
+    expect(await screen.findByText('Attachment mirror')).toBeInTheDocument();
+    expect(screen.getByText(/of 5 GB/)).toBeInTheDocument();
+    expect(api.backfillBeeperAttachments).not.toHaveBeenCalled();
+  });
+
+  it('names the count and the byte size before the backfill runs, and only then runs it', async () => {
+    api.getBeeperAttachmentSummary.mockResolvedValue({
+      ...BASE_ATTACHMENT_SUMMARY, pendingCount: 12, pendingBytes: 4 * 1024 * 1024, pendingUnknownCount: 3,
+    });
+    api.backfillBeeperAttachments.mockResolvedValue({ fetched: 12, failed: 0, bytes: 4194304, stoppedForBudget: false });
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole('button', { name: /Mirror all attachments/i }));
+    // The modal states BOTH numbers, and the unknown-size tail separately
+    // rather than folding it into the total as zero.
+    expect(await screen.findByText('Mirror all attachments?')).toBeInTheDocument();
+    expect(screen.getAllByText(/12 attachment\(s\)/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/4 MB/)).toBeInTheDocument();
+    expect(screen.getByText(/3 whose size Beeper did not report/)).toBeInTheDocument();
+    expect(api.backfillBeeperAttachments).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /Mirror 12 attachment/i }));
+    await waitFor(() => expect(api.backfillBeeperAttachments).toHaveBeenCalledTimes(1));
+  });
+
+  it('cancels the consent modal without transferring anything', async () => {
+    api.getBeeperAttachmentSummary.mockResolvedValue({ ...BASE_ATTACHMENT_SUMMARY, pendingCount: 4, pendingBytes: 2048 });
+    renderPanel();
+    fireEvent.click(await screen.findByRole('button', { name: /Mirror all attachments/i }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Cancel$/ }));
+    await waitFor(() => expect(screen.queryByText(/Mirror all attachments\?/)).not.toBeInTheDocument());
+    expect(api.backfillBeeperAttachments).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed summary read instead of rendering zeros as the truth', async () => {
+    api.getBeeperAttachmentSummary.mockRejectedValue(new Error('Database unavailable'));
+    renderPanel();
+    expect(await screen.findByText('Database unavailable')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Mirror all attachments/i })).not.toBeInTheDocument();
   });
 });

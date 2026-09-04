@@ -173,12 +173,21 @@ export async function saveBase64Upload(dir, { filename, data }, { allowedExtensi
  *
  * Mirrors the exact serving behavior of `routes/attachments.js`.
  *
+ * `contentType` overrides the extension-derived type for a store whose
+ * filenames carry no meaning. The Beeper attachment mirror (#37) is the
+ * caller: it is content-addressed (`<sha256>.<ext>`), and the source it
+ * downloads from (`GET /v1/assets/serve`) sends no `Content-Type` header at
+ * all, so the type Beeper declared in the message payload is the only real
+ * answer and the extension is decoration. The override is still run through
+ * the same `RISKY_MIME_TYPES` disposition rule — it changes what is served as,
+ * never whether the risky-type guard applies.
+ *
  * @param {import('express').Response} res
  * @param {string} dir - The containing directory.
  * @param {string} filename - Raw user-supplied filename.
- * @param {{ missingError?: { message: string, code: string } }} [opts]
+ * @param {{ missingError?: { message: string, code: string }, contentType?: string }} [opts]
  */
-export async function serveLocalFile(res, dir, filename, { missingError } = {}) {
+export async function serveLocalFile(res, dir, filename, { missingError, contentType } = {}) {
   const safeFilename = sanitizeFilename(filename);
   const filePath = resolvePath(dir, safeFilename);
 
@@ -191,7 +200,8 @@ export async function serveLocalFile(res, dir, filename, { missingError } = {}) 
     throw new ServerError(message, { status: 404, code });
   }
 
-  const mimeType = getMimeType(getFileExtension(safeFilename));
+  const declared = typeof contentType === 'string' ? contentType.trim().split(';')[0] : '';
+  const mimeType = declared || getMimeType(getFileExtension(safeFilename));
   res.set('X-Content-Type-Options', 'nosniff');
   if (RISKY_MIME_TYPES.has(mimeType)) {
     res.set('Content-Disposition', `attachment; filename="${safeFilename}"`);

@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowLeft, Archive, BellOff, ChevronDown, Loader2, Paperclip, Plus, RefreshCw, Send, Trash2, UserPlus, Users,
+  ArrowLeft, Archive, BellOff, ChevronDown, Loader2, Plus, RefreshCw, Send, Trash2, UserPlus, Users,
 } from 'lucide-react';
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
+import BeeperAttachment from './BeeperAttachment';
+import { formatBytes } from '../../../utils/formatters';
 
 /**
  * Thread + composer + the inline Tribe-linking action, for the Beeper chat
@@ -147,9 +149,14 @@ export default function BeeperThread({
   onRetry,
   onArchive,
   onLowPriority,
+  onPurge,
+  purging,
+  onAttachmentUpdated,
   writePending,
 }) {
   const [peopleOpen, setPeopleOpen] = useState(false);
+  const [purgeOpen, setPurgeOpen] = useState(false);
+  const [purgeConfirmation, setPurgeConfirmation] = useState('');
   const bottomRef = useRef(null);
 
   // Newest-first from the API (the order a chat surface pages in); oldest-first
@@ -167,6 +174,14 @@ export default function BeeperThread({
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' });
   }, [conversation?.id, ordered.length]);
+
+  // A typed confirmation must never survive the conversation it was typed for:
+  // switching threads with the panel open would otherwise leave a primed
+  // Purge button pointing at a different chat.
+  useEffect(() => {
+    setPurgeOpen(false);
+    setPurgeConfirmation('');
+  }, [conversation?.id]);
 
   // Order matters, and this is the whole reason these three are separate
   // branches: `loading` and `error` are both reachable with NO conversation —
@@ -272,6 +287,18 @@ export default function BeeperThread({
             <Users size={12} />
             People
           </button>
+          {onPurge && (
+            <button
+              type="button"
+              onClick={() => setPurgeOpen((open) => !open)}
+              aria-expanded={purgeOpen}
+              title="Delete this conversation's PortOS mirror — Beeper keeps the chat"
+              className="inline-flex min-h-[32px] items-center gap-1 rounded border border-port-border px-2 text-[11px] text-gray-300 transition-colors hover:border-port-error hover:text-port-error"
+            >
+              <Trash2 size={12} />
+              Purge
+            </button>
+          )}
         </div>
       </div>
 
@@ -299,6 +326,55 @@ export default function BeeperThread({
               ))}
             </ul>
           )}
+        </div>
+      )}
+
+      {/* The purge confirmation is TYPED, in-drawer, and names both the
+          conversation and the bytes it is about to free (#13) — not a
+          `window.confirm`, which the client conventions forbid and which could
+          not state either fact. It is also explicit that this is a LOCAL
+          purge: Beeper still has the chat, and the next sweep re-mirrors it. */}
+      {purgeOpen && onPurge && (
+        <div className="shrink-0 border-b border-port-error/40 bg-port-error/5 px-3 py-2">
+          <p className="text-[11px] uppercase tracking-wide text-port-error">Purge this mirror</p>
+          <p className="pt-1 text-xs text-gray-300">
+            Deletes PortOS&rsquo;s copy of <span className="text-white">{conversation.title || 'this conversation'}</span>
+            {' '}— its messages, participants and{' '}
+            {formatBytes(conversation.attachmentBytes || 0)} of mirrored attachment bytes
+            {conversation.attachmentFiles ? ` across ${conversation.attachmentFiles} file(s)` : ''}.
+          </p>
+          <p className="pt-1 text-[11px] text-gray-500">
+            Beeper itself is untouched: the chat stays on its network, and the next sync will mirror it again.
+          </p>
+          <div className="flex flex-wrap items-center gap-2 pt-2">
+            <label htmlFor="beeper-purge-confirm" className="text-[11px] text-gray-400">
+              Type <span className="font-mono text-gray-200">purge</span> to confirm
+            </label>
+            <input
+              id="beeper-purge-confirm"
+              type="text"
+              value={purgeConfirmation}
+              onChange={(event) => setPurgeConfirmation(event.target.value)}
+              autoComplete="off"
+              className="w-28 rounded border border-port-border bg-port-bg px-2 py-1 text-xs text-white"
+            />
+            <button
+              type="button"
+              disabled={purgeConfirmation.trim().toLowerCase() !== 'purge' || purging}
+              onClick={() => onPurge()}
+              className="inline-flex min-h-[32px] items-center gap-1.5 rounded border border-port-error px-2 text-[11px] text-port-error transition-colors hover:bg-port-error/10 disabled:opacity-40"
+            >
+              {purging ? <Loader2 size={11} className="animate-spin" /> : <Trash2 size={11} />}
+              Purge mirror
+            </button>
+            <button
+              type="button"
+              onClick={() => { setPurgeOpen(false); setPurgeConfirmation(''); }}
+              className="min-h-[32px] px-2 text-[11px] text-gray-400 transition-colors hover:text-gray-200"
+            >
+              Cancel
+            </button>
+          </div>
         </div>
       )}
 
@@ -363,14 +439,16 @@ export default function BeeperThread({
                   ) : (
                     <p className="whitespace-pre-wrap break-words">{message.body}</p>
                   )}
+                  {/* Bytes arrive on first view through the mirror route, not
+                      with the message payload — see BeeperAttachment. */}
                   {(message.attachments || []).map((attachment) => (
-                    <p
+                    <BeeperAttachment
                       key={`${message.id}-${attachment.idx}`}
-                      className="mt-1 flex items-center gap-1.5 rounded border border-dashed border-port-border px-2 py-1 text-[11px] text-gray-400"
-                    >
-                      <Paperclip size={11} />
-                      {attachment.fileName || attachment.mimeType || 'Attachment'}
-                    </p>
+                      attachment={attachment}
+                      onUpdated={onAttachmentUpdated
+                        ? (updated) => onAttachmentUpdated(message.id, updated)
+                        : undefined}
+                    />
                   ))}
                   <span className="mt-0.5 flex items-center justify-end gap-1 text-[10px] text-gray-500">
                     {clockTime(message.sentAt)}

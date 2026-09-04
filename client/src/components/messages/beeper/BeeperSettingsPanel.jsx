@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Save, Loader2, MessageCircle, ShieldCheck, ShieldAlert, RefreshCw, Clock, Link2, Unlink } from 'lucide-react';
+import { Save, Loader2, MessageCircle, ShieldCheck, ShieldAlert, RefreshCw, Clock, Link2, Unlink, HardDrive, Download } from 'lucide-react';
 import toast from '../../ui/Toast';
+import Modal from '../../ui/Modal';
 import BrailleSpinner from '../../BrailleSpinner';
 import { useBeeperSettings } from '../../../hooks/useBeeperSettings';
 import useMounted from '../../../hooks/useMounted';
 import ConnectionStatusDot from '../../ui/ConnectionStatusDot';
+import { formatBytes } from '../../../utils/formatters';
 import {
   getBeeperStatus, checkBeeperConnection, startBeeperOAuth, saveBeeperToken, disconnectBeeper,
+  getBeeperAttachmentSummary, backfillBeeperAttachments,
 } from '../../../services/api';
 
 // The Beeper connection story (#30 + #31, fork issue #1): ingestion settings,
@@ -242,6 +245,8 @@ export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onR
           </div>
         </div>
       </div>
+
+      <AttachmentMirrorCard budgetGb={form.attachmentBudgetGb} settingsDirty={dirty || saving} />
 
       {statusLoading ? (
         <BrailleSpinner text="Checking Beeper status" />
@@ -572,5 +577,190 @@ function BeeperStatusCard({
       </div>
       <BeeperRealtimeRow realtime={realtime} />
     </div>
+  );
+}
+
+/**
+ * The attachment byte mirror's own card (#37): what is on disk against the
+ * budget, and the ONE place a bulk backfill can be started.
+ *
+ * The backfill is gated behind a consent modal that names the count and the
+ * byte size first. That is the root AGENTS.md no-unbidden-work policy applied
+ * to bytes rather than to LLM calls, and it is the same split as
+ * `meatspacePostDrillCache` / `CacheFillConsentModal`: the incremental
+ * fetch-on-view needs no prompt because the user opened the thread, while a
+ * from-zero batch of thousands of files does.
+ *
+ * "Mirror all" gates on the SAVED budget, not the form input: the server reads
+ * `settings.beeper.attachmentBudgetGb` when it decides where to stop, so
+ * running with an unsaved number would silently use the old one.
+ */
+function AttachmentMirrorCard({ budgetGb, settingsDirty }) {
+  const [summary, setSummary] = useState(null);
+  const [summaryError, setSummaryError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [consentOpen, setConsentOpen] = useState(false);
+  const [running, setRunning] = useState(false);
+  const mountedRef = useMounted();
+
+  const loadSummary = useCallback(async () => {
+    const [result, error] = await getBeeperAttachmentSummary({ silent: true })
+      .then((value) => [value, null])
+      .catch((err) => [null, err]);
+    if (!mountedRef.current) return;
+    setSummary(result);
+    // "The request failed" and "the mirror is empty" are different answers, and
+    // only one of them means the numbers below are trustworthy.
+    setSummaryError(error ? (error?.message || 'Could not read the attachment mirror') : null);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { loadSummary(); }, [loadSummary]);
+
+  const handleBackfill = async () => {
+    setConsentOpen(false);
+    setRunning(true);
+    const result = await backfillBeeperAttachments({}, { silent: true }).catch((err) => {
+      toast.error(err?.message || 'Attachment backfill failed');
+      return null;
+    });
+    if (!mountedRef.current) return;
+    setRunning(false);
+    if (result) {
+      toast.success(
+        `Mirrored ${result.fetched} attachment(s)${result.failed ? `, ${result.failed} unavailable` : ''}`
+        + `${result.stoppedForBudget ? ' — stopped at the disk budget' : ''}`,
+      );
+    }
+    loadSummary();
+  };
+
+  if (loading) return <BrailleSpinner text="Reading the attachment mirror" />;
+
+  const budgetBytes = summary?.budgetBytes || 0;
+  const usedBytes = summary?.usedBytes || 0;
+  const usedPercent = budgetBytes > 0 ? Math.min(100, Math.round((usedBytes / budgetBytes) * 100)) : 0;
+  const pending = summary?.pendingCount || 0;
+
+  return (
+    <div className="bg-port-card border border-port-border rounded-lg p-4 sm:p-6 space-y-3">
+      <div className="flex items-center gap-2">
+        <HardDrive size={16} className="text-port-accent" />
+        <h3 className="text-lg font-semibold text-white">Attachment mirror</h3>
+      </div>
+      <p className="text-sm text-gray-400">
+        Attachment bytes are downloaded when you first open the thread that shows them, kept under the
+        {' '}{budgetGb} GB budget above, and evicted least-recently-viewed first — never a file Beeper can no
+        longer re-supply, and never one you locked. Photos and files stay on this machine.
+      </p>
+
+      {summaryError ? (
+        <p className="text-xs text-port-error">{summaryError}</p>
+      ) : (
+        <>
+          <div>
+            <div className="flex items-center justify-between text-xs text-gray-400">
+              <span>{formatBytes(usedBytes)} of {formatBytes(budgetBytes)}</span>
+              <span>{summary?.storedFiles || 0} file(s) mirrored</span>
+            </div>
+            <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-port-bg">
+              <div className="h-full rounded-full bg-port-accent" style={{ width: `${usedPercent}%` }} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Stat label="Not mirrored" value={pending} />
+            <Stat label="Kept" value={summary?.keptCount || 0} />
+            <Stat label="Over limit" value={summary?.overCapCount || 0} />
+            <Stat label="Unavailable" value={summary?.unavailableCount || 0} />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              type="button"
+              onClick={() => setConsentOpen(true)}
+              disabled={running || pending === 0 || settingsDirty}
+              title={settingsDirty ? 'Save your settings first — the backfill reads the saved budget' : undefined}
+              className="inline-flex items-center justify-center gap-2 min-h-[36px] px-3 py-1.5 bg-port-bg border border-port-border hover:border-port-accent text-gray-200 rounded-lg text-xs transition-colors disabled:opacity-40"
+            >
+              {running ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+              {running ? 'Mirroring…' : 'Mirror all attachments'}
+            </button>
+            <button
+              type="button"
+              onClick={loadSummary}
+              className="inline-flex items-center justify-center gap-2 min-h-[36px] px-3 py-1.5 text-gray-400 hover:text-gray-200 rounded-lg text-xs transition-colors"
+            >
+              <RefreshCw size={12} />
+              Refresh
+            </button>
+          </div>
+        </>
+      )}
+
+      <BackfillConsentModal
+        open={consentOpen}
+        summary={summary}
+        onCancel={() => setConsentOpen(false)}
+        onConfirm={handleBackfill}
+      />
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="rounded border border-port-border bg-port-bg/50 px-2 py-1.5">
+      <p className="text-[11px] uppercase tracking-wide text-gray-500">{label}</p>
+      <p className="text-sm text-gray-200">{value}</p>
+    </div>
+  );
+}
+
+/**
+ * Names the cost before the transfer starts: how many attachments, how many
+ * bytes, and — separately — how many the bridge never reported a size for, so
+ * the total is never quietly presented as complete when it isn't.
+ */
+function BackfillConsentModal({ open, summary, onCancel, onConfirm }) {
+  if (!open || !summary) return null;
+  const unknown = summary.pendingUnknownCount || 0;
+  return (
+    <Modal open={open} onClose={onCancel} size="sm" ariaLabel="Mirror all Beeper attachments">
+      <div className="bg-port-card border border-port-border rounded-lg p-5 space-y-4">
+        <div className="flex items-center gap-2">
+          <Download size={18} className="text-port-accent" />
+          <h3 className="text-white font-medium">Mirror all attachments?</h3>
+        </div>
+        <p className="text-sm text-gray-400">
+          PortOS will download <span className="text-gray-200">{summary.pendingCount} attachment(s)</span>
+          {' '}from Beeper Desktop — about <span className="text-gray-200">{formatBytes(summary.pendingBytes)}</span>
+          {unknown > 0 && <> plus {unknown} whose size Beeper did not report</>}.
+          {' '}It stops when the mirror reaches its {formatBytes(summary.budgetBytes)} budget, skips anything over
+          {' '}{formatBytes(summary.maxBytes)}, and runs one file at a time so Beeper Desktop stays usable.
+        </p>
+        <p className="text-xs text-gray-500">
+          You do not need this to read attachments: opening a thread mirrors what it shows. This is for having
+          them all on disk in advance.
+        </p>
+        <div className="flex flex-wrap justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="min-h-[36px] px-3 text-xs text-gray-400 transition-colors hover:text-gray-200"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-port-accent/20 px-3 text-xs text-port-accent transition-colors hover:bg-port-accent/30"
+          >
+            <Download size={12} />
+            Mirror {summary.pendingCount} attachment(s)
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }

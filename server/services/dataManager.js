@@ -52,6 +52,16 @@ export const CATEGORIES = {
   'avatar': { label: 'Avatar', description: 'Uploaded avatar images', archivable: true, deletable: false },
   'backup': { label: 'Backups', description: 'Data backup archives', archivable: false, deletable: true, purgeScope: 'category' },
   'brain': { label: 'Brain', description: 'Brain items and sync log', archivable: true, deletable: false },
+  // The Beeper attachment byte mirror (#37) — the only thing the Beeper feature
+  // writes to `data/`; every other Beeper record is Postgres. Not archivable:
+  // the tarball would land inside `data/` and grow the number the user came here
+  // to shrink, and the bytes are re-fetchable from Beeper anyway. Deletable, but
+  // ITEM-scoped: a category-wide wipe is refused because it would strand every
+  // conversation's photos in one click, while the budget sweep and the
+  // per-conversation purge are the paths that reclaim space with a reference
+  // check behind them. A row whose file is removed from under it is healed by
+  // the next sweep, which clears `local_path` and re-renders the reference.
+  'beeper': { label: 'Beeper Attachments', description: 'Mirrored Beeper attachment bytes — a lazy cache bounded by the attachment budget, re-fetchable while the source network still holds the media', archivable: false, deletable: true, purgeScope: 'items' },
   // Legacy location — current installs download to ~/Downloads (PATHS.browserDownloads),
   // but installs that predate that move still carry the dir, and backup still excludes it.
   'browser-downloads': { label: 'Browser Downloads', description: 'Files the agent browser downloaded — re-downloadable, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },

@@ -253,6 +253,7 @@ export * from './persistentMindPrompt.js';
 export * from './persistentMindPublic.js';
 export * from './agentSentinel.js';
 export * from './bareUrl.js';
+export * from './beeperAttachmentPaths.js';
 export * from './bashResolver.js';
 export * from './branchUpstreamGuard.js';
 export * from './bufferedSpawn.js';

@@ -1,4 +1,4 @@
-import { request } from './apiCore.js';
+import { API_BASE, request } from './apiCore.js';
 
 // Beeper Desktop bridge — status card (#30). Read-only connection status
 // (token-configured flag, never the token; tri-state reachability; the
@@ -70,3 +70,51 @@ export const setBeeperConversationLowPriority = (conversationId, lowPriority, op
 export const startBeeperOAuth = (options = {}) => request('/beeper/oauth/start', { method: 'POST', ...options });
 export const saveBeeperToken = (token, options = {}) => request('/beeper/token', { method: 'POST', body: JSON.stringify({ token }), ...options });
 export const disconnectBeeper = (options = {}) => request('/beeper/token', { method: 'DELETE', ...options });
+
+// ---------------------------------------------------------------------------
+// Attachment byte mirror (#37)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `src` for one attachment's BYTES. A relative `/api/...` path, never an
+ * absolute URL: PortOS is routinely reached over Tailscale from another
+ * machine, and a hardcoded origin would point that browser at its own laptop.
+ *
+ * Requesting this URL is what triggers the mirror. The bytes are fetched from
+ * Beeper on a miss and served from disk afterwards, so an `<img loading="lazy">`
+ * pointed here IS the "download on first human view" rule — nothing else has to
+ * decide when a view happened.
+ */
+export const beeperAttachmentUrl = (messageId, idx) =>
+  `${API_BASE}/beeper/attachments/${encodeURIComponent(messageId)}/${encodeURIComponent(idx)}`;
+
+// The over-cap placeholder's "fetch anyway", and the only path that retries an
+// attachment Beeper previously refused. Returns the refreshed row, not bytes.
+export const fetchBeeperAttachment = (messageId, idx, options = {}) =>
+  request(`/beeper/attachments/${encodeURIComponent(messageId)}/${encodeURIComponent(idx)}/fetch`, {
+    method: 'POST',
+    ...options,
+  });
+
+// The per-attachment keep lock (the `useLockToggle` optimistic-PATCH shape):
+// exempt this one from least-recently-viewed eviction.
+export const setBeeperAttachmentKeep = (messageId, idx, keep, options = {}) =>
+  request(`/beeper/attachments/${encodeURIComponent(messageId)}/${encodeURIComponent(idx)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ keep }),
+    ...options,
+  });
+
+// The census the bulk-backfill consent modal must state before it runs, plus
+// the budget/usage picture the settings card renders.
+export const getBeeperAttachmentSummary = (options = {}) => request('/beeper/attachments/summary', options);
+
+// The bulk backfill itself — only ever called after the consent modal.
+export const backfillBeeperAttachments = (body = {}, options = {}) =>
+  request('/beeper/attachments/backfill', { method: 'POST', body: JSON.stringify(body), ...options });
+
+// Purge ONE conversation's mirror (messages, participants, attachment rows and
+// the bytes). PortOS-local: Beeper still has the chat. The caller gates this
+// behind a typed confirmation naming the conversation and the byte count.
+export const purgeBeeperConversation = (conversationId, options = {}) =>
+  request(`/beeper/conversations/${encodeURIComponent(conversationId)}`, { method: 'DELETE', ...options });
