@@ -52,9 +52,17 @@ const DEFAULT_BUDGET_GB = 5;
 // Data Manager, and a half-written `.partial` sitting in a hash-prefix dir
 // would read as a corrupt mirror entry to both.
 const TMP_DIR_NAME = '.tmp';
-// A partial older than this is from a process that is no longer running (the
-// asset request budget is 60s), so the sweep may drop it.
+// A partial older than this is from a process that is no longer running: an
+// in-flight transfer is abandoned after `STREAM_IDLE_TIMEOUT_MS` without a
+// chunk, so nothing legitimate is still writing an hour-old `.partial`.
 const TMP_MAX_AGE_MS = 60 * 60 * 1000;
+// The stall guard for the BODY. `fetchWithTimeout`'s own budget covers only the
+// response headers — it clears its abort timer once `fetch` resolves — so a
+// source that answers and then goes silent mid-transfer would otherwise hold a
+// half-written file and its socket open indefinitely. This timer is reset on
+// every chunk, so it bounds SILENCE rather than the transfer: a slow but
+// progressing 32 MiB download is never cut off, and a dead one is.
+const STREAM_IDLE_TIMEOUT_MS = 60_000;
 // One sweep evicts at most this many files. Each eviction costs a HEAD against
 // Beeper Desktop, and a budget cut from 50 GB to 1 GB should not turn into a
 // thousand-request burst inside one tick — the next sweep continues.
@@ -217,10 +225,26 @@ const tooLarge = (bytes) => new ServerError(
  * past a ceiling the pre-flight could not see.
  */
 async function streamAssetToStore(mxcId, { maxBytes, extension }) {
-  const response = await fetchAssetStream(mxcId);
+  // Abort on SILENCE, not on elapsed time — see STREAM_IDLE_TIMEOUT_MS. The
+  // controller is handed to the client so the abort tears down the live socket,
+  // not just this side's reader. `abort()` cannot throw, which matters because
+  // the timer fires outside the request lifecycle.
+  const controller = new AbortController();
+  let idleTimer = null;
+  const clearIdle = () => { if (idleTimer) clearTimeout(idleTimer); idleTimer = null; };
+  const armIdle = () => {
+    clearIdle();
+    idleTimer = setTimeout(() => controller.abort(), STREAM_IDLE_TIMEOUT_MS);
+    idleTimer.unref?.();
+  };
+  armIdle();
+
+  const response = await fetchAssetStream(mxcId, { signal: controller.signal })
+    .catch((err) => { clearIdle(); throw err; });
   // A 200 with no body at all: `Readable.fromWeb(null)` would throw a bare
   // TypeError from inside the store, which tells the surface nothing.
   if (!response.body) {
+    clearIdle();
     throw new ServerError('Beeper returned no body for this attachment', {
       status: 502, code: 'ATTACHMENT_DOWNLOAD_FAILED',
     });
@@ -233,6 +257,7 @@ async function streamAssetToStore(mxcId, { maxBytes, extension }) {
   let exceeded = false;
   const counter = async function* counter(source) {
     for await (const chunk of source) {
+      armIdle();
       received += chunk.length;
       if (received > maxBytes) {
         exceeded = true;
@@ -250,6 +275,7 @@ async function streamAssetToStore(mxcId, { maxBytes, extension }) {
     counter,
     createWriteStream(tmpPath),
   ).then(() => null).catch((err) => err);
+  clearIdle();
 
   if (failure) {
     await rm(tmpPath, { force: true }).catch(() => {});
@@ -344,7 +370,22 @@ export async function ensureAttachmentBytes(messageId, idx, { force = false } = 
     if (err?.code === 'ASSET_UNAVAILABLE') await markUnavailable(row, err.message);
     throw err;
   });
-  if (head.bytes !== null && head.bytes > maxBytes) throw tooLarge(head.bytes);
+  if (head.bytes !== null && head.bytes > maxBytes) {
+    // Persist the size the HEAD just reported before refusing. Beeper does not
+    // always populate `byte_length` on ingest, and an attachment whose size is
+    // unknown is deliberately not `overCap` — so without this the surface
+    // renders an `<img>`, takes the 413, and falls back to a generic "could not
+    // load / Retry" whose retry runs with `force: true`: an unbounded download
+    // behind a button that names neither the size nor the ceiling. With the
+    // size stored, the next render is the real over-cap placeholder, which
+    // states both.
+    await query(
+      `UPDATE beeper_attachments SET byte_length = $3, updated_at = NOW()
+        WHERE message_id = $1 AND idx = $2`,
+      [row.message_id, row.idx, head.bytes],
+    );
+    throw tooLarge(head.bytes);
+  }
 
   const extension = attachmentExtension({ mimeType: row.mime_type, fileName: row.file_name });
   const stored = await streamAssetToStore(row.mxc_id, { maxBytes, extension }).catch(async (err) => {
@@ -490,27 +531,31 @@ export async function evictToBudget() {
   let keptUnavailable = 0;
   for (let attempt = 0; attempt < MAX_EVICTIONS_PER_SWEEP && used > budgetBytes; attempt += 1) {
     const candidates = await query(
+      // `mxc_id IS NOT NULL` is part of the eviction RULE, not an optimisation:
+      // eviction is only ever safe because the file can be fetched again, and a
+      // row with no source reference is precisely the one that could not be.
+      // Filtering in the query (rather than skipping in the loop) also keeps
+      // the loop from re-selecting the same unevictable row forever.
       `SELECT message_id, idx, mxc_id, local_path, byte_length
          FROM beeper_attachments
         WHERE local_path IS NOT NULL AND keep = FALSE AND unavailable_at IS NULL
+          AND mxc_id IS NOT NULL
         ORDER BY last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST
         LIMIT 1`,
     );
     const row = candidates?.rows?.[0];
     if (!row) break;
 
-    if (row.mxc_id) {
-      const probe = await headAsset(row.mxc_id).then(() => null).catch((err) => err);
-      if (probe?.code === 'ASSET_UNAVAILABLE') {
-        await markUnavailable(row, probe.message);
-        keptUnavailable += 1;
-        continue;
-      }
-      // Any other probe failure (Beeper closed, a transport blip) is not
-      // evidence the file is re-fetchable, so this sweep stops rather than
-      // evicting on an unanswered question.
-      if (probe) break;
+    const probe = await headAsset(row.mxc_id).then(() => null).catch((err) => err);
+    if (probe?.code === 'ASSET_UNAVAILABLE') {
+      await markUnavailable(row, probe.message);
+      keptUnavailable += 1;
+      continue;
     }
+    // Any other probe failure (Beeper closed, a transport blip) is not
+    // evidence the file is re-fetchable, so this sweep stops rather than
+    // evicting on an unanswered question.
+    if (probe) break;
 
     const freed = await releaseRowBytes(row);
     evicted += 1;

@@ -22,7 +22,7 @@
  * client cannot invent a retry policy on top of an API with no idempotency key.
  */
 
-import { query } from '../lib/db.js';
+import { query, withTransaction } from '../lib/db.js';
 import { ServerError } from '../lib/errorHandler.js';
 import { updateChat } from './beeperClient.js';
 import {
@@ -440,7 +440,7 @@ async function setConversationFlag(conversationId, field, column, value) {
  */
 export async function purgeConversation(conversationId) {
   const found = await query(
-    'SELECT id, title FROM beeper_conversations WHERE id = $1',
+    'SELECT id, title, account_id, source_chat_id FROM beeper_conversations WHERE id = $1',
     [conversationId],
   );
   const row = found?.rows?.[0];
@@ -451,7 +451,24 @@ export async function purgeConversation(conversationId) {
     'SELECT COUNT(*)::int AS count FROM beeper_messages WHERE conversation_id = $1',
     [conversationId],
   );
-  await query('DELETE FROM beeper_conversations WHERE id = $1', [conversationId]);
+  // The conversation row and its SYNC CURSOR go together, in one transaction.
+  //
+  // `beeper_sync_cursors` is keyed on Beeper's own `(account_id, chat_id)` and
+  // carries an FK onto `beeper_accounts` alone, so the conversation's cascade
+  // cannot reach it. Left behind, its `last_activity` watermark still says this
+  // chat has not moved: `chatNeedsSweep` skips it, and once it does move,
+  // `fetchNewMessages` walks forward from the surviving cursor and mirrors only
+  // what arrives next. The purged history would never come back — the opposite
+  // of what the typed confirmation promises the user before they confirm an
+  // irreversible delete. Deleting the cursor is also the only thing that ever
+  // removes one, so it stops orphan cursor rows accumulating.
+  await withTransaction(async (client) => {
+    await client.query('DELETE FROM beeper_conversations WHERE id = $1', [conversationId]);
+    await client.query(
+      'DELETE FROM beeper_sync_cursors WHERE account_id = $1 AND chat_id = $2',
+      [row.account_id, row.source_chat_id],
+    );
+  });
   console.log(`🫧 Beeper conversation mirror purged: ${conversationId} (${bytes.removedFiles} file(s), ${bytes.freedBytes} bytes)`);
   return {
     purged: true,

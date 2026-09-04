@@ -577,9 +577,13 @@ export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
  * `ASSET_UNAVAILABLE`, never the ordinarily-retryable `UPSTREAM_ERROR` a
  * generic "5xx is transient" policy would loop on forever.
  */
-// A mirrored attachment is capped at 32 MiB but arrives over loopback from a
-// local process, so the transfer budget is generous rather than the 15s a JSON
-// call gets — Beeper itself may have to pull the media from the network first.
+// Time to the RESPONSE HEADERS, not to the last byte: `fetchWithTimeout` clears
+// its abort timer once `fetch` resolves, which is the moment the headers land.
+// Generous rather than the 15s a JSON call gets, because Beeper may have to
+// pull the media off the network before it can answer at all. The BODY is
+// bounded separately by the mirror's own idle-abort (`STREAM_IDLE_TIMEOUT_MS`
+// in `beeperAttachments.js`), which is what a caller passing `signal` here is
+// usually doing.
 const ASSET_REQUEST_TIMEOUT_MS = 60_000;
 
 function assetErrorFrom(response) {
@@ -643,7 +647,8 @@ export async function headAsset(mxcId, { baseUrl, token, timeoutMs, signal } = {
  *
  * `serve` sends NO `Content-Type` (probed live, #13), which is why the mirror
  * stores Beeper's declared `mimeType` from the message payload and serves from
- * that instead of sniffing anything here.
+ * that instead of sniffing anything here. `timeoutMs` covers the headers only;
+ * pass `signal` to bound the body.
  */
 export async function fetchAssetStream(mxcId, { baseUrl, token, timeoutMs, signal } = {}) {
   return assetRequest(mxcId, { method: 'GET', baseUrl, token, timeoutMs, signal });

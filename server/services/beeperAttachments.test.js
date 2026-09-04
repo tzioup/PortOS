@@ -161,10 +161,52 @@ describe('ensureAttachmentBytes — the lazy mirror', () => {
     vi.mocked(headAsset).mockResolvedValue({ bytes: 40 * 1024 * 1024 });
 
     await expect(ensureAttachmentBytes('msg-example-1', 0)).rejects.toMatchObject({
-      code: 'ATTACHMENT_TOO_LARGE', status: 413,
+      code: 'ATTACHMENT_TOO_LARGE', status: 413, context: { bytes: 40 * 1024 * 1024, maxBytes: 32 * 1024 * 1024 },
     });
     expect(vi.mocked(fetchAssetStream)).not.toHaveBeenCalled();
     expect(storedFiles()).toEqual([]);
+  });
+
+  it('records the size the HEAD reported when it refuses, so the next render is the real placeholder', async () => {
+    // A row the bridge never reported a size for is NOT `overCap`, so the
+    // thread renders an <img>, takes the 413, and would otherwise fall into the
+    // generic retry — whose retry forces an unbounded download behind a button
+    // that names neither the size nor the ceiling.
+    respondTo([['FROM beeper_attachments WHERE message_id', { rows: [attachmentRow({ byte_length: null })] }]]);
+    vi.mocked(headAsset).mockResolvedValue({ bytes: 41 * 1024 * 1024 });
+
+    await expect(ensureAttachmentBytes('msg-example-1', 0)).rejects.toMatchObject({ code: 'ATTACHMENT_TOO_LARGE' });
+    const write = vi.mocked(query).mock.calls.find(([sql]) => String(sql).includes('SET byte_length = $3'));
+    expect(write).toBeTruthy();
+    expect(write[1]).toEqual(['msg-example-1', 0, 41 * 1024 * 1024]);
+  });
+
+  it('abandons a transfer that goes silent mid-stream instead of holding the file open', async () => {
+    respondTo([['FROM beeper_attachments WHERE message_id', { rows: [attachmentRow()] }]]);
+    vi.mocked(headAsset).mockResolvedValue({ bytes: 8 });
+    // A body that emits one chunk and then never resolves again — the shape the
+    // header-only fetch budget cannot see. The mirror's own idle abort is what
+    // ends it; the signal it passes is the one under test.
+    vi.mocked(fetchAssetStream).mockImplementation(async (_id, { signal } = {}) => ({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+          signal?.addEventListener('abort', () => controller.error(new Error('aborted')), { once: true });
+        },
+      }),
+    }));
+    vi.useFakeTimers();
+    const pending = ensureAttachmentBytes('msg-example-1', 0);
+    const settled = pending.then(() => null).catch((err) => err);
+    await vi.advanceTimersByTimeAsync(61_000);
+    const failure = await settled;
+    vi.useRealTimers();
+
+    expect(failure).toMatchObject({ code: 'ATTACHMENT_DOWNLOAD_FAILED' });
+    expect(storedFiles()).toEqual([]);
+    expect(readdirSync(join(attachmentsRoot(), '.tmp'))).toEqual([]);
   });
 
   it('aborts mid-stream when the source declines to report a size and overruns the ceiling', async () => {
@@ -275,6 +317,19 @@ describe('evictToBudget — least-recently-viewed, guarded by a HEAD', () => {
     mkdirSync(join(attachmentsRoot(), relativePath.split('/')[0]), { recursive: true });
     writeFileSync(join(attachmentsRoot(), relativePath), Buffer.alloc(bytes));
   };
+
+  it('never offers a row with no source reference as a candidate', async () => {
+    respondTo([['unique_files', { rows: [{ bytes: String(10 * 1024 * 1024 * 1024), files: 1 }] }]]);
+    await evictToBudget();
+    // Eviction is only safe because the bytes can be fetched again; a row with
+    // no `mxc_id` is precisely the one that could not be, so it is filtered in
+    // the candidate query rather than skipped after selection (which would
+    // re-select it forever).
+    const candidateSql = vi.mocked(query).mock.calls
+      .map(([sql]) => String(sql).replace(/\s+/g, ' '))
+      .find((sql) => sql.includes('ORDER BY last_viewed_at ASC NULLS FIRST'));
+    expect(candidateSql).toContain('mxc_id IS NOT NULL');
+  });
 
   it('does nothing while the mirror fits its budget', async () => {
     respondTo([['unique_files', { rows: [{ bytes: '1024', files: 1 }] }]]);

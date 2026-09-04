@@ -176,9 +176,18 @@ export default function BeeperThread({
   }, [conversation?.id, ordered.length]);
 
   // A typed confirmation must never survive the conversation it was typed for:
-  // switching threads with the panel open would otherwise leave a primed
-  // Purge button pointing at a different chat.
+  // switching threads with the panel open would otherwise leave a primed Purge
+  // button pointing at a different chat.
+  //
+  // Keyed on a CHANGE of id, not on the id as a dependency: a refetch that
+  // momentarily resolves `conversation` to null (a reload, a failed poll) would
+  // otherwise fire this twice and silently close a panel the user is typing
+  // into — the value is discarded on a real switch, never on a re-render.
+  const purgeConversationRef = useRef(null);
   useEffect(() => {
+    const id = conversation?.id || null;
+    if (!id || purgeConversationRef.current === id) return;
+    purgeConversationRef.current = id;
     setPurgeOpen(false);
     setPurgeConfirmation('');
   }, [conversation?.id]);

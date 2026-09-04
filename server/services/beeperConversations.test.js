@@ -13,16 +13,23 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('../lib/db.js', () => ({ query: vi.fn() }));
+// `withTransaction` hands its callback a pg client; the fake records the
+// statements the purge issues inside the transaction, which is exactly what the
+// cursor-deletion contract below is about.
+vi.mock('../lib/db.js', () => ({
+  query: vi.fn(),
+  withTransaction: vi.fn(),
+}));
 vi.mock('./beeperClient.js', () => ({ updateChat: vi.fn() }));
 
-import { query } from '../lib/db.js';
+import { query, withTransaction } from '../lib/db.js';
 import { updateChat } from './beeperClient.js';
 import {
   listConversations,
   getConversation,
   listMessages,
   listNetworks,
+  purgeConversation,
   setConversationArchived,
   setConversationLowPriority,
   encodeCursor,
@@ -323,5 +330,49 @@ describe('the two wired rail controls', () => {
     vi.mocked(query).mockResolvedValueOnce({ rows: [] });
     await expect(setConversationArchived(CONV_B, true)).rejects.toMatchObject({ status: 404 });
     expect(updateChat).not.toHaveBeenCalled();
+  });
+});
+
+// The purge is the one destructive path over the mirror, and the sentence the
+// user reads before confirming it promises the chat comes back on the next
+// sync. That promise is only true if the sync cursor goes with the rows.
+describe('purgeConversation', () => {
+  const purgeQueries = () => vi.mocked(query).mock.calls.map(([sql]) => flat(sql));
+
+  const stubPurgeReads = (row) => {
+    vi.mocked(query).mockImplementation(async (sql) => {
+      const text = flat(sql);
+      if (text.includes('SELECT id, title, account_id, source_chat_id')) return { rows: [row] };
+      if (text.includes('COUNT(*)::int AS count FROM beeper_messages')) return { rows: [{ count: 7 }] };
+      return { rows: [] };
+    });
+  };
+
+  it('deletes the conversation AND its sync cursor, in one transaction, keyed on Beeper\'s own ids', async () => {
+    stubPurgeReads({ id: CONV_A, title: 'Example Conversation', account_id: 'acct-example-1', source_chat_id: 'chat-example-1' });
+    const statements = [];
+    vi.mocked(withTransaction).mockImplementation(async (fn) => fn({
+      query: async (sql, params) => { statements.push([flat(sql), params]); return { rows: [] }; },
+    }));
+
+    const result = await purgeConversation(CONV_A);
+
+    expect(statements.map(([sql]) => sql)).toEqual([
+      'DELETE FROM beeper_conversations WHERE id = $1',
+      'DELETE FROM beeper_sync_cursors WHERE account_id = $1 AND chat_id = $2',
+    ]);
+    // The cursor is keyed on the ACCOUNT id and the SOURCE chat id, never the
+    // synthetic conversation uuid — its FK reaches beeper_accounts only, so the
+    // conversation cascade cannot take it.
+    expect(statements[1][1]).toEqual(['acct-example-1', 'chat-example-1']);
+    expect(result).toMatchObject({ purged: true, conversationId: CONV_A, messagesRemoved: 7 });
+    // Never a DELETE outside the transaction.
+    expect(purgeQueries().some((sql) => sql.startsWith('DELETE'))).toBe(false);
+  });
+
+  it('404s an unknown id without deleting anything', async () => {
+    vi.mocked(query).mockResolvedValue({ rows: [] });
+    await expect(purgeConversation(CONV_B)).rejects.toMatchObject({ status: 404, code: 'NOT_FOUND' });
+    expect(vi.mocked(withTransaction)).not.toHaveBeenCalled();
   });
 });

@@ -78,7 +78,17 @@ const BEEPER_ERROR_STATUS = {
   SEND_FAILED: 502,
 };
 
-const mapBeeperError = createServiceErrorMapper(BEEPER_ERROR_STATUS);
+// The one code whose envelope carries data the client can act on: an over-cap
+// refusal states the size it measured and the ceiling it measured against, so
+// a caller is not left to re-derive either. `createServiceErrorMapper` builds a
+// FRESH ServerError, so a context the service attached is dropped unless it is
+// rebuilt here; returning `undefined` for every other code leaves those
+// envelopes exactly as they were.
+const mapBeeperError = createServiceErrorMapper(BEEPER_ERROR_STATUS, (err) => (
+  err?.code === 'ATTACHMENT_TOO_LARGE'
+    ? { bytes: err?.context?.bytes, maxBytes: err?.context?.maxBytes }
+    : undefined
+));
 
 // Write paths (connect / paste / disconnect) carry `retryable: false` into the
 // error envelope. Beeper sends are non-idempotent and the connect exchange

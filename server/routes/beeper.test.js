@@ -633,13 +633,16 @@ describe('attachment mirror routes (#37)', () => {
     expect(vi.mocked(ensureAttachmentBytes)).not.toHaveBeenCalled();
   });
 
-  it('answers an over-cap attachment with 413 and names the ceiling', async () => {
+  it('answers an over-cap attachment with 413 and carries the measured size into the envelope', async () => {
     vi.mocked(ensureAttachmentBytes).mockRejectedValue(new ServerError('Attachment is 40000000 bytes, over the 33554432-byte mirror ceiling', {
-      status: 413, code: 'ATTACHMENT_TOO_LARGE',
+      status: 413, code: 'ATTACHMENT_TOO_LARGE', context: { bytes: 40000000, maxBytes: 33554432 },
     }));
     const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0');
     expect(res.status).toBe(413);
     expect(res.body.code).toBe('ATTACHMENT_TOO_LARGE');
+    // The mapper builds a fresh ServerError, so the size the service measured
+    // reaches the client only because the mapper rebuilds the context.
+    expect(res.body.context).toMatchObject({ bytes: 40000000, maxBytes: 33554432 });
   });
 
   it('maps a source that can no longer supply the asset to 404 ASSET_UNAVAILABLE, never a 502 retry', async () => {
