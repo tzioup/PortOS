@@ -29,7 +29,7 @@ import { readResponseJson } from '../lib/readResponseJson.js';
 import { describeFetchError } from '../lib/fetchErrorChain.js';
 import { isPlainObject } from '../lib/objects.js';
 import {
-  BeeperApiError, getAccounts, probeBeeperInfo, resolveBeeperBaseUrl,
+  BeeperApiError, getAccounts, getInfo, probeBeeperInfo, resolveBeeperBaseUrl,
 } from './beeperClient.js';
 import { deleteBeeperCredential, readBeeperCredential, saveBeeperCredential } from './beeperCredentials.js';
 
@@ -113,6 +113,45 @@ async function fetchJson(url, init, { timeoutMs = OAUTH_TIMEOUT_MS } = {}) {
 }
 
 /**
+ * A live Beeper Desktop's metadata document (verified against 4.3.89) carries
+ * twelve keys and no `introspection_endpoint` — the RFC 8414 field is
+ * genuinely optional, and this server omits it, which makes the paste path's
+ * introspection branch dead on every real install and every pasted token gets
+ * stored with `expiresAt: null` / `scopes: []`, silencing the expiry warnings
+ * `beeperStatus.tokenExpiryInfo` exists for. `GET /v1/info` advertises the
+ * same endpoint at `endpoints.oauth.introspection_endpoint` instead
+ * (live-verified), so this is the fallback discovery falls back to when the
+ * metadata document is silent. It goes through the identical `resolveEndpoint`
+ * same-host check as every other discovered endpoint — `/v1/info` is fetched
+ * from the same user-editable base URL as the metadata document, so a value it
+ * names still needs to be refused if it points elsewhere. A `/v1/info` that
+ * fails outright (network error, malformed body) is not itself a discovery
+ * failure — it just leaves introspection unavailable, same as if the metadata
+ * document had said nothing at all, and `connectWithPastedToken` already falls
+ * back to `verifyByAuthenticatedCall` for that case.
+ *
+ * `timeoutMs: OAUTH_TIMEOUT_MS` is deliberate — `getInfo`'s own default is
+ * `DEFAULT_PROBE_TIMEOUT_MS` (1s), sized for the passive, frequently-polled
+ * status card, not for a user-initiated connect/paste action that already
+ * budgets 10s for every other request in this flow (`fetchJson` above).
+ * Reusing the 1s probe cap here made this fallback fail under exactly the
+ * kind of everyday local latency a live Beeper Desktop can show under load —
+ * silently landing back on the no-expiry authenticated-call path this fix
+ * exists to avoid.
+ */
+async function discoverIntrospectionEndpointFromInfo(resolvedBase) {
+  let info;
+  try {
+    info = await getInfo({ baseUrl: resolvedBase, timeoutMs: OAUTH_TIMEOUT_MS });
+  } catch {
+    return null;
+  }
+  const value = info?.endpoints?.oauth?.introspection_endpoint;
+  if (typeof value !== 'string' || !value.trim()) return null;
+  return resolveEndpoint(value, resolvedBase, 'endpoints.oauth.introspection_endpoint');
+}
+
+/**
  * `GET /.well-known/oauth-authorization-server` on the configured base URL,
  * validated rather than trusted: every endpoint this flow uses must be present
  * and on the same host, and the server must advertise S256 when it advertises
@@ -129,6 +168,14 @@ export async function discoverAuthorizationServer({ baseUrl } = {}) {
   if (Array.isArray(methods) && !methods.includes('S256')) {
     throw oauthError('Beeper authorization server does not support PKCE S256', 'OAUTH_DISCOVERY_INVALID');
   }
+  // Optional: RFC 7662 introspection, which is how the paste path proves a
+  // pasted token is real (see `connectWithPastedToken`). Falls back to
+  // `/v1/info` when the metadata document omits it (see
+  // `discoverIntrospectionEndpointFromInfo` above) — a live install commonly
+  // does.
+  const introspectionEndpoint = body.introspection_endpoint
+    ? resolveEndpoint(body.introspection_endpoint, resolvedBase, 'introspection_endpoint')
+    : await discoverIntrospectionEndpointFromInfo(resolvedBase);
   return {
     baseUrl: resolvedBase,
     authorizationEndpoint: resolveEndpoint(body.authorization_endpoint, resolvedBase, 'authorization_endpoint'),
@@ -139,11 +186,7 @@ export async function discoverAuthorizationServer({ baseUrl } = {}) {
     revocationEndpoint: body.revocation_endpoint
       ? resolveEndpoint(body.revocation_endpoint, resolvedBase, 'revocation_endpoint')
       : null,
-    // Optional: RFC 7662 introspection, which is how the paste path proves a
-    // pasted token is real (see `connectWithPastedToken`).
-    introspectionEndpoint: body.introspection_endpoint
-      ? resolveEndpoint(body.introspection_endpoint, resolvedBase, 'introspection_endpoint')
-      : null,
+    introspectionEndpoint,
   };
 }
 
