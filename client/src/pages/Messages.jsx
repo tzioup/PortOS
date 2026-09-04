@@ -6,6 +6,8 @@ import PageSkeleton from '../components/ui/PageSkeleton';
 import PageHeader from '../components/PageHeader';
 import TabPills from '../components/ui/TabPills';
 import { useValidTab } from '../hooks/useValidTab';
+import { useInstanceFeatures } from '../hooks/useInstanceFeatures.js';
+import { filterNavByFeatures } from '../lib/navFeatures.js';
 
 import InboxTab from '../components/messages/InboxTab';
 import ConfigTab from '../components/messages/ConfigTab';
@@ -28,7 +30,7 @@ export const TABS = [
   { id: 'drafts', label: 'Drafts', icon: Mail, needsAccounts: true },
   { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true, recordParam: true },
   { id: 'signal', label: 'Signal', icon: MessageSquare },
-  { id: 'beeper', label: 'Beeper', icon: MessageCircle, fullBleed: true, recordParam: true },
+  { id: 'beeper', label: 'Beeper', icon: MessageCircle, fullBleed: true, recordParam: true, feature: 'beeper' },
   { id: 'contacts', label: 'Contacts', icon: Users },
   { id: 'sync', label: 'Sync', icon: RefreshCw, needsAccounts: true },
   { id: 'config', label: 'Config', icon: Settings, needsAccounts: true },
@@ -48,6 +50,11 @@ export default function Messages() {
   const { chatKey } = useParams();
   const activeTab = useValidTab(TABS, 'inbox');
   const fullBleed = FULL_BLEED_TAB_IDS.has(activeTab);
+  // Gate the Beeper pill on the instance feature the same way the sidebar does
+  // (#30): the route stays live for a direct link/bookmark/voice nav, but the
+  // tab strip itself must not offer a way to navigate to a disabled feature.
+  const { isFeatureEnabled } = useInstanceFeatures();
+  const visibleTabs = filterNavByFeatures(TABS, isFeatureEnabled);
   // `null` = the account list never loaded (request failed) — deliberately distinct
   // from `[]`, which means "loaded, and there genuinely are no accounts". The inbox
   // empty state branches on that difference to avoid telling a user to add an
@@ -122,7 +129,7 @@ export default function Messages() {
         bodyClassName="p-4"
         titleWidthClass="w-36"
         showSubtitle
-        tabs={TABS.length}
+        tabs={visibleTabs.length}
         cards={3}
         sidebar={false}
       />
@@ -135,14 +142,23 @@ export default function Messages() {
         icon={Mail}
         title="Messages"
         subtitle="Unified email and messaging management"
-        actions={loading ? null : (
+        // #35 real-browser pass: this counts the email-style provider accounts
+        // (Gmail/Outlook/Teams — `api.getMessageAccounts()`) that Inbox/Drafts/
+        // Sync/Config act on. It is unrelated to Beeper's own account roster
+        // (`beeper_accounts`, shown inside its own settings drawer) or to any
+        // other bridge tab's accounts, so it read "0 accounts" while the Beeper
+        // mirror held nine — correct for what it measures, misleading shown on
+        // a tab it says nothing about. Scope it to the tabs that actually use
+        // this fetch, same `ACCOUNT_TAB_IDS` gate the loading skeleton already
+        // keys off, rather than teaching it a second "accounts" meaning.
+        actions={loading || !ACCOUNT_TAB_IDS.has(activeTab) ? null : (
           <span className="text-sm text-gray-500">
             {accounts === null ? 'Accounts unavailable' : `${accounts.length} accounts`}
           </span>
         )}
       />
 
-      <TabPills tabs={TABS} activeTab={activeTab} onChange={handleTabChange} ariaLabel="Messages sections" />
+      <TabPills tabs={visibleTabs} activeTab={activeTab} onChange={handleTabChange} ariaLabel="Messages sections" />
 
       <div className={`flex-1 min-h-0 ${fullBleed ? 'overflow-hidden' : 'overflow-auto p-4'}`}>
         {renderTabContent()}

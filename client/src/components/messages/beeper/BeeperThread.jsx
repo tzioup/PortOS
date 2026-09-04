@@ -34,6 +34,37 @@ import { formatBytes } from '../../../utils/formatters';
  * reference interface's shape.
  */
 
+// Real-browser pass on #35: a message body containing an ampersand rendered
+// as the five-character HTML entity `&amp;` in the thread bubble. `beeperSync.js`
+// `normalizeMessageRow` writes `message.text` through unescaped, and PortOS
+// never HTML-encodes on the way in — Beeper Desktop itself delivers
+// entity-encoded text for some bridged networks, so the decode belongs here,
+// on the way OUT to the DOM. This renders as a plain text node (`{body}`
+// below), never `dangerouslySetInnerHTML`, so decoding entities only changes
+// which characters are shown — it cannot introduce markup.
+//
+// Mirrors `server/lib/xmlEntities.js` `decodeXmlEntities` (also privately
+// mirrored by `client/src/lib/tabNotation.js` — lib stays a leaf, so each
+// consumer carries its own small copy rather than one lib file importing
+// another). Keep the three in sync.
+const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+const ENTITY_RE = /&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g;
+// Exported for the focused parser-level unit test (root AGENTS.md Test
+// Strategy: "parsers and algorithms with a real input matrix" are exactly the
+// case a higher-level render test cannot pin as cheaply).
+export const decodeHtmlEntities = (str) => {
+  if (typeof str !== 'string' || str.indexOf('&') === -1) return str;
+  return str.replace(ENTITY_RE, (match, code) => {
+    if (code[0] === '#') {
+      const cp = code[1] === 'x' || code[1] === 'X'
+        ? parseInt(code.slice(2), 16)
+        : parseInt(code.slice(1), 10);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : match;
+    }
+    return Object.hasOwn(NAMED_ENTITIES, code) ? NAMED_ENTITIES[code] : match;
+  });
+};
+
 const dayLabel = (iso) => {
   if (!iso) return 'Unknown date';
   const date = new Date(iso);
@@ -446,7 +477,7 @@ export default function BeeperThread({
                       <Trash2 size={12} /> This message was unsent
                     </p>
                   ) : (
-                    <p className="whitespace-pre-wrap break-words">{message.body}</p>
+                    <p className="whitespace-pre-wrap break-words">{decodeHtmlEntities(message.body)}</p>
                   )}
                   {/* Bytes arrive on first view through the mirror route, not
                       with the message payload — see BeeperAttachment. */}
