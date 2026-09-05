@@ -169,7 +169,7 @@ const query = vi.fn(async (sql, params = []) => {
 vi.mock('../lib/db.js', () => ({ query: (...args) => query(...args) }));
 
 const {
-  BREAKER_MAX_CONSECUTIVE_FAILURES, BREAKER_MAX_SENDS_IN_WINDOW,
+  BREAKER_MAX_CONSECUTIVE_FAILURES, BREAKER_MAX_SENDS_IN_WINDOW, BREAKER_WINDOW_MS,
   CONFIRMATION_TIMEOUT_MS, SEND_INTERRUPTED_MESSAGE,
   cancelPendingConfirmations, clearOutboxBreaker, configureOutboxRuntime, createOutboxEntry,
   discardOutboxEntry, getOutboxBreakerState, getOutboxStatus, isFirstContact, listOutboxEntries,
@@ -697,5 +697,47 @@ describe('runaway breaker', () => {
     const next = await approvedEntry('one more');
     await expect(sendOutboxEntry(next.id)).rejects.toMatchObject({ code: 'OUTBOX_BREAKER_OPEN' });
     expect(sendMessage).toHaveBeenCalledTimes(BREAKER_MAX_CONSECUTIVE_FAILURES);
+  });
+
+  // The window is ROLLING, and that is the whole difference between a runaway
+  // breaker and a rate quota: the same count of sends spread over an afternoon
+  // is a person using the app, and must never be treated as a loop.
+  it('stays closed when the same count of sends is spread beyond the window', async () => {
+    markPriorSend();
+    for (let i = 0; i <= BREAKER_MAX_SENDS_IN_WINDOW; i += 1) {
+      // eslint-disable-next-line no-await-in-loop -- ordered sends, one per window
+      const entry = await approvedEntry(`message ${i}`);
+      // eslint-disable-next-line no-await-in-loop
+      await sendOutboxEntry(entry.id);
+      clock.advance(BREAKER_WINDOW_MS + 1);
+    }
+
+    expect(sendMessage).toHaveBeenCalledTimes(BREAKER_MAX_SENDS_IN_WINDOW + 1);
+    expect(getOutboxBreakerState()).toMatchObject({ tripped: false, sendsInWindow: 0 });
+  });
+
+  // The consecutive arm counts a RUN, not a total. Two failures either side of
+  // a success are two runs of one, so a flaky connection cannot accumulate its
+  // way into a breaker only a human can clear.
+  it('resets the consecutive-failure count on a successful send', async () => {
+    markPriorSend();
+    const failOnce = async (label) => {
+      sendMessage.mockRejectedValueOnce(new BeeperApiError('Beeper request failed', { status: 0, code: 'NETWORK_ERROR' }));
+      const entry = await approvedEntry(label);
+      await expect(sendOutboxEntry(entry.id)).rejects.toMatchObject({ code: 'NETWORK_ERROR' });
+    };
+
+    await failOnce('one');
+    await failOnce('two');
+    expect(getOutboxBreakerState()).toMatchObject({ tripped: false, consecutiveFailures: 2 });
+
+    const recovered = await approvedEntry('three');
+    await sendOutboxEntry(recovered.id);
+    expect(getOutboxBreakerState().consecutiveFailures).toBe(0);
+
+    // Two more failures are now a run of two, not the fourth and fifth of five.
+    await failOnce('four');
+    await failOnce('five');
+    expect(getOutboxBreakerState()).toMatchObject({ tripped: false, consecutiveFailures: 2 });
   });
 });
