@@ -221,7 +221,11 @@ export function normalizeAttachmentRows(message) {
   return attachments.map((attachment, idx) => ({
     idx,
     mxcId: typeof attachment?.id === 'string' && attachment.id ? attachment.id : null,
-    mimeType: String(attachment?.mimeType ?? ''),
+    // Lowercased (RFC 2045: a media type is case-insensitive) so the stored
+    // value matches what `beeperAttachmentPaths.MIRRORED_MIME_TYPES` and the
+    // client's `isImage()` check both compare against — a bridge that sends
+    // `Image/JPEG` must not silently miss either one.
+    mimeType: String(attachment?.mimeType ?? '').toLowerCase(),
     byteLength: toIntOrNull(attachment?.fileSize),
     fileName: String(attachment?.fileName ?? ''),
     width: toIntOrNull(attachment?.size?.width),

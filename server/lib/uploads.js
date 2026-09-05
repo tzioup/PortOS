@@ -2,6 +2,7 @@
 import { copyFile, readFile, stat, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { join, resolve as resolvePath } from 'path';
+import { MIRRORED_MIME_TYPES } from './beeperAttachmentPaths.js';
 import { ServerError } from './errorHandler.js';
 import { atomicWrite, ensureDir, pathExists } from './fileCore.js';
 import { detectImageFormat, getFileExtension, getMimeType, RISKY_MIME_TYPES, sanitizeFilename } from './mimeTypes.js';
@@ -165,6 +166,16 @@ export async function saveBase64Upload(dir, { filename, data }, { allowedExtensi
 }
 
 /**
+ * A declared media type reduced to a bare, comparable `type/subtype`:
+ * parameters dropped, whitespace trimmed on BOTH sides of the split (a value
+ * like ` text/html ;charset=utf-8` leaves a trailing space otherwise), case
+ * folded. Returns `''` for anything that is not a non-empty string.
+ */
+function normalizeDeclaredMimeType(value) {
+  return typeof value === 'string' ? value.split(';')[0].trim().toLowerCase() : '';
+}
+
+/**
  * Serve a machine-local file from `dir` by user-supplied filename with the
  * shared safety pipeline: sanitize → containment guard (400
  * `INVALID_FILENAME`) → existence check (404, message/code parametrized via
@@ -178,9 +189,23 @@ export async function saveBase64Upload(dir, { filename, data }, { allowedExtensi
  * caller: it is content-addressed (`<sha256>.<ext>`), and the source it
  * downloads from (`GET /v1/assets/serve`) sends no `Content-Type` header at
  * all, so the type Beeper declared in the message payload is the only real
- * answer and the extension is decoration. The override is still run through
- * the same `RISKY_MIME_TYPES` disposition rule — it changes what is served as,
- * never whether the risky-type guard applies.
+ * answer and the extension is decoration.
+ *
+ * That declared type is written by a REMOTE SENDER and this route is on the
+ * authenticated dashboard origin, so the override is normalized and bounded
+ * rather than trusted:
+ *
+ *   - Normalized first — parameters dropped, trimmed, lowercased. A media type
+ *     is case-insensitive (RFC 2045) while `RISKY_MIME_TYPES` is a lowercase
+ *     set, so `text/HTML` walked straight past the guard until this step
+ *     existed and executed inline on the dashboard's own origin.
+ *   - Bounded second — only a type the mirror itself can produce
+ *     (`MIRRORED_MIME_TYPES`) is echoed; anything else is served as
+ *     `application/octet-stream` instead of whatever was declared.
+ *
+ * The disposition decision is then taken on the declared type as well as the
+ * served one, so downgrading a `text/html` to octet-stream never costs it the
+ * attachment header it earned.
  *
  * @param {import('express').Response} res
  * @param {string} dir - The containing directory.
@@ -200,10 +225,12 @@ export async function serveLocalFile(res, dir, filename, { missingError, content
     throw new ServerError(message, { status: 404, code });
   }
 
-  const declared = typeof contentType === 'string' ? contentType.trim().split(';')[0] : '';
-  const mimeType = declared || getMimeType(getFileExtension(safeFilename));
+  const declared = normalizeDeclaredMimeType(contentType);
+  const mimeType = declared
+    ? (MIRRORED_MIME_TYPES.has(declared) ? declared : 'application/octet-stream')
+    : getMimeType(getFileExtension(safeFilename));
   res.set('X-Content-Type-Options', 'nosniff');
-  if (RISKY_MIME_TYPES.has(mimeType)) {
+  if (RISKY_MIME_TYPES.has(mimeType) || RISKY_MIME_TYPES.has(declared)) {
     res.set('Content-Disposition', `attachment; filename="${safeFilename}"`);
   }
   res.type(mimeType).sendFile(filePath);

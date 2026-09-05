@@ -753,6 +753,19 @@ describe('normalizers', () => {
     expect(row.unsentAt).toBeNull();
   });
 
+  // Case-insensitivity (RFC 2045) means a bridge is free to send `Image/JPEG`
+  // or `IMAGE/jpeg` — the stored value has to be lowercased so it matches what
+  // `beeperAttachmentPaths.MIRRORED_MIME_TYPES` and the client's `isImage()`
+  // check both compare against.
+  it('lowercases a mixed-case declared mimeType before it is stored', () => {
+    const rows = normalizeAttachmentRows({
+      attachments: [{
+        type: 'img', id: 'mxc://example.invalid/mixed-case', mimeType: 'Image/JPEG', fileName: 'photo.jpg',
+      }],
+    });
+    expect(rows[0].mimeType).toBe('image/jpeg');
+  });
+
   it('chatNeedsSweep keeps "never swept", "swept but silent" and "moved" apart', () => {
     expect(chatNeedsSweep({ lastActivity: null }, undefined)).toBe(true);
     expect(chatNeedsSweep({ lastActivity: null }, { lastActivity: null })).toBe(false);
