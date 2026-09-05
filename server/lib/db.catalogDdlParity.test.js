@@ -427,14 +427,19 @@ describe('catalog DDL parity (init-db.sql ↔ db.js ensureSchema)', () => {
     });
   }
 
-  // Every column beeper_messages gained after its first ship needs an additive
-  // ALTER on the upgrade path too — a fresh install gets it from the CREATE
-  // above, an existing one only from here.
-  it('beeper_messages additive columns carry an ALTER TABLE for existing installs', () => {
-    for (const column of ['is_sender']) {
-      const re = new RegExp(`ALTER TABLE beeper_messages ADD COLUMN IF NOT EXISTS ${column}\\b`, 'i');
-      expect(re.test(DB_JS), `db/schema/beeper.js missing the additive ALTER for ${column}`).toBe(true);
-      expect(extractCreateTable(INIT_SQL, 'beeper_messages')).toContain(column);
+  // Every column a beeper_* table gained after its first ship needs an
+  // additive ALTER on the upgrade path too — a fresh install gets it from the
+  // CREATE above, an existing one only from here.
+  it('beeper_* additive columns carry an ALTER TABLE for existing installs', () => {
+    for (const { table, columns } of [
+      { table: 'beeper_messages', columns: ['is_sender'] },
+      { table: 'beeper_attachments', columns: ['local_path', 'fetched_at', 'unavailable_at', 'fetch_error'] },
+    ]) {
+      for (const column of columns) {
+        const re = new RegExp(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column}\\b`, 'i');
+        expect(re.test(DB_JS), `db/schema/beeper.js missing the additive ALTER for ${table}.${column}`).toBe(true);
+        expect(extractCreateTable(INIT_SQL, table)).toContain(column);
+      }
     }
   });
 

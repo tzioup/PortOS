@@ -3,9 +3,7 @@
  * controls (#35). Postgres is mocked at `query()` and inspected as SQL text +
  * bind parameters, because the behaviour under test IS the query shape: which
  * filter reaches the WHERE clause, whether a keyset cursor is applied, and
- * whether the PATCH to Beeper happens before the mirror is touched. The
- * behavioural acceptance path against a real database is
- * `beeperConversations.db.test.js` (`npm run test:db`).
+ * whether the PATCH to Beeper happens before the mirror is touched.
  *
  * Every fixture value is invented (placeholder ids, `Example` names) per root
  * AGENTS.md Sensitive Data & Privacy — no value here came from a running
