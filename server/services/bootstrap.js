@@ -85,6 +85,7 @@ import { startQuotaBurnScheduler } from './quotaBurnRunner.js';
 import { startSeriesAutopilotScheduler } from './seriesAutopilotScheduler.js';
 import { startCommissionScheduler } from './creativeCommissions/scheduler.js';
 import { startBeeperScheduler } from './beeperScheduler.js';
+import { reconcileOutboxOnBoot } from './beeperOutbox.js';
 import { startBeeperSocket, stopBeeperSocket } from './beeperSocket.js';
 import { startImessageScheduler } from './imessageScheduler.js';
 import { startSignalScheduler } from './signalScheduler.js';
@@ -455,6 +456,14 @@ const startBackgroundServices = ({ spawnerReady, io }) => {
   // NOT gated on Beeper's own `app.state`, which was measured reporting
   // `initializing` for 105s while every account was connected.
   startBeeperScheduler().catch(err => console.error(`❌ Beeper sync scheduler init failed: ${err.message}`));
+  // Reconcile the outbox's two non-terminal states against the process that
+  // just died: a row left in `sending` becomes a failed row the user can act on
+  // (never an automatic resend — Beeper has no idempotency key), and a row left
+  // in `awaiting-confirmation` gets its lookup re-armed, which reads and never
+  // sends. Deliberately NOT on the ingestion gate above: a send stranded by a
+  // restart is stranded whether or not scheduled sync is switched on, and it is
+  // otherwise un-actionable forever, since nothing but this can move it.
+  reconcileOutboxOnBoot().catch(err => console.error(`❌ Beeper outbox boot reconcile failed: ${err.message}`));
   // Arm the Beeper realtime transport on the SAME gate as the sweep above
   // (feature on + token present, never `app.state`) — one long-lived WebSocket
   // to the local Beeper Desktop whose only job is to make ingestion prompt

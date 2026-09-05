@@ -28,10 +28,11 @@ import { formatBytes } from '../../../utils/formatters';
  * over `onSend`/`confirmAndSend`/`cancelConfirmation`/`retryOutboxEntry`/
  * `dismissOutboxEntry`, which the surface supplies from `useBeeperOutbox`.
  * This component owns none of the send lifecycle — it only renders what the
- * hook reports: the pending/failed/stalled rows in `outboxEntries` (filtered
- * against `messages` so a confirmed send shows once, as the real mirrored
- * message, not twice), and the inline first-contact question when
- * `confirmation` is set. Nothing here ever retries a send that touched the
+ * hook reports: the pending/failed/stalled rows in `outboxEntries` (filtered on
+ * STATE, so a settled `sent` entry shows once as the real mirrored message and
+ * never as a second bubble — including when its message has aged out of the
+ * loaded page), and the inline first-contact question when `confirmation` is
+ * set. Nothing here ever retries a send that touched the
  * wire on its own; a `failed` row's "Retry" composes a NEW outbox entry with
  * the same text, exactly like typing it again, because Beeper has no
  * idempotency key and a client-driven resend of the same row would risk a
@@ -194,10 +195,33 @@ function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
 }
 
 /**
+ * The exact sentence shown for a send the server found stranded in `sending` at
+ * boot (`SEND_INTERRUPTED`, written by `reconcileOutboxOnBoot` in
+ * `server/services/beeperOutbox.js`, which owns the identical literal — the two
+ * bundles cannot share a module, so they share a test instead).
+ *
+ * It deliberately does not claim a delivery verdict. The POST was in flight
+ * when the process died, so whether it landed is unknowable from here; the copy
+ * points at the chat, because looking is the only thing that actually answers
+ * it, and Retry composes a new message rather than resending that one.
+ */
+const SEND_INTERRUPTED_COPY = 'Delivery unconfirmed: PortOS restarted mid-send. Check the chat before retrying.';
+
+/** The outbox states that still have something to say above the composer. */
+const RENDERED_OUTBOX_STATES = new Set(['approved', 'sending', 'awaiting-confirmation', 'failed']);
+
+/**
  * One outbox row — a send that has not yet been confirmed by the mirror, or
  * one that failed. Always outbound (right-aligned, no avatar), matching the
  * bubble a mirrored `isSender` message renders, so a pending send does not
  * visually jump when it swaps for the real thing.
+ *
+ * Only ONE of the four outcomes below spins, and the spinner is the exception
+ * rather than the default. Every state that will not change on its own — a
+ * failure, an interrupted send, an unconfirmed one, a refused one — resolves to
+ * a terminal line that says what happened, because a spinner for a state
+ * nothing can ever advance is a lie the user cannot dismiss, and it survives
+ * every reload.
  *
  * `approved` is normally in flight for the moment between the create and
  * send requests (`sending` is true). If it is STILL `approved` once nothing
@@ -221,14 +245,29 @@ function OutboxRow({
   entry, sending, isConfirming, onRetry, onDismiss, breakerTripped, breakerReason,
 }) {
   const failed = entry.state === 'failed';
-  const confirming = entry.state === 'awaiting-confirmation' || entry.state === 'sent';
+  const interrupted = failed && entry.errorCode === 'SEND_INTERRUPTED';
+  // Recorded by the server's 30s fallback when it could not find the message it
+  // had just sent. The row stays `awaiting-confirmation` on purpose — the send
+  // may well have been delivered, and marking it failed would invite the one
+  // mistake that cannot be taken back — so this reads as "sent, unconfirmed",
+  // carries the reason the server recorded, and offers NO Retry. It never
+  // changes on its own, so it must never spin.
+  const unresolved = !failed && entry.errorCode === 'CONFIRMATION_UNRESOLVED';
   const stalled = entry.state === 'approved' && !sending && !isConfirming;
   const blocked = failed || stalled;
+  const confirming = entry.state === 'awaiting-confirmation' || entry.state === 'sent';
   const retryBlocked = breakerTripped && !stalled;
+  const outcome = blocked ? (failed ? 'failed' : 'stalled') : (unresolved ? 'unconfirmed' : 'pending');
+  // An interrupted send gets the copy verbatim and nothing else: prefixing
+  // "Not delivered" would assert a verdict the crash destroyed the evidence for.
+  let blockedReason = 'Not sent — the send was refused';
+  if (interrupted) blockedReason = SEND_INTERRUPTED_COPY;
+  else if (failed) blockedReason = `Not delivered${entry.errorMessage ? ` — ${entry.errorMessage}` : ''}`;
   return (
     <div
       data-testid="beeper-outbox-row"
       data-state={entry.state}
+      data-outcome={outcome}
       className="flex items-end justify-end gap-2"
     >
       <div
@@ -238,13 +277,9 @@ function OutboxRow({
       >
         <p className="whitespace-pre-wrap break-words">{entry.body}</p>
         <span className="mt-0.5 flex items-center justify-end gap-1.5 text-[10px]">
-          {blocked ? (
+          {blocked && (
             <>
-              <span className="text-port-error">
-                {failed
-                  ? `Not delivered${entry.errorMessage ? ` — ${entry.errorMessage}` : ''}`
-                  : 'Not sent — the send was refused'}
-              </span>
+              <span className="text-port-error">{blockedReason}</span>
               <button
                 type="button"
                 onClick={() => onRetry(entry)}
@@ -264,7 +299,13 @@ function OutboxRow({
                 </button>
               )}
             </>
-          ) : (
+          )}
+          {unresolved && (
+            <span className="text-port-warning">
+              {`Sent, unconfirmed${entry.errorMessage ? ` — ${entry.errorMessage}` : ''}`}
+            </span>
+          )}
+          {!blocked && !unresolved && (
             <span className="flex items-center gap-1 text-gray-400">
               <Loader2 size={10} className="animate-spin" />
               {confirming ? 'Confirming…' : 'Sending…'}
@@ -326,14 +367,20 @@ export default function BeeperThread({
   }, [conversation?.participants]);
 
   // Outbox rows still worth showing: anything the mirror has not caught up
-  // with yet. Once a `sent` entry's `messageId` shows up in `messages` (the
-  // real message, arrived via the invalidation-driven refetch), it is dropped
-  // here rather than rendered twice — the mirrored message IS the confirmation.
+  // with yet, decided on the entry's own STATE rather than on whether its
+  // message happens to be in the page currently loaded. `sent` is settled —
+  // the mirrored message IS the record of it — and `GET /outbox` returns up to
+  // 50 entries in every state, so a `sent` entry whose message had aged out of
+  // the newest page used to render forever as a spinning bubble with old text.
+  // `draft` is excluded for the same reason it has no writer: it is not a send.
   // `entries` arrives newest-first (the server's own order, preserved through
   // every client-side prepend); reversed to read oldest-first like `ordered`.
   const visibleOutbox = useMemo(() => {
     const mirroredIds = new Set(messages.map((message) => message.id));
     return [...outboxEntries]
+      .filter((entry) => RENDERED_OUTBOX_STATES.has(entry.state))
+      // The tiebreak, not the rule: an `awaiting-confirmation` row the sweep
+      // already mirrored would otherwise show twice, once as each.
       .filter((entry) => !(entry.messageId && mirroredIds.has(entry.messageId)))
       .reverse();
   }, [outboxEntries, messages]);

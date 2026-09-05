@@ -514,6 +514,33 @@ describe('the composer sends', () => {
     fireEvent.click(send);
     expect(apiBeeper.createOutboxEntry).not.toHaveBeenCalled();
   });
+
+  // The breaker is PROCESS state that can trip mid-session — a send loop, or
+  // three refused sends in a row — and the composer's gate used to be a
+  // mount-time snapshot: `seedStatus` ran once and never again, so the Send
+  // button stayed live against a server that would refuse every send until a
+  // human cleared it, and only a page reload showed the truth.
+  it('disables Send for a breaker that trips after mount, with no page reload', async () => {
+    const status = (breaker) => ({
+      tokenConfigured: true, reachable: true, accounts: [], realtime: { state: 'connected' }, outbox: { breaker },
+    });
+    api.getBeeperStatus.mockResolvedValue(status({ tripped: false, reason: null, trippedAt: null }));
+    await openComposer();
+
+    const send = screen.getByRole('button', { name: 'Send' });
+    await waitFor(() => expect(send).toBeEnabled());
+
+    api.getBeeperStatus.mockResolvedValue(status({ tripped: true, reason: 'synthetic loop', trippedAt: '2026-09-01T09:00:00.000Z' }));
+    act(() => {
+      for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+        fn({ kind: 'message.upserted', chatID: 'chat-example-1', ids: ['m1'], seq: 7 });
+      }
+    });
+
+    await waitFor(() => expect(send).toBeDisabled());
+    expect(send.getAttribute('title')).toMatch(/runaway breaker/);
+    expect(send.getAttribute('title')).toContain('synthetic loop');
+  });
 });
 
 describe('realtime', () => {

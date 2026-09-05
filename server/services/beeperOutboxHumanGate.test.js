@@ -52,15 +52,18 @@ describe('beeper outbox has no agent-initiated send path (#36)', () => {
     expect(PRODUCTION_SOURCES.some((file) => file.path === 'services/beeperOutbox.js')).toBe(true);
   });
 
-  it('is imported by exactly one production module: the human HTTP route', () => {
+  it('is imported for a send by exactly one production module: the human HTTP route', () => {
     const importers = PRODUCTION_SOURCES
       .filter((file) => file.path !== 'services/beeperOutbox.js')
       .filter((file) => /from '\.{1,2}\/(?:services\/)?beeperOutbox\.js'/.test(file.source))
       .map((file) => file.path)
       .sort();
-    // `beeperStatus.js` reads the breaker's state for the settings card. It
-    // imports the STATUS getter only, never a send — asserted below.
-    expect(importers).toEqual(['routes/beeper.js', 'services/beeperStatus.js']);
+    // Two non-send importers ride alongside the route, and the test below is
+    // what keeps them non-send: `beeperStatus.js` reads the breaker's state for
+    // the settings card, and `bootstrap.js` calls the boot reconcile, whose two
+    // arms are a state write and a re-armed LOOKUP — neither reaches
+    // `sendMessage`, which is why a crash mid-send can never resend itself.
+    expect(importers).toEqual(['routes/beeper.js', 'services/beeperStatus.js', 'services/bootstrap.js']);
   });
 
   it('names the send functions in no production module but the route', () => {

@@ -54,6 +54,30 @@ const LOG_PREFIX = '🫧 Beeper outbox';
 export const CONFIRMATION_TIMEOUT_MS = 30_000;
 
 /**
+ * The code and the recorded reason for a send this process found stranded in
+ * `sending` at boot — a POST that was in flight when the previous process died.
+ *
+ * The outcome is UNKNOWABLE: the request may have been delivered, refused, or
+ * never have left. Rule 2 above therefore still holds — nothing re-POSTs it.
+ * The row lands `failed` so it is actionable (a failed row's Retry composes a
+ * NEW row, exactly like typing the message again), and the copy says what
+ * actually happened rather than claiming a delivery verdict PortOS does not
+ * have. The client renders this sentence verbatim off the code, so the same
+ * string is repeated in `client/src/components/messages/beeper/BeeperThread.jsx`
+ * — the two bundles cannot share a module, so they share a test instead.
+ */
+export const SEND_INTERRUPTED_CODE = 'SEND_INTERRUPTED';
+export const SEND_INTERRUPTED_MESSAGE = 'Delivery unconfirmed: PortOS restarted mid-send. Check the chat before retrying.';
+
+/**
+ * PostgreSQL's `undefined_table`. The boot reconcile runs before the DB phase
+ * has called `ensureSchema()`, so a brand-new install's very first start can
+ * reach it with no `beeper_outbox` table — which is not a fault to narrate: an
+ * absent table holds no interrupted sends. Every other error still logs.
+ */
+const UNDEFINED_TABLE = '42P01';
+
+/**
  * Runaway-breaker thresholds. Deliberately far above anything a human at a
  * composer produces and far below what an unattended loop produces in the same
  * minute: eleven sends inside a minute is one every 5.5 seconds, sustained,
@@ -233,10 +257,23 @@ export async function createOutboxEntry({ conversationId, body }) {
 }
 
 /**
- * Whether PortOS has ever COMPLETED a send to this conversation. First contact
- * is the case #8 decision 5 puts a confirmation on — a first message to a
- * possibly mis-resolved handle on a possibly wrong network — and it is the only
- * one, because confirming every reply trains the user to click through.
+ * States that mean PortOS has already ADDRESSED this conversation — the POST
+ * reached Beeper, whatever the mirror has confirmed since. `sent` alone is the
+ * wrong test: an `awaiting-confirmation` row is a send that left this machine
+ * and was very likely delivered (the unresolved case is deliberately not
+ * `failed` for exactly that reason), and `sending` is one in flight right now.
+ * Counting only `sent` re-asks the first-contact question on the next message
+ * to someone PortOS has already messaged — which is precisely the prompt the
+ * design says must fire once and never again, or the user learns to click
+ * through it.
+ */
+const CONTACTED_STATES = ['sent', 'awaiting-confirmation', 'sending'];
+
+/**
+ * Whether PortOS has ever ADDRESSED this conversation. First contact is the
+ * case #8 decision 5 puts a confirmation on — a first message to a possibly
+ * mis-resolved handle on a possibly wrong network — and it is the only one,
+ * because confirming every reply trains the user to click through.
  *
  * Keyed on the outbox rather than on a mirrored `isSender` message: the mirror
  * records what the USER sent from their phone, which is not evidence that this
@@ -244,8 +281,9 @@ export async function createOutboxEntry({ conversationId, body }) {
  */
 export async function isFirstContact(conversationId) {
   const result = await query(
-    "SELECT 1 FROM beeper_outbox WHERE conversation_id = $1 AND state = 'sent' LIMIT 1",
-    [conversationId],
+    `SELECT 1 FROM beeper_outbox
+     WHERE conversation_id = $1 AND state = ANY($2::text[]) LIMIT 1`,
+    [conversationId, CONTACTED_STATES],
   );
   return (result?.rows?.length ?? 0) === 0;
 }
@@ -393,14 +431,21 @@ function handleInvalidation(frame) {
   }
 }
 
-function armConfirmation({ id, chatId, conversationId, body, pendingMessageId }) {
+/**
+ * `requestedAt` defaults to now because the ordinary caller is the send that
+ * just happened. The boot reconcile passes the row's persisted send moment
+ * instead: it is the floor `lookupSentMessage` matches timestamps against, so
+ * dating a week-old re-armed row to boot time would reject the very message it
+ * is looking for.
+ */
+function armConfirmation({ id, chatId, conversationId, body, pendingMessageId, requestedAt = runtime.now() }) {
   const timer = runtime.setTimeout(() => {
     resolveConfirmation(id, 'fallback-timeout').catch((err) => {
       console.error(`${LOG_PREFIX}: fallback confirmation failed: ${err.message}`);
     });
   }, CONFIRMATION_TIMEOUT_MS);
   pendingConfirmations.set(id, {
-    chatId, conversationId, body, pendingMessageId, requestedAt: runtime.now(), timer, resolving: false,
+    chatId, conversationId, body, pendingMessageId, requestedAt, timer, resolving: false,
   });
   if (!invalidateListenerAttached) {
     beeperSocketEvents.on('invalidate', handleInvalidation);
@@ -570,6 +615,88 @@ async function noteUnresolved(id, message) {
  */
 export function cancelPendingConfirmations() {
   for (const id of [...pendingConfirmations.keys()]) releasePending(id);
+}
+
+// ---------------------------------------------------------------------------
+// Boot reconcile
+// ---------------------------------------------------------------------------
+
+/** The send moment a re-armed row is matched against, from what the row kept. */
+function persistedSendMoment(row) {
+  const stamped = Date.parse(row?.updatedAt ?? row?.createdAt ?? '');
+  return Number.isFinite(stamped) ? stamped : runtime.now();
+}
+
+/**
+ * Reconcile the two NON-TERMINAL states against a process that no longer
+ * exists. Called once per server start, from `bootstrap.js`, regardless of
+ * whether the Beeper feature is armed — a stranded row is stranded whether or
+ * not ingestion is switched on.
+ *
+ * `sending` and `awaiting-confirmation` are exit-only through in-memory state:
+ * `pendingConfirmations`, its timer, and the socket listener. A restart mid-
+ * flight takes all three with it, and no route can move a row out of either
+ * state — so without this the row is permanently un-actionable, and the client
+ * renders it as a spinner with no Retry and no Dismiss, forever, across every
+ * later restart.
+ *
+ * Two different faults, two different answers:
+ *
+ *  - **`sending` → `failed` / `SEND_INTERRUPTED`.** The POST was in flight; its
+ *    outcome is unknowable. Never auto-resent (rule 2 has no exception for a
+ *    crash — Beeper has no idempotency key, so a "recovery" resend is a second
+ *    real message). `failed` is the actionable state: the user reads the copy,
+ *    checks the chat, and Retry composes a NEW row like any other failed one.
+ *  - **`awaiting-confirmation` → re-armed.** The send DID leave; only the
+ *    resolve was lost. Re-arming replays the lookup from the row's own
+ *    `chat_id` / `pending_message_id` / `body`, which is a read on both paths
+ *    (`getMessage`, then the newest page) and sends nothing. A row already
+ *    recorded `CONFIRMATION_UNRESOLVED` is re-armed too: the message may have
+ *    landed in the mirror since, and one more GET can only upgrade the record.
+ *
+ * Terminal rows (`sent`, `failed`) are not touched. Idempotent: the second call
+ * finds no `sending` rows left, and skips every `awaiting-confirmation` row the
+ * first call already armed rather than stacking a second timer on it.
+ *
+ * @returns {Promise<{interrupted: number, rearmed: number}>}
+ */
+export async function reconcileOutboxOnBoot() {
+  const interrupted = await query(
+    `UPDATE beeper_outbox SET state = 'failed', error_code = $1, error_message = $2, updated_at = NOW()
+     WHERE state = 'sending' RETURNING id`,
+    [SEND_INTERRUPTED_CODE, SEND_INTERRUPTED_MESSAGE],
+  ).catch((err) => {
+    if (err?.code === UNDEFINED_TABLE) return null;
+    throw err;
+  });
+  // The table does not exist yet, so neither do the rows this would reconcile.
+  if (!interrupted) return { interrupted: 0, rearmed: 0 };
+
+  const inFlight = await query(
+    `SELECT id, conversation_id AS "conversationId", chat_id AS "chatId", body,
+       pending_message_id AS "pendingMessageId", created_at AS "createdAt", updated_at AS "updatedAt"
+     FROM beeper_outbox WHERE state = 'awaiting-confirmation'`,
+  );
+
+  let rearmed = 0;
+  for (const row of inFlight?.rows ?? []) {
+    if (pendingConfirmations.has(row.id)) continue;
+    armConfirmation({
+      id: row.id,
+      chatId: row.chatId,
+      conversationId: row.conversationId,
+      body: row.body,
+      pendingMessageId: row.pendingMessageId,
+      requestedAt: persistedSendMoment(row),
+    });
+    rearmed += 1;
+  }
+
+  const counts = { interrupted: interrupted.rows?.length ?? 0, rearmed };
+  if (counts.interrupted || counts.rearmed) {
+    console.log(`${LOG_PREFIX}: boot reconcile — ${counts.interrupted} interrupted send(s) failed, ${counts.rearmed} awaiting confirmation re-armed`);
+  }
+  return counts;
 }
 
 /** The outbox's slice of `GET /api/beeper/status`. */

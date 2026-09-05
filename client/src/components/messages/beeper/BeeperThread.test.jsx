@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import {
+  cleanup, fireEvent, render, screen, within,
+} from '@testing-library/react';
 import BeeperThread from './BeeperThread';
 
 /**
@@ -61,6 +63,33 @@ const FAILED_ENTRY = {
   id: 'outbox-2', state: 'failed', body: 'hello there', errorMessage: 'Network error',
 };
 const TRIPPED_BREAKER = { tripped: true, reason: 'too many sends' };
+
+// The server's own copy for a send interrupted by a restart, repeated here on
+// purpose: client and server cannot share a module, so this literal and
+// `SEND_INTERRUPTED_MESSAGE` in `server/services/beeperOutbox.js` are pinned by
+// a test on each side rather than by an import.
+const SEND_INTERRUPTED_COPY = 'Delivery unconfirmed: PortOS restarted mid-send. Check the chat before retrying.';
+const UNRESOLVED_REASON = 'Beeper reported no matching message within 30s — it may still have been delivered, so it was not re-sent.';
+
+// A send that settled long ago. `GET /outbox` returns up to 50 entries in every
+// state, so its mirrored message is routinely older than the newest page.
+const SENT_ENTRY = {
+  id: 'outbox-3', state: 'sent', body: 'settled long ago', messageId: 'msg-aged-out',
+};
+const UNRESOLVED_ENTRY = {
+  id: 'outbox-4',
+  state: 'awaiting-confirmation',
+  body: 'hello there',
+  errorCode: 'CONFIRMATION_UNRESOLVED',
+  errorMessage: UNRESOLVED_REASON,
+};
+const INTERRUPTED_ENTRY = {
+  id: 'outbox-5',
+  state: 'failed',
+  body: 'hello there',
+  errorCode: 'SEND_INTERRUPTED',
+  errorMessage: SEND_INTERRUPTED_COPY,
+};
 
 const renderThread = (overrides = {}) => render(<BeeperThread {...BASE_PROPS} {...overrides} />);
 
@@ -167,6 +196,81 @@ describe('BeeperThread — outbox row states', () => {
 
     fireEvent.click(retry);
     expect(retryOutboxEntry).toHaveBeenCalledWith(OUTBOX_ENTRY);
+  });
+});
+
+/**
+ * Every outbox state that cannot change on its own has to READ as finished. The
+ * three below could each hold a spinner forever: a settled `sent` row whose
+ * message had aged out of the loaded page, a send the server could not confirm,
+ * and a send a restart interrupted. None of them will ever advance, so none of
+ * them may spin — and none may lose that property on a remount, which is the
+ * shape a reload takes.
+ */
+describe('BeeperThread — terminal outbox states never spin', () => {
+  it('renders no bubble for a settled sent entry whose mirrored message is not in the loaded page', () => {
+    const { container } = renderThread({ outboxEntries: [SENT_ENTRY], messages: [] });
+
+    expect(screen.queryByTestId('beeper-outbox-row')).toBeNull();
+    expect(screen.queryByText('settled long ago')).toBeNull();
+    expect(container.querySelector('.animate-spin')).toBeNull();
+  });
+
+  // The mirrored-id check survives as the tiebreak for the one case it is still
+  // the right answer for: a row still in flight that the sweep already mirrored.
+  it('drops an awaiting-confirmation row the sweep has already mirrored', () => {
+    const mirrored = {
+      id: 'msg-mirrored', body: 'hello there', sentAt: '2026-09-01T10:00:00.000Z', isSender: true, senderId: 'user-me',
+    };
+    renderThread({
+      outboxEntries: [{ ...UNRESOLVED_ENTRY, errorCode: null, errorMessage: null, messageId: 'msg-mirrored' }],
+      messages: [mirrored],
+    });
+
+    expect(screen.queryByTestId('beeper-outbox-row')).toBeNull();
+    expect(screen.getByTestId('beeper-message')).toBeInTheDocument();
+  });
+
+  it('renders an unconfirmed send as terminal, carrying the reason the server recorded', () => {
+    const { container } = renderThread({ outboxEntries: [UNRESOLVED_ENTRY] });
+
+    const row = screen.getByTestId('beeper-outbox-row');
+    expect(row).toHaveAttribute('data-outcome', 'unconfirmed');
+    expect(within(row).getByText(`Sent, unconfirmed — ${UNRESOLVED_REASON}`)).toBeInTheDocument();
+    expect(screen.queryByText('Confirming…')).toBeNull();
+    expect(container.querySelector('.animate-spin')).toBeNull();
+    // No Retry: the message may well have been delivered, and a resend is the
+    // one mistake that cannot be taken back.
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+  });
+
+  it('renders an interrupted send with the exact copy and the usual failed-row Retry', () => {
+    const onSend = vi.fn();
+    const { container } = renderThread({ outboxEntries: [INTERRUPTED_ENTRY], onSend });
+
+    const row = screen.getByTestId('beeper-outbox-row');
+    expect(row).toHaveAttribute('data-outcome', 'failed');
+    expect(within(row).getByText(SEND_INTERRUPTED_COPY)).toBeInTheDocument();
+    expect(container.querySelector('.animate-spin')).toBeNull();
+
+    fireEvent.click(within(row).getByRole('button', { name: 'Retry' }));
+    // Retry composes a NEW entry from that row's text, exactly like any other
+    // failed row — never a resend of a POST whose outcome is unknown.
+    expect(onSend).toHaveBeenCalledWith('hello there', { clearsDraft: false });
+  });
+
+  it('keeps both terminal states across a remount, the shape a reload takes', () => {
+    const first = renderThread({ outboxEntries: [UNRESOLVED_ENTRY, INTERRUPTED_ENTRY] });
+    expect(screen.getAllByTestId('beeper-outbox-row')).toHaveLength(2);
+    first.unmount();
+
+    const { container } = renderThread({ outboxEntries: [UNRESOLVED_ENTRY, INTERRUPTED_ENTRY] });
+
+    // Rendered oldest-last: `entries` arrives newest-first and is reversed.
+    expect(screen.getAllByTestId('beeper-outbox-row').map((row) => row.dataset.outcome))
+      .toEqual(['failed', 'unconfirmed']);
+    expect(within(screen.getAllByTestId('beeper-outbox-row')[0]).getByText(SEND_INTERRUPTED_COPY)).toBeInTheDocument();
+    expect(container.querySelector('.animate-spin')).toBeNull();
   });
 });
 
