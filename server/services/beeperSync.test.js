@@ -229,14 +229,14 @@ describe('watermark-bounded sweep', () => {
     oldestCursor: 'chats-page-2',
   };
 
-  it('stops the account walk at the first chat that is not newer than its watermark', async () => {
+  it('pages only the chats that are newer than their watermark', async () => {
     storedCursorRows = [
       { chat_id: 'chat-1', cursor: 'cur-chat-1', last_activity: '2026-09-01T00:00:00.000Z' },
       { chat_id: 'chat-2', cursor: 'cur-chat-2', last_activity: '2026-08-01T00:00:00.000Z' },
       { chat_id: 'chat-3', cursor: 'cur-chat-3', last_activity: '2026-07-01T00:00:00.000Z' },
     ];
     installFetch({
-      chatPages: [CHAT_PAGE],
+      chatPages: [CHAT_PAGE, { items: [], hasMore: false }],
       messagePages: {
         'chat-1': {
           items: [{
@@ -251,12 +251,65 @@ describe('watermark-bounded sweep', () => {
 
     const result = await runBeeperSweep({ reason: 'manual' });
 
-    // chat-2 is not newer than its watermark, so the walk ends there: chat-3 is
-    // never even considered, and the second chat page is never requested.
+    // chat-2 and chat-3 both sit exactly on their watermarks, so neither is
+    // paged for messages — but neither ends the walk, and the sweep stops on
+    // the next page instead, which asks for nothing at all.
     expect(result).toMatchObject({ skipped: false, accounts: 1, chats: 1, messages: 1, failedAccounts: 0 });
     expect(messageRequests()).toHaveLength(1);
     expect(new URL(messageRequests()[0]).pathname).toBe('/v1/chats/chat-1/messages');
-    expect(chatsRequests()).toHaveLength(1);
+    expect(chatsRequests()).toHaveLength(2);
+  });
+
+  // The truncation contract (`sweepChat` withholding the watermark) and the old
+  // "stop at the first caught-up chat" rule cancelled each other out: the list
+  // is ordered by last activity, not by eligibility, so in the steady state a
+  // truncated chat sat below chats that were caught up and was never reached
+  // again. Its backlog was stranded until unrelated activity moved it back to
+  // the top of the list.
+  it('walks past a caught-up chat to a truncated one below it, then stops on a page that needs nothing', async () => {
+    const chatRow = (id, lastActivity) => ({
+      id,
+      accountID: 'acct-a',
+      network: 'Example Net',
+      title: `Example Chat ${id}`,
+      type: 'single',
+      lastActivity,
+      participants: { hasMore: false, total: 0, items: [] },
+    });
+    storedCursorRows = [
+      // Caught up: its watermark equals its current activity.
+      { chat_id: 'chat-caught-up', cursor: 'cur-caught-up', last_activity: '2026-09-02T10:00:00.000Z' },
+      // Truncated on an earlier pass: the cursor advanced, the watermark did
+      // not, so it is still eligible — and it sorts BELOW the caught-up chat.
+      { chat_id: 'chat-truncated', cursor: 'cur-truncated', last_activity: '2026-08-01T00:00:00.000Z' },
+      { chat_id: 'chat-quiet', cursor: 'cur-quiet', last_activity: '2026-07-01T00:00:00.000Z' },
+    ];
+    installFetch({
+      chatPages: [
+        {
+          items: [chatRow('chat-caught-up', '2026-09-02T10:00:00.000Z'), chatRow('chat-truncated', '2026-09-01T00:00:00.000Z')],
+          hasMore: true,
+          oldestCursor: 'chats-page-2',
+        },
+        { items: [chatRow('chat-quiet', '2026-07-01T00:00:00.000Z')], hasMore: true, oldestCursor: 'chats-page-3' },
+      ],
+      messagePages: {
+        'chat-truncated': {
+          items: [{ id: 'msg-b', senderID: 'user-1', text: 'Example message', timestamp: '2026-09-01T00:00:00.000Z' }],
+          hasMore: false,
+          newestCursor: 'cur-truncated-next',
+        },
+      },
+    });
+
+    const result = await runBeeperSweep({ reason: 'manual' });
+
+    expect(result).toMatchObject({ skipped: false, chats: 1, messages: 1, failedChats: 0 });
+    expect(messageRequests()).toHaveLength(1);
+    expect(new URL(messageRequests()[0]).pathname).toBe('/v1/chats/chat-truncated/messages');
+    // Page two asked for nothing, so the walk ends there rather than running
+    // out the 20-page budget — the page is the terminator, not the chat.
+    expect(chatsRequests()).toHaveLength(2);
   });
 
   it('sends accountIDs, and resumes each chat forward from its stored opaque cursor', async () => {

@@ -12,9 +12,13 @@
  *
  * Watermark-bounded, never a full history rebuild. Per account:
  *   1. refresh `beeper_accounts` from the live roster (never `loginID`);
- *   2. page `GET /v1/chats?accountIDs=…` newest-first and STOP at the first
- *      chat that is not newer than its stored `beeper_sync_cursors.last_activity`
- *      — the list is ordered by last activity, so everything past it is older;
+ *   2. page `GET /v1/chats?accountIDs=…` newest-first, sweeping every chat on
+ *      the page that is newer than its stored
+ *      `beeper_sync_cursors.last_activity`, and STOP at the first page that
+ *      asked for nothing. A single caught-up chat does not end the walk: a
+ *      chat whose forward walk was truncated keeps its OLD watermark on
+ *      purpose, so it stays eligible while sorting below chats that are
+ *      already caught up;
  *   3. for each changed chat: upsert the conversation, upsert participants
  *      (`beeperTribe.upsertParticipant`), page new messages from the stored
  *      opaque cursor with `direction: 'after'`, log daily Tribe touchpoints
@@ -566,6 +570,21 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
  * abort this account's whole walk on every single pass and starve every chat
  * below it indefinitely. Its cursor and watermark are untouched by the failed
  * transaction, so it is retried next pass either way.
+ *
+ * A CAUGHT-UP CHAT DOES NOT END THE WALK, and that is the whole reason the
+ * truncation contract works. `sweepChat` withholds the watermark from a chat
+ * whose forward walk ran out of page budget, precisely so the chat stays
+ * eligible next pass — but the list is ordered by last activity, not by
+ * eligibility, so that chat sorts wherever its last message puts it. Ending the
+ * walk at the first chat that is not newer than its watermark therefore made
+ * the two rules cancel each other out: in the steady state, where the chats
+ * above are all caught up, a truncated chat sitting below one of them was never
+ * reached again and its backlog was stranded until unrelated activity moved it
+ * to the top of the list.
+ *
+ * The termination rule is the PAGE instead: a page scanned end to end that
+ * asked for no sweep at all means everything below it is older still. The page
+ * budget stays the hard guarantee, so a pathological account still ends.
  */
 async function sweepAccount(account, clientOptions, observedAt) {
   const cursors = await readAccountCursors(account.accountId);
@@ -573,23 +592,19 @@ async function sweepAccount(account, clientOptions, observedAt) {
   let chatsSwept = 0;
   let messagesWritten = 0;
   let failedChats = 0;
-  let reachedWatermark = false;
 
-  for (let pageIndex = 0; pageIndex < MAX_CHAT_PAGES_PER_ACCOUNT && !reachedWatermark; pageIndex++) {
+  for (let pageIndex = 0; pageIndex < MAX_CHAT_PAGES_PER_ACCOUNT; pageIndex++) {
     // eslint-disable-next-line no-await-in-loop -- cursor pagination is inherently sequential
     const page = await listChatsPage({
       cursor, direction: 'before', accountIDs: [account.accountId], ...clientOptions,
     });
     assertPagedShape(page, '/v1/chats');
 
+    let pageNeededSweep = false;
     for (const chat of page.items) {
       const stored = cursors.get(String(chat?.id ?? ''));
-      if (!chatNeedsSweep(chat, stored)) {
-        // The list is ordered by last activity, so the first chat that is not
-        // newer than its watermark ends the walk for this account.
-        reachedWatermark = true;
-        break;
-      }
+      if (!chatNeedsSweep(chat, stored)) continue;
+      pageNeededSweep = true;
       // eslint-disable-next-line no-await-in-loop -- one chat at a time; each is its own transaction
       const result = await sweepChat({ chat, stored, clientOptions, observedAt }).catch((err) => {
         failedChats++;
@@ -601,7 +616,9 @@ async function sweepAccount(account, clientOptions, observedAt) {
       messagesWritten += result.messages;
     }
 
-    if (reachedWatermark || !page.hasMore) break;
+    // A chat that FAILED still counted as needing a sweep, so a bridge that
+    // 502s cannot end the account's walk early either.
+    if (!pageNeededSweep || !page.hasMore) break;
     if (!page.oldestCursor || page.oldestCursor === cursor) break;
     cursor = page.oldestCursor;
   }

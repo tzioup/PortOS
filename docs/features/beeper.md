@@ -209,9 +209,11 @@ registration; changing it takes effect at the next process start.
 Per account, one sweep:
 
 1. refreshes `beeper_accounts` from the live roster;
-2. pages `GET /v1/chats?accountIDs=…` newest-first and **stops at the first chat that is not
-   newer than the stored `beeper_sync_cursors.last_activity` watermark** — the list is ordered by
-   last activity, so everything past that point is older;
+2. pages `GET /v1/chats?accountIDs=…` newest-first, sweeping every chat on the page that is newer
+   than the stored `beeper_sync_cursors.last_activity` watermark, and **stops at the first page
+   that asks for no sweep at all**. One caught-up chat does not end the walk: the list is ordered
+   by last activity, not by eligibility, and a chat whose forward walk was truncated keeps its old
+   watermark on purpose, so it stays eligible while sorting below chats that are already caught up;
 3. for each changed chat: upserts the conversation, upserts participants, pages new messages
    forward from the stored opaque cursor, logs daily Tribe touchpoints, then commits message
    rows, attachment references and the cursor row in **one transaction**.
