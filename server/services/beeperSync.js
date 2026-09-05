@@ -451,14 +451,31 @@ async function commitMessages({ conversationId, accountId, sourceChatId, rows, c
 
     // The cursor moves LAST and only inside this transaction, so a failure
     // anywhere above rolls it back with the rows it was going to describe.
+    //
+    // `WHERE EXISTS` is the purge interlock. `beeper_sync_cursors` carries an FK
+    // onto `beeper_accounts` alone, so the conversation's cascade cannot reach
+    // it and `purgeConversation` deletes the two by hand in one transaction. A
+    // sweep already in flight when that purge commits would otherwise re-insert
+    // the cursor here — unconditionally, because a window with ZERO message rows
+    // still writes it — carrying the chat's current `last_activity`. That
+    // resurrected watermark makes `chatNeedsSweep` skip the chat, so the history
+    // the user just purged never comes back, contradicting the typed
+    // confirmation's promise that the next sync will mirror it again.
+    //
+    // The guard is a row check rather than a constraint on purpose: no DDL, no
+    // cascade, and the schema's own note that "a cursor can exist before the
+    // conversation row does" still holds everywhere else. On this path the
+    // conversation is upserted before the walk starts, so a missing row means it
+    // was deleted underneath us — exactly the case to decline.
     await client.query(
       `INSERT INTO beeper_sync_cursors (account_id, chat_id, cursor, last_activity, last_swept_at)
-       VALUES ($1, $2, $3, $4, NOW())
+       SELECT $1::text, $2::text, $3::text, $4::timestamptz, NOW()
+        WHERE EXISTS (SELECT 1 FROM beeper_conversations WHERE id = $5::uuid)
        ON CONFLICT (account_id, chat_id) DO UPDATE SET
          cursor = COALESCE(EXCLUDED.cursor, beeper_sync_cursors.cursor),
          last_activity = COALESCE(EXCLUDED.last_activity, beeper_sync_cursors.last_activity),
          last_swept_at = NOW()`,
-      [accountId, sourceChatId, cursor, lastActivity],
+      [accountId, sourceChatId, cursor, lastActivity, conversationId],
     );
     return rows.length;
   });
