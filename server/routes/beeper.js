@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
+import { asyncHandler, createServiceErrorMapper, ServerError } from '../lib/errorHandler.js';
 import { resolveOAuthOrigin } from '../lib/beeperOAuthOrigin.js';
 import { PORTOS_API_URL, PORTOS_UI_URL } from '../lib/ports.js';
 import { serveLocalFile } from '../lib/fileUtils.js';
@@ -216,12 +216,19 @@ router.get('/networks', asyncHandler(async (_req, res) => {
 // GET /api/beeper/conversations/:id — one conversation with its full mirrored
 // participant set. 404 when the id is unknown, so a stale deep link degrades to
 // the surface's not-found state instead of an empty thread that looks live.
+//
+// The chat surface fetches this with `silent: true` and renders its own inline
+// not-found state, and it re-fetches on every invalidation frame while the
+// missing id stays selected — so this is a speculative, expected-high-volume
+// 404, not an operator-actionable one. `severity: 'warning'` (mediaJobs.js's
+// GET /:id pattern) keeps it out of the global toast and the server console
+// via `useErrorNotifications` / `asyncHandler` while the body is unchanged:
+// callers still get a 404 + NOT_FOUND code, and it still reaches errorEvents.
 router.get('/conversations/:id', asyncHandler(async (req, res) => {
   const { id } = validateRequest(conversationParamsSchema, req.params);
   const conversation = await getConversation(id);
   if (!conversation) {
-    res.status(404).json({ error: 'Conversation not found', code: 'NOT_FOUND' });
-    return;
+    throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND', severity: 'warning' });
   }
   res.json(conversation);
 }));

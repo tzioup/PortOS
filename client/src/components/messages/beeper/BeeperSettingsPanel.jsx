@@ -29,10 +29,12 @@ import {
 // whether or not this drawer is open — Beeper's consent screen redirects the
 // browser back to the page, not to the drawer.
 //
-// `realtime` is a PROP rather than a second realtime subscription. The hook
-// emits `beeper:unsubscribe` on unmount, so another instance inside a drawer
-// would tear the surface's subscription down every time the drawer closed.
-// One subscriber per page; the page owns it.
+// `realtime` is a PROP, not a subscription this panel opens itself. Several
+// Beeper surfaces may each pair their own useBeeperRealtime subscribe/
+// unsubscribe (client/src/hooks/README.md sanctions this — see
+// useBeeperOutbox, mounted inside BeeperChatSurface); the page-level instance
+// in BeeperTab is the one that owns the status card, so this drawer just
+// reads what it's handed rather than opening a second one.
 export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onRealtimeSeed, onBreakerCleared }) {
   const {
     loading: settingsLoading, form, setForm, saving, dirty, save,

@@ -73,7 +73,7 @@ import {
   setAttachmentKeep,
 } from '../services/beeperAttachments.js';
 import { serveLocalFile } from '../lib/fileUtils.js';
-import { ServerError } from '../lib/errorHandler.js';
+import { ServerError, errorEvents } from '../lib/errorHandler.js';
 import { BeeperApiError } from '../services/beeperClient.js';
 
 const buildApp = () => {
@@ -605,7 +605,41 @@ describe('GET /api/beeper/conversations/:id and its messages', () => {
     vi.mocked(getConversation).mockResolvedValue(null);
     const res = await request(buildApp()).get(`/api/beeper/conversations/${CONV_ID}`);
     expect(res.status).toBe(404);
+    // Standard error envelope: { error, code, timestamp } — same shape
+    // errorMiddleware stamps everywhere else (regression for the hand-rolled
+    // res.status(404).json(...) this route used to write itself).
     expect(res.body.code).toBe('NOT_FOUND');
+    expect(typeof res.body.timestamp).toBe('number');
+  });
+
+  it('marks the 404 severity: warning (mediaJobs.js GET /:id pattern) so it still reaches errorEvents but skips the global toast and the server console.error', async () => {
+    vi.mocked(getConversation).mockResolvedValue(null);
+    const emit = vi.fn();
+    const capturedErrors = [];
+    const onError = (error) => capturedErrors.push(error);
+    errorEvents.on('error', onError);
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const app = buildApp();
+      app.set('io', { emit });
+      const res = await request(app).get(`/api/beeper/conversations/${CONV_ID}`);
+      expect(res.status).toBe(404);
+      // Still reaches the error broadcast — item 1's envelope/broadcast
+      // contract is unchanged, only the presentation drops.
+      expect(capturedErrors).toHaveLength(1);
+      expect(capturedErrors[0].severity).toBe('warning');
+      expect(emit).toHaveBeenCalledWith('error:occurred', expect.objectContaining({
+        code: 'NOT_FOUND',
+        severity: 'warning',
+      }));
+      // ...but does not write the server console.error a plain (non-warning)
+      // error would — that log line, repeated on every ~350ms refetch of a
+      // stale deep link, is exactly what this severity opts out of.
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorEvents.off('error', onError);
+      consoleErrorSpy.mockRestore();
+    }
   });
 
   it('rejects a non-uuid conversation id before it reaches the store', async () => {
