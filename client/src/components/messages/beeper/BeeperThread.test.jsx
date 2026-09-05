@@ -1,57 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
-import BeeperThread, { decodeHtmlEntities } from './BeeperThread';
-
-/**
- * #35 real-browser pass: a message body containing an ampersand rendered as
- * the five-character HTML entity `&amp;` in the thread bubble. Beeper Desktop
- * delivers entity-encoded text for some bridged networks; PortOS itself never
- * escapes on the way in (`beeperSync.js` `normalizeMessageRow` passes
- * `message.text` through unchanged), so decoding belongs here, on the way out
- * to the DOM — as a plain text node, never `dangerouslySetInnerHTML`.
- */
-describe('decodeHtmlEntities', () => {
-  it('decodes the five predefined named entities', () => {
-    expect(decodeHtmlEntities('&amp;')).toBe('&');
-    expect(decodeHtmlEntities('&lt;')).toBe('<');
-    expect(decodeHtmlEntities('&gt;')).toBe('>');
-    expect(decodeHtmlEntities('&quot;')).toBe('"');
-    expect(decodeHtmlEntities('&#39;')).toBe("'");
-  });
-
-  it('decodes a realistic sentence with an ampersand', () => {
-    expect(decodeHtmlEntities('salt &amp; pepper')).toBe('salt & pepper');
-  });
-
-  it('leaves a plain string with no entities untouched', () => {
-    expect(decodeHtmlEntities('no entities here')).toBe('no entities here');
-  });
-
-  it('is double-decode-safe: &amp;lt; decodes to &lt;, never <', () => {
-    expect(decodeHtmlEntities('&amp;lt;')).toBe('&lt;');
-  });
-
-  it('leaves an unknown named entity and an out-of-range numeric ref untouched', () => {
-    expect(decodeHtmlEntities('&zzz;')).toBe('&zzz;');
-    expect(decodeHtmlEntities('&#99999999;')).toBe('&#99999999;');
-  });
-
-  it('does not resolve inherited Object.prototype properties as entities', () => {
-    // Untrusted remote chat text can contain literally anything. A lookup of
-    // `NAMED_ENTITIES[code]` walks the prototype chain, so `&constructor;` and
-    // `&toString;` used to render as the stringified built-in functions
-    // instead of being left as unknown entities.
-    expect(decodeHtmlEntities('&constructor;')).toBe('&constructor;');
-    expect(decodeHtmlEntities('&toString;')).toBe('&toString;');
-    expect(decodeHtmlEntities('&hasOwnProperty;')).toBe('&hasOwnProperty;');
-  });
-
-  it('passes through non-string and empty input unchanged', () => {
-    expect(decodeHtmlEntities(undefined)).toBe(undefined);
-    expect(decodeHtmlEntities(null)).toBe(null);
-    expect(decodeHtmlEntities('')).toBe('');
-  });
-});
+import BeeperThread from './BeeperThread';
 
 /**
  * PR #60 blocker 1: `OutboxRow` had no branch for the `approved` state — only
@@ -218,5 +167,47 @@ describe('BeeperThread — outbox row states', () => {
 
     fireEvent.click(retry);
     expect(retryOutboxEntry).toHaveBeenCalledWith(OUTBOX_ENTRY);
+  });
+});
+
+/**
+ * Final live pass: some networks (Discord, Matrix — 26% of messages on a real
+ * install) deliver HTML bodies, and the mirror stores what the source sent, so
+ * the bubble rendered the tags literally. The allowlisted subset is parsed and
+ * rendered as elements; nothing reaches `dangerouslySetInnerHTML`.
+ */
+describe('BeeperThread — message bodies', () => {
+  const message = (body) => ({
+    id: 'msg-1', body, sentAt: '2026-09-01T10:00:00.000Z', isSender: false, senderId: 'user-1',
+  });
+
+  it('renders an HTML body as elements rather than showing the tags', () => {
+    renderThread({ messages: [message('<p>hello <strong>there</strong></p><p>second line</p>')] });
+
+    const bubble = screen.getByTestId('beeper-message');
+    expect(bubble).toHaveTextContent('hello there');
+    expect(bubble).toHaveTextContent('second line');
+    expect(bubble.textContent).not.toContain('<p>');
+    expect(bubble.textContent).not.toContain('<strong>');
+    expect(bubble.querySelector('strong')).toBeInTheDocument();
+  });
+
+  it('renders a blockquote and a link, and refuses a non-http scheme', () => {
+    renderThread({
+      messages: [message('<blockquote>quoted</blockquote><p><a href="https://example.com">ok</a> <a href="javascript:alert(1)">no</a></p>')],
+    });
+
+    const bubble = screen.getByTestId('beeper-message');
+    expect(bubble.querySelector('blockquote')).toHaveTextContent('quoted');
+    const links = bubble.querySelectorAll('a');
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute('href', 'https://example.com');
+    expect(bubble).toHaveTextContent('no');
+  });
+
+  it('keeps a plain body on the text-node path with its entities decoded (#59)', () => {
+    renderThread({ messages: [message('salt &amp; pepper — 5 < 6')] });
+
+    expect(screen.getByTestId('beeper-message')).toHaveTextContent('salt & pepper — 5 < 6');
   });
 });

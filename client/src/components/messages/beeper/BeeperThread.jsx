@@ -5,6 +5,7 @@ import {
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
 import BeeperAttachment from './BeeperAttachment';
 import InlineConfirmRow from '../../ui/InlineConfirmRow';
+import { decodeHtmlEntities, parseMessageBody } from '../../../lib/beeperMessageBody';
 import { formatBytes } from '../../../utils/formatters';
 
 /**
@@ -47,36 +48,53 @@ import { formatBytes } from '../../../utils/formatters';
  * reference interface's shape.
  */
 
-// Real-browser pass on #35: a message body containing an ampersand rendered
-// as the five-character HTML entity `&amp;` in the thread bubble. `beeperSync.js`
-// `normalizeMessageRow` writes `message.text` through unescaped, and PortOS
-// never HTML-encodes on the way in — Beeper Desktop itself delivers
-// entity-encoded text for some bridged networks, so the decode belongs here,
-// on the way OUT to the DOM. This renders as a plain text node (`{body}`
-// below), never `dangerouslySetInnerHTML`, so decoding entities only changes
-// which characters are shown — it cannot introduce markup.
-//
-// Mirrors `server/lib/xmlEntities.js` `decodeXmlEntities` (also privately
-// mirrored by `client/src/lib/tabNotation.js` — lib stays a leaf, so each
-// consumer carries its own small copy rather than one lib file importing
-// another). Keep the three in sync.
-const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
-const ENTITY_RE = /&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]*);/g;
-// Exported for the focused parser-level unit test (root AGENTS.md Test
-// Strategy: "parsers and algorithms with a real input matrix" are exactly the
-// case a higher-level render test cannot pin as cheaply).
-export const decodeHtmlEntities = (str) => {
-  if (typeof str !== 'string' || str.indexOf('&') === -1) return str;
-  return str.replace(ENTITY_RE, (match, code) => {
-    if (code[0] === '#') {
-      const cp = code[1] === 'x' || code[1] === 'X'
-        ? parseInt(code.slice(2), 16)
-        : parseInt(code.slice(1), 10);
-      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : match;
-    }
-    return Object.hasOwn(NAMED_ENTITIES, code) ? NAMED_ENTITIES[code] : match;
+/**
+ * One message body.
+ *
+ * Two shapes arrive from Beeper and both are handled here. A PLAIN body is a
+ * text node with its entities decoded (#59: an ampersand was rendering as the
+ * five-character `&amp;`, because `normalizeMessageRow` stores what the source
+ * sent and some bridges send entity-encoded text). An HTML body — 26% of
+ * messages on a real install, Discord and Matrix — is parsed into an
+ * allowlisted block/span model by `lib/beeperMessageBody.js` and rendered as
+ * React elements, since rendering it as a text node showed the tags literally.
+ *
+ * Nothing here ever reaches `dangerouslySetInnerHTML`: every branch produces
+ * elements and text nodes, so a tag outside the allowlist cannot execute, load
+ * or style anything.
+ */
+function MessageBody({ body }) {
+  const blocks = parseMessageBody(body);
+  if (blocks === null) return <p className="whitespace-pre-wrap break-words">{decodeHtmlEntities(body)}</p>;
+  return blocks.map((block, blockIndex) => {
+    const spans = block.spans.map((span, spanIndex) => {
+      const key = `${blockIndex}-${spanIndex}`;
+      let node = span.text;
+      if (span.bold) node = <strong className="font-semibold">{node}</strong>;
+      if (span.italic) node = <em className="italic">{node}</em>;
+      if (span.href) {
+        node = (
+          <a
+            href={span.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-port-accent underline underline-offset-2"
+          >
+            {node}
+          </a>
+        );
+      }
+      return <span key={key}>{node}</span>;
+    });
+    return block.type === 'quote'
+      ? (
+        <blockquote key={blockIndex} className="my-1 border-l-2 border-port-border pl-2 whitespace-pre-wrap break-words text-gray-300">
+          {spans}
+        </blockquote>
+      )
+      : <p key={blockIndex} className="whitespace-pre-wrap break-words">{spans}</p>;
   });
-};
+}
 
 const dayLabel = (iso) => {
   if (!iso) return 'Unknown date';
@@ -632,7 +650,7 @@ export default function BeeperThread({
                       <Trash2 size={12} /> This message was unsent
                     </p>
                   ) : (
-                    <p className="whitespace-pre-wrap break-words">{decodeHtmlEntities(message.body)}</p>
+                    <MessageBody body={message.body} />
                   )}
                   {/* Bytes arrive on first view through the mirror route, not
                       with the message payload — see BeeperAttachment. */}

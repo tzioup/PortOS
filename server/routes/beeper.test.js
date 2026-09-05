@@ -219,6 +219,55 @@ describe('POST /api/beeper/oauth/start', () => {
     });
   });
 
+  // Under the Vite dev proxy (`changeOrigin: true`, no `x-forwarded-*`) the
+  // request carries the API's own origin on the API port, so the derivation
+  // above sent the browser to a host the TLS certificate does not cover. The
+  // browser sends its own origin, and a recognized one wins.
+  it('uses the browser origin the client sent when the request origin is the proxy target', async () => {
+    vi.mocked(startBeeperOAuth).mockResolvedValue({ authorizationUrl: 'http://127.0.0.1:23373/oauth/authorize?x=1', redirectUri: 'x', state: 's' });
+    const res = await request(buildApp())
+      .post('/api/beeper/oauth/start')
+      .set('X-Forwarded-Proto', 'https')
+      .set('X-Forwarded-Host', 'localhost:5555')
+      .send({ origin: 'http://localhost:5554' });
+
+    expect(res.status).toBe(200);
+    expect(startBeeperOAuth).toHaveBeenCalledWith({
+      redirectUri: 'http://localhost:5554/api/beeper/oauth/callback',
+      clientUri: 'http://localhost:5554',
+    });
+  });
+
+  it('ignores a browser origin this install does not serve and falls back to the request origin', async () => {
+    vi.mocked(startBeeperOAuth).mockResolvedValue({ authorizationUrl: 'http://127.0.0.1:23373/oauth/authorize?x=1', redirectUri: 'x', state: 's' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const res = await request(buildApp())
+      .post('/api/beeper/oauth/start')
+      .set('X-Forwarded-Proto', 'https')
+      .set('X-Forwarded-Host', 'example.ts.net:5555')
+      .send({ origin: 'https://example.com' });
+
+    expect(res.status).toBe(200);
+    expect(startBeeperOAuth).toHaveBeenCalledWith({
+      redirectUri: 'https://example.ts.net:5555/api/beeper/oauth/callback',
+      clientUri: 'https://example.ts.net:5555',
+    });
+    // The warning never carries the value: it is a host off the user's own
+    // machine or tailnet, and this line can end up in a shared log.
+    expect(String(warn.mock.calls[0]?.[0])).not.toContain('example.com');
+    warn.mockRestore();
+  });
+
+  it('rejects an unexpected body field rather than letting it through unvalidated', async () => {
+    const res = await request(buildApp())
+      .post('/api/beeper/oauth/start')
+      .send({ origin: 'http://localhost:5554', unexpected: true });
+
+    expect(res.status).toBe(400);
+    expect(startBeeperOAuth).not.toHaveBeenCalled();
+  });
+
   it('maps a discovery failure to 502 and marks it non-retryable', async () => {
     vi.mocked(startBeeperOAuth).mockRejectedValue(
       new BeeperApiError('Beeper authorization-server metadata unavailable (404)', { status: 502, code: 'OAUTH_DISCOVERY_FAILED', retryable: false }),

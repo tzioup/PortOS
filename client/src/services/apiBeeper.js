@@ -67,7 +67,19 @@ export const setBeeperConversationLowPriority = (conversationId, lowPriority, op
 // no-expiry token and the OAuth surface accepts no lifetime at all. None of
 // these ever return a token value: the client only ever sees `tokenConfigured`,
 // `tokenExpiresAt` and `tokenSource`.
-export const startBeeperOAuth = (options = {}) => request('/beeper/oauth/start', { method: 'POST', ...options });
+//
+// The browser sends its OWN origin, because the server cannot derive it: under
+// the Vite dev proxy (`changeOrigin: true`, no `x-forwarded-*`) the request
+// arrives carrying the API's origin on the API port, so the consent redirect
+// went to a host the TLS certificate does not cover and the user landed on a
+// certificate error. The server validates the value against the hosts this
+// install answers on and falls back to the request origin when it does not
+// recognize it.
+export const startBeeperOAuth = (options = {}) => request('/beeper/oauth/start', {
+  method: 'POST',
+  body: JSON.stringify({ origin: window.location.origin }),
+  ...options,
+});
 export const saveBeeperToken = (token, options = {}) => request('/beeper/token', { method: 'POST', body: JSON.stringify({ token }), ...options });
 export const disconnectBeeper = (options = {}) => request('/beeper/token', { method: 'DELETE', ...options });
 

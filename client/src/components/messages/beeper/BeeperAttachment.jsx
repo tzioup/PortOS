@@ -211,17 +211,32 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
   if (isImage(row.mimeType)) {
     // Attachments carry size.width/size.height from the sweep (`beeperSync.js`
     // normalizeAttachment) as plain `width`/`height` fields once persisted.
-    // With those, the native width/height attributes reserve the image's real
-    // aspect ratio before the first byte arrives; without them (older rows, or
-    // a network that never reported size), the skeleton falls back to a fixed
-    // neutral box so the layout still doesn't collapse to nothing.
+    //
+    // The native width/height attributes are NOT enough to reserve the box in a
+    // real browser: the image carries `w-auto` and Tailwind's preflight sets
+    // `height: auto`, and an explicit CSS `width`/`height` beats the
+    // presentational attributes — so an unloaded image is 0x0 and the absolutely
+    // positioned skeleton has nothing to fill. The WRAPPER therefore carries an
+    // explicit `aspect-ratio` plus the width the loaded image will actually
+    // occupy: its natural width, capped by the `max-h-64` the image is bound to
+    // (so a tall image reserves the height it will really take) and by
+    // `max-w-full` at the bubble edge. Without dimensions (older rows, or a
+    // network that never reported size) the skeleton keeps the fixed neutral
+    // box, so the layout still does not collapse to nothing.
     const hasDims = Number.isFinite(row.width) && row.width > 0
       && Number.isFinite(row.height) && row.height > 0;
+    const reservedBox = hasDims
+      ? {
+        aspectRatio: `${row.width} / ${row.height}`,
+        width: `min(${row.width}px, calc(16rem * ${(row.width / row.height).toFixed(4)}))`,
+        maxWidth: '100%',
+      }
+      : (!imgLoaded ? { width: '8rem', height: '8rem' } : undefined);
     return (
       <div className="mt-1">
         <div
           className="relative w-fit max-w-full overflow-hidden rounded-lg border border-port-border"
-          style={!imgLoaded && !hasDims ? { width: '8rem', height: '8rem' } : undefined}
+          style={reservedBox}
         >
           {!imgLoaded && (
             <div

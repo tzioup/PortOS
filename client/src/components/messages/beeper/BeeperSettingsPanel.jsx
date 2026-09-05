@@ -440,6 +440,40 @@ function BeeperRealtimeRow({ realtime, showRemedy = true }) {
   );
 }
 
+/**
+ * The mirrored account roster (#30), rendered in EVERY reachability state.
+ *
+ * These rows come from `beeper_accounts` — PortOS's own mirror — not from a
+ * live call, which is the whole reason #27 stores them: the card is supposed to
+ * render with Beeper Desktop closed. Hiding the roster whenever the probe fails
+ * threw away information the install already had and made an unreachable app
+ * look like an empty one, so reachability is stated on its own line above and
+ * the roster stands beside it.
+ *
+ * Read-only by design: it never offers to add a network. Joined by `accountId`,
+ * never by `network`.
+ */
+function AccountRoster({ accounts }) {
+  const rows = Array.isArray(accounts) ? accounts : [];
+  return (
+    <div className="space-y-1.5">
+      <p className="text-[11px] uppercase tracking-wide text-gray-500">Mirrored accounts</p>
+      {rows.length === 0 ? (
+        <p data-testid="beeper-roster-empty" className="text-sm text-gray-500">No accounts mirrored yet.</p>
+      ) : (
+        <ul data-testid="beeper-roster" className="space-y-1.5">
+          {rows.map((account) => (
+            <li key={account.accountId} className="flex items-center justify-between text-sm text-gray-300 border-t border-port-border pt-1.5 first:border-t-0 first:pt-0">
+              <span>{account.displayName || account.accountId}</span>
+              <span className="text-xs text-gray-500 uppercase">{account.network || '—'}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 // Every state the status card can be in, decided at fork issue #11 and
 // carried into #30's Acceptance criteria. `reachable` is read with strict
 // equality throughout (`=== false` / `=== true` / `=== null`) — never
@@ -522,6 +556,8 @@ function BeeperStatusCard({
         <p className="text-xs text-gray-500 mt-1">Checked against {status.baseUrl}.</p>
         <TokenExpiryNotice status={status} />
         <div className="mt-2"><BeeperRealtimeRow realtime={realtime} /></div>
+        {/* The mirror still knows which accounts exist even with Beeper closed. */}
+        <div className="mt-3"><AccountRoster accounts={status.accounts} /></div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -540,7 +576,6 @@ function BeeperStatusCard({
   }
 
   if (status.reachable === true) {
-    const accounts = Array.isArray(status.accounts) ? status.accounts : [];
     return (
       <div className="bg-port-card border border-port-success/40 rounded-lg p-4 sm:p-6 space-y-3">
         <div className="flex items-center gap-2">
@@ -550,18 +585,7 @@ function BeeperStatusCard({
         </div>
         <TokenExpiryNotice status={status} />
         <BeeperRealtimeRow realtime={realtime} />
-        {accounts.length === 0 ? (
-          <p className="text-sm text-gray-500">No accounts synced yet.</p>
-        ) : (
-          <ul className="space-y-1.5">
-            {accounts.map((account) => (
-              <li key={account.accountId} className="flex items-center justify-between text-sm text-gray-300 border-t border-port-border pt-1.5 first:border-t-0 first:pt-0">
-                <span>{account.displayName || account.accountId}</span>
-                <span className="text-xs text-gray-500 uppercase">{account.network || '—'}</span>
-              </li>
-            ))}
-          </ul>
-        )}
+        <AccountRoster accounts={status.accounts} />
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -589,6 +613,7 @@ function BeeperStatusCard({
         <h3 className="text-sm font-semibold text-white">Checking Beeper Desktop…</h3>
       </div>
       <BeeperRealtimeRow realtime={realtime} />
+      <AccountRoster accounts={status.accounts} />
     </div>
   );
 }

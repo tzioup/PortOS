@@ -11,10 +11,18 @@ vi.mock('./beeperCredentials.js', () => ({
   // call in this flow passes an explicit token (or an explicit null).
   resolveBeeperToken: vi.fn(),
 }));
+// Arming the sweep and the realtime transport is orchestration this module
+// triggers but does not own — what a reconcile actually does to each subsystem
+// is `beeperArming.test.js`. Here the assertion is only that every path which
+// changes whether a credential exists fires one.
+vi.mock('./beeperArming.js', () => ({
+  reconcileBeeperIngestion: vi.fn(async () => ({ armed: true, changed: true })),
+}));
 
 import { fetchWithTimeout } from '../lib/fetchWithTimeout.js';
 import { mockJsonResponse } from '../lib/testHelper.js';
 import { getSettings } from './settings.js';
+import { reconcileBeeperIngestion } from './beeperArming.js';
 import { deleteBeeperCredential, readBeeperCredential, saveBeeperCredential } from './beeperCredentials.js';
 import {
   __resetPendingAuthorizationsForTests, completeBeeperOAuth, connectWithPastedToken,
@@ -302,6 +310,38 @@ describe('completeBeeperOAuth', () => {
     await expect(completeBeeperOAuth({ code: 'auth-code', state }))
       .rejects.toMatchObject({ code: 'OAUTH_EXCHANGE_FAILED', message: expect.stringContaining('invalid_grant') });
     expect(saveBeeperCredential).not.toHaveBeenCalled();
+    // Nothing was stored, so the gate did not move.
+    expect(reconcileBeeperIngestion).not.toHaveBeenCalled();
+  });
+
+  // The live-pass blocker: the arming gate was read at boot only, so a connect
+  // on a running install left realtime down (`reconnectAttempts: 0`) and no
+  // sweep registered until the next restart.
+  it('arms ingestion once the credential is stored, without waiting for a restart', async () => {
+    mockConnectStart();
+    const { state } = await startBeeperOAuth({ redirectUri: REDIRECT_URI });
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse({ access_token: TOKEN }))
+      .mockResolvedValueOnce(mockJsonResponse(INFO));
+
+    await completeBeeperOAuth({ code: 'auth-code', state });
+
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'oauth-connect' });
+  });
+
+  // The credential is already vaulted by then, so a reconcile that throws must
+  // not turn a completed connect into a failure.
+  it('still reports a successful connect when arming fails', async () => {
+    vi.mocked(reconcileBeeperIngestion).mockRejectedValueOnce(new Error('Beeper request failed'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockConnectStart();
+    const { state } = await startBeeperOAuth({ redirectUri: REDIRECT_URI });
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse({ access_token: TOKEN }))
+      .mockResolvedValueOnce(mockJsonResponse(INFO));
+
+    await expect(completeBeeperOAuth({ code: 'auth-code', state }))
+      .resolves.toMatchObject({ tokenConfigured: true, tokenSource: 'oauth' });
   });
 });
 
@@ -451,6 +491,28 @@ describe('connectWithPastedToken', () => {
     await expect(connectWithPastedToken('   ')).rejects.toMatchObject({ code: 'TOKEN_REQUIRED', status: 400 });
     expect(fetchWithTimeout).not.toHaveBeenCalled();
     expect(saveBeeperCredential).not.toHaveBeenCalled();
+    expect(reconcileBeeperIngestion).not.toHaveBeenCalled();
+  });
+
+  // Both credential-store paths arm, not just OAuth: pasting a token is a
+  // first-class alternative (#11 decision 3), so it must leave the install in
+  // the same running state.
+  it('arms ingestion after vaulting a pasted token', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse(METADATA))
+      .mockResolvedValueOnce(mockJsonResponse({ active: true, scope: 'read write' }));
+
+    await connectWithPastedToken(TOKEN);
+
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'token-pasted' });
+  });
+
+  it('does not arm when the token was refused', async () => {
+    vi.mocked(fetchWithTimeout)
+      .mockResolvedValueOnce(mockJsonResponse(METADATA))
+      .mockResolvedValueOnce(mockJsonResponse({ active: false }));
+    await expect(connectWithPastedToken(TOKEN)).rejects.toMatchObject({ code: 'TOKEN_REJECTED' });
+    expect(reconcileBeeperIngestion).not.toHaveBeenCalled();
   });
 });
 
@@ -484,5 +546,16 @@ describe('disconnectBeeper', () => {
     vi.mocked(deleteBeeperCredential).mockResolvedValue({ deleted: true, tokenConfigured: false });
     await expect(disconnectBeeper()).resolves.toMatchObject({ deleted: true });
     expect(fetchWithTimeout).not.toHaveBeenCalled();
+  });
+
+  // The symmetric half of the live-pass blocker: without this the relay kept
+  // running on a token that had just been revoked.
+  it('reconciles ingestion after deleting the credential, so the relay stops', async () => {
+    vi.mocked(readBeeperCredential).mockResolvedValue({ token: TOKEN, tokenSource: 'pasted', clientId: '' });
+    vi.mocked(deleteBeeperCredential).mockResolvedValue({ deleted: true, tokenConfigured: false });
+
+    await disconnectBeeper();
+
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'disconnect' });
   });
 });

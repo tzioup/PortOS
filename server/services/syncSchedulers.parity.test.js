@@ -10,7 +10,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // before the factory ever runs — so `./beeperSync.js` is mocked with that gate
 // already open here; `beeperScheduler.test.js` covers the closed cases.
 const scheduleMock = vi.fn();
-vi.mock('./eventScheduler.js', () => ({ schedule: (...args) => scheduleMock(...args) }));
+// `getEvent`/`cancel` are here for beeperScheduler's arm/disarm helpers, which
+// ask the scheduler whether `beeper-sync` is already registered rather than
+// keeping a second copy of that fact. Nothing is registered in this suite, so
+// `getEvent` always answers null.
+vi.mock('./eventScheduler.js', () => ({
+  schedule: (...args) => scheduleMock(...args),
+  getEvent: () => null,
+  cancel: () => false,
+}));
 
 const enabledConfig = async () => ({ enabled: true, intervalMinutes: 25 });
 vi.mock('./imessageSync.js', () => ({ getImessageConfig: enabledConfig, runSync: vi.fn() }));
