@@ -65,7 +65,14 @@ export default function BeeperTab() {
       .catch(() => {});
   }, [seedRealtime, mountedRef]);
 
-  useEffect(() => { seedStatus(); }, [seedStatus]);
+  // Re-read on the invalidation counter, not only at mount. `seedStatus` is a
+  // stable callback, so keying the effect on it alone made this a MOUNT-TIME
+  // SNAPSHOT: a breaker that trips during the session (a send loop, three
+  // refused sends in a row) never reached the composer, which stayed live
+  // against a server that would refuse every send until a human cleared it —
+  // and the only way to see the truth was a page reload. The counter is the
+  // one "something moved" signal this page already owns.
+  useEffect(() => { seedStatus(); }, [seedStatus, invalidationSeq]);
 
   // Beeper redirects the BROWSER back to this PAGE after consent (#31), not to
   // the settings drawer — so the outcome flag is read here, where something is

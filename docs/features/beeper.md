@@ -370,8 +370,10 @@ is terminal and says so:
   **Retry**, which re-dispatches that same row because nothing ever touched the wire for it, and
   **Dismiss**, which discards it.
 
-Send is disabled and names the reason while the breaker is tripped; the breaker's own banner
-stays in the settings drawer rather than appearing a second time on the chat surface.
+Send is disabled and names the reason while the breaker is tripped — re-read whenever the mirror
+signals a change, so a breaker that trips mid-session reaches the composer without a reload; the
+breaker's own banner stays in the settings drawer rather than appearing a second time on the chat
+surface.
 
 ## Purge and disconnect
 
