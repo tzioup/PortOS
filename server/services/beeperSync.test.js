@@ -466,7 +466,9 @@ describe('cursor transactionality', () => {
     expect(insert).toBeTruthy();
     expect(insert.params.at(-1)).toBe(true);
     // A later page may omit the optional field; the upsert must not flip a
-    // message the user actually sent onto the other side of the thread.
+    // message the user actually sent onto the other side of the thread. This is
+    // the guard's SHAPE against a mocked client — the row-level proof that a
+    // stored TRUE survives a second sweep lives in `beeperSync.db.test.js`.
     expect(insert.text).toContain('is_sender = beeper_messages.is_sender OR EXCLUDED.is_sender');
   });
 

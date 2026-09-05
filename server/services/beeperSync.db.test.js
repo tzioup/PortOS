@@ -13,7 +13,9 @@
  *   - the stored watermark stops the second sweep from re-paging an unchanged
  *     chat;
  *   - a sweep whose conversation is purged mid-flight commits no cursor row, so
- *     a purge can never be silently undone by a resurrected watermark.
+ *     a purge can never be silently undone by a resurrected watermark;
+ *   - a stored `is_sender` TRUE survives a later sweep whose payload omits the
+ *     optional field.
  *
  * `*.db.test.js` → runs ONLY via `npm run test:db` against `portos_test`
  * (registered in vitest.config.db.js's DB_TEST_INCLUDE — a `<name>.db.test.js`
@@ -287,5 +289,51 @@ describe.skipIf(!runDb)('beeperSync against Postgres', () => {
     // Nothing resurrects the watermark, so the next sweep sees a never-swept
     // chat and mirrors it from scratch — what the purge confirmation promises.
     expect(cursor.rows).toHaveLength(0);
+  });
+
+  // `is_sender` is the only inbound/outbound signal a chat surface has —
+  // `accounts[].user.id` differs from `senderID` on every network, so nothing
+  // can be recomputed from the rest of the row. The unit suite can only assert
+  // the upsert's SQL against a mocked client; the guarantee is a property of
+  // the ROW after two sweeps, and that is what this pins.
+  it('never downgrades a stored is_sender TRUE when a later sweep omits the field', async () => {
+    const chatId = `${nonce}-chat-sender`;
+    const messageId = `${nonce}-msg-sender`;
+    const chatAt = (lastActivity) => ({
+      ...chatFixture(lastActivity),
+      id: chatId,
+      participants: { hasMore: false, total: 0, items: [] },
+    });
+    const outbound = (withFlag) => ({
+      id: messageId,
+      chatID: chatId,
+      accountID: ACCOUNT_ID,
+      senderID: `${nonce}-self`,
+      timestamp: '2026-09-05T10:00:00.000Z',
+      sortKey: '000000002',
+      text: 'Example outbound message',
+      attachments: [],
+      ...(withFlag ? { isSender: true } : {}),
+    });
+
+    installFetch({
+      chats: { items: [chatAt('2026-09-05T10:00:00.000Z')], hasMore: false },
+      messages: { items: [outbound(true)], hasMore: false, newestCursor: 'cursor-sender-1' },
+    });
+    await runBeeperSweep({ reason: 'db-test' });
+    const first = await query('SELECT is_sender FROM beeper_messages WHERE id = $1', [messageId]);
+    expect(first.rows[0].is_sender).toBe(true);
+
+    // The field is optional on the inbound Message, and the normalizer reads an
+    // omitted one as inbound — so a re-observation of the same message must not
+    // flip a message the user actually sent onto the other side of the thread.
+    installFetch({
+      chats: { items: [chatAt('2026-09-06T10:00:00.000Z')], hasMore: false },
+      messages: { items: [outbound(false)], hasMore: false, newestCursor: 'cursor-sender-2' },
+    });
+    await runBeeperSweep({ reason: 'db-test' });
+
+    const second = await query('SELECT is_sender FROM beeper_messages WHERE id = $1', [messageId]);
+    expect(second.rows[0].is_sender).toBe(true);
   });
 });
