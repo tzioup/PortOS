@@ -310,9 +310,11 @@ function assertPagedShape(page, what) {
  * every message of every chat the first time a user enables the toggle is not
  * a sweep.
  *
- * `truncated` is true only when the walk ran out of PAGE BUDGET with the
- * server still reporting `hasMore` — i.e. messages exist that this pass did
- * not fetch. The caller MUST NOT advance the chat's watermark in that case
+ * `truncated` is true whenever a FORWARD walk ends with the server still
+ * reporting `hasMore` — i.e. messages exist that this pass did not fetch.
+ * That is the page budget running out, and equally a server that answers
+ * `hasMore: true` with no usable cursor to continue on (a null one, or the one
+ * it was just handed). The caller MUST NOT advance the chat's watermark in that case
  * (see `sweepChat`): the cursor moved forward but the newest messages are
  * still missing, and a watermark equal to the chat's current activity would
  * make `chatNeedsSweep` skip the chat forever. The first-page-only anchor walk
@@ -334,7 +336,17 @@ async function fetchNewMessages(chatId, storedCursor, clientOptions) {
     if (page.newestCursor) anchorCursor = page.newestCursor;
     if (!page.hasMore) break;
     const nextCursor = direction === 'after' ? page.newestCursor : page.oldestCursor;
-    if (!nextCursor || nextCursor === cursor) break;
+    if (!nextCursor || nextCursor === cursor) {
+      // The server says there is more and hands back no way to ask for it — a
+      // null cursor, or the very cursor it was just given. On a forward walk
+      // that is the same state as running out of page budget: messages exist
+      // that this pass did not fetch, so the watermark must not commit over
+      // them. Reading it as a clean end (which is what falling out of the loop
+      // with `truncated === false` did) marked the chat caught up and lost
+      // every message beyond the stall.
+      truncated = direction === 'after';
+      break;
+    }
     cursor = nextCursor;
     if (direction === 'after' && pageIndex === maxPages - 1) truncated = true;
   }
