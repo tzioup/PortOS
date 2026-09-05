@@ -235,6 +235,24 @@ export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onR
             </div>
           </div>
 
+          {/* Loopback-only by default (SEC-2) — a non-loopback base URL would
+              carry the Beeper access token off this machine on every request. */}
+          <label htmlFor="beeper-allow-non-loopback" className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer">
+            <input
+              id="beeper-allow-non-loopback"
+              type="checkbox"
+              checked={form.allowNonLoopbackBaseUrl}
+              onChange={(e) => setForm((prev) => ({ ...prev, allowNonLoopbackBaseUrl: e.target.checked }))}
+              className="w-4 h-4 mt-0.5 accent-port-accent"
+            />
+            <span>
+              Allow a non-loopback base URL
+              <span className="block text-xs text-gray-500">
+                Off by default — a non-loopback address sends the Beeper access token off this machine on every request.
+              </span>
+            </span>
+          </label>
+
           <div className="pt-1">
             <button
               type="button"

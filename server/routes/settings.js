@@ -345,9 +345,13 @@ router.put('/', asyncHandler(async (req, res) => {
   // `token`/`tokenExpiresAt` field, so a client attempting to smuggle a token
   // through this generic route 400s instead of it silently reaching disk —
   // the credential's own write path is POST/DELETE /api/beeper/token (#31),
-  // which stores it AES-256-GCM encrypted in Postgres.
+  // which stores it AES-256-GCM encrypted in Postgres. Used directly, NOT
+  // `.partial()`: every field is already individually `.optional()` (so
+  // `.partial()` was a no-op), and the schema's `superRefine` (SEC-2's
+  // loopback-only `baseUrl` gate) returns a `ZodEffects`, which has no
+  // `.partial()` method at all.
   if (req.body?.beeper !== undefined) {
-    validateRequest(beeperSettingsSchema.partial(), req.body.beeper);
+    validateRequest(beeperSettingsSchema, req.body.beeper);
   }
   // Spotify ingestion config (#2152) — validate the slice when present so a
   // malformed enabled/interval can't reach disk and break the sync scheduler.

@@ -13,6 +13,7 @@ import { PORTS } from './ports.js';
 import { ASSESSABLE_RUNTIMES } from './localProviderRuntime.js';
 import { SWEEP_SCOPES } from './localModelAssessment.js';
 import { CAPABILITY_TEST_IDS } from './modelCapabilityTests.js';
+import { isLoopbackHostname, parseBrowserOrigin } from './beeperOAuthOrigin.js';
 
 // iMessage ingestion config (#2151) — the `settings.imessage` slice. Sync is OFF
 // by default and only reads chat.db when enabled (needs macOS Full Disk Access).
@@ -63,12 +64,45 @@ export const youtubeConfigSchema = z.object({
 // plaintext. `.strict()` so a client attempting to
 // smuggle a token through this generic route 400s instead of the value
 // silently reaching disk.
+// `baseUrl` is prefixed onto every Beeper API call AND the realtime WebSocket
+// URL with `Authorization: Bearer <vault token>` attached (SEC-2) — so a value
+// pointed at an attacker-controlled host turns one settings PUT into a
+// credential exfiltration (SSRF). Loopback-only by default: `baseUrl` must
+// parse as a bare `http(s)` origin (reusing `parseBrowserOrigin`, the same
+// "not a path, not a query, not credentials" parser the OAuth redirect-origin
+// gate uses) whose hostname is loopback (`isLoopbackHostname`, ditto reused
+// rather than duplicated). `allowNonLoopbackBaseUrl` is the explicit opt-in
+// for an install that genuinely runs Beeper Desktop elsewhere on the
+// network — off by default, so the dangerous posture is never the shipped one.
+// Both checks are re-applied inside `normalizeBaseUrl`
+// (`server/services/beeperClient.js`) because `getSettings()` reads
+// `settings.json` with no schema re-validation on read, so a hand-edited file
+// is a second path to the same value this schema exists to block.
 export const beeperSettingsSchema = z.object({
   enabled: z.boolean().optional(),
   intervalMinutes: z.number().int().min(1).max(1440).optional(),
   baseUrl: z.string().trim().min(1).max(500).optional(),
   attachmentBudgetGb: z.number().min(0.1).max(1000).optional(),
-}).strict();
+  allowNonLoopbackBaseUrl: z.boolean().optional(),
+}).strict().superRefine((value, ctx) => {
+  if (value.baseUrl === undefined) return;
+  const parsed = parseBrowserOrigin(value.baseUrl);
+  if (!parsed) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['baseUrl'],
+      message: 'baseUrl must be a bare http(s) origin (scheme, host, optional port — no path, query, or credentials)',
+    });
+    return;
+  }
+  if (!isLoopbackHostname(parsed.hostname) && value.allowNonLoopbackBaseUrl !== true) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['baseUrl'],
+      message: 'baseUrl must be a loopback origin unless allowNonLoopbackBaseUrl is set',
+    });
+  }
+});
 
 // Beeper connect flow (#31). The token NEVER rides the generic settings route
 // (`beeperSettingsSchema` above is `.strict()` with no token field) — it is

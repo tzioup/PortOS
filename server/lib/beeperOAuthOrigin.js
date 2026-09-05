@@ -37,7 +37,11 @@
 // URL defaults to `127.0.0.1` for exactly that reason.
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
 
-const isLoopbackHostname = (hostname) => LOOPBACK_HOSTNAMES.has(String(hostname).toLowerCase())
+// Exported so other Beeper-facing modules that make the same "is this
+// loopback" decision (the `settings.beeper.baseUrl` gate, #30/SEC-2; the OAuth
+// token-endpoint host pin, SEC-3) reuse this one predicate rather than each
+// keeping their own copy of the loopback-spelling list.
+export const isLoopbackHostname = (hostname) => LOOPBACK_HOSTNAMES.has(String(hostname).toLowerCase())
   // 127.0.0.0/8 is all loopback, not just .0.1.
   || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(String(hostname));
 
