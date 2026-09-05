@@ -83,6 +83,7 @@ const query = vi.fn(async (sql, params = []) => {
       errorMessage: null,
       createdAt: '2026-09-01T00:00:00.000Z',
       approvedAt: '2026-09-01T00:00:00.000Z',
+      updatedAt: '2026-09-01T00:00:00.000Z',
       sentAt: null,
     };
     outbox.set(row.id, row);
@@ -91,6 +92,21 @@ const query = vi.fn(async (sql, params = []) => {
   if (/SELECT 1 FROM beeper_outbox WHERE conversation_id = \$1 AND state = 'sent'/.test(sql)) {
     const sent = [...outbox.values()].filter((row) => row.conversationId === params[0] && row.state === 'sent');
     return { rows: sent.map(() => ({ '?column?': 1 })), rowCount: sent.length };
+  }
+  // The boot reconcile's two statements. Both are keyed on a STATE rather than
+  // on an id, so they sit ahead of the single-row branches whose patterns they
+  // would otherwise be caught by.
+  if (/UPDATE beeper_outbox SET state = 'failed'[\s\S]*WHERE state = 'sending'/.test(sql)) {
+    const stranded = [...outbox.values()].filter((row) => row.state === 'sending');
+    for (const row of stranded) {
+      row.state = 'failed';
+      row.errorCode = params[0];
+      row.errorMessage = params[1];
+    }
+    return { rows: stranded.map((row) => ({ id: row.id })), rowCount: stranded.length };
+  }
+  if (/FROM beeper_outbox WHERE state = 'awaiting-confirmation'/.test(sql)) {
+    return { rows: [...outbox.values()].filter((row) => row.state === 'awaiting-confirmation').map(entryView) };
   }
   if (/FROM beeper_outbox\s+WHERE conversation_id = \$1 ORDER BY/.test(sql)) {
     return { rows: [...outbox.values()].filter((row) => row.conversationId === params[0]).map(entryView) };
@@ -152,10 +168,11 @@ const query = vi.fn(async (sql, params = []) => {
 vi.mock('../lib/db.js', () => ({ query: (...args) => query(...args) }));
 
 const {
-  BREAKER_MAX_CONSECUTIVE_FAILURES, BREAKER_MAX_SENDS_IN_WINDOW, CONFIRMATION_TIMEOUT_MS,
+  BREAKER_MAX_CONSECUTIVE_FAILURES, BREAKER_MAX_SENDS_IN_WINDOW,
+  CONFIRMATION_TIMEOUT_MS, SEND_INTERRUPTED_MESSAGE,
   cancelPendingConfirmations, clearOutboxBreaker, configureOutboxRuntime, createOutboxEntry,
   discardOutboxEntry, getOutboxBreakerState, getOutboxStatus, isFirstContact, listOutboxEntries,
-  resetOutboxRuntime, sendOutboxEntry,
+  reconcileOutboxOnBoot, resetOutboxRuntime, sendOutboxEntry,
 } = await import('./beeperOutbox.js');
 const { beeperSocketEvents } = await import('./beeperSocketEvents.js');
 
@@ -219,9 +236,35 @@ function markPriorSend(conversationId = CONVERSATION_ID) {
     errorMessage: null,
     createdAt: '2026-08-31T00:00:00.000Z',
     approvedAt: '2026-08-31T00:00:00.000Z',
+    updatedAt: '2026-08-31T00:00:01.000Z',
     sentAt: '2026-08-31T00:00:01.000Z',
   };
   outbox.set(row.id, row);
+}
+
+/**
+ * A row the PREVIOUS process left behind: persisted mid-flight, with nothing
+ * armed in memory for it, which is exactly the state a restart produces.
+ */
+function strandedRow(state, overrides = {}) {
+  const row = {
+    id: `outbox-stranded-${nextId++}`,
+    conversationId: CONVERSATION_ID,
+    chatId: CHAT_ID,
+    body: 'hello there',
+    state,
+    pendingMessageId: state === 'awaiting-confirmation' ? 'pending-1' : null,
+    messageId: null,
+    errorCode: null,
+    errorMessage: null,
+    createdAt: '2026-09-01T00:00:00.000Z',
+    approvedAt: '2026-09-01T00:00:00.000Z',
+    updatedAt: '2026-09-01T00:00:01.000Z',
+    sentAt: null,
+    ...overrides,
+  };
+  outbox.set(row.id, row);
+  return row;
 }
 
 beforeEach(() => {
@@ -481,6 +524,100 @@ describe('confirmation — socket first, 30s GET fallback', () => {
 
     expect(outbox.get(entry.id).state).toBe('failed');
     expect(outbox.get(entry.id).errorCode).toBe('SEND_FAIL_PERMANENT');
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+// `sending` and `awaiting-confirmation` are exit-only through in-memory state,
+// so a restart mid-flight used to leave a row nothing could ever move: the
+// client rendered it as a spinner with no Retry and no Dismiss, permanently.
+describe('reconcileOutboxOnBoot — the durable half of the confirmation state', () => {
+  it('fails every row stranded in "sending" with SEND_INTERRUPTED, and posts nothing', async () => {
+    const stranded = strandedRow('sending');
+    const settled = strandedRow('sent', { messageId: 'msg-earlier', sentAt: '2026-09-01T00:00:02.000Z' });
+    const failed = strandedRow('failed', { errorCode: 'NETWORK_ERROR', errorMessage: 'connection refused' });
+
+    const result = await reconcileOutboxOnBoot();
+
+    expect(result.interrupted).toBe(1);
+    expect(outbox.get(stranded.id)).toMatchObject({ state: 'failed', errorCode: 'SEND_INTERRUPTED' });
+    // The exact sentence the client renders off the code, asserted literally on
+    // both sides so the two bundles cannot drift apart.
+    expect(outbox.get(stranded.id).errorMessage)
+      .toBe('Delivery unconfirmed: PortOS restarted mid-send. Check the chat before retrying.');
+    expect(SEND_INTERRUPTED_MESSAGE).toBe(outbox.get(stranded.id).errorMessage);
+    // Terminal rows are left exactly as they were.
+    expect(outbox.get(settled.id)).toMatchObject({ state: 'sent', messageId: 'msg-earlier', errorCode: null });
+    expect(outbox.get(failed.id)).toMatchObject({ state: 'failed', errorCode: 'NETWORK_ERROR' });
+    // The whole point: a crash never resends. Nothing on this path POSTs.
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('re-arms an "awaiting-confirmation" row from its persisted fields and resolves it without sending', async () => {
+    const stranded = strandedRow('awaiting-confirmation');
+    expect(getOutboxStatus().awaitingConfirmation).toBe(0);
+
+    const result = await reconcileOutboxOnBoot();
+
+    expect(result).toEqual({ interrupted: 0, rearmed: 1 });
+    expect(getOutboxStatus().awaitingConfirmation).toBe(1);
+
+    // The re-armed row now resolves through the same socket path a live send
+    // uses — a lookup, never a second POST.
+    beeperSocketEvents.emit('invalidate', { kind: 'message.upserted', chatID: CHAT_ID, ids: ['msg-final-1'] });
+    await flush();
+
+    expect(getMessage).toHaveBeenCalledWith(CHAT_ID, 'pending-1');
+    expect(outbox.get(stranded.id)).toMatchObject({ state: 'sent', messageId: 'msg-final-1' });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('re-arms a row already recorded unresolved, and still never sends on the fallback path', async () => {
+    const stranded = strandedRow('awaiting-confirmation', {
+      errorCode: 'CONFIRMATION_UNRESOLVED', errorMessage: 'Beeper reported no matching message within 30s',
+    });
+    getMessage.mockResolvedValue(null);
+    listMessagesPage.mockResolvedValue({ items: [sentMessage({ id: 'msg-final-3' })] });
+
+    await reconcileOutboxOnBoot();
+    clock.advance(CONFIRMATION_TIMEOUT_MS);
+    expect(clock.runTimersWithDelay(CONFIRMATION_TIMEOUT_MS)).toBe(1);
+    await flush();
+
+    // The body match is floored on the row's PERSISTED send moment, not on boot
+    // time — dating it to now would reject the very message it is looking for.
+    expect(outbox.get(stranded.id)).toMatchObject({ state: 'sent', messageId: 'msg-final-3' });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent across two calls — nothing double-fails and nothing double-arms', async () => {
+    const stranded = strandedRow('sending');
+    strandedRow('awaiting-confirmation');
+
+    const first = await reconcileOutboxOnBoot();
+    const second = await reconcileOutboxOnBoot();
+
+    expect(first).toEqual({ interrupted: 1, rearmed: 1 });
+    expect(second).toEqual({ interrupted: 0, rearmed: 0 });
+    expect(getOutboxStatus().awaitingConfirmation).toBe(1);
+    // One armed fallback timer, not two.
+    expect(clock.pending()).toBe(1);
+    expect(outbox.get(stranded.id).errorCode).toBe('SEND_INTERRUPTED');
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('leaves an interrupted row re-sendable only as a NEW row, exactly like any other failure', async () => {
+    markPriorSend();
+    const stranded = strandedRow('sending');
+    await reconcileOutboxOnBoot();
+
+    // The failed row itself refuses to send in place…
+    await expect(sendOutboxEntry(stranded.id)).rejects.toMatchObject({ code: 'OUTBOX_INVALID_STATE', status: 409 });
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // …and the recovery is a fresh, human-composed entry.
+    const composed = await approvedEntry('hello there');
+    await sendOutboxEntry(composed.id);
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 });

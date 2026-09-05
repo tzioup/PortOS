@@ -332,6 +332,17 @@ Four rules the outbox exists to enforce:
    human clears it (`POST /api/beeper/outbox/breaker/clear`); a breaker that clears itself is a
    delay, not a breaker.
 
+**A restart mid-flight** is reconciled at boot, because `sending` and `awaiting-confirmation` are
+exit-only through in-memory state (the pending map, its timer, the socket listener) and no route
+can move a row out of either. `reconcileOutboxOnBoot()` runs once per server start from
+`bootstrap.js`, regardless of whether the Beeper feature is armed — a stranded send is stranded
+either way. A row left in `sending` becomes `failed` with `SEND_INTERRUPTED`, because the POST's
+outcome is genuinely unknowable and rule 2 has no crash exception: nothing re-POSTs it, and the
+user's recovery is the ordinary failed-row Retry, which composes a new row. A row left in
+`awaiting-confirmation` has its lookup re-armed from the row's own `chat_id`, `pending_message_id`
+and `body` — a resolve on both paths, never a send. Terminal rows are untouched, and a second call
+finds nothing left to do.
+
 **First contact** to a conversation is refused with a coded 409 unless `confirmFirstContact` is
 explicitly true. The composer renders that inline, naming the network and the recipient — never
 a `window.confirm`. Cancelling discards the row through `DELETE /api/beeper/outbox/:id`, which
