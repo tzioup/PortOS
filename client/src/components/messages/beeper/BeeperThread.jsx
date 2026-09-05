@@ -28,10 +28,11 @@ import { formatBytes } from '../../../utils/formatters';
  * over `onSend`/`confirmAndSend`/`cancelConfirmation`/`retryOutboxEntry`/
  * `dismissOutboxEntry`, which the surface supplies from `useBeeperOutbox`.
  * This component owns none of the send lifecycle — it only renders what the
- * hook reports: the pending/failed/stalled rows in `outboxEntries` (filtered
- * against `messages` so a confirmed send shows once, as the real mirrored
- * message, not twice), and the inline first-contact question when
- * `confirmation` is set. Nothing here ever retries a send that touched the
+ * hook reports: the pending/failed/stalled rows in `outboxEntries` (filtered on
+ * STATE, so a settled `sent` entry shows once as the real mirrored message and
+ * never as a second bubble — including when its message has aged out of the
+ * loaded page), and the inline first-contact question when `confirmation` is
+ * set. Nothing here ever retries a send that touched the
  * wire on its own; a `failed` row's "Retry" composes a NEW outbox entry with
  * the same text, exactly like typing it again, because Beeper has no
  * idempotency key and a client-driven resend of the same row would risk a
@@ -206,6 +207,9 @@ function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
  */
 const SEND_INTERRUPTED_COPY = 'Delivery unconfirmed: PortOS restarted mid-send. Check the chat before retrying.';
 
+/** The outbox states that still have something to say above the composer. */
+const RENDERED_OUTBOX_STATES = new Set(['approved', 'sending', 'awaiting-confirmation', 'failed']);
+
 /**
  * One outbox row — a send that has not yet been confirmed by the mirror, or
  * one that failed. Always outbound (right-aligned, no avatar), matching the
@@ -363,14 +367,20 @@ export default function BeeperThread({
   }, [conversation?.participants]);
 
   // Outbox rows still worth showing: anything the mirror has not caught up
-  // with yet. Once a `sent` entry's `messageId` shows up in `messages` (the
-  // real message, arrived via the invalidation-driven refetch), it is dropped
-  // here rather than rendered twice — the mirrored message IS the confirmation.
+  // with yet, decided on the entry's own STATE rather than on whether its
+  // message happens to be in the page currently loaded. `sent` is settled —
+  // the mirrored message IS the record of it — and `GET /outbox` returns up to
+  // 50 entries in every state, so a `sent` entry whose message had aged out of
+  // the newest page used to render forever as a spinning bubble with old text.
+  // `draft` is excluded for the same reason it has no writer: it is not a send.
   // `entries` arrives newest-first (the server's own order, preserved through
   // every client-side prepend); reversed to read oldest-first like `ordered`.
   const visibleOutbox = useMemo(() => {
     const mirroredIds = new Set(messages.map((message) => message.id));
     return [...outboxEntries]
+      .filter((entry) => RENDERED_OUTBOX_STATES.has(entry.state))
+      // The tiebreak, not the rule: an `awaiting-confirmation` row the sweep
+      // already mirrored would otherwise show twice, once as each.
       .filter((entry) => !(entry.messageId && mirroredIds.has(entry.messageId)))
       .reverse();
   }, [outboxEntries, messages]);

@@ -349,10 +349,12 @@ a `window.confirm`. Cancelling discards the row through `DELETE /api/beeper/outb
 only accepts a row still in `approved` (nothing has been POSTed for it, so this is a local record
 removal, never an unsend); anything further along answers 409.
 
-**What the composer shows.** Outbox rows render inline with the mirrored messages, filtered
-against the fetched messages so a confirmed send appears exactly once — as the real mirrored
-message — and never twice. Only a send that can still change spins. Everything else is terminal
-and says so:
+**What the composer shows.** Outbox rows render inline with the mirrored messages, filtered on the
+entry's STATE: a settled `sent` row is dropped outright, because the mirrored message is the
+record of it — filtering on "is its message in the page I happen to have loaded" instead left a
+long-settled send rendering forever as a spinning bubble with old text, since `GET /outbox`
+returns up to 50 entries in every state. Only a send that can still change spins. Everything else
+is terminal and says so:
 
 - **Failed** — "Not delivered", with the recorded error and **Retry**, which composes a brand-new
   entry with the same text rather than resending the failed one.

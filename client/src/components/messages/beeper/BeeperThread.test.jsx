@@ -71,6 +71,11 @@ const TRIPPED_BREAKER = { tripped: true, reason: 'too many sends' };
 const SEND_INTERRUPTED_COPY = 'Delivery unconfirmed: PortOS restarted mid-send. Check the chat before retrying.';
 const UNRESOLVED_REASON = 'Beeper reported no matching message within 30s — it may still have been delivered, so it was not re-sent.';
 
+// A send that settled long ago. `GET /outbox` returns up to 50 entries in every
+// state, so its mirrored message is routinely older than the newest page.
+const SENT_ENTRY = {
+  id: 'outbox-3', state: 'sent', body: 'settled long ago', messageId: 'msg-aged-out',
+};
 const UNRESOLVED_ENTRY = {
   id: 'outbox-4',
   state: 'awaiting-confirmation',
@@ -195,12 +200,37 @@ describe('BeeperThread — outbox row states', () => {
 });
 
 /**
- * A send the server could not confirm, and a send a restart interrupted, are
- * both finished: nothing will ever advance either one. So neither may spin, and
- * neither may lose that property on a remount, which is the shape a reload
- * takes.
+ * Every outbox state that cannot change on its own has to READ as finished. The
+ * three below could each hold a spinner forever: a settled `sent` row whose
+ * message had aged out of the loaded page, a send the server could not confirm,
+ * and a send a restart interrupted. None of them will ever advance, so none of
+ * them may spin — and none may lose that property on a remount, which is the
+ * shape a reload takes.
  */
 describe('BeeperThread — terminal outbox states never spin', () => {
+  it('renders no bubble for a settled sent entry whose mirrored message is not in the loaded page', () => {
+    const { container } = renderThread({ outboxEntries: [SENT_ENTRY], messages: [] });
+
+    expect(screen.queryByTestId('beeper-outbox-row')).toBeNull();
+    expect(screen.queryByText('settled long ago')).toBeNull();
+    expect(container.querySelector('.animate-spin')).toBeNull();
+  });
+
+  // The mirrored-id check survives as the tiebreak for the one case it is still
+  // the right answer for: a row still in flight that the sweep already mirrored.
+  it('drops an awaiting-confirmation row the sweep has already mirrored', () => {
+    const mirrored = {
+      id: 'msg-mirrored', body: 'hello there', sentAt: '2026-09-01T10:00:00.000Z', isSender: true, senderId: 'user-me',
+    };
+    renderThread({
+      outboxEntries: [{ ...UNRESOLVED_ENTRY, errorCode: null, errorMessage: null, messageId: 'msg-mirrored' }],
+      messages: [mirrored],
+    });
+
+    expect(screen.queryByTestId('beeper-outbox-row')).toBeNull();
+    expect(screen.getByTestId('beeper-message')).toBeInTheDocument();
+  });
+
   it('renders an unconfirmed send as terminal, carrying the reason the server recorded', () => {
     const { container } = renderThread({ outboxEntries: [UNRESOLVED_ENTRY] });
 
