@@ -89,9 +89,10 @@ const query = vi.fn(async (sql, params = []) => {
     outbox.set(row.id, row);
     return { rows: [entryView(row)], rowCount: 1 };
   }
-  if (/SELECT 1 FROM beeper_outbox WHERE conversation_id = \$1 AND state = 'sent'/.test(sql)) {
-    const sent = [...outbox.values()].filter((row) => row.conversationId === params[0] && row.state === 'sent');
-    return { rows: sent.map(() => ({ '?column?': 1 })), rowCount: sent.length };
+  if (/SELECT 1 FROM beeper_outbox\s+WHERE conversation_id = \$1 AND state = ANY/.test(sql)) {
+    const contacted = [...outbox.values()]
+      .filter((row) => row.conversationId === params[0] && params[1].includes(row.state));
+    return { rows: contacted.map(() => ({ '?column?': 1 })), rowCount: contacted.length };
   }
   // The boot reconcile's two statements. Both are keyed on a STATE rather than
   // on an id, so they sit ahead of the single-row branches whose patterns they
@@ -397,6 +398,35 @@ describe('sendOutboxEntry — the human gates', () => {
 
   it('404s an unknown entry', async () => {
     await expect(sendOutboxEntry('outbox-missing')).rejects.toMatchObject({ code: 'OUTBOX_ENTRY_NOT_FOUND', status: 404 });
+  });
+});
+
+// The first-contact prompt has to fire exactly once per conversation, or the
+// user learns to click through it. Counting only `sent` rows re-asked it after
+// a send that left the machine but never confirmed — which is the NORMAL
+// resting state of an unresolved send, since that case deliberately stays
+// `awaiting-confirmation` rather than being marked failed.
+describe('isFirstContact — has PortOS addressed this conversation before', () => {
+  it.each(['sent', 'awaiting-confirmation', 'sending'])(
+    'treats a prior %s row as contact already made, so no confirmation is asked',
+    async (state) => {
+      const prior = await approvedEntry('an earlier message');
+      outbox.get(prior.id).state = state;
+
+      expect(await isFirstContact(CONVERSATION_ID)).toBe(false);
+
+      const next = await approvedEntry('a reply');
+      await expect(sendOutboxEntry(next.id)).resolves.toMatchObject({ state: 'awaiting-confirmation' });
+    },
+  );
+
+  it('still asks when nothing PortOS composed ever reached Beeper', async () => {
+    const failed = await approvedEntry('never left');
+    outbox.get(failed.id).state = 'failed';
+    await approvedEntry('still queued');
+
+    expect(await isFirstContact(CONVERSATION_ID)).toBe(true);
+    expect(await isFirstContact(OTHER_CONVERSATION_ID)).toBe(true);
   });
 });
 

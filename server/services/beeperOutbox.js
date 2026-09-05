@@ -257,10 +257,23 @@ export async function createOutboxEntry({ conversationId, body }) {
 }
 
 /**
- * Whether PortOS has ever COMPLETED a send to this conversation. First contact
- * is the case #8 decision 5 puts a confirmation on — a first message to a
- * possibly mis-resolved handle on a possibly wrong network — and it is the only
- * one, because confirming every reply trains the user to click through.
+ * States that mean PortOS has already ADDRESSED this conversation — the POST
+ * reached Beeper, whatever the mirror has confirmed since. `sent` alone is the
+ * wrong test: an `awaiting-confirmation` row is a send that left this machine
+ * and was very likely delivered (the unresolved case is deliberately not
+ * `failed` for exactly that reason), and `sending` is one in flight right now.
+ * Counting only `sent` re-asks the first-contact question on the next message
+ * to someone PortOS has already messaged — which is precisely the prompt the
+ * design says must fire once and never again, or the user learns to click
+ * through it.
+ */
+const CONTACTED_STATES = ['sent', 'awaiting-confirmation', 'sending'];
+
+/**
+ * Whether PortOS has ever ADDRESSED this conversation. First contact is the
+ * case #8 decision 5 puts a confirmation on — a first message to a possibly
+ * mis-resolved handle on a possibly wrong network — and it is the only one,
+ * because confirming every reply trains the user to click through.
  *
  * Keyed on the outbox rather than on a mirrored `isSender` message: the mirror
  * records what the USER sent from their phone, which is not evidence that this
@@ -268,8 +281,9 @@ export async function createOutboxEntry({ conversationId, body }) {
  */
 export async function isFirstContact(conversationId) {
   const result = await query(
-    "SELECT 1 FROM beeper_outbox WHERE conversation_id = $1 AND state = 'sent' LIMIT 1",
-    [conversationId],
+    `SELECT 1 FROM beeper_outbox
+     WHERE conversation_id = $1 AND state = ANY($2::text[]) LIMIT 1`,
+    [conversationId, CONTACTED_STATES],
   );
   return (result?.rows?.length ?? 0) === 0;
 }
