@@ -53,6 +53,20 @@ const MIME_EXTENSIONS = new Map([
   ['text/plain', 'txt'],
 ]);
 
+/**
+ * The media types the mirror knows how to store, as a Set — the keys of
+ * `MIME_EXTENSIONS` above, exported so the serving pipeline can BOUND the
+ * `contentType` override rather than echo it.
+ *
+ * The declared type on a mirrored attachment is written by a remote sender, and
+ * the mirror is served from the authenticated dashboard origin, so a type
+ * outside this set is served as `application/octet-stream` instead
+ * (`serveLocalFile` in `lib/uploads.js`). Reusing the extension table's keys
+ * keeps the two answers in lockstep: a type the mirror cannot even name a file
+ * for is not a type it should be declaring on the wire either.
+ */
+export const MIRRORED_MIME_TYPES = new Set(MIME_EXTENSIONS.keys());
+
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const EXTENSION_PATTERN = /^[a-z0-9]{1,8}$/;
 

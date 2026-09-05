@@ -4,6 +4,7 @@ import { resolveBeeperToken } from './beeperCredentials.js';
 import {
   BeeperApiError,
   DEFAULT_BASE_URL,
+  resolveBeeperBaseUrl,
   resolveBeeperConfig,
   mapBeeperResponseError,
   paginateBeeperCursor,
@@ -104,6 +105,52 @@ describe('beeperClient', () => {
       const config = await resolveBeeperConfig({ token: null });
       expect(config).toEqual({ baseUrl: DEFAULT_BASE_URL, token: null });
       expect(resolveBeeperToken).not.toHaveBeenCalled();
+    });
+
+    // SEC-2: `getSettings()` reads `settings.json` off disk with no schema
+    // re-validation on read, so `normalizeBaseUrl` re-applies the SAME
+    // loopback-only gate `beeperSettingsSchema` enforces on the PUT route —
+    // otherwise a hand-edited settings.json is a second path to the exact
+    // value the schema exists to block.
+    it('falls back to the loopback default for a non-loopback settings baseUrl with no opt-in', async () => {
+      vi.mocked(getSettings).mockResolvedValue({ beeper: { baseUrl: 'https://example.com:23373' } });
+      vi.mocked(resolveBeeperToken).mockResolvedValue({ token: 'vaulted-token', tokenSource: 'oauth' });
+      const config = await resolveBeeperConfig();
+      expect(config).toEqual({ baseUrl: DEFAULT_BASE_URL, token: 'vaulted-token' });
+    });
+
+    it('honors a non-loopback settings baseUrl once allowNonLoopbackBaseUrl is set', async () => {
+      vi.mocked(getSettings).mockResolvedValue({
+        beeper: { baseUrl: 'https://example.com:23373', allowNonLoopbackBaseUrl: true },
+      });
+      vi.mocked(resolveBeeperToken).mockResolvedValue({ token: 'vaulted-token', tokenSource: 'oauth' });
+      const config = await resolveBeeperConfig();
+      expect(config).toEqual({ baseUrl: 'https://example.com:23373', token: 'vaulted-token' });
+    });
+
+    // The "both explicit" bypass trusts its caller rather than re-deriving the
+    // opt-in here — it exists for values a caller ALREADY resolved through
+    // `resolveBeeperBaseUrl()` (which is where the gate lives), not for a raw
+    // unvalidated string. `beeperStatus.js` is the worked example: it calls
+    // `resolveBeeperBaseUrl()` first and passes the result in here, rather
+    // than reading `settings.beeper.baseUrl` straight into this bypass.
+    it('does not re-derive the opt-in for the "both explicit" bypass — it trusts an already-resolved baseUrl', async () => {
+      const config = await resolveBeeperConfig({ baseUrl: 'https://example.com:23373', token: 'abc123' });
+      expect(config).toEqual({ baseUrl: 'https://example.com:23373', token: 'abc123' });
+    });
+  });
+
+  describe('resolveBeeperBaseUrl', () => {
+    it('falls back to the loopback default for a non-loopback settings baseUrl with no opt-in', async () => {
+      vi.mocked(getSettings).mockResolvedValue({ beeper: { baseUrl: 'http://example.com:23373' } });
+      await expect(resolveBeeperBaseUrl()).resolves.toBe(DEFAULT_BASE_URL);
+    });
+
+    it('honors a non-loopback settings baseUrl once allowNonLoopbackBaseUrl is set', async () => {
+      vi.mocked(getSettings).mockResolvedValue({
+        beeper: { baseUrl: 'http://example.com:23373', allowNonLoopbackBaseUrl: true },
+      });
+      await expect(resolveBeeperBaseUrl()).resolves.toBe('http://example.com:23373');
     });
   });
 

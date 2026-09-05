@@ -18,6 +18,18 @@ Beeper Desktop exposes a local HTTP + WebSocket API. PortOS defaults to
 loopback literal rather than `localhost` is deliberate: a dual-stack box may resolve `localhost`
 to `::1` first.
 
+**`baseUrl` is loopback-only by default.** Every request carries `Authorization: Bearer
+<vault-stored token>`, and `baseUrl` is prefixed onto both the REST calls and the realtime
+WebSocket URL — a value pointed at an attacker-controlled host would turn one settings write into
+a credential exfiltration. `beeperSettingsSchema` (`server/lib/mediaValidation.js`) refuses a
+non-loopback `baseUrl` unless the sibling field `allowNonLoopbackBaseUrl` is explicitly set to
+`true` (default `false`), and `normalizeBaseUrl` in `server/services/beeperClient.js` re-applies
+the identical check on every read — `settings.json` is not schema-validated when it is loaded, so
+a hand-edited file is a second path to the same value the PUT route already refuses; a value that
+fails either check falls back to the shipped loopback default rather than reaching a request. The
+settings drawer exposes the opt-in as a checkbox beside the Base URL field for the rare install
+that genuinely runs Beeper Desktop on another machine.
+
 The client is raw `fetch`, deliberately **not** `@beeper/desktop-api`: the published SDK lags
 the live API and exposes no `Account.status`, no `loginID`, and no `/v1/bridges`. `GET /v1/spec`
 on the running instance is the reference the client was written against. `server/lib/safeUrlFetch.js`
@@ -77,9 +89,9 @@ status code.
    same drawer.
 
 The settings the drawer writes are `settings.beeper.{enabled, intervalMinutes, baseUrl,
-attachmentBudgetGb}` — `enabled` false, 5 minutes, the loopback default, and 5 GB. The schema
-(`beeperSettingsSchema`) is `.strict()` and has no token field at all, so a credential can never
-ride the generic settings route.
+attachmentBudgetGb, allowNonLoopbackBaseUrl}` — `enabled` false, 5 minutes, the loopback default,
+5 GB, and the non-loopback opt-in off. The schema (`beeperSettingsSchema`) is `.strict()` and has
+no token field at all, so a credential can never ride the generic settings route.
 
 Storing a credential, or flipping the Beeper feature or the Comms group, arms or disarms both
 the sweep scheduler and the realtime transport immediately — `reconcileBeeperIngestion()` in

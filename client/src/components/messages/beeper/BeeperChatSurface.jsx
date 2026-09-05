@@ -541,9 +541,14 @@ export default function BeeperChatSurface({
     setPurging(false);
     if (!result) return;
     setConversations((prev) => prev.filter((row) => row.id !== conversationId));
+    // The purge removes every message the mirror held for this conversation,
+    // so a drafted-but-unsent reply left in `drafts` would otherwise survive
+    // it forever in localStorage — nothing else ever clears an entry once its
+    // conversation is gone from the list. Same shape `setDraft` uses.
+    setDraft('');
     toast.success(`Mirror purged — ${result.messagesRemoved} message(s), ${result.filesRemoved} attachment file(s) removed`);
     clearSelection();
-  }, [clearSelection, conversationId, mountedRef]);
+  }, [clearSelection, conversationId, mountedRef, setDraft]);
 
   // One attachment changed under the thread (a "fetch anyway", a keep toggle).
   // Merge it into the message it belongs to instead of refetching the page —

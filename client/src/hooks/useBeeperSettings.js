@@ -8,6 +8,12 @@ const DEFAULTS = {
   intervalMinutes: 5,
   baseUrl: BEEPER_DEFAULT_BASE_URL,
   attachmentBudgetGb: 5,
+  // Loopback-only by default (SEC-2, server/lib/mediaValidation.js): a
+  // non-loopback baseUrl is prefixed onto every Beeper API call AND the
+  // realtime WebSocket URL with the vault-stored access token attached, so
+  // off is the only safe default — this is an explicit opt-in, never inferred
+  // from the baseUrl the user typed.
+  allowNonLoopbackBaseUrl: false,
 };
 
 // `value === ''` (a cleared field) falls back to the default; any other
@@ -22,15 +28,16 @@ const toFiniteNumber = (value, fallback) => {
 const clampInterval = (value) => Math.max(1, Math.min(1440, Math.floor(toFiniteNumber(value, DEFAULTS.intervalMinutes))));
 const clampBudget = (value) => Math.max(0.1, Math.min(1000, toFiniteNumber(value, DEFAULTS.attachmentBudgetGb)));
 
-// settings.beeper.{enabled,intervalMinutes,baseUrl,attachmentBudgetGb} — the
-// ingestion + connection config this slice's Comms → Beeper card edits (#30).
-// Deliberately never reads or writes `token`/`tokenExpiresAt`: the server
-// strips the token from every GET /api/settings response and rejects a
-// `beeper` PUT that includes one. The credential lives encrypted in Postgres
-// and is written only through the dedicated connect routes (#31) — the Beeper
-// card's Connect / paste / Disconnect actions, never this settings save.
+// settings.beeper.{enabled,intervalMinutes,baseUrl,attachmentBudgetGb,
+// allowNonLoopbackBaseUrl} — the ingestion + connection config this slice's
+// Comms → Beeper card edits (#30). Deliberately never reads or writes
+// `token`/`tokenExpiresAt`: the server strips the token from every
+// GET /api/settings response and rejects a `beeper` PUT that includes one.
+// The credential lives encrypted in Postgres and is written only through the
+// dedicated connect routes (#31) — the Beeper card's Connect / paste /
+// Disconnect actions, never this settings save.
 //
-// `save()` always PUTs the complete four-field object, never a diff — same
+// `save()` always PUTs the complete five-field object, never a diff — same
 // convention as `useSyncSourceSettings` for iMessage/Signal/Spotify/YouTube —
 // so a partial edit can never silently drop a sibling field on the server's
 // generic top-level shallow merge.
@@ -51,6 +58,8 @@ export function useBeeperSettings() {
           intervalMinutes: Number.isFinite(config.intervalMinutes) ? config.intervalMinutes : DEFAULTS.intervalMinutes,
           baseUrl: typeof config.baseUrl === 'string' && config.baseUrl ? config.baseUrl : DEFAULTS.baseUrl,
           attachmentBudgetGb: Number.isFinite(config.attachmentBudgetGb) ? config.attachmentBudgetGb : DEFAULTS.attachmentBudgetGb,
+          allowNonLoopbackBaseUrl: typeof config.allowNonLoopbackBaseUrl === 'boolean'
+            ? config.allowNonLoopbackBaseUrl : DEFAULTS.allowNonLoopbackBaseUrl,
         };
         setForm(next);
         setSaved(next);
@@ -68,6 +77,7 @@ export function useBeeperSettings() {
       intervalMinutes: clampInterval(form.intervalMinutes),
       attachmentBudgetGb: clampBudget(form.attachmentBudgetGb),
       baseUrl: (form.baseUrl || '').trim() || DEFAULTS.baseUrl,
+      allowNonLoopbackBaseUrl: Boolean(form.allowNonLoopbackBaseUrl),
     };
     setSaving(true);
     const settings = await updateSettings({ beeper: next }).catch(() => null);

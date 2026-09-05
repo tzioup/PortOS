@@ -742,20 +742,41 @@ describe('attachment mirror routes (#37)', () => {
     });
     const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0');
     expect(res.status).toBe(200);
-    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0, { force: false });
+    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0);
     const [, dir, filename, options] = vi.mocked(serveLocalFile).mock.calls[0];
     expect(dir).toBe('/data/beeper/attachments/ab');
     expect(filename).toBe('abc.bin');
     expect(options.contentType).toBe('image/png');
   });
 
-  it('does not force a fetch unless the caller literally asks for it', async () => {
+  // SEC-4: GET is a safe method — no query param may raise the size ceiling or
+  // clear a terminal refusal. `force=true` on the query string is simply
+  // ignored (not rejected, since GET no longer parses `force` at all), and the
+  // call into the service carries no `force` option regardless of what the
+  // query string says.
+  it('ignores a force=true query string — GET never asks the service to force a fetch', async () => {
     vi.mocked(ensureAttachmentBytes).mockResolvedValue({ filePath: '/x/y.bin', mimeType: '', fileName: '', cached: true });
-    await request(buildApp()).get('/api/beeper/attachments/msg-1/0?force=false');
-    // `force=false` is rejected outright rather than coerced — the literal
-    // "false" reads as true under z.coerce.boolean(), which is the bug this
-    // schema exists to prevent.
-    expect(vi.mocked(ensureAttachmentBytes)).not.toHaveBeenCalled();
+    await request(buildApp()).get('/api/beeper/attachments/msg-1/0?force=true');
+    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0);
+  });
+
+  it('still answers 413 over-cap even with force=true on the query string — the ceiling is not bypassable from GET', async () => {
+    vi.mocked(ensureAttachmentBytes).mockRejectedValue(new ServerError('Attachment is 40000000 bytes, over the 33554432-byte mirror ceiling', {
+      status: 413, code: 'ATTACHMENT_TOO_LARGE', context: { bytes: 40000000, maxBytes: 33554432 },
+    }));
+    const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0?force=true');
+    expect(res.status).toBe(413);
+    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0);
+  });
+
+  it('still answers 404 ASSET_UNAVAILABLE even with force=true on the query string — a safe method cannot clear the terminal refusal', async () => {
+    vi.mocked(ensureAttachmentBytes).mockRejectedValue(new ServerError('Beeper can no longer supply this attachment', {
+      status: 404, code: 'ASSET_UNAVAILABLE',
+    }));
+    const res = await request(buildApp()).get('/api/beeper/attachments/msg-1/0?force=true');
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('ASSET_UNAVAILABLE');
+    expect(vi.mocked(ensureAttachmentBytes)).toHaveBeenCalledWith('msg-1', 0);
   });
 
   it('answers an over-cap attachment with 413 and carries the measured size into the envelope', async () => {

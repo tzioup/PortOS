@@ -15,11 +15,12 @@
  * module answers the connection/status question only.
  */
 import { query } from '../lib/db.js';
-import { probeBeeperInfo, getInfo, assertValidInfoResponse, BeeperApiError, DEFAULT_BASE_URL } from './beeperClient.js';
+import {
+  probeBeeperInfo, getInfo, assertValidInfoResponse, BeeperApiError, resolveBeeperBaseUrl,
+} from './beeperClient.js';
 import { getBeeperRealtimeState } from './beeperSocket.js';
 import { getOutboxStatus } from './beeperOutbox.js';
 import { resolveBeeperTokenMeta } from './beeperCredentials.js';
-import { getSettings } from './settings.js';
 
 const TOKEN_EXPIRY_WARNING_DAYS = 7;
 
@@ -77,7 +78,13 @@ export async function listBeeperAccounts() {
  * `false` for a question it never asked.
  */
 export async function getBeeperStatus() {
-  const settings = await getSettings();
+  // `resolveBeeperBaseUrl()`, never a raw `settings.beeper.baseUrl` read
+  // (SEC-2): it re-applies the loopback-only gate `beeperSettingsSchema`
+  // enforces on the PUT route, which a hand-edited `settings.json` can still
+  // bypass on read. The probe and the payload's own `baseUrl` field both have
+  // to report the SAME (validated) value the sweep and every other call
+  // actually use.
+  const resolvedBaseUrl = await resolveBeeperBaseUrl();
   // Deliberately NOT wrapped in a catch: an unreadable credential store throws
   // (#11 decision 8), and the card renders its "could not read status" branch
   // rather than telling a connected install to connect again.
@@ -86,7 +93,7 @@ export async function getBeeperStatus() {
 
   const [probe, accounts] = await Promise.all([
     credential.tokenConfigured
-      ? probeBeeperInfo({ baseUrl: settings?.beeper?.baseUrl })
+      ? probeBeeperInfo({ baseUrl: resolvedBaseUrl })
       : Promise.resolve(null),
     listBeeperAccounts().catch(() => []),
   ]);
@@ -97,7 +104,7 @@ export async function getBeeperStatus() {
     // value. This is the ONLY credential detail a client payload ever carries
     // besides presence and expiry.
     tokenSource: credential.tokenSource,
-    baseUrl: settings?.beeper?.baseUrl || DEFAULT_BASE_URL,
+    baseUrl: resolvedBaseUrl,
     reachable: probe ? probe.reachable : null,
     lastProbeError: probe?.error ?? null,
     appVersion: probe?.info?.app?.version ?? null,
@@ -127,14 +134,15 @@ export async function getBeeperStatus() {
  * status route's flattened `lastProbeError` string.
  */
 export async function checkBeeperConnection() {
-  const settings = await getSettings();
   const { tokenConfigured } = await resolveBeeperTokenMeta();
   if (!tokenConfigured) {
     throw new BeeperApiError('Beeper access token is not configured', {
       status: 401, code: 'NOT_CONFIGURED', retryable: false,
     });
   }
-  const info = await getInfo({ baseUrl: settings?.beeper?.baseUrl });
+  // `resolveBeeperBaseUrl()`, never a raw `settings.beeper.baseUrl` read — see
+  // the same note on `getBeeperStatus` above (SEC-2).
+  const info = await getInfo({ baseUrl: await resolveBeeperBaseUrl() });
   assertValidInfoResponse(info);
   return { reachable: true, info };
 }

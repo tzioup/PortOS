@@ -797,6 +797,37 @@ describe('purging one conversation mirror', () => {
     await waitFor(() => expect(api.purgeBeeperConversation).toHaveBeenCalledWith(CONV_A, { silent: true }));
     expect(await screen.findByText('Pick a conversation')).toBeInTheDocument();
   });
+
+  // CLIENT SEC-2: an unsent draft is written straight to localStorage as the
+  // composer changes (`portos-beeper-drafts`), independent of the server-side
+  // mirror. A purge only deletes the mirror's messages, so nothing else ever
+  // clears that draft entry once its conversation is gone — it would sit in
+  // localStorage forever otherwise.
+  it('deletes the conversation draft from localStorage on a successful purge', async () => {
+    api.getBeeperConversations.mockResolvedValue({ conversations: [conversation()], nextCursor: null });
+    api.getBeeperConversation.mockResolvedValue(conversation());
+    api.purgeBeeperConversation.mockResolvedValue({
+      purged: true, conversationId: CONV_A, messagesRemoved: 12, filesRemoved: 3, bytesFreed: 4194304,
+    });
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const composer = await screen.findByLabelText(/^Message Example Conversation/);
+    fireEvent.change(composer, { target: { value: 'Placeholder unsent draft' } });
+    await waitFor(() => {
+      const stored = JSON.parse(window.localStorage.getItem('portos-beeper-drafts') || '{}');
+      expect(stored[CONV_A]).toBe('Placeholder unsent draft');
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /^Purge$/ }));
+    fireEvent.change(await screen.findByLabelText(/Type purge to confirm/i), { target: { value: 'purge' } });
+    fireEvent.click(screen.getByRole('button', { name: /Purge mirror/i }));
+
+    await waitFor(() => expect(api.purgeBeeperConversation).toHaveBeenCalledWith(CONV_A, { silent: true }));
+    await waitFor(() => {
+      const stored = JSON.parse(window.localStorage.getItem('portos-beeper-drafts') || '{}');
+      expect(stored[CONV_A]).toBeUndefined();
+    });
+  });
 });
 
 // Final live pass: some networks deliver HTML message bodies (Discord, Matrix)

@@ -275,12 +275,6 @@ const attachmentParamsSchema = z.object({
   messageId: z.string().min(1).max(500),
   idx: z.coerce.number().int().min(0).max(999),
 });
-const attachmentFetchQuerySchema = z.object({
-  // The over-cap placeholder's "fetch anyway". A query-string boolean is a
-  // string, so this is the literal "true" and nothing else — `z.coerce.boolean()`
-  // would read "false" as true.
-  force: z.literal('true').optional(),
-}).strict();
 const attachmentKeepSchema = z.object({ keep: z.boolean() }).strict();
 const backfillSchema = z.object({ limit: z.number().int().min(1).max(5000).optional() }).strict();
 
@@ -316,10 +310,17 @@ router.post('/attachments/backfill', asyncHandler(async (req, res) => {
 // the file's own extension is cosmetic — `GET /v1/assets/serve` sends no
 // `Content-Type` at all, so Beeper's declared `mimeType` from the message
 // payload is the only real answer.
+//
+// No `force` query param (SEC-4): this is a safe (GET) method, and
+// `ensureAttachmentBytes` treats `force: true` as "raise the 32 MiB mirror
+// ceiling AND clear a terminal `unavailable_at` refusal so it retries a source
+// that already said no." Reading `force` off the query string here let a plain
+// GET — no confirmation, no method-level intent — do both. `force: true`
+// stays reachable ONLY through the dedicated
+// `POST /attachments/:messageId/:idx/fetch` "fetch anyway" route below.
 router.get('/attachments/:messageId/:idx', asyncHandler(async (req, res) => {
   const { messageId, idx } = validateRequest(attachmentParamsSchema, req.params);
-  const { force } = validateRequest(attachmentFetchQuerySchema, req.query);
-  const resolved = await ensureAttachmentBytes(messageId, idx, { force: force === 'true' })
+  const resolved = await ensureAttachmentBytes(messageId, idx)
     .catch((err) => { throw mapBeeperError(err); });
   await serveLocalFile(res, dirname(resolved.filePath), basename(resolved.filePath), {
     contentType: resolved.mimeType,

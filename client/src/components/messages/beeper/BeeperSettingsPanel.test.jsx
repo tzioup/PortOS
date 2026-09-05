@@ -253,7 +253,9 @@ describe('BeeperSettingsPanel — settings', () => {
   it('saves the complete settings slice and disables Save until dirty', async () => {
     api.getBeeperStatus.mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [] });
     api.updateSettings.mockResolvedValue({
-      beeper: { enabled: true, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 },
+      beeper: {
+        enabled: true, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5, allowNonLoopbackBaseUrl: false,
+      },
     });
     renderPanel();
 
@@ -266,9 +268,35 @@ describe('BeeperSettingsPanel — settings', () => {
 
     fireEvent.click(saveButton);
     await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith({
-      beeper: { enabled: true, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5 },
+      beeper: {
+        enabled: true, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5, allowNonLoopbackBaseUrl: false,
+      },
     }));
     expect(toast.success).toHaveBeenCalled();
+  });
+
+  // SEC-2: the opt-in is off by default and never inferred from the baseUrl
+  // text — it has to be an explicit, separate checkbox flip.
+  it('carries the non-loopback opt-in as its own explicit field', async () => {
+    api.getBeeperStatus.mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [] });
+    api.updateSettings.mockResolvedValue({
+      beeper: {
+        enabled: false, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5, allowNonLoopbackBaseUrl: true,
+      },
+    });
+    renderPanel();
+
+    const checkbox = await screen.findByLabelText(/Allow a non-loopback base URL/);
+    expect(checkbox).not.toBeChecked();
+
+    fireEvent.click(checkbox);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.updateSettings).toHaveBeenCalledWith({
+      beeper: {
+        enabled: false, intervalMinutes: 5, baseUrl: 'http://127.0.0.1:23373', attachmentBudgetGb: 5, allowNonLoopbackBaseUrl: true,
+      },
+    }));
   });
 
   it('disables Retry while the form has unsaved edits, per the save-gating convention', async () => {

@@ -37,6 +37,7 @@ import { readResponseJson } from '../lib/readResponseJson.js';
 import { describeFetchError, isReplayableConnectionError } from '../lib/fetchErrorChain.js';
 import { ServerError } from '../lib/errorHandler.js';
 import { isPlainObject } from '../lib/objects.js';
+import { isLoopbackHostname, parseBrowserOrigin } from '../lib/beeperOAuthOrigin.js';
 import { getSettings } from './settings.js';
 import { resolveBeeperToken } from './beeperCredentials.js';
 
@@ -72,9 +73,34 @@ export class BeeperApiError extends ServerError {
   }
 }
 
-function normalizeBaseUrl(value) {
+// Logged at most once per distinct rejected value (not on every call — this
+// runs on the hot path: every sweep tick, every status poll) so a
+// misconfigured install narrates the fallback without spamming the log.
+let lastRejectedBaseUrl;
+
+/**
+ * Normalize a candidate Beeper Desktop base URL, re-applying the SAME
+ * loopback-only gate `beeperSettingsSchema` enforces on the PUT route
+ * (SEC-2, `server/lib/mediaValidation.js`) — not belt-and-suspenders.
+ * `getSettings()` reads `settings.json` off disk with NO schema
+ * re-validation on read, so a hand-edited file is a path that can still hand
+ * a non-loopback origin — with a live vault token attached to every request —
+ * to `beeperRequest`, even though the settings PUT route would have refused
+ * it. A rejected value falls back to the shipped loopback default rather than
+ * reaching a single request.
+ */
+function normalizeBaseUrl(value, { allowNonLoopback = false } = {}) {
   const trimmed = String(value || '').trim().replace(/\/+$/, '');
-  return trimmed || DEFAULT_BASE_URL;
+  if (!trimmed) return DEFAULT_BASE_URL;
+  const parsed = parseBrowserOrigin(trimmed);
+  if (parsed && (isLoopbackHostname(parsed.hostname) || allowNonLoopback)) {
+    return parsed.origin;
+  }
+  if (trimmed !== lastRejectedBaseUrl) {
+    lastRejectedBaseUrl = trimmed;
+    console.error(`❌ Beeper baseUrl "${trimmed}" is not a loopback origin and allowNonLoopbackBaseUrl is not set — falling back to ${DEFAULT_BASE_URL}`);
+  }
+  return DEFAULT_BASE_URL;
 }
 
 /**
@@ -84,7 +110,9 @@ function normalizeBaseUrl(value) {
  */
 export async function resolveBeeperBaseUrl() {
   const settings = await getSettings().catch(() => null);
-  return normalizeBaseUrl(settings?.beeper?.baseUrl);
+  return normalizeBaseUrl(settings?.beeper?.baseUrl, {
+    allowNonLoopback: settings?.beeper?.allowNonLoopbackBaseUrl === true,
+  });
 }
 
 function normalizeToken(value) {
@@ -104,18 +132,35 @@ function normalizeToken(value) {
  * "the credential cannot be read" and "no credential is configured" are
  * different conditions, and collapsing them would report a connected install as
  * unconfigured (the absent-vs-empty sentinel rule).
+ *
+ * SEC-2's loopback-only gate applies whenever `baseUrl` is resolved FROM
+ * settings below — the one path a hand-edited `settings.json` can reach. The
+ * "both explicit" bypass above trusts its caller instead of re-deriving the
+ * gate here: it exists for values ALREADY resolved through
+ * `resolveBeeperBaseUrl()` (the OAuth discovery baseUrl, and
+ * `beeperStatus.js`'s probes — both call `resolveBeeperBaseUrl()` rather than
+ * reading `settings.beeper.baseUrl` directly for exactly this reason) plus the
+ * many tests in this file, and gating it a second time would need the
+ * opt-in re-derived here anyway, defeating "skip both stores entirely." A
+ * caller with a genuinely unvalidated `baseUrl` must resolve it through
+ * `resolveBeeperBaseUrl()` first, never pass it straight into this bypass.
  */
 export async function resolveBeeperConfig({ baseUrl, token } = {}) {
   if (baseUrl !== undefined && token !== undefined) {
-    return { baseUrl: normalizeBaseUrl(baseUrl), token: normalizeToken(token) };
+    // `allowNonLoopback: true` — trust the caller entirely rather than
+    // re-deriving the settings-sourced opt-in (which would defeat "skip both
+    // stores"). `normalizeBaseUrl` still enforces the bare-origin SHAPE and
+    // still trims a trailing slash; only the loopback gate is waived here.
+    return { baseUrl: normalizeBaseUrl(baseUrl, { allowNonLoopback: true }), token: normalizeToken(token) };
   }
   const settings = await getSettings().catch(() => null);
   const resolvedBaseUrl = baseUrl !== undefined ? baseUrl : settings?.beeper?.baseUrl;
+  const allowNonLoopback = settings?.beeper?.allowNonLoopbackBaseUrl === true;
   if (token !== undefined) {
-    return { baseUrl: normalizeBaseUrl(resolvedBaseUrl), token: normalizeToken(token) };
+    return { baseUrl: normalizeBaseUrl(resolvedBaseUrl, { allowNonLoopback }), token: normalizeToken(token) };
   }
   const stored = await resolveBeeperToken();
-  return { baseUrl: normalizeBaseUrl(resolvedBaseUrl), token: normalizeToken(stored?.token) };
+  return { baseUrl: normalizeBaseUrl(resolvedBaseUrl, { allowNonLoopback }), token: normalizeToken(stored?.token) };
 }
 
 /**

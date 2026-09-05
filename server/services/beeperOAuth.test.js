@@ -133,6 +133,26 @@ describe('discoverAuthorizationServer', () => {
     });
   });
 
+  // SEC-3: host and port were pinned, but not scheme — metadata served from an
+  // `https` base could still name an `http` endpoint on the same host/port and
+  // silently downgrade the token exchange to plaintext.
+  it('refuses an http token endpoint under a non-loopback https base (scheme downgrade)', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse({
+      ...METADATA, token_endpoint: 'http://example.com:23373/oauth/token',
+    }));
+    await expect(discoverAuthorizationServer({ baseUrl: 'https://example.com:23373' }))
+      .rejects.toMatchObject({ code: 'OAUTH_DISCOVERY_INVALID' });
+  });
+
+  it('still accepts a scheme mismatch when both the base and the endpoint are loopback', async () => {
+    vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse({
+      ...METADATA, token_endpoint: 'http://127.0.0.1:23373/oauth/token',
+    }));
+    await expect(discoverAuthorizationServer({ baseUrl: 'https://127.0.0.1:23373' })).resolves.toMatchObject({
+      tokenEndpoint: 'http://127.0.0.1:23373/oauth/token',
+    });
+  });
+
   it('refuses a server that advertises PKCE without S256', async () => {
     vi.mocked(fetchWithTimeout).mockResolvedValue(mockJsonResponse({
       ...METADATA, code_challenge_methods_supported: ['plain'],
