@@ -14,11 +14,14 @@ import BeeperSettingsPanel from './beeper/BeeperSettingsPanel';
  *
  * It owns exactly two things the surface and the settings panel must share:
  *
- *  1. **The one realtime subscription.** `useBeeperRealtime` emits
- *     `beeper:unsubscribe` on unmount, so a second instance inside the settings
- *     drawer would tear the surface's subscription down every time the drawer
- *     closed. One subscriber per page, and the liveness snapshot plus an
- *     invalidation counter are handed down as props.
+ *  1. **The page-level realtime subscription.** `useBeeperRealtime` pairs its
+ *     own `beeper:subscribe`/`beeper:unsubscribe` per mount, and several
+ *     subscribers may be live at once — `useBeeperOutbox`, reached through
+ *     `BeeperChatSurface`, mounts its own instance to refetch the outbox on a
+ *     `message.upserted` invalidation (`client/src/hooks/README.md` sanctions
+ *     this). This is the ONE that owns the status card: its liveness snapshot
+ *     plus an invalidation counter are handed down as props, so the settings
+ *     drawer never needs a subscription of its own.
  *  2. **The settings drawer.** #30's status card is not removed by the chat
  *     surface landing — it moves behind a header action, deep-linked as
  *     `?settings=1` exactly like the iMessage ingestion drawer, so ⌘K and voice
