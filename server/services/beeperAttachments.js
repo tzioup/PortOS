@@ -568,16 +568,40 @@ export async function evictToBudget() {
   return { evicted, reclaimedBytes, keptUnavailable, overBudget: used > budgetBytes };
 }
 
+/**
+ * Every file in the store, plus whether the listing actually COMPLETED.
+ *
+ * "The store could not be read" and "the store is empty" are the same value to
+ * a `catch(() => [])` — and the row-healing half of the sweep below clears
+ * `local_path` for every referenced path it did not see, so one EACCES on the
+ * root, or a data volume that came back unmounted, would unlink every mirrored
+ * row in the install from its bytes in a single pass. The `complete` flag is
+ * the sentinel that keeps the two apart (root AGENTS.md, absent-vs-empty).
+ *
+ * A PARTIAL listing counts as incomplete for the same reason: a prefix
+ * directory that cannot be read hides real files exactly as effectively as an
+ * unreadable root does.
+ */
 async function listStoredFiles() {
   const root = attachmentsRoot();
-  const prefixes = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const prefixes = await readdir(root, { withFileTypes: true }).catch((err) => err);
+  if (!Array.isArray(prefixes)) {
+    console.error(`❌ Beeper attachment store could not be listed: ${prefixes.message}`);
+    return { files: [], complete: false };
+  }
   const files = [];
+  let complete = true;
   for (const prefix of prefixes) {
     if (!prefix.isDirectory() || prefix.name === TMP_DIR_NAME) continue;
-    const entries = await readdir(join(root, prefix.name)).catch(() => []);
+    const entries = await readdir(join(root, prefix.name)).catch((err) => err);
+    if (!Array.isArray(entries)) {
+      console.error(`❌ Beeper attachment store prefix ${prefix.name} could not be listed: ${entries.message}`);
+      complete = false;
+      continue;
+    }
     for (const name of entries) files.push(`${prefix.name}/${name}`);
   }
-  return files;
+  return { files, complete };
 }
 
 /**
@@ -588,9 +612,19 @@ async function listStoredFiles() {
  *
  * Both directions get healed here, plus abandoned `.tmp` partials from a
  * process that died mid-download.
+ *
+ * The row-healing direction is the destructive one, and it runs ONLY on a
+ * listing that completed: a store that could not be read is not an empty store,
+ * and treating it as one would clear every mirrored row's `local_path` at once.
+ * Orphan removal is unaffected — it only ever touches files it actually saw.
  */
 export async function sweepAttachmentOrphans() {
-  const onDisk = await listStoredFiles();
+  // Create the root before listing it. On an install that has enabled Beeper
+  // but never mirrored a byte the directory does not exist yet, and THAT ENOENT
+  // really is "empty"; making it once means every later listing failure is a
+  // genuine anomaly worth logging and refusing to act on.
+  await mkdir(attachmentsRoot(), { recursive: true }).catch(() => {});
+  const { files: onDisk, complete: storeListed } = await listStoredFiles();
   const referenced = await query(
     `SELECT DISTINCT local_path FROM beeper_attachments WHERE local_path IS NOT NULL`,
   );
@@ -611,15 +645,19 @@ export async function sweepAttachmentOrphans() {
   }
 
   const diskSet = new Set(onDisk);
-  const missing = [...referencedSet].filter((relativePath) => !diskSet.has(relativePath));
   let healedRows = 0;
-  if (missing.length > 0) {
-    const result = await query(
-      `UPDATE beeper_attachments SET local_path = NULL, fetched_at = NULL, updated_at = NOW()
-        WHERE local_path = ANY($1::text[])`,
-      [missing],
-    );
-    healedRows = result?.rowCount || 0;
+  if (!storeListed) {
+    console.error('❌ Beeper attachment sweep: the store did not list completely — no row healed this pass');
+  } else {
+    const missing = [...referencedSet].filter((relativePath) => !diskSet.has(relativePath));
+    if (missing.length > 0) {
+      const result = await query(
+        `UPDATE beeper_attachments SET local_path = NULL, fetched_at = NULL, updated_at = NOW()
+          WHERE local_path = ANY($1::text[])`,
+        [missing],
+      );
+      healedRows = result?.rowCount || 0;
+    }
   }
 
   const now = Date.now();
@@ -636,7 +674,7 @@ export async function sweepAttachmentOrphans() {
   if (orphansRemoved || healedRows || partialsRemoved) {
     console.log(`🧹 Beeper attachment sweep: ${orphansRemoved} orphan file(s), ${healedRows} stale row(s), ${partialsRemoved} abandoned partial(s)`);
   }
-  return { orphansRemoved, healedRows, partialsRemoved };
+  return { orphansRemoved, healedRows, partialsRemoved, storeListed };
 }
 
 /** One scheduler tick: budget first, then the orphan backstop. */

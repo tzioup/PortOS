@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { createTempDataRoot, makePathsProxy } from '../lib/mockPathsDataRoot.js';
 
 const tempRoot = createTempDataRoot('portos-beeper-attachments-');
@@ -468,6 +468,39 @@ describe('sweepAttachmentOrphans — the backstop, both directions', () => {
     expect(result).toMatchObject({ orphansRemoved: 1, healedRows: 1 });
     expect(existsSync(join(attachmentsRoot(), orphan))).toBe(false);
     expect(healed[0]).toEqual([missing]);
+  });
+
+  it('reads a store it cannot list as unreadable rather than empty, and heals no row', async () => {
+    // The store root is replaced by a FILE, so every listing of it fails
+    // (ENOTDIR) exactly the way an EACCES or a data volume that came back
+    // unmounted would. A `catch(() => [])` reads that as "no files on disk" and
+    // then clears every mirrored row's claim on its bytes in one pass.
+    const root = attachmentsRoot();
+    mkdirSync(dirname(root), { recursive: true });
+    writeFileSync(root, Buffer.alloc(0));
+
+    const referencedPath = `bb/${'b'.repeat(64)}.png`;
+    const healed = [];
+    vi.mocked(query).mockImplementation(async (sql, params) => {
+      const flat = String(sql).replace(/\s+/g, ' ');
+      if (flat.includes('SELECT DISTINCT local_path FROM beeper_attachments WHERE local_path IS NOT NULL')) {
+        return { rows: [{ local_path: referencedPath }] };
+      }
+      if (flat.includes('WHERE local_path = ANY')) { healed.push(params[0]); return { rowCount: 1 }; }
+      return { rows: [] };
+    });
+    const errors = [];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation((line) => { errors.push(String(line)); });
+
+    const result = await sweepAttachmentOrphans();
+
+    expect(result).toMatchObject({ storeListed: false, healedRows: 0 });
+    // Not one `local_path` cleared, and the failure is said out loud rather
+    // than read as an empty store.
+    expect(healed).toEqual([]);
+    expect(errors.some((line) => line.includes('could not be listed'))).toBe(true);
+    expect(errors.some((line) => line.includes('no row healed this pass'))).toBe(true);
+    errorSpy.mockRestore();
   });
 
   it('spares an unreferenced file young enough to be a download still finishing', async () => {
