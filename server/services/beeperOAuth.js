@@ -92,6 +92,16 @@ const sameHost = (a, b) => a === b || (LOOPBACK_HOSTS.has(a) && LOOPBACK_HOSTS.h
  * user-editable base URL (#30 makes it editable); without this check, whatever
  * answers on that URL could name any host as the token endpoint and PortOS
  * would POST the authorization code — and receive a token — off-box.
+ *
+ * Host and port are pinned for every base URL; SCHEME is pinned too UNLESS
+ * both sides are loopback (SEC-3). Without that, metadata served from an
+ * `https` base could name an `http` endpoint on the same host/port and
+ * silently downgrade the token exchange to plaintext — same class of bug as
+ * the OAuth redirect-origin check in `lib/beeperOAuthOrigin.js`, applied here
+ * to the discovered endpoints instead of the browser-supplied origin. Loopback
+ * still accepts a scheme mismatch: `resolveBeeperBaseUrl`'s own default is
+ * `http://127.0.0.1:23373`, and a loopback connection carries no
+ * network-path downgrade risk to defend against.
  */
 function resolveEndpoint(value, baseUrl, field) {
   if (typeof value !== 'string' || !value.trim()) {
@@ -99,7 +109,13 @@ function resolveEndpoint(value, baseUrl, field) {
   }
   const base = new URL(baseUrl);
   const url = new URL(value.trim(), base);
-  if (!['http:', 'https:'].includes(url.protocol) || !sameHost(url.hostname, base.hostname) || url.port !== base.port) {
+  const bothLoopback = LOOPBACK_HOSTS.has(url.hostname) && LOOPBACK_HOSTS.has(base.hostname);
+  if (
+    !['http:', 'https:'].includes(url.protocol)
+    || !sameHost(url.hostname, base.hostname)
+    || url.port !== base.port
+    || (!bothLoopback && url.protocol !== base.protocol)
+  ) {
     throw oauthError(`Beeper authorization-server metadata points ${field} at a different host`, 'OAUTH_DISCOVERY_INVALID');
   }
   return url.toString();
