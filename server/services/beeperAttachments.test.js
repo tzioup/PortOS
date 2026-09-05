@@ -470,6 +470,30 @@ describe('sweepAttachmentOrphans — the backstop, both directions', () => {
     expect(healed[0]).toEqual([missing]);
   });
 
+  it('spares a file that gained a reference between the snapshot and the unlink', async () => {
+    const shared = `ff/${'f'.repeat(64)}.png`;
+    mkdirSync(join(attachmentsRoot(), 'ff'), { recursive: true });
+    writeFileSync(join(attachmentsRoot(), shared), Buffer.alloc(8));
+    const hoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000);
+    utimesSync(join(attachmentsRoot(), shared), hoursAgo, hoursAgo);
+
+    // Unreferenced when the sweep took its snapshot, and claimed by the time
+    // the unlink loop reaches it — a dedupe fetch that landed on these exact
+    // bytes through link()'s EEXIST. The age gate cannot see that: the file is
+    // genuinely old, it is the REFERENCE that is new.
+    respondTo([
+      ['SELECT DISTINCT local_path FROM beeper_attachments WHERE local_path IS NOT NULL', { rows: [] }],
+      ['WHERE local_path = $1 LIMIT 1', { rows: [{ '?column?': 1 }] }],
+    ]);
+
+    const result = await sweepAttachmentOrphans();
+
+    // Otherwise the row that just claimed these bytes reports `stored: true`
+    // against a file that is gone.
+    expect(result.orphansRemoved).toBe(0);
+    expect(existsSync(join(attachmentsRoot(), shared))).toBe(true);
+  });
+
   it('reads a store it cannot list as unreadable rather than empty, and heals no row', async () => {
     // The store root is replaced by a FILE, so every listing of it fails
     // (ENOTDIR) exactly the way an EACCES or a data volume that came back

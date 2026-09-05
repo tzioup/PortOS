@@ -487,7 +487,7 @@ export async function backfillAttachments({ limit = 500 } = {}) {
 /**
  * Drop one row's claim on its bytes, unlinking the file only when no OTHER row
  * still points at it (content addressing means several usually do).
- * @returns {Promise<number>} bytes actually reclaimed from disk
+ * @returns {Promise<{ removed: boolean, bytes: number }>}
  */
 async function releaseRowBytes(row) {
   const relativePath = row.local_path;
@@ -499,17 +499,28 @@ async function releaseRowBytes(row) {
   return unlinkIfUnreferenced(relativePath);
 }
 
+/**
+ * Unlink one stored file if — and only if — the reference check run RIGHT NOW
+ * says nothing points at it. The freshness is the contract: every caller here
+ * decided a file was unreferenced at some earlier point, and a dedupe fetch
+ * landing on these exact bytes through `link()`'s EEXIST in between would leave
+ * the row that just claimed them saying `stored: true` against a deleted file.
+ *
+ * `removed` is its own field rather than "bytes > 0" because a legitimately
+ * empty file reclaims nothing and is still gone.
+ * @returns {Promise<{ removed: boolean, bytes: number }>}
+ */
 async function unlinkIfUnreferenced(relativePath) {
-  if (!relativePath || !isSafeAttachmentRelativePath(relativePath)) return 0;
+  if (!relativePath || !isSafeAttachmentRelativePath(relativePath)) return { removed: false, bytes: 0 };
   const others = await query(
     `SELECT 1 FROM beeper_attachments WHERE local_path = $1 LIMIT 1`,
     [relativePath],
   );
-  if (others?.rows?.length) return 0;
+  if (others?.rows?.length) return { removed: false, bytes: 0 };
   const filePath = join(attachmentsRoot(), relativePath);
   const info = await stat(filePath).catch(() => null);
   const removed = await unlink(filePath).then(() => true).catch(() => false);
-  return removed ? (info?.size || 0) : 0;
+  return { removed, bytes: removed ? (info?.size || 0) : 0 };
 }
 
 /**
@@ -557,7 +568,7 @@ export async function evictToBudget() {
     // evicting on an unanswered question.
     if (probe) break;
 
-    const freed = await releaseRowBytes(row);
+    const { bytes: freed } = await releaseRowBytes(row);
     evicted += 1;
     reclaimedBytes += freed;
     used -= freed;
@@ -640,7 +651,13 @@ export async function sweepAttachmentOrphans() {
     // request budget cannot be.
     const info = await stat(join(attachmentsRoot(), relativePath)).catch(() => null);
     if (!info || sweepStart - info.mtimeMs < TMP_MAX_AGE_MS) continue;
-    const removed = await unlink(join(attachmentsRoot(), relativePath)).then(() => true).catch(() => false);
+    // `referencedSet` is a SNAPSHOT taken before this loop started, and the
+    // mtime gate only rules out a file being written right now — not a dedupe
+    // fetch that landed on this exact OLD file through `link()`'s EEXIST while
+    // the loop was working through the rest of the store. Re-ask the reference
+    // question immediately before the unlink, or the row that just claimed
+    // these bytes is left reporting `stored: true` against a deleted file.
+    const { removed } = await unlinkIfUnreferenced(relativePath);
     if (removed) orphansRemoved += 1;
   }
 
@@ -712,10 +729,10 @@ export async function purgeConversationAttachments(conversationId) {
   let removedFiles = 0;
   let freedBytes = 0;
   for (const relativePath of paths) {
-    const freed = await unlinkIfUnreferenced(relativePath);
-    if (freed > 0) {
+    const { removed, bytes } = await unlinkIfUnreferenced(relativePath);
+    if (removed) {
       removedFiles += 1;
-      freedBytes += freed;
+      freedBytes += bytes;
     }
   }
   return { removedFiles, freedBytes };
