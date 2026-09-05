@@ -421,7 +421,7 @@ describe('the store is content-addressed, so every unlink is reference-checked',
     });
 
     const result = await purgeConversationAttachments(CONV);
-    expect(result).toEqual({ removedFiles: 0, freedBytes: 0 });
+    expect(result).toEqual({ removedFiles: 0, freedBytes: 0, failedUnlinks: 0 });
     expect(existsSync(join(attachmentsRoot(), relPath))).toBe(true);
   });
 
@@ -437,8 +437,31 @@ describe('the store is content-addressed, so every unlink is reference-checked',
     });
 
     const result = await purgeConversationAttachments(CONV);
-    expect(result).toMatchObject({ removedFiles: 1, freedBytes: 32 });
+    expect(result).toMatchObject({ removedFiles: 1, freedBytes: 32, failedUnlinks: 0 });
     expect(existsSync(join(attachmentsRoot(), relPath))).toBe(false);
+  });
+
+  it('counts an unlink it could not perform instead of reporting the bytes as reclaimed', async () => {
+    // A directory standing where the mirrored file should be: `unlink` refuses
+    // it, which is the shape every un-unlinkable path takes — a read-only
+    // mount, a permissions change, a handle the OS will not let go of.
+    const blocked = `ab/${'ab'.repeat(32)}.png`;
+    mkdirSync(join(attachmentsRoot(), blocked), { recursive: true });
+    respondTo([
+      ['SELECT DISTINCT local_path FROM beeper_attachments WHERE conversation_id', { rows: [{ local_path: blocked }] }],
+    ]);
+    const errors = [];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation((line) => { errors.push(String(line)); });
+
+    const result = await purgeConversationAttachments(CONV);
+
+    // The row has already given up its claim, so nothing points at these bytes
+    // any more. Reporting them as reclaimed is exactly how they vanish from the
+    // budget while still sitting on the disk.
+    expect(result).toEqual({ removedFiles: 0, freedBytes: 0, failedUnlinks: 1 });
+    expect(existsSync(join(attachmentsRoot(), blocked))).toBe(true);
+    expect(errors.some((line) => line.includes('unlink failed'))).toBe(true);
+    errorSpy.mockRestore();
   });
 });
 
@@ -524,6 +547,26 @@ describe('sweepAttachmentOrphans — the backstop, both directions', () => {
     expect(healed).toEqual([]);
     expect(errors.some((line) => line.includes('could not be listed'))).toBe(true);
     expect(errors.some((line) => line.includes('no row healed this pass'))).toBe(true);
+    errorSpy.mockRestore();
+  });
+
+  it('names a failed unlink in the sweep log line rather than swallowing it', async () => {
+    const blocked = `ba/${'ba'.repeat(32)}.png`;
+    mkdirSync(join(attachmentsRoot(), blocked), { recursive: true });
+    const hoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000);
+    utimesSync(join(attachmentsRoot(), blocked), hoursAgo, hoursAgo);
+    respondTo([['SELECT DISTINCT local_path FROM beeper_attachments WHERE local_path IS NOT NULL', { rows: [] }]]);
+    const logs = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((line) => { logs.push(String(line)); });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    const result = await sweepAttachmentOrphans();
+
+    // Swallowed, this is a sweep that reports "0 orphan file(s)" and stays
+    // silent while the bytes it meant to reclaim are still there.
+    expect(result).toMatchObject({ orphansRemoved: 0, failedUnlinks: 1 });
+    expect(logs.some((line) => line.includes('1 unlink failure(s)'))).toBe(true);
+    logSpy.mockRestore();
     errorSpy.mockRestore();
   });
 
