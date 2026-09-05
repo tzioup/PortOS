@@ -605,7 +605,11 @@ describe('GET /api/beeper/conversations/:id and its messages', () => {
     vi.mocked(getConversation).mockResolvedValue(null);
     const res = await request(buildApp()).get(`/api/beeper/conversations/${CONV_ID}`);
     expect(res.status).toBe(404);
+    // Standard error envelope: { error, code, timestamp } — same shape
+    // errorMiddleware stamps everywhere else (regression for the hand-rolled
+    // res.status(404).json(...) this route used to write itself).
     expect(res.body.code).toBe('NOT_FOUND');
+    expect(typeof res.body.timestamp).toBe('number');
   });
 
   it('rejects a non-uuid conversation id before it reaches the store', async () => {

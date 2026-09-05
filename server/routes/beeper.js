@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { asyncHandler, createServiceErrorMapper } from '../lib/errorHandler.js';
+import { asyncHandler, createServiceErrorMapper, ServerError } from '../lib/errorHandler.js';
 import { resolveOAuthOrigin } from '../lib/beeperOAuthOrigin.js';
 import { PORTOS_API_URL, PORTOS_UI_URL } from '../lib/ports.js';
 import { serveLocalFile } from '../lib/fileUtils.js';
@@ -219,10 +219,7 @@ router.get('/networks', asyncHandler(async (_req, res) => {
 router.get('/conversations/:id', asyncHandler(async (req, res) => {
   const { id } = validateRequest(conversationParamsSchema, req.params);
   const conversation = await getConversation(id);
-  if (!conversation) {
-    res.status(404).json({ error: 'Conversation not found', code: 'NOT_FOUND' });
-    return;
-  }
+  if (!conversation) throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
   res.json(conversation);
 }));
 
