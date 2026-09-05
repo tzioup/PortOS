@@ -351,10 +351,21 @@ removal, never an unsend); anything further along answers 409.
 
 **What the composer shows.** Outbox rows render inline with the mirrored messages, filtered
 against the fetched messages so a confirmed send appears exactly once — as the real mirrored
-message — and never twice. A failed row offers **Retry**, which composes a brand-new entry with
-the same text rather than resending the failed one. A row stranded in `approved` (most often
-because the breaker was tripped when the send was attempted) offers **Retry**, which re-dispatches
-that same row because nothing ever touched the wire for it, and **Dismiss**, which discards it.
+message — and never twice. Only a send that can still change spins. Everything else is terminal
+and says so:
+
+- **Failed** — "Not delivered", with the recorded error and **Retry**, which composes a brand-new
+  entry with the same text rather than resending the failed one.
+- **Interrupted by a restart** (`SEND_INTERRUPTED`) — "Delivery unconfirmed: PortOS restarted
+  mid-send. Check the chat before retrying.", with the same Retry. It does not claim a delivery
+  verdict, because there isn't one.
+- **Sent, unconfirmed** (`CONFIRMATION_UNRESOLVED`) — the reason the 30-second fallback recorded,
+  and no Retry: the message may well have been delivered, and a resend is the one mistake that
+  cannot be taken back.
+- **Stranded in `approved`** (most often the breaker was tripped when the send was attempted) —
+  **Retry**, which re-dispatches that same row because nothing ever touched the wire for it, and
+  **Dismiss**, which discards it.
+
 Send is disabled and names the reason while the breaker is tripped; the breaker's own banner
 stays in the settings drawer rather than appearing a second time on the chat surface.
 
