@@ -20,6 +20,12 @@ const socket = {
   running: false,
   starts: 0,
   stops: 0,
+  // Both default to an immediate no-op so every existing test below observes
+  // exactly the old synchronous mock. The overlapping arm/disarm test further
+  // down replaces them for that one case, to force `startBeeperSocket()` to
+  // suspend at a known point instead of resolving on the same microtask tick.
+  gate: Promise.resolve(),
+  onStart: () => {},
 };
 
 vi.mock('./beeperSync.js', () => ({
@@ -32,6 +38,8 @@ vi.mock('./beeperSocket.js', () => ({
   // Same contract as the real module: declines (false) when already running.
   startBeeperSocket: async () => {
     socket.starts += 1;
+    socket.onStart();
+    await socket.gate;
     if (socket.running) return false;
     socket.running = true;
     return true;
@@ -61,6 +69,8 @@ beforeEach(() => {
   socket.running = false;
   socket.starts = 0;
   socket.stops = 0;
+  socket.gate = Promise.resolve();
+  socket.onStart = () => {};
 });
 
 afterEach(() => {
@@ -146,5 +156,44 @@ describe('reconcileBeeperIngestion', () => {
     // Two calls into the transport, but only the first one started it.
     expect(socket.starts).toBe(2);
     expect(getEvent('beeper-sync')).toBeTruthy();
+  });
+
+  // The serialization case an arm+arm race does not stress: two OPPOSITE
+  // triggers landing in the same tick. Without the `tail` queue in
+  // `reconcileBeeperIngestion`, both calls' `reconcileOnce()` run concurrently
+  // instead of one fully finishing before the next starts, and whichever one's
+  // async chain happens to settle LAST wins — not whichever was issued last.
+  // Here that would leave the socket running and the sweep registered even
+  // though `disconnect` (issued second) is the trigger that should have had
+  // the final say.
+  //
+  // This is proved by temporarily removing the queue: replace
+  // `reconcileBeeperIngestion`'s body in beeperArming.js with
+  // `return reconcileOnce(reason);` and re-run this file. The socket stays
+  // running (asserted false below) because the arm call's `startBeeperSocket()`
+  // — parked on `socket.gate` until this test releases it — resumes and starts
+  // the socket AFTER the disarm call has already run and found nothing to stop.
+  // Restore the `tail.then(run, run)` body afterward; this test passes again
+  // once it is back.
+  it('lets a disarm issued while an arm is still starting the socket win the final state', async () => {
+    captureLogs();
+    let releaseSocket;
+    socket.gate = new Promise((resolve) => { releaseSocket = resolve; });
+    const socketStartSeen = new Promise((resolve) => { socket.onStart = resolve; });
+
+    // `state.armed` is read again inside `reconcileOnce` — flipping it here
+    // (once the arm call has already captured `true` and is parked inside
+    // `startBeeperSocket()`) is what makes the disarm call, issued next, a
+    // genuine disarm rather than a second arm.
+    const armPromise = reconcileBeeperIngestion({ reason: 'oauth-connect' });
+    await socketStartSeen;
+    state.armed = false;
+    const disarmPromise = reconcileBeeperIngestion({ reason: 'disconnect' });
+    releaseSocket();
+
+    await Promise.all([armPromise, disarmPromise]);
+
+    expect(socket.running).toBe(false);
+    expect(getEvent('beeper-sync')).toBeFalsy();
   });
 });
