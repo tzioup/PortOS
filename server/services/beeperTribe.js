@@ -152,6 +152,17 @@ export async function resolveParticipantPerson({ conversationId, sourceUserId },
 }
 
 /**
+ * Load and index the Tribe roster ONCE, for a caller (a sweep pass in
+ * `beeperSync.js`) about to resolve MANY participants and wants to hand the
+ * same `personIndex` to every `upsertParticipant` call rather than let each
+ * one reload and reindex every Tribe person for itself. Mirrors the batching
+ * `logSenderTouchpoints` already does internally for its own candidate list.
+ */
+export async function loadRosterIndex() {
+  return buildPersonMatchIndex(await tribe.listPeople());
+}
+
+/**
  * Insert-or-refresh a participant row. The `ON CONFLICT` update list
  * deliberately EXCLUDES `tribe_person_id` — a re-sync must never clobber a
  * manual link (#34 acceptance: "a counterparty with no durable identifier
@@ -166,9 +177,16 @@ export async function resolveParticipantPerson({ conversationId, sourceUserId },
  * handle — that handle IS the `tribe_identities` axis, so erasing it would
  * silently demote the participant to the no-durable-identifier case and strand
  * the identity claim. A genuinely new, non-empty handle still replaces it.
+ *
+ * `personIndex` is the SAME optional pre-built `buildPersonMatchIndex(...)`
+ * result `resolveParticipantPerson` and `logSenderTouchpoints` accept — pass
+ * one (via `loadRosterIndex` below) when a caller will call this once per
+ * participant in a sweep pass, so the phone fallback doesn't reload and
+ * reindex the whole Tribe roster on every single participant. `null` falls
+ * back to `resolveParticipantPerson`'s own per-call load, unchanged.
  */
 export async function upsertParticipant({
-  conversationId, sourceUserId, displayName = '', handle = '', observedVia,
+  conversationId, sourceUserId, displayName = '', handle = '', observedVia, personIndex = null,
 }) {
   if (!conversationId || !sourceUserId) {
     throw new ServerError('conversationId and sourceUserId are required', { status: 400, code: 'BAD_REQUEST' });
@@ -194,7 +212,7 @@ export async function upsertParticipant({
   // Gate on the row's OWN handle, not this call's argument — the COALESCE
   // above means a handle-less re-observation leaves a durable handle in place.
   if (!participant.tribePersonId && participant.handle) {
-    const resolved = await resolveParticipantPerson({ conversationId, sourceUserId });
+    const resolved = await resolveParticipantPerson({ conversationId, sourceUserId }, personIndex);
     if (resolved) {
       await query(
         `UPDATE beeper_participants SET tribe_person_id = $3, updated_at = NOW()

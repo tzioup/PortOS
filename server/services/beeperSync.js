@@ -52,7 +52,7 @@ import {
   listChatsPage,
   listMessagesPage,
 } from './beeperClient.js';
-import { upsertParticipant, logSenderTouchpoints } from './beeperTribe.js';
+import { upsertParticipant, logSenderTouchpoints, loadRosterIndex } from './beeperTribe.js';
 import { isInstanceFeatureEnabled } from './instanceFeatures.js';
 import { getSettings } from './settings.js';
 
@@ -501,7 +501,9 @@ async function commitMessages({ conversationId, accountId, sourceChatId, rows, c
 // Sweep
 // ---------------------------------------------------------------------------
 
-async function sweepChat({ chat, stored, clientOptions, observedAt }) {
+async function sweepChat({
+  chat, stored, clientOptions, observedAt, personIndex,
+}) {
   const normalized = normalizeChatRow(chat);
   if (!normalized.accountId || !normalized.sourceChatId) return { messages: 0 };
 
@@ -515,9 +517,16 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
   // Roster first, then senders: a message-sender observation carries a richer
   // handle than a truncated roster entry, and `upsertParticipant` COALESCEs
   // the handle rather than overwriting it, so the better one wins either way.
+  //
+  // `personIndex` is `executeSweep`'s ONE Tribe-roster load for the whole
+  // sweep pass, threaded down here and to the sender loop below — without it
+  // `upsertParticipant`'s phone-match fallback would reload and reindex every
+  // Tribe person once per participant, in every chat, on every pass.
   for (const participant of normalizeParticipants(chat)) {
     // eslint-disable-next-line no-await-in-loop -- at most 20 per chat (the list endpoint truncates there)
-    await upsertParticipant({ conversationId, ...participant, observedVia: 'participant-list' });
+    await upsertParticipant({
+      conversationId, ...participant, observedVia: 'participant-list', personIndex,
+    });
   }
 
   const rows = messages
@@ -536,6 +545,7 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
       displayName: String(raw?.senderName ?? ''),
       handle: '',
       observedVia: 'message-sender',
+      personIndex,
     });
   }
 
@@ -598,7 +608,7 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
  * asked for no sweep at all means everything below it is older still. The page
  * budget stays the hard guarantee, so a pathological account still ends.
  */
-async function sweepAccount(account, clientOptions, observedAt) {
+async function sweepAccount(account, clientOptions, observedAt, personIndex) {
   const cursors = await readAccountCursors(account.accountId);
   let cursor;
   let chatsSwept = 0;
@@ -618,7 +628,9 @@ async function sweepAccount(account, clientOptions, observedAt) {
       if (!chatNeedsSweep(chat, stored)) continue;
       pageNeededSweep = true;
       // eslint-disable-next-line no-await-in-loop -- one chat at a time; each is its own transaction
-      const result = await sweepChat({ chat, stored, clientOptions, observedAt }).catch((err) => {
+      const result = await sweepChat({
+        chat, stored, clientOptions, observedAt, personIndex,
+      }).catch((err) => {
         failedChats++;
         console.error(`❌ ${LOG_PREFIX}: chat ${String(chat?.id ?? 'unknown')} failed: ${err.message}`);
         return null;
@@ -658,13 +670,19 @@ async function executeSweep(reason) {
   const observedAt = new Date(startedAt).toISOString();
   const accounts = await refreshAccounts(clientOptions);
 
+  // Loaded ONCE for the whole sweep pass, across every account/chat/participant
+  // below — not once per participant. `upsertParticipant`'s phone-match
+  // fallback reindexes the entire Tribe roster on a miss, and a sweep touches
+  // every participant of every changed chat on every account.
+  const personIndex = await loadRosterIndex();
+
   let chats = 0;
   let messages = 0;
   let failedAccounts = 0;
   let failedChats = 0;
   for (const account of accounts) {
     // eslint-disable-next-line no-await-in-loop -- accounts are swept in order; each owns its own cursors
-    const result = await sweepAccount(account, clientOptions, observedAt).catch((err) => {
+    const result = await sweepAccount(account, clientOptions, observedAt, personIndex).catch((err) => {
       failedAccounts++;
       console.error(`❌ ${LOG_PREFIX}: account ${account.accountId} failed: ${err.message}`);
       return null;

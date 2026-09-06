@@ -341,3 +341,67 @@ describe('upsertParticipant handle preservation', () => {
     expect(resynced.handle).toBe('@new_handle');
   });
 });
+
+// The audit's roster-reload finding: `upsertParticipant`'s phone-match
+// fallback used to reload and reindex the ENTIRE Tribe roster once per
+// participant, so a sweep with N participants across a handful of chats made
+// N (or more) identical `tribe.listPeople()` calls for the same unchanging
+// roster. `personIndex` lets a caller (`beeperSync.js`'s sweep pass, via
+// `loadRosterIndex`) build the index once and hand it to every
+// `upsertParticipant` call.
+describe('upsertParticipant — roster hoisting: personIndex loaded once, not once per participant', () => {
+  const rosterPeople = () => ([
+    { id: CACHED_PERSON, name: 'Example One', phones: ['+15550100011'] },
+    { id: CLAIMING_PERSON, name: 'Example Two', phones: ['+15550100022'] },
+    { id: LEGACY_PHONE_PERSON, name: 'Example Three', phones: ['+15550100033'] },
+  ]);
+
+  it('reuses one caller-supplied personIndex across N participants instead of reloading the roster per participant', async () => {
+    db.conversations.set(CONVERSATION, 'whatsapp');
+    listPeople.mockResolvedValue(rosterPeople());
+
+    // The one load a whole sweep pass is meant to do, built up front —
+    // mirrors `loadRosterIndex()` being called once in `beeperSync.js`.
+    const personIndex = await beeperTribe.loadRosterIndex();
+    expect(listPeople).toHaveBeenCalledTimes(1);
+
+    const participants = [
+      { sourceUserId: 'user-1', handle: '+1 (555) 010-0011', expected: CACHED_PERSON },
+      { sourceUserId: 'user-2', handle: '+1 (555) 010-0022', expected: CLAIMING_PERSON },
+      { sourceUserId: 'user-3', handle: '+1 (555) 010-0033', expected: LEGACY_PHONE_PERSON },
+    ];
+
+    for (const p of participants) {
+      // eslint-disable-next-line no-await-in-loop -- sequential upserts mirroring the sweep's own per-chat loop
+      const result = await beeperTribe.upsertParticipant({
+        conversationId: CONVERSATION,
+        sourceUserId: p.sourceUserId,
+        handle: p.handle,
+        observedVia: 'message-sender',
+        personIndex,
+      });
+      // The linking result is UNCHANGED: every participant still resolves to
+      // the right person through the shared index.
+      expect(result.tribePersonId).toBe(p.expected);
+    }
+
+    // The roster was loaded ONCE, up front — never again across all 3 upserts.
+    expect(listPeople).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to one reload per call with no personIndex supplied — the old, unchanged default', async () => {
+    db.conversations.set(CONVERSATION, 'whatsapp');
+    listPeople.mockResolvedValue(rosterPeople());
+
+    const first = await beeperTribe.upsertParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', handle: '+1 (555) 010-0011', observedVia: 'message-sender',
+    });
+    const second = await beeperTribe.upsertParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-2', handle: '+1 (555) 010-0022', observedVia: 'message-sender',
+    });
+
+    expect(first.tribePersonId).toBe(CACHED_PERSON);
+    expect(second.tribePersonId).toBe(CLAIMING_PERSON);
+    expect(listPeople).toHaveBeenCalledTimes(2);
+  });
+});
