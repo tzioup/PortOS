@@ -257,7 +257,17 @@ function scheduleReconnect() {
   }
   reconnectTimer = runtime.setTimeout(() => {
     reconnectTimer = null;
-    connect().catch((err) => console.error(`${LOG_PREFIX}: reconnect failed: ${err?.message ?? err}`));
+    // A rejected `connect()` (a credential read that throws — an unreadable
+    // vault, not merely an absent token) must not silently end the reconnect
+    // loop: without this catch the timer never fires again, yet
+    // `getBeeperRealtimeState()` keeps reporting `reconnecting` for the life of
+    // the process. Drop whatever half-open socket the attempt left behind and
+    // schedule the next attempt exactly as a `close`/`error` event would.
+    connect().catch((err) => {
+      console.error(`${LOG_PREFIX}: reconnect failed: ${err?.message ?? err}`);
+      dropSocket();
+      scheduleReconnect();
+    });
   }, delay);
   if (typeof reconnectTimer?.unref === 'function') reconnectTimer.unref();
 }
@@ -504,7 +514,22 @@ export async function startBeeperSocket(overrides = {}) {
   connectionCount = 0;
   hasEverConnected = false;
   authRejected = false;
-  await connect();
+  try {
+    await connect();
+  } catch (err) {
+    // A credential read that throws (an unreadable vault, not merely an
+    // absent token — #11 decision 8) rejects `connect()` before it ever
+    // schedules a reconnect. Left at `running: true` with no timer behind it,
+    // this is stuck for the life of the process: `isBeeperSocketRunning()`
+    // says armed, the state stays whatever `pendingStateWord()` last set, and
+    // no later reconcile call can re-arm it because `startBeeperSocket()`
+    // declines whenever `running` is already true. Reset it here — guarded on
+    // generation so a `stopBeeperSocket()` that landed while `connect()` was
+    // suspended is not undone — so the next `reconcileBeeperIngestion()` call
+    // (a credential re-saved, a feature retoggled) gets a fresh attempt.
+    console.error(`${LOG_PREFIX}: initial connect failed: ${err?.message ?? err}`);
+    if (stopGeneration === generation) running = false;
+  }
   return true;
 }
 
