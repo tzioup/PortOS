@@ -12,9 +12,13 @@
  *
  * Watermark-bounded, never a full history rebuild. Per account:
  *   1. refresh `beeper_accounts` from the live roster (never `loginID`);
- *   2. page `GET /v1/chats?accountIDs=…` newest-first and STOP at the first
- *      chat that is not newer than its stored `beeper_sync_cursors.last_activity`
- *      — the list is ordered by last activity, so everything past it is older;
+ *   2. page `GET /v1/chats?accountIDs=…` newest-first, sweeping every chat on
+ *      the page that is newer than its stored
+ *      `beeper_sync_cursors.last_activity`, and STOP at the first page that
+ *      asked for nothing. A single caught-up chat does not end the walk: a
+ *      chat whose forward walk was truncated keeps its OLD watermark on
+ *      purpose, so it stays eligible while sorting below chats that are
+ *      already caught up;
  *   3. for each changed chat: upsert the conversation, upsert participants
  *      (`beeperTribe.upsertParticipant`), page new messages from the stored
  *      opaque cursor with `direction: 'after'`, log daily Tribe touchpoints
@@ -306,9 +310,11 @@ function assertPagedShape(page, what) {
  * every message of every chat the first time a user enables the toggle is not
  * a sweep.
  *
- * `truncated` is true only when the walk ran out of PAGE BUDGET with the
- * server still reporting `hasMore` — i.e. messages exist that this pass did
- * not fetch. The caller MUST NOT advance the chat's watermark in that case
+ * `truncated` is true whenever a FORWARD walk ends with the server still
+ * reporting `hasMore` — i.e. messages exist that this pass did not fetch.
+ * That is the page budget running out, and equally a server that answers
+ * `hasMore: true` with no usable cursor to continue on (a null one, or the one
+ * it was just handed). The caller MUST NOT advance the chat's watermark in that case
  * (see `sweepChat`): the cursor moved forward but the newest messages are
  * still missing, and a watermark equal to the chat's current activity would
  * make `chatNeedsSweep` skip the chat forever. The first-page-only anchor walk
@@ -330,7 +336,17 @@ async function fetchNewMessages(chatId, storedCursor, clientOptions) {
     if (page.newestCursor) anchorCursor = page.newestCursor;
     if (!page.hasMore) break;
     const nextCursor = direction === 'after' ? page.newestCursor : page.oldestCursor;
-    if (!nextCursor || nextCursor === cursor) break;
+    if (!nextCursor || nextCursor === cursor) {
+      // The server says there is more and hands back no way to ask for it — a
+      // null cursor, or the very cursor it was just given. On a forward walk
+      // that is the same state as running out of page budget: messages exist
+      // that this pass did not fetch, so the watermark must not commit over
+      // them. Reading it as a clean end (which is what falling out of the loop
+      // with `truncated === false` did) marked the chat caught up and lost
+      // every message beyond the stall.
+      truncated = direction === 'after';
+      break;
+    }
     cursor = nextCursor;
     if (direction === 'after' && pageIndex === maxPages - 1) truncated = true;
   }
@@ -451,14 +467,31 @@ async function commitMessages({ conversationId, accountId, sourceChatId, rows, c
 
     // The cursor moves LAST and only inside this transaction, so a failure
     // anywhere above rolls it back with the rows it was going to describe.
+    //
+    // `WHERE EXISTS` is the purge interlock. `beeper_sync_cursors` carries an FK
+    // onto `beeper_accounts` alone, so the conversation's cascade cannot reach
+    // it and `purgeConversation` deletes the two by hand in one transaction. A
+    // sweep already in flight when that purge commits would otherwise re-insert
+    // the cursor here — unconditionally, because a window with ZERO message rows
+    // still writes it — carrying the chat's current `last_activity`. That
+    // resurrected watermark makes `chatNeedsSweep` skip the chat, so the history
+    // the user just purged never comes back, contradicting the typed
+    // confirmation's promise that the next sync will mirror it again.
+    //
+    // The guard is a row check rather than a constraint on purpose: no DDL, no
+    // cascade, and the schema's own note that "a cursor can exist before the
+    // conversation row does" still holds everywhere else. On this path the
+    // conversation is upserted before the walk starts, so a missing row means it
+    // was deleted underneath us — exactly the case to decline.
     await client.query(
       `INSERT INTO beeper_sync_cursors (account_id, chat_id, cursor, last_activity, last_swept_at)
-       VALUES ($1, $2, $3, $4, NOW())
+       SELECT $1::text, $2::text, $3::text, $4::timestamptz, NOW()
+        WHERE EXISTS (SELECT 1 FROM beeper_conversations WHERE id = $5::uuid)
        ON CONFLICT (account_id, chat_id) DO UPDATE SET
          cursor = COALESCE(EXCLUDED.cursor, beeper_sync_cursors.cursor),
          last_activity = COALESCE(EXCLUDED.last_activity, beeper_sync_cursors.last_activity),
          last_swept_at = NOW()`,
-      [accountId, sourceChatId, cursor, lastActivity],
+      [accountId, sourceChatId, cursor, lastActivity, conversationId],
     );
     return rows.length;
   });
@@ -549,6 +582,21 @@ async function sweepChat({ chat, stored, clientOptions, observedAt }) {
  * abort this account's whole walk on every single pass and starve every chat
  * below it indefinitely. Its cursor and watermark are untouched by the failed
  * transaction, so it is retried next pass either way.
+ *
+ * A CAUGHT-UP CHAT DOES NOT END THE WALK, and that is the whole reason the
+ * truncation contract works. `sweepChat` withholds the watermark from a chat
+ * whose forward walk ran out of page budget, precisely so the chat stays
+ * eligible next pass — but the list is ordered by last activity, not by
+ * eligibility, so that chat sorts wherever its last message puts it. Ending the
+ * walk at the first chat that is not newer than its watermark therefore made
+ * the two rules cancel each other out: in the steady state, where the chats
+ * above are all caught up, a truncated chat sitting below one of them was never
+ * reached again and its backlog was stranded until unrelated activity moved it
+ * to the top of the list.
+ *
+ * The termination rule is the PAGE instead: a page scanned end to end that
+ * asked for no sweep at all means everything below it is older still. The page
+ * budget stays the hard guarantee, so a pathological account still ends.
  */
 async function sweepAccount(account, clientOptions, observedAt) {
   const cursors = await readAccountCursors(account.accountId);
@@ -556,23 +604,19 @@ async function sweepAccount(account, clientOptions, observedAt) {
   let chatsSwept = 0;
   let messagesWritten = 0;
   let failedChats = 0;
-  let reachedWatermark = false;
 
-  for (let pageIndex = 0; pageIndex < MAX_CHAT_PAGES_PER_ACCOUNT && !reachedWatermark; pageIndex++) {
+  for (let pageIndex = 0; pageIndex < MAX_CHAT_PAGES_PER_ACCOUNT; pageIndex++) {
     // eslint-disable-next-line no-await-in-loop -- cursor pagination is inherently sequential
     const page = await listChatsPage({
       cursor, direction: 'before', accountIDs: [account.accountId], ...clientOptions,
     });
     assertPagedShape(page, '/v1/chats');
 
+    let pageNeededSweep = false;
     for (const chat of page.items) {
       const stored = cursors.get(String(chat?.id ?? ''));
-      if (!chatNeedsSweep(chat, stored)) {
-        // The list is ordered by last activity, so the first chat that is not
-        // newer than its watermark ends the walk for this account.
-        reachedWatermark = true;
-        break;
-      }
+      if (!chatNeedsSweep(chat, stored)) continue;
+      pageNeededSweep = true;
       // eslint-disable-next-line no-await-in-loop -- one chat at a time; each is its own transaction
       const result = await sweepChat({ chat, stored, clientOptions, observedAt }).catch((err) => {
         failedChats++;
@@ -584,7 +628,9 @@ async function sweepAccount(account, clientOptions, observedAt) {
       messagesWritten += result.messages;
     }
 
-    if (reachedWatermark || !page.hasMore) break;
+    // A chat that FAILED still counted as needing a sweep, so a bridge that
+    // 502s cannot end the account's walk early either.
+    if (!pageNeededSweep || !page.hasMore) break;
     if (!page.oldestCursor || page.oldestCursor === cursor) break;
     cursor = page.oldestCursor;
   }

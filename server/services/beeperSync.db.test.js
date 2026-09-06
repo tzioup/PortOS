@@ -11,7 +11,11 @@
  *   - a re-observed message keeps its body and gains `unsent_at` (the source
  *     tombstone is never a removal, #7/#13);
  *   - the stored watermark stops the second sweep from re-paging an unchanged
- *     chat.
+ *     chat;
+ *   - a sweep whose conversation is purged mid-flight commits no cursor row, so
+ *     a purge can never be silently undone by a resurrected watermark;
+ *   - a stored `is_sender` TRUE survives a later sweep whose payload omits the
+ *     optional field.
  *
  * `*.db.test.js` → runs ONLY via `npm run test:db` against `portos_test`
  * (registered in vitest.config.db.js's DB_TEST_INCLUDE — a `<name>.db.test.js`
@@ -232,5 +236,104 @@ describe.skipIf(!runDb)('beeperSync against Postgres', () => {
 
     expect(result).toMatchObject({ chats: 0, messages: 0 });
     expect(urls.filter((url) => /\/messages$/.test(new URL(url).pathname))).toHaveLength(0);
+  });
+
+  // `beeper_sync_cursors` has no FK onto `beeper_conversations`, so the purge's
+  // own DELETE is the only thing that removes a cursor row. A sweep already in
+  // flight when the purge commits used to re-insert one — a window with zero
+  // messages still wrote it — and the resurrected watermark made the chat look
+  // caught-up forever, so the purged history never came back.
+  it('writes no cursor row for a conversation purged out from under the sweep', async () => {
+    const purgedChatId = `${nonce}-chat-purged`;
+    const purgedChat = {
+      ...chatFixture('2026-09-04T10:00:00.000Z'),
+      id: purgedChatId,
+      // No participants: the roster upsert runs AFTER the message fetch and
+      // carries its own FK onto the conversation, so a roster entry would fail
+      // the chat before the commit under test is ever reached.
+      participants: { hasMore: false, total: 0, items: [] },
+    };
+    // The message fetch is the seam. `sweepChat` has committed the conversation
+    // by then and has not yet opened the commit transaction, so deleting the row
+    // here reproduces a purge landing mid-sweep exactly.
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const { pathname } = new URL(url);
+      if (pathname === '/v1/accounts') return jsonResponse(ACCOUNTS);
+      if (pathname === '/v1/bridges') return jsonResponse(BRIDGES);
+      if (pathname === '/v1/chats') return jsonResponse({ items: [purgedChat], hasMore: false });
+      if (/\/messages$/.test(pathname)) {
+        await query(
+          'DELETE FROM beeper_conversations WHERE account_id = $1 AND source_chat_id = $2',
+          [ACCOUNT_ID, purgedChatId],
+        );
+        await query(
+          'DELETE FROM beeper_sync_cursors WHERE account_id = $1 AND chat_id = $2',
+          [ACCOUNT_ID, purgedChatId],
+        );
+        return jsonResponse({ items: [], hasMore: false, newestCursor: 'cursor-after-purge' });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    }));
+
+    await runBeeperSweep({ reason: 'db-test' });
+
+    const conversation = await query(
+      'SELECT id FROM beeper_conversations WHERE account_id = $1 AND source_chat_id = $2',
+      [ACCOUNT_ID, purgedChatId],
+    );
+    expect(conversation.rows).toHaveLength(0);
+    const cursor = await query(
+      'SELECT * FROM beeper_sync_cursors WHERE account_id = $1 AND chat_id = $2',
+      [ACCOUNT_ID, purgedChatId],
+    );
+    // Nothing resurrects the watermark, so the next sweep sees a never-swept
+    // chat and mirrors it from scratch — what the purge confirmation promises.
+    expect(cursor.rows).toHaveLength(0);
+  });
+
+  // `is_sender` is the only inbound/outbound signal a chat surface has —
+  // `accounts[].user.id` differs from `senderID` on every network, so nothing
+  // can be recomputed from the rest of the row. The unit suite can only assert
+  // the upsert's SQL against a mocked client; the guarantee is a property of
+  // the ROW after two sweeps, and that is what this pins.
+  it('never downgrades a stored is_sender TRUE when a later sweep omits the field', async () => {
+    const chatId = `${nonce}-chat-sender`;
+    const messageId = `${nonce}-msg-sender`;
+    const chatAt = (lastActivity) => ({
+      ...chatFixture(lastActivity),
+      id: chatId,
+      participants: { hasMore: false, total: 0, items: [] },
+    });
+    const outbound = (withFlag) => ({
+      id: messageId,
+      chatID: chatId,
+      accountID: ACCOUNT_ID,
+      senderID: `${nonce}-self`,
+      timestamp: '2026-09-05T10:00:00.000Z',
+      sortKey: '000000002',
+      text: 'Example outbound message',
+      attachments: [],
+      ...(withFlag ? { isSender: true } : {}),
+    });
+
+    installFetch({
+      chats: { items: [chatAt('2026-09-05T10:00:00.000Z')], hasMore: false },
+      messages: { items: [outbound(true)], hasMore: false, newestCursor: 'cursor-sender-1' },
+    });
+    await runBeeperSweep({ reason: 'db-test' });
+    const first = await query('SELECT is_sender FROM beeper_messages WHERE id = $1', [messageId]);
+    expect(first.rows[0].is_sender).toBe(true);
+
+    // The field is optional on the inbound Message, and the normalizer reads an
+    // omitted one as inbound — so a re-observation of the same message must not
+    // flip a message the user actually sent onto the other side of the thread.
+    installFetch({
+      chats: { items: [chatAt('2026-09-06T10:00:00.000Z')], hasMore: false },
+      messages: { items: [outbound(false)], hasMore: false, newestCursor: 'cursor-sender-2' },
+    });
+    await runBeeperSweep({ reason: 'db-test' });
+
+    const second = await query('SELECT is_sender FROM beeper_messages WHERE id = $1', [messageId]);
+    expect(second.rows[0].is_sender).toBe(true);
   });
 });

@@ -487,7 +487,7 @@ export async function backfillAttachments({ limit = 500 } = {}) {
 /**
  * Drop one row's claim on its bytes, unlinking the file only when no OTHER row
  * still points at it (content addressing means several usually do).
- * @returns {Promise<number>} bytes actually reclaimed from disk
+ * @returns {Promise<{ removed: boolean, bytes: number, failed: boolean }>}
  */
 async function releaseRowBytes(row) {
   const relativePath = row.local_path;
@@ -499,17 +499,37 @@ async function releaseRowBytes(row) {
   return unlinkIfUnreferenced(relativePath);
 }
 
+/**
+ * Unlink one stored file if — and only if — the reference check run RIGHT NOW
+ * says nothing points at it. The freshness is the contract: every caller here
+ * decided a file was unreferenced at some earlier point, and a dedupe fetch
+ * landing on these exact bytes through `link()`'s EEXIST in between would leave
+ * the row that just claimed them saying `stored: true` against a deleted file.
+ *
+ * `removed` is its own field rather than "bytes > 0" because a legitimately
+ * empty file reclaims nothing and is still gone. `failed` is its own field
+ * because a swallowed unlink error is the worst of the three outcomes: the row
+ * has already given up its claim, so the bytes stay on disk with nothing left
+ * pointing at them, counting against a budget that has just been told they were
+ * reclaimed. ENOENT is not a failure — the file is gone, which is the outcome
+ * asked for, and there are no bytes left to under-report.
+ * @returns {Promise<{ removed: boolean, bytes: number, failed: boolean }>}
+ */
 async function unlinkIfUnreferenced(relativePath) {
-  if (!relativePath || !isSafeAttachmentRelativePath(relativePath)) return 0;
+  const untouched = { removed: false, bytes: 0, failed: false };
+  if (!relativePath || !isSafeAttachmentRelativePath(relativePath)) return untouched;
   const others = await query(
     `SELECT 1 FROM beeper_attachments WHERE local_path = $1 LIMIT 1`,
     [relativePath],
   );
-  if (others?.rows?.length) return 0;
+  if (others?.rows?.length) return untouched;
   const filePath = join(attachmentsRoot(), relativePath);
   const info = await stat(filePath).catch(() => null);
-  const removed = await unlink(filePath).then(() => true).catch(() => false);
-  return removed ? (info?.size || 0) : 0;
+  const failure = await unlink(filePath).then(() => null).catch((err) => err);
+  if (!failure) return { removed: true, bytes: info?.size || 0, failed: false };
+  if (failure.code === 'ENOENT') return untouched;
+  console.error(`❌ Beeper attachment unlink failed for ${relativePath}: ${failure.message}`);
+  return { removed: false, bytes: 0, failed: true };
 }
 
 /**
@@ -529,6 +549,7 @@ export async function evictToBudget() {
   let evicted = 0;
   let reclaimedBytes = 0;
   let keptUnavailable = 0;
+  let failedUnlinks = 0;
   for (let attempt = 0; attempt < MAX_EVICTIONS_PER_SWEEP && used > budgetBytes; attempt += 1) {
     const candidates = await query(
       // `mxc_id IS NOT NULL` is part of the eviction RULE, not an optimisation:
@@ -557,27 +578,55 @@ export async function evictToBudget() {
     // evicting on an unanswered question.
     if (probe) break;
 
-    const freed = await releaseRowBytes(row);
+    // `freed` is 0 when the unlink failed, so the reclaimed total never counts
+    // bytes that are still on disk — and `used` does not drop either, which is
+    // what keeps the loop from believing it has made room it has not made.
+    const { bytes: freed, failed } = await releaseRowBytes(row);
     evicted += 1;
+    if (failed) failedUnlinks += 1;
     reclaimedBytes += freed;
     used -= freed;
   }
   if (evicted > 0 || keptUnavailable > 0) {
-    console.log(`🧹 Beeper attachment eviction: ${evicted} evicted, ${reclaimedBytes} bytes reclaimed, ${keptUnavailable} kept (source can no longer supply)`);
+    console.log(`🧹 Beeper attachment eviction: ${evicted} evicted, ${reclaimedBytes} bytes reclaimed, ${keptUnavailable} kept (source can no longer supply), ${failedUnlinks} unlink failure(s)`);
   }
-  return { evicted, reclaimedBytes, keptUnavailable, overBudget: used > budgetBytes };
+  return { evicted, reclaimedBytes, keptUnavailable, failedUnlinks, overBudget: used > budgetBytes };
 }
 
+/**
+ * Every file in the store, plus whether the listing actually COMPLETED.
+ *
+ * "The store could not be read" and "the store is empty" are the same value to
+ * a `catch(() => [])` — and the row-healing half of the sweep below clears
+ * `local_path` for every referenced path it did not see, so one EACCES on the
+ * root, or a data volume that came back unmounted, would unlink every mirrored
+ * row in the install from its bytes in a single pass. The `complete` flag is
+ * the sentinel that keeps the two apart (root AGENTS.md, absent-vs-empty).
+ *
+ * A PARTIAL listing counts as incomplete for the same reason: a prefix
+ * directory that cannot be read hides real files exactly as effectively as an
+ * unreadable root does.
+ */
 async function listStoredFiles() {
   const root = attachmentsRoot();
-  const prefixes = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const prefixes = await readdir(root, { withFileTypes: true }).catch((err) => err);
+  if (!Array.isArray(prefixes)) {
+    console.error(`❌ Beeper attachment store could not be listed: ${prefixes.message}`);
+    return { files: [], complete: false };
+  }
   const files = [];
+  let complete = true;
   for (const prefix of prefixes) {
     if (!prefix.isDirectory() || prefix.name === TMP_DIR_NAME) continue;
-    const entries = await readdir(join(root, prefix.name)).catch(() => []);
+    const entries = await readdir(join(root, prefix.name)).catch((err) => err);
+    if (!Array.isArray(entries)) {
+      console.error(`❌ Beeper attachment store prefix ${prefix.name} could not be listed: ${entries.message}`);
+      complete = false;
+      continue;
+    }
     for (const name of entries) files.push(`${prefix.name}/${name}`);
   }
-  return files;
+  return { files, complete };
 }
 
 /**
@@ -588,9 +637,19 @@ async function listStoredFiles() {
  *
  * Both directions get healed here, plus abandoned `.tmp` partials from a
  * process that died mid-download.
+ *
+ * The row-healing direction is the destructive one, and it runs ONLY on a
+ * listing that completed: a store that could not be read is not an empty store,
+ * and treating it as one would clear every mirrored row's `local_path` at once.
+ * Orphan removal is unaffected — it only ever touches files it actually saw.
  */
 export async function sweepAttachmentOrphans() {
-  const onDisk = await listStoredFiles();
+  // Create the root before listing it. On an install that has enabled Beeper
+  // but never mirrored a byte the directory does not exist yet, and THAT ENOENT
+  // really is "empty"; making it once means every later listing failure is a
+  // genuine anomaly worth logging and refusing to act on.
+  await mkdir(attachmentsRoot(), { recursive: true }).catch(() => {});
+  const { files: onDisk, complete: storeListed } = await listStoredFiles();
   const referenced = await query(
     `SELECT DISTINCT local_path FROM beeper_attachments WHERE local_path IS NOT NULL`,
   );
@@ -598,6 +657,7 @@ export async function sweepAttachmentOrphans() {
 
   const sweepStart = Date.now();
   let orphansRemoved = 0;
+  let failedUnlinks = 0;
   for (const relativePath of onDisk) {
     if (referencedSet.has(relativePath)) continue;
     // An age gate, because a file is linked into place a moment BEFORE its row
@@ -606,20 +666,31 @@ export async function sweepAttachmentOrphans() {
     // request budget cannot be.
     const info = await stat(join(attachmentsRoot(), relativePath)).catch(() => null);
     if (!info || sweepStart - info.mtimeMs < TMP_MAX_AGE_MS) continue;
-    const removed = await unlink(join(attachmentsRoot(), relativePath)).then(() => true).catch(() => false);
+    // `referencedSet` is a SNAPSHOT taken before this loop started, and the
+    // mtime gate only rules out a file being written right now — not a dedupe
+    // fetch that landed on this exact OLD file through `link()`'s EEXIST while
+    // the loop was working through the rest of the store. Re-ask the reference
+    // question immediately before the unlink, or the row that just claimed
+    // these bytes is left reporting `stored: true` against a deleted file.
+    const { removed, failed } = await unlinkIfUnreferenced(relativePath);
     if (removed) orphansRemoved += 1;
+    if (failed) failedUnlinks += 1;
   }
 
   const diskSet = new Set(onDisk);
-  const missing = [...referencedSet].filter((relativePath) => !diskSet.has(relativePath));
   let healedRows = 0;
-  if (missing.length > 0) {
-    const result = await query(
-      `UPDATE beeper_attachments SET local_path = NULL, fetched_at = NULL, updated_at = NOW()
-        WHERE local_path = ANY($1::text[])`,
-      [missing],
-    );
-    healedRows = result?.rowCount || 0;
+  if (!storeListed) {
+    console.error('❌ Beeper attachment sweep: the store did not list completely — no row healed this pass');
+  } else {
+    const missing = [...referencedSet].filter((relativePath) => !diskSet.has(relativePath));
+    if (missing.length > 0) {
+      const result = await query(
+        `UPDATE beeper_attachments SET local_path = NULL, fetched_at = NULL, updated_at = NOW()
+          WHERE local_path = ANY($1::text[])`,
+        [missing],
+      );
+      healedRows = result?.rowCount || 0;
+    }
   }
 
   const now = Date.now();
@@ -629,21 +700,33 @@ export async function sweepAttachmentOrphans() {
     const partialPath = join(tmpRoot(), name);
     const info = await stat(partialPath).catch(() => null);
     if (!info || now - info.mtimeMs < TMP_MAX_AGE_MS) continue;
-    const removed = await unlink(partialPath).then(() => true).catch(() => false);
-    if (removed) partialsRemoved += 1;
+    const failure = await unlink(partialPath).then(() => null).catch((err) => err);
+    if (!failure) { partialsRemoved += 1; continue; }
+    if (failure.code === 'ENOENT') continue;
+    console.error(`❌ Beeper attachment partial unlink failed for ${name}: ${failure.message}`);
+    failedUnlinks += 1;
   }
 
-  if (orphansRemoved || healedRows || partialsRemoved) {
-    console.log(`🧹 Beeper attachment sweep: ${orphansRemoved} orphan file(s), ${healedRows} stale row(s), ${partialsRemoved} abandoned partial(s)`);
+  // The failure count rides in the log line unconditionally: bytes that a
+  // failed unlink left on disk are invisible everywhere else — nothing points
+  // at them any more, and they still count against the budget.
+  if (orphansRemoved || healedRows || partialsRemoved || failedUnlinks) {
+    console.log(`🧹 Beeper attachment sweep: ${orphansRemoved} orphan file(s), ${healedRows} stale row(s), ${partialsRemoved} abandoned partial(s), ${failedUnlinks} unlink failure(s)`);
   }
-  return { orphansRemoved, healedRows, partialsRemoved };
+  return { orphansRemoved, healedRows, partialsRemoved, failedUnlinks, storeListed };
 }
 
 /** One scheduler tick: budget first, then the orphan backstop. */
 export async function sweepBeeperAttachments() {
   const eviction = await evictToBudget();
   const orphans = await sweepAttachmentOrphans();
-  return { ...eviction, ...orphans };
+  // Both halves unlink, so their tallies are summed rather than shadowed by the
+  // spread.
+  return {
+    ...eviction,
+    ...orphans,
+    failedUnlinks: eviction.failedUnlinks + orphans.failedUnlinks,
+  };
 }
 
 /**
@@ -661,7 +744,7 @@ export async function purgeConversationAttachments(conversationId) {
     [conversationId],
   );
   const paths = (owned?.rows || []).map((row) => row.local_path);
-  if (paths.length === 0) return { removedFiles: 0, freedBytes: 0 };
+  if (paths.length === 0) return { removedFiles: 0, freedBytes: 0, failedUnlinks: 0 };
 
   // Drop this conversation's claims first so the shared-reference check below
   // sees only rows that will SURVIVE the purge.
@@ -673,14 +756,19 @@ export async function purgeConversationAttachments(conversationId) {
 
   let removedFiles = 0;
   let freedBytes = 0;
+  let failedUnlinks = 0;
   for (const relativePath of paths) {
-    const freed = await unlinkIfUnreferenced(relativePath);
-    if (freed > 0) {
+    const { removed, bytes, failed } = await unlinkIfUnreferenced(relativePath);
+    if (failed) failedUnlinks += 1;
+    if (removed) {
       removedFiles += 1;
-      freedBytes += freed;
+      freedBytes += bytes;
     }
   }
-  return { removedFiles, freedBytes };
+  // `freedBytes` counts only files actually gone, so the purge confirmation
+  // never claims disk it did not reclaim; `failedUnlinks` is how the caller
+  // learns the difference is real rather than an accounting slip.
+  return { removedFiles, freedBytes, failedUnlinks };
 }
 
 /** Mirrored bytes a conversation is holding — what the purge confirmation names. */

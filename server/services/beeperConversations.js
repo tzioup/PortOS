@@ -469,7 +469,7 @@ export async function purgeConversation(conversationId) {
       [row.account_id, row.source_chat_id],
     );
   });
-  console.log(`🫧 Beeper conversation mirror purged: ${conversationId} (${bytes.removedFiles} file(s), ${bytes.freedBytes} bytes)`);
+  console.log(`🫧 Beeper conversation mirror purged: ${conversationId} (${bytes.removedFiles} file(s), ${bytes.freedBytes} bytes, ${bytes.failedUnlinks} unlink failure(s))`);
   return {
     purged: true,
     conversationId,

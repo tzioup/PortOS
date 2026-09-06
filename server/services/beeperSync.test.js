@@ -113,6 +113,12 @@ function installFetch({ chatPages = [], messagePages = {} } = {}) {
 const chatsRequests = () => fetchedUrls.filter((url) => new URL(url).pathname === '/v1/chats');
 const messageRequests = () => fetchedUrls.filter((url) => /\/messages$/.test(new URL(url).pathname));
 
+/** The `(cursor, last_activity)` pair the last cursor upsert actually carried. */
+const committedCursorRow = () => txWrites
+  .filter(({ text }) => text.includes('INSERT INTO beeper_sync_cursors'))
+  .map(({ params }) => ({ cursor: params[2], lastActivity: params[3] }))
+  .at(-1);
+
 beforeEach(() => {
   dbCalls.length = 0;
   txCalls.length = 0;
@@ -229,14 +235,14 @@ describe('watermark-bounded sweep', () => {
     oldestCursor: 'chats-page-2',
   };
 
-  it('stops the account walk at the first chat that is not newer than its watermark', async () => {
+  it('pages only the chats that are newer than their watermark', async () => {
     storedCursorRows = [
       { chat_id: 'chat-1', cursor: 'cur-chat-1', last_activity: '2026-09-01T00:00:00.000Z' },
       { chat_id: 'chat-2', cursor: 'cur-chat-2', last_activity: '2026-08-01T00:00:00.000Z' },
       { chat_id: 'chat-3', cursor: 'cur-chat-3', last_activity: '2026-07-01T00:00:00.000Z' },
     ];
     installFetch({
-      chatPages: [CHAT_PAGE],
+      chatPages: [CHAT_PAGE, { items: [], hasMore: false }],
       messagePages: {
         'chat-1': {
           items: [{
@@ -251,12 +257,65 @@ describe('watermark-bounded sweep', () => {
 
     const result = await runBeeperSweep({ reason: 'manual' });
 
-    // chat-2 is not newer than its watermark, so the walk ends there: chat-3 is
-    // never even considered, and the second chat page is never requested.
+    // chat-2 and chat-3 both sit exactly on their watermarks, so neither is
+    // paged for messages — but neither ends the walk, and the sweep stops on
+    // the next page instead, which asks for nothing at all.
     expect(result).toMatchObject({ skipped: false, accounts: 1, chats: 1, messages: 1, failedAccounts: 0 });
     expect(messageRequests()).toHaveLength(1);
     expect(new URL(messageRequests()[0]).pathname).toBe('/v1/chats/chat-1/messages');
-    expect(chatsRequests()).toHaveLength(1);
+    expect(chatsRequests()).toHaveLength(2);
+  });
+
+  // The truncation contract (`sweepChat` withholding the watermark) and the old
+  // "stop at the first caught-up chat" rule cancelled each other out: the list
+  // is ordered by last activity, not by eligibility, so in the steady state a
+  // truncated chat sat below chats that were caught up and was never reached
+  // again. Its backlog was stranded until unrelated activity moved it back to
+  // the top of the list.
+  it('walks past a caught-up chat to a truncated one below it, then stops on a page that needs nothing', async () => {
+    const chatRow = (id, lastActivity) => ({
+      id,
+      accountID: 'acct-a',
+      network: 'Example Net',
+      title: `Example Chat ${id}`,
+      type: 'single',
+      lastActivity,
+      participants: { hasMore: false, total: 0, items: [] },
+    });
+    storedCursorRows = [
+      // Caught up: its watermark equals its current activity.
+      { chat_id: 'chat-caught-up', cursor: 'cur-caught-up', last_activity: '2026-09-02T10:00:00.000Z' },
+      // Truncated on an earlier pass: the cursor advanced, the watermark did
+      // not, so it is still eligible — and it sorts BELOW the caught-up chat.
+      { chat_id: 'chat-truncated', cursor: 'cur-truncated', last_activity: '2026-08-01T00:00:00.000Z' },
+      { chat_id: 'chat-quiet', cursor: 'cur-quiet', last_activity: '2026-07-01T00:00:00.000Z' },
+    ];
+    installFetch({
+      chatPages: [
+        {
+          items: [chatRow('chat-caught-up', '2026-09-02T10:00:00.000Z'), chatRow('chat-truncated', '2026-09-01T00:00:00.000Z')],
+          hasMore: true,
+          oldestCursor: 'chats-page-2',
+        },
+        { items: [chatRow('chat-quiet', '2026-07-01T00:00:00.000Z')], hasMore: true, oldestCursor: 'chats-page-3' },
+      ],
+      messagePages: {
+        'chat-truncated': {
+          items: [{ id: 'msg-b', senderID: 'user-1', text: 'Example message', timestamp: '2026-09-01T00:00:00.000Z' }],
+          hasMore: false,
+          newestCursor: 'cur-truncated-next',
+        },
+      },
+    });
+
+    const result = await runBeeperSweep({ reason: 'manual' });
+
+    expect(result).toMatchObject({ skipped: false, chats: 1, messages: 1, failedChats: 0 });
+    expect(messageRequests()).toHaveLength(1);
+    expect(new URL(messageRequests()[0]).pathname).toBe('/v1/chats/chat-truncated/messages');
+    // Page two asked for nothing, so the walk ends there rather than running
+    // out the 20-page budget — the page is the terminator, not the chat.
+    expect(chatsRequests()).toHaveLength(2);
   });
 
   it('sends accountIDs, and resumes each chat forward from its stored opaque cursor', async () => {
@@ -407,7 +466,9 @@ describe('cursor transactionality', () => {
     expect(insert).toBeTruthy();
     expect(insert.params.at(-1)).toBe(true);
     // A later page may omit the optional field; the upsert must not flip a
-    // message the user actually sent onto the other side of the thread.
+    // message the user actually sent onto the other side of the thread. This is
+    // the guard's SHAPE against a mocked client — the row-level proof that a
+    // stored TRUE survives a second sweep lives in `beeperSync.db.test.js`.
     expect(insert.text).toContain('is_sender = beeper_messages.is_sender OR EXCLUDED.is_sender');
   });
 
@@ -520,11 +581,6 @@ describe('a chat with more new messages than the page cap', () => {
     vi.stubGlobal('fetch', fetchMock);
   }
 
-  const committedCursorRow = () => txWrites
-    .filter(({ text }) => text.includes('INSERT INTO beeper_sync_cursors'))
-    .map(({ params }) => ({ cursor: params[2], lastActivity: params[3] }))
-    .at(-1);
-
   it('leaves last_activity unchanged on the first pass and resumes from the advanced cursor on the second', async () => {
     storedCursorRows = [{ chat_id: CHAT_ID, cursor: 'cursor-0', last_activity: STORED_WATERMARK }];
     installEndlessBacklogFetch();
@@ -575,6 +631,75 @@ describe('a chat with more new messages than the page cap', () => {
     await runBeeperSweep({ reason: 'manual' });
 
     expect(committedCursorRow()).toEqual({ cursor: 'cursor-final', lastActivity: CHAT_ACTIVITY });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A forward walk that stalls is truncated too, not finished
+// ---------------------------------------------------------------------------
+
+// The page budget is not the only way a forward walk can end short of the
+// newest message. A server that answers `hasMore: true` and then hands back no
+// usable cursor — a null one, or the very cursor it was just given — leaves
+// exactly the same state: messages exist that this pass never fetched. Reading
+// that as a clean end committed the chat's current activity as its watermark,
+// so `chatNeedsSweep` marked the chat caught up and everything past the stall
+// was lost.
+describe('a forward walk the server stalls with hasMore but no usable cursor', () => {
+  const CHAT_ID = 'chat-stalled';
+  const CHAT_ACTIVITY = '2026-09-02T10:00:00.000Z';
+  const STORED_CURSOR = 'cur-stored';
+  const STORED_WATERMARK = '2026-09-01T00:00:00.000Z';
+
+  const chatPage = () => ({
+    items: [{
+      id: CHAT_ID,
+      accountID: 'acct-a',
+      network: 'Example Net',
+      title: 'Example Stalled Chat',
+      type: 'single',
+      lastActivity: CHAT_ACTIVITY,
+      participants: { hasMore: false, total: 0, items: [] },
+    }],
+    hasMore: false,
+  });
+
+  const messagePage = (newestCursor) => ({
+    items: [{ id: 'msg-1', senderID: 'user-1', text: 'Example message', timestamp: '2026-09-02T09:00:00.000Z', sortKey: '1' }],
+    hasMore: true,
+    newestCursor,
+  });
+
+  it.each([
+    ['a null newestCursor', null],
+    ['the cursor it was handed', STORED_CURSOR],
+  ])('holds the watermark back when the page answers hasMore with %s', async (_label, newestCursor) => {
+    storedCursorRows = [{ chat_id: CHAT_ID, cursor: STORED_CURSOR, last_activity: STORED_WATERMARK }];
+    installFetch({ chatPages: [chatPage()], messagePages: { [CHAT_ID]: messagePage(newestCursor) } });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    // The walk asked once, could not continue, and did NOT reach the newest
+    // message — so a null watermark rides into the COALESCE and the stored one
+    // survives.
+    expect(messageRequests()).toHaveLength(1);
+    expect(committedCursorRow().lastActivity).toBeNull();
+    expect(committedCursorRow().lastActivity).not.toBe(CHAT_ACTIVITY);
+
+    // Which is what keeps the chat eligible: the database kept the old
+    // watermark, so the next pass still sees the chat as moved.
+    expect(chatNeedsSweep({ lastActivity: CHAT_ACTIVITY }, { lastActivity: STORED_WATERMARK })).toBe(true);
+  });
+
+  it('still commits the watermark when the stall is on a first-sweep anchor walk', async () => {
+    // A chat with no stored cursor takes the newest page ONLY and is never
+    // trying to reach the end, so its `hasMore: true` is expected rather than a
+    // truncation — the anchor is exactly what it went to fetch.
+    installFetch({ chatPages: [chatPage()], messagePages: { [CHAT_ID]: messagePage(null) } });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    expect(committedCursorRow().lastActivity).toBe(CHAT_ACTIVITY);
   });
 });
 
