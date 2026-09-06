@@ -61,12 +61,26 @@ export function encodeCursor(orderingTs, id) {
   return Buffer.from(`${new Date(orderingTs).toISOString()}|${id}`, 'utf8').toString('base64url');
 }
 
+// `listConversations` binds the decoded id as `::uuid` (conversation ids are
+// real Postgres uuids); `listMessages` binds it as `::text` (Beeper message
+// ids are arbitrary bridge-assigned strings, never uuids). A hand-edited or
+// truncated cursor whose `id` half is not a uuid used to sail through here and
+// 500 on the Postgres cast instead of falling back to the first page, which
+// contradicts this function's own contract of returning `null` for anything
+// malformed. Callers that bind the id as `::uuid` pass `idPattern` so the
+// SHAPE check happens here, once, rather than after a failed query.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * `null` for anything unparseable — a stale or hand-edited cursor restarts the
  * page rather than 500ing, which is the same posture the rest of the surface
  * takes toward a deleted conversation id.
+ *
+ * @param {string} cursor
+ * @param {{ idPattern?: RegExp }} [options] - When given, `id` must match it or
+ *   the cursor is treated as malformed (see `UUID_PATTERN` above).
  */
-export function decodeCursor(cursor) {
+export function decodeCursor(cursor, { idPattern } = {}) {
   if (typeof cursor !== 'string' || !cursor) return null;
   const raw = Buffer.from(cursor, 'base64url').toString('utf8');
   const separator = raw.indexOf('|');
@@ -74,6 +88,7 @@ export function decodeCursor(cursor) {
   const ts = raw.slice(0, separator);
   const id = raw.slice(separator + 1);
   if (!id || Number.isNaN(new Date(ts).getTime())) return null;
+  if (idPattern && !idPattern.test(id)) return null;
   return { ts: new Date(ts).toISOString(), id };
 }
 
@@ -241,7 +256,7 @@ export async function listConversations({
     where.push(`c.is_low_priority = $${params.length}`);
   }
 
-  const decoded = decodeCursor(cursor);
+  const decoded = decodeCursor(cursor, { idPattern: UUID_PATTERN });
   if (decoded) {
     params.push(decoded.ts, decoded.id);
     where.push(`(COALESCE(c.last_activity, c.created_at), c.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`);

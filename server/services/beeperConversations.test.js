@@ -136,6 +136,28 @@ describe('listConversations — keyset pagination', () => {
     expect(flat(sql)).not.toContain('c.id) <');
     expect(decodeCursor('not-a-cursor')).toBeNull();
   });
+
+  // A hand-edited (or truncated) cursor can decode cleanly — valid base64url,
+  // a real timestamp, a non-empty id half — while that id half is not a uuid.
+  // `c.id` is bound as `::uuid`, so this used to reach Postgres and 500 on the
+  // cast, contradicting decodeCursor's own contract of returning null for
+  // anything malformed. This is a shape a hand rolled cursor can produce even
+  // though `encodeCursor` itself never emits one — no PortOS conversation id
+  // is ever a non-uuid string.
+  it('restarts the page rather than 500ing on a well-formed cursor whose id is not a uuid', async () => {
+    const garbled = encodeCursor('2026-09-01T10:00:00.000Z', 'not-a-uuid');
+    vi.mocked(query).mockResolvedValue({ rows: [] });
+
+    await expect(listConversations({ cursor: garbled })).resolves.toMatchObject({ conversations: [] });
+    const [sql] = vi.mocked(query).mock.calls[0];
+    expect(flat(sql)).not.toContain('c.id) <');
+    // decodeCursor is the shape-check boundary: with the uuid pattern the
+    // conversation route applies, this decodes to null just like a garbled one.
+    expect(decodeCursor(garbled, { idPattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i })).toBeNull();
+    // Without a pattern (the shape `listMessages` uses — Beeper message ids are
+    // arbitrary bridge strings, never uuids) the same cursor still decodes.
+    expect(decodeCursor(garbled)).toEqual({ ts: '2026-09-01T10:00:00.000Z', id: 'not-a-uuid' });
+  });
 });
 
 describe('listConversations — row shaping', () => {
