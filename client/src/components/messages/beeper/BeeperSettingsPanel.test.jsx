@@ -247,6 +247,49 @@ describe('BeeperSettingsPanel — status card states', () => {
     expect(screen.queryByRole('heading', { name: 'Connect Beeper' })).toBeNull();
     expect(screen.getByRole('button', { name: /Retry/ })).toBeInTheDocument();
   });
+
+  // Fork issue #61, decision 7: a probe timeout shortly after a real Beeper
+  // success stays on the connected card with a latency note, never the
+  // unreachable/actionable-fault card, and never touches the empty-state
+  // ("Connect Beeper") or the Retry-button branch.
+  it('renders the slow probe state on the connected card, with its latency, instead of the unreachable card', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, probeState: 'slow', probeLatencyMs: 3000, lastProbeError: null, accounts: [],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
+    expect(screen.getByText(/Slow to respond \(3000ms\)/)).toBeInTheDocument();
+    expect(screen.queryByText('Beeper Desktop unreachable')).toBeNull();
+    // The connected card's action is "Recheck", never the unreachable card's
+    // "Retry" — a slow probe must not borrow that copy or its gating.
+    expect(screen.queryByRole('button', { name: /Retry/ })).toBeNull();
+    expect(screen.getByRole('button', { name: /Recheck/ })).toBeInTheDocument();
+  });
+
+  it('renders the ordinary connected card with no slow note for probeState:ok', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, probeState: 'ok', probeLatencyMs: 8, lastProbeError: null, accounts: [],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
+    expect(screen.queryByText(/Slow to respond/)).toBeNull();
+  });
+
+  // A failed accounts read is a different, unknown state from a legitimately
+  // empty roster — collapsing them would show "No accounts mirrored yet" for
+  // a DB hiccup.
+  it('shows the account roster as unknown, not empty, when the mirror read failed', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, lastProbeError: null, accounts: null, accountsError: 'Could not read the mirrored account roster',
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
+    expect(screen.getByTestId('beeper-roster-unknown')).toHaveTextContent('Could not read the mirrored account roster');
+    expect(screen.queryByTestId('beeper-roster-empty')).toBeNull();
+  });
 });
 
 describe('BeeperSettingsPanel — settings', () => {
@@ -311,6 +354,20 @@ describe('BeeperSettingsPanel — settings', () => {
 
     fireEvent.click(screen.getByLabelText('Enable scheduled Beeper sync'));
     expect(retryButton).toBeDisabled();
+  });
+
+  // The regression: a failed settings GET used to fall through to DEFAULTS
+  // silently, so the form rendered as though it had read this install's real
+  // config — and the next Save PUT those defaults over whatever was actually
+  // stored. The card must show the failure instead of the (wrong) form.
+  it('shows the load-failed card instead of the form when settings fail to load, and never offers Save', async () => {
+    api.getSettings.mockRejectedValue(new Error('network error'));
+    api.getBeeperStatus.mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [] });
+    renderPanel();
+
+    expect(await screen.findByText('Could not load Beeper settings')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save' })).toBeNull();
+    expect(screen.queryByLabelText('Enable scheduled Beeper sync')).toBeNull();
   });
 });
 

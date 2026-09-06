@@ -1,9 +1,12 @@
 /**
  * Beeper status resolution for the Comms → Beeper status card (#30, fork
  * issue #1). Combines three things the card renders from:
- *   - whether a token is configured (never the token itself — the vaulted
- *     credential store #31 landed answers presence/expiry/provenance without
- *     ever decrypting, and this module has no path to the value);
+ *   - whether a token is configured (never the token itself — this module
+ *     resolves the vaulted credential store #31 through `resolveBeeperToken()`,
+ *     which DOES decrypt, specifically so a vault whose ciphertext cannot be
+ *     decrypted is noticed rather than reported as a healthy, connected
+ *     install (audit cluster 04, finding 1) — but never reads the decrypted
+ *     `token` field beyond the presence check itself);
  *   - a liveness probe against the local Beeper Desktop API;
  *   - the read-only account roster mirrored by fork issue #27's schema, so
  *     the card renders something even with Beeper Desktop closed (accounts
@@ -17,10 +20,11 @@
 import { query } from '../lib/db.js';
 import {
   probeBeeperInfo, getInfo, assertValidInfoResponse, BeeperApiError, resolveBeeperBaseUrl,
+  hasRecentBeeperSuccess, RECENT_SUCCESS_WINDOW_MS,
 } from './beeperClient.js';
 import { getBeeperRealtimeState } from './beeperSocket.js';
 import { getOutboxStatus } from './beeperOutbox.js';
-import { resolveBeeperTokenMeta } from './beeperCredentials.js';
+import { resolveBeeperToken } from './beeperCredentials.js';
 
 const TOKEN_EXPIRY_WARNING_DAYS = 7;
 
@@ -65,6 +69,21 @@ export async function listBeeperAccounts() {
 }
 
 /**
+ * Whether SOMETHING recently proved Beeper Desktop is actually up: a real API
+ * call through `beeperClient.js`, or the realtime socket receiving a fresh
+ * server ping (`beeperSocket.js`'s own ~10.5s-then-30s cadence). Fork issue
+ * #61 decision 7 — paired with `RECENT_SUCCESS_WINDOW_MS` in `beeperClient.js`
+ * so both signals share one window rather than each guessing its own.
+ */
+function hasRecentBeeperActivity() {
+  if (hasRecentBeeperSuccess()) return true;
+  const { lastPingAt } = getBeeperRealtimeState();
+  if (!lastPingAt) return false;
+  const pingedAt = new Date(lastPingAt).getTime();
+  return Number.isFinite(pingedAt) && (Date.now() - pingedAt) <= RECENT_SUCCESS_WINDOW_MS;
+}
+
+/**
  * The full status payload the Comms → Beeper card renders from (#30). Never
  * throws — every sub-fetch degrades to its own "unknown" value so one failure
  * (a DB hiccup, Beeper Desktop closed) doesn't blank the whole card. Use
@@ -75,7 +94,9 @@ export async function listBeeperAccounts() {
  * once probed, `null` when the probe was never attempted (no token
  * configured) — the absent-vs-empty sentinel from root AGENTS.md. `null`
  * must never render as offline; this function never lies and reports
- * `false` for a question it never asked.
+ * `false` for a question it never asked. `probeState` ('ok' | 'slow' |
+ * 'unreachable' | 'unknown') carries the finer-grained answer the card's
+ * "slow" treatment reads from — see the timeout-vs-recent-success logic below.
  */
 export async function getBeeperStatus() {
   // `resolveBeeperBaseUrl()`, never a raw `settings.beeper.baseUrl` read
@@ -85,18 +106,58 @@ export async function getBeeperStatus() {
   // to report the SAME (validated) value the sweep and every other call
   // actually use.
   const resolvedBaseUrl = await resolveBeeperBaseUrl();
-  // Deliberately NOT wrapped in a catch: an unreadable credential store throws
-  // (#11 decision 8), and the card renders its "could not read status" branch
-  // rather than telling a connected install to connect again.
-  const credential = await resolveBeeperTokenMeta();
+  // Deliberately NOT wrapped in a catch: an unreadable vault throws (#11
+  // decision 8), and the card renders its "could not read status" branch
+  // rather than telling a connected install to connect again. This has to be
+  // `resolveBeeperToken()` (which decrypts the row), not the cheaper
+  // `resolveBeeperTokenMeta()` (which only reads the row's PRESENCE): the
+  // cheap check can never notice a corrupt vault — a row whose ciphertext
+  // cannot be decrypted still has a row — which is exactly how this used to
+  // report `tokenConfigured: true, reachable: true` for a credential nobody
+  // could actually authenticate with. Never reads `stored.token` beyond this
+  // line: only presence, source and expiry ever reach the response below.
+  const stored = await resolveBeeperToken();
+  const credential = {
+    tokenConfigured: Boolean(stored),
+    tokenSource: stored?.tokenSource ?? null,
+    tokenExpiresAt: stored?.tokenExpiresAt ?? null,
+  };
   const expiry = tokenExpiryInfo(credential.tokenExpiresAt);
 
-  const [probe, accounts] = await Promise.all([
+  const [probe, accountsResult] = await Promise.all([
     credential.tokenConfigured
       ? probeBeeperInfo({ baseUrl: resolvedBaseUrl })
       : Promise.resolve(null),
-    listBeeperAccounts().catch(() => []),
+    listBeeperAccounts()
+      .then((accounts) => ({ accounts, accountsError: null }))
+      // A failed mirror read must not read as "no accounts mirrored yet" — that
+      // is a legitimate, trustworthy empty result (see `listBeeperAccounts`
+      // above), and a DB hiccup is not the same thing. `accounts: null` is the
+      // absent-vs-empty sentinel: the card renders this as unknown, never as
+      // zero accounts.
+      .catch((err) => ({
+        accounts: null,
+        accountsError: err?.message || 'Could not read the mirrored account roster',
+      })),
   ]);
+
+  // Fork issue #61, decision 7. A probe TIMEOUT specifically (never a fast
+  // refusal — `beeperClient.js` only sets `timedOut` on its own AbortController
+  // firing) is ambiguous on its own: nothing distinguishes "briefly slow" from
+  // "actually closed" by timing alone. Paired with something that recently
+  // proved Beeper Desktop is up, it means "slow to answer this one bare check,"
+  // not "gone" — `reachable` stays `true` and the card renders `slow` with the
+  // latency instead of flipping to the unreachable/actionable-fault card. With
+  // no recent activity (or for any other failure shape), a genuinely closed
+  // Beeper Desktop still reaches `unreachable` on the very first probe — this
+  // never delays that. `reachable: null` (no token, probe never attempted)
+  // never reaches here at all, since `probe` is `null` in that case.
+  let reachable = probe ? probe.reachable : null;
+  let probeState = probe === null ? 'unknown' : (probe.reachable ? 'ok' : 'unreachable');
+  if (probe && !probe.reachable && probe.timedOut && hasRecentBeeperActivity()) {
+    reachable = true;
+    probeState = 'slow';
+  }
 
   return {
     tokenConfigured: credential.tokenConfigured,
@@ -105,7 +166,9 @@ export async function getBeeperStatus() {
     // besides presence and expiry.
     tokenSource: credential.tokenSource,
     baseUrl: resolvedBaseUrl,
-    reachable: probe ? probe.reachable : null,
+    reachable,
+    probeState,
+    probeLatencyMs: probe?.latencyMs ?? null,
     lastProbeError: probe?.error ?? null,
     appVersion: probe?.info?.app?.version ?? null,
     ...expiry,
@@ -121,7 +184,8 @@ export async function getBeeperStatus() {
     // that needs a human action, so it renders on the settings card the same
     // way an actionable transport fault does — never as a global banner.
     outbox: getOutboxStatus(),
-    accounts,
+    accounts: accountsResult.accounts,
+    accountsError: accountsResult.accountsError,
   };
 }
 
@@ -134,8 +198,11 @@ export async function getBeeperStatus() {
  * status route's flattened `lastProbeError` string.
  */
 export async function checkBeeperConnection() {
-  const { tokenConfigured } = await resolveBeeperTokenMeta();
-  if (!tokenConfigured) {
+  // Same reasoning as `getBeeperStatus()` above: `resolveBeeperToken()`
+  // decrypts and so actually notices an unreadable vault, rather than reading
+  // a row's mere presence and reporting a connected install as unconfigured.
+  const stored = await resolveBeeperToken();
+  if (!stored) {
     throw new BeeperApiError('Beeper access token is not configured', {
       status: 401, code: 'NOT_CONFIGURED', retryable: false,
     });

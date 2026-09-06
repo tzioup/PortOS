@@ -502,6 +502,79 @@ describe('beeperSocket — a closed Beeper Desktop, and a rejected token', () =>
   });
 });
 
+describe('beeperSocket — a connect() that rejects (an unreadable credential store)', () => {
+  beforeEach(() => {
+    createdSockets.length = 0;
+    sweeps.length = 0;
+    armed = true;
+    syncEnabled = true;
+    random = 0;
+    resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
+  });
+  afterEach(() => { stopBeeperSocket(); vi.restoreAllMocks(); });
+
+  // Fork issue #1 (audit cluster 04, finding 2): a credential read that throws
+  // — an unreadable vault, not merely an absent token, which resolves the
+  // config with `token: null` and takes a different path entirely — used to
+  // end the reconnect loop for the life of the process: the timer's own
+  // `.catch()` only logged, so no further reconnect was ever scheduled, and
+  // `getBeeperRealtimeState().state` stayed stuck reporting `reconnecting`
+  // forever with nothing behind it.
+  it('still schedules a reconnect after a rejected connect(), and a later successful connect() re-arms', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    await start();
+    latest().handshake();
+
+    // An ordinary drop starts a reconnect cycle; make the credential read
+    // behind the NEXT attempt reject before it ever reaches the socket.
+    latest().fire('close', 1006);
+    vi.mocked(resolveBeeperConfig).mockRejectedValueOnce(new Error('Malformed vault ciphertext'));
+    const [delay] = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
+    clock.runTimersWithDelay(delay);
+    await flush();
+
+    // The rejected attempt never opened a socket, but the loop must not be
+    // dead: the state still honestly says `reconnecting` (a real attempt IS
+    // pending)...
+    expect(createdSockets).toHaveLength(1);
+    expect(getBeeperRealtimeState().state).toBe('reconnecting');
+    // ...backed by an ACTUAL new reconnect timer — this is what the old code
+    // failed to arm, leaving `reconnecting` reported with nothing behind it.
+    const rescheduled = clock.delaysFor((timer) => timer.ms !== SILENCE_TIMEOUT_MS);
+    expect(rescheduled.length).toBeGreaterThan(0);
+
+    // The vault becomes readable again (or the token gets re-saved) before
+    // the next attempt — the loop re-arms rather than staying stuck.
+    clock.runTimersWithDelay(rescheduled[0]);
+    await flush();
+    latest().handshake();
+
+    expect(getBeeperRealtimeState().state).toBe('connected');
+    expect(createdSockets).toHaveLength(2);
+  });
+
+  // The other half of the same fix: `startBeeperSocket()`'s OWN `await
+  // connect()` can reject too (the very first attempt, not a reconnect).
+  // Left at `running: true` with nothing behind it, no later
+  // `reconcileBeeperIngestion()` call could ever re-arm — `startBeeperSocket()`
+  // declines outright whenever `running` is already true.
+  it('resets running to false when the initial connect() rejects, so a later startBeeperSocket() call can retry', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(resolveBeeperConfig).mockRejectedValueOnce(new Error('Malformed vault ciphertext'));
+
+    await start();
+    expect(createdSockets).toHaveLength(0);
+
+    // A later reconcile — the credential re-saved, a feature retoggled — must
+    // get a genuine retry, not an immediate decline from a `running` flag
+    // stuck true over a socket that was never actually opened.
+    resolvedConfig = { baseUrl: 'http://127.0.0.1:23373', token: 'example-token' };
+    expect(await start()).toBe(true);
+    expect(createdSockets).toHaveLength(1);
+  });
+});
+
 describe('beeperSocket — invalidation payloads carry no content', () => {
   beforeEach(() => {
     createdSockets.length = 0;

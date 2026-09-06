@@ -317,7 +317,9 @@ describe('beeperClient', () => {
         jsonResponse(200, { app: { name: 'Beeper', version: '4.3.73' }, server: { status: 'running' } }),
       ));
       const result = await probeBeeperInfo({ baseUrl: DEFAULT_BASE_URL });
-      expect(result).toEqual({ reachable: true, info: expect.objectContaining({ app: expect.any(Object) }), error: null });
+      expect(result).toEqual({
+        reachable: true, info: expect.objectContaining({ app: expect.any(Object) }), error: null, timedOut: false, latencyMs: expect.any(Number),
+      });
     });
 
     it('reports reachable:false — not true — for a 200 whose body is not the documented /v1/info shape', async () => {
@@ -345,6 +347,17 @@ describe('beeperClient', () => {
       expect(() => assertValidInfoResponse(null)).toThrow(BeeperApiError);
       expect(() => assertValidInfoResponse({ app: { name: 'Beeper' }, server: { status: 'running' } })).not.toThrow();
     });
+
+    // Fork issue #61, decision 7: `timedOut` is what `beeperStatus.js` reads to
+    // tell "briefly slow" from "genuinely closed" — a fast refusal (nothing
+    // listening) must never be mistaken for a timeout, or a closed Beeper
+    // Desktop could ride a stale recent-success window into a false "slow".
+    it('reports timedOut:false for a fast connection refusal, distinct from an abort', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockRejectedValue(Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } })));
+      const result = await probeBeeperInfo({ baseUrl: DEFAULT_BASE_URL });
+      expect(result.reachable).toBe(false);
+      expect(result.timedOut).toBe(false);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -352,7 +365,9 @@ describe('beeperClient', () => {
   // -------------------------------------------------------------------------
 
   describe('timeout behavior (fake timers)', () => {
-    it('probeBeeperInfo caps at 1s and resolves reachable:false without throwing, and without a real sleep', async () => {
+    // Fork issue #61, decision 7: 1s proved too tight for a briefly-busy Beeper
+    // Desktop, so the cap moved to 3s.
+    it('probeBeeperInfo caps at 3s and resolves reachable:false/timedOut:true without throwing, and without a real sleep', async () => {
       vi.useFakeTimers();
       try {
         vi.stubGlobal('fetch', vi.fn().mockImplementation((_url, opts) =>
@@ -361,13 +376,17 @@ describe('beeperClient', () => {
           })));
 
         const probePromise = probeBeeperInfo({ baseUrl: DEFAULT_BASE_URL });
-        // Advance virtual time only — a real 1s sleep here would fail CI timing
+        // Advance virtual time only — a real 3s sleep here would fail CI timing
         // budgets and defeats the point of injected time.
-        await vi.advanceTimersByTimeAsync(1000);
+        await vi.advanceTimersByTimeAsync(3000);
         const result = await probePromise;
 
         expect(result.reachable).toBe(false);
         expect(result.error).toBeTruthy();
+        // The abort IS the timeout — this is the signal `beeperStatus.js` reads
+        // to decide `slow` vs `unreachable` (fork issue #61, decision 7), so a
+        // regression here is silent everywhere downstream.
+        expect(result.timedOut).toBe(true);
       } finally {
         vi.useRealTimers();
       }

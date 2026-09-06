@@ -99,11 +99,29 @@ export function resolveOAuthOrigin({ clientOrigin, requestOrigin, configuredOrig
     };
   }
 
+  const hostname = parsed.hostname.toLowerCase();
+  const loopback = isLoopbackHostname(hostname);
+
+  // An https→http downgrade of the redirect origin: the request reached this
+  // install over TLS, but the browser-supplied origin proposes handing the
+  // authorization code back over plaintext HTTP on a non-loopback host — a
+  // network attacker on that path could otherwise intercept the code. The
+  // loopback branch is exempt: Beeper Desktop and the Vite dev proxy both
+  // round-trip through plain `http://127.0.0.1`/`localhost` even when the API
+  // itself terminates TLS, and loopback traffic never leaves the machine.
+  const requestIsHttps = parseBrowserOrigin(requestOrigin)?.protocol === 'https:';
+  if (!loopback && requestIsHttps && parsed.protocol === 'http:') {
+    return {
+      origin: requestOrigin || null,
+      source: requestOrigin ? 'request' : 'none',
+      rejectedClientOrigin: true,
+    };
+  }
+
   const allowedHostnames = new Set(
     [requestOrigin, ...configuredOrigins].map(hostnameOf).filter(Boolean),
   );
-  const hostname = parsed.hostname.toLowerCase();
-  if (isLoopbackHostname(hostname) || allowedHostnames.has(hostname)) {
+  if (loopback || allowedHostnames.has(hostname)) {
     return { origin: parsed.origin, source: 'client', rejectedClientOrigin: false };
   }
   return {

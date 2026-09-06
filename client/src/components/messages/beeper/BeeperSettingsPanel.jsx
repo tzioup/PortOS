@@ -37,7 +37,7 @@ import {
 // reads what it's handed rather than opening a second one.
 export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onRealtimeSeed, onBreakerCleared }) {
   const {
-    loading: settingsLoading, form, setForm, saving, dirty, save,
+    loading: settingsLoading, form, setForm, saving, dirty, save, loadFailed: settingsLoadFailed,
   } = useBeeperSettings();
   const [status, setStatus] = useState(null);
   // Distinguishes "the GET failed" from "the GET succeeded and says no token
@@ -164,6 +164,26 @@ export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onR
   };
 
   if (settingsLoading) return <BrailleSpinner text="Loading Beeper settings" />;
+
+  // A failed GET must never render as though it read DEFAULTS off this
+  // install — `form`/`saved` inside the hook are the hardcoded fallback, not
+  // this install's actual config, so hiding the ingestion form (rather than
+  // showing it "successfully" pre-filled with defaults) and refusing Save is
+  // what keeps a retry from PUTting those defaults over whatever is really
+  // stored.
+  if (settingsLoadFailed) {
+    return (
+      <div className="bg-port-card border border-port-error/40 rounded-lg p-4 sm:p-6">
+        <div className="flex items-center gap-2 mb-2">
+          <ShieldAlert size={16} className="text-port-error" />
+          <h3 className="text-sm font-semibold text-white">Could not load Beeper settings</h3>
+        </div>
+        <p className="text-sm text-port-error">
+          Reload the page and try again — saving now would overwrite the stored configuration with defaults.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -472,8 +492,22 @@ function BeeperRealtimeRow({ realtime, showRemedy = true }) {
  *
  * Read-only by design: it never offers to add a network. Joined by `accountId`,
  * never by `network`.
+ *
+ * `accounts: null` (paired with `error`) is a FAILED mirror read, distinct
+ * from `accounts: []` (a successful read that legitimately found none yet) —
+ * the absent-vs-empty sentinel (root AGENTS.md). Collapsing the two would show
+ * "No accounts mirrored yet" for a DB hiccup, which reads as a healthy,
+ * disconnected-feeling install rather than the unknown state it actually is.
  */
-function AccountRoster({ accounts }) {
+function AccountRoster({ accounts, error }) {
+  if (error) {
+    return (
+      <div className="space-y-1.5">
+        <p className="text-[11px] uppercase tracking-wide text-gray-500">Mirrored accounts</p>
+        <p data-testid="beeper-roster-unknown" className="text-sm text-port-error">{error}</p>
+      </div>
+    );
+  }
   const rows = Array.isArray(accounts) ? accounts : [];
   return (
     <div className="space-y-1.5">
@@ -577,7 +611,7 @@ function BeeperStatusCard({
         <TokenExpiryNotice status={status} />
         <div className="mt-2"><BeeperRealtimeRow realtime={realtime} /></div>
         {/* The mirror still knows which accounts exist even with Beeper closed. */}
-        <div className="mt-3"><AccountRoster accounts={status.accounts} /></div>
+        <div className="mt-3"><AccountRoster accounts={status.accounts} error={status.accountsError} /></div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -596,6 +630,14 @@ function BeeperStatusCard({
   }
 
   if (status.reachable === true) {
+    // Fork issue #61, decision 7: a probe timeout shortly after Beeper
+    // Desktop proved itself alive (a real API call, or a live socket ping)
+    // stays on THIS card — `reachable` never flips to false for it — with an
+    // inline note naming the latency, rather than jumping to the unreachable/
+    // actionable-fault card below. The empty-state ("Connect Beeper") and
+    // Retry-button branches never see `probeState` at all, so neither can flip
+    // on a slow probe.
+    const isSlow = status.probeState === 'slow';
     return (
       <div className="bg-port-card border border-port-success/40 rounded-lg p-4 sm:p-6 space-y-3">
         <div className="flex items-center gap-2">
@@ -603,9 +645,15 @@ function BeeperStatusCard({
           <h3 className="text-sm font-semibold text-white">Beeper Desktop connected</h3>
           {status.appVersion && <span className="text-xs text-gray-500">v{status.appVersion}</span>}
         </div>
+        {isSlow && (
+          <p className="text-xs text-port-warning flex items-center gap-1.5">
+            <Clock size={12} />
+            Slow to respond{Number.isFinite(status.probeLatencyMs) ? ` (${status.probeLatencyMs}ms)` : ''} — Beeper Desktop is up but answered the last check slowly.
+          </p>
+        )}
         <TokenExpiryNotice status={status} />
         <BeeperRealtimeRow realtime={realtime} />
-        <AccountRoster accounts={status.accounts} />
+        <AccountRoster accounts={status.accounts} error={status.accountsError} />
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -633,7 +681,7 @@ function BeeperStatusCard({
         <h3 className="text-sm font-semibold text-white">Checking Beeper Desktop…</h3>
       </div>
       <BeeperRealtimeRow realtime={realtime} />
-      <AccountRoster accounts={status.accounts} />
+      <AccountRoster accounts={status.accounts} error={status.accountsError} />
     </div>
   );
 }

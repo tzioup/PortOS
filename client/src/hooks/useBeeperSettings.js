@@ -46,6 +46,14 @@ export function useBeeperSettings() {
   const [form, setForm] = useState(DEFAULTS);
   const [saved, setSaved] = useState(DEFAULTS);
   const [saving, setSaving] = useState(false);
+  // Distinguishes "the GET failed" from "the GET succeeded and returned no
+  // beeper config yet" (a fresh install, which legitimately falls through to
+  // DEFAULTS). Collapsing the two — the empty `.catch(() => {})` this replaced
+  // — left `form`/`saved` holding DEFAULTS as though they were this install's
+  // stored config, so the very next Save PUT those defaults over whatever was
+  // actually there. `save()` below refuses while this is true; the card is the
+  // one that turns it into a visible failure (root AGENTS.md, absent-vs-empty).
+  const [loadFailed, setLoadFailed] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -63,8 +71,9 @@ export function useBeeperSettings() {
         };
         setForm(next);
         setSaved(next);
+        setLoadFailed(false);
       })
-      .catch(() => {})
+      .catch(() => { if (active) setLoadFailed(true); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, []);
@@ -72,6 +81,11 @@ export function useBeeperSettings() {
   const dirty = Object.keys(DEFAULTS).some((key) => String(form[key]) !== String(saved[key]));
 
   const save = async () => {
+    // Refuse rather than PUT: `form`/`saved` are still DEFAULTS here, not this
+    // install's actual config, so writing them would overwrite whatever is
+    // really stored the moment the failed GET is retried and the card is
+    // dismissed.
+    if (loadFailed) return false;
     const next = {
       enabled: form.enabled,
       intervalMinutes: clampInterval(form.intervalMinutes),
@@ -88,7 +102,9 @@ export function useBeeperSettings() {
     return true;
   };
 
-  return { loading, form, setForm, saving, dirty, save };
+  return {
+    loading, form, setForm, saving, dirty, save, loadFailed,
+  };
 }
 
 export default useBeeperSettings;
