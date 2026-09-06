@@ -55,13 +55,19 @@ export const CATEGORIES = {
   // The Beeper attachment byte mirror (#37) — the only thing the Beeper feature
   // writes to `data/`; every other Beeper record is Postgres. Not archivable:
   // the tarball would land inside `data/` and grow the number the user came here
-  // to shrink, and the bytes are re-fetchable from Beeper anyway. Deletable, but
-  // ITEM-scoped: a category-wide wipe is refused because it would strand every
-  // conversation's photos in one click, while the budget sweep and the
-  // per-conversation purge are the paths that reclaim space with a reference
-  // check behind them. A row whose file is removed from under it is healed by
-  // the next sweep, which clears `local_path` and re-renders the reference.
-  'beeper': { label: 'Beeper Attachments', description: 'Mirrored Beeper attachment bytes — a lazy cache bounded by the attachment budget, re-fetchable while the source network still holds the media', archivable: false, deletable: true, purgeScope: 'items' },
+  // to shrink, and the bytes are re-fetchable from Beeper anyway. NOT deletable
+  // from here either (audit cluster 04, decision 2): the directory holds a
+  // single subdirectory, `attachments/`, which the per-item purge form refuses
+  // outright (item-scoped purges remove a single FILE and never recurse — see
+  // `purgeCategory` below) and the category-wide form was never reachable
+  // without `purgeScope: 'category'`. The visible purge control was dead on
+  // arrival either way. Reclamation is two paths that both reference-check
+  // before touching a byte: the attachment budget sweep (least-recently-viewed
+  // eviction, bounded by `settings.beeper.attachmentBudgetGb`) and the
+  // per-conversation purge (`DELETE /api/beeper/conversations/:id`, content-
+  // addressed so a photo forwarded into three chats survives one being
+  // purged). This category reports size only.
+  'beeper': { label: 'Beeper Attachments', description: 'Mirrored Beeper attachment bytes — reclaimed by the attachment budget sweep and per-conversation purge, not from here', archivable: false, deletable: false },
   // Legacy location — current installs download to ~/Downloads (PATHS.browserDownloads),
   // but installs that predate that move still carry the dir, and backup still excludes it.
   'browser-downloads': { label: 'Browser Downloads', description: 'Files the agent browser downloaded — re-downloadable, safe to purge', archivable: false, deletable: true, purgeScope: 'category' },

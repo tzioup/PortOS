@@ -297,6 +297,16 @@ Bytes are served from an authenticated `/api/` route (`GET /api/beeper/attachmen
 never a static `data/` mount — message media is PII and the store is a pile of hashes that a
 directory mount would expose without the row-level check the route performs.
 
+**Data Manager's `beeper` category (`server/services/dataManager.js`) is size-only** —
+`deletable: false`, no `purgeScope`. `data/beeper/` holds one subdirectory, `attachments/`, so the
+generic purge control was never actually reachable: a category-wide wipe needs `purgeScope:
+'category'`, and the per-item form refuses a directory entry outright (it removes a single file
+and never recurses). Reclaiming space runs through the two paths above that reference-check
+before touching a byte instead: the attachment budget sweep (least-recently-viewed eviction,
+bounded by `settings.beeper.attachmentBudgetGb`) and the per-conversation purge
+(`DELETE /api/beeper/conversations/:id`, content-addressed so a photo forwarded into other chats
+survives one conversation being purged).
+
 ### Realtime
 
 `server/services/beeperSocket.js` holds one long-lived WebSocket from the PortOS server to
