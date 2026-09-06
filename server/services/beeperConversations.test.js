@@ -13,15 +13,25 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // `withTransaction` hands its callback a pg client; the fake records the
 // statements the purge issues inside the transaction, which is exactly what the
-// cursor-deletion contract below is about.
+// cursor-deletion contract below is about. `ensureSchema` is only needed below
+// for the cross-module parity test, which imports the REAL `beeperTribe.js` to
+// prove its shaper agrees with this file's own — `beeperTribe.js`'s
+// `getParticipant` calls it before every query.
 vi.mock('../lib/db.js', () => ({
   query: vi.fn(),
   withTransaction: vi.fn(),
+  ensureSchema: vi.fn(async () => {}),
 }));
 vi.mock('./beeperClient.js', () => ({ updateChat: vi.fn() }));
+// `beeperTribe.js` imports `./tribe.js` at the top level for its own
+// touchpoint/roster logic, unrelated to the parity test below — stubbed so
+// importing it here doesn't drag in tribe.js's own real (and much heavier)
+// dependency chain.
+vi.mock('./tribe.js', () => ({ listPeople: vi.fn(async () => []) }));
 
 import { query, withTransaction } from '../lib/db.js';
 import { updateChat } from './beeperClient.js';
+import * as beeperTribe from './beeperTribe.js';
 import {
   listConversations,
   getConversation,
@@ -213,6 +223,90 @@ describe('getConversation', () => {
     const conversation = await getConversation(CONV_A);
     expect(conversation.participants).toHaveLength(12);
     expect(conversation.hasMoreParticipants).toBe(false);
+  });
+
+  it('reads a soft-deleted Tribe link as fully unlinked — null id, no name, so the re-link control returns', async () => {
+    vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [conversationRow()] })
+      .mockResolvedValueOnce({
+        rows: [{
+          conversation_id: CONV_A,
+          source_user_id: 'user-1',
+          display_name: 'Sam Example',
+          handle: '+15550100',
+          tribe_person_id: 'deleted-person-1',
+          observed_via: 'participant-list',
+          tribe_person_name: 'Deleted Person',
+          tribe_person_deleted: true,
+        }],
+      });
+    const conversation = await getConversation(CONV_A);
+    expect(conversation.participants[0]).toMatchObject({ tribePersonId: null, tribePersonName: null });
+  });
+});
+
+// The audit's soft-deleted-link finding: `beeperConversations.js`'s own
+// participant shaper used to leak `tribePersonId`/`tribePersonName` for a
+// soft-deleted Tribe person while `beeperTribe.js`'s shaper already nulled the
+// cached id. Both now call the SAME extracted predicate
+// (`resolveLinkedPersonId` in `lib/tribeMatch.js`), and this test drives BOTH
+// real code paths off the identical underlying row so a future edit that
+// re-duplicates the logic in only one of them fails here first.
+describe('parity: a soft-deleted Tribe link reads as unlinked from every shaper', () => {
+  const DELETED_PERSON = 'deleted-person-1';
+
+  const softDeletedConversationParticipantsRow = {
+    conversation_id: CONV_A,
+    source_user_id: 'user-1',
+    display_name: 'Sam Example',
+    handle: '+15550100',
+    tribe_person_id: DELETED_PERSON,
+    observed_via: 'participant-list',
+    tribe_person_name: 'Deleted Person',
+    tribe_person_deleted: true,
+  };
+
+  const softDeletedTribeParticipantRow = {
+    conversation_id: CONV_A,
+    source_user_id: 'user-1',
+    display_name: 'Sam Example',
+    handle: '+15550100',
+    tribe_person_id: DELETED_PERSON,
+    observed_via: 'participant-list',
+    network: 'examplenet',
+    tribe_person_deleted: true,
+    created_at: '2026-09-01T10:00:00.000Z',
+    updated_at: '2026-09-01T10:00:00.000Z',
+  };
+
+  it('agrees with beeperTribe.getParticipant: both null tribePersonId (and this file also nulls tribePersonName)', async () => {
+    vi.mocked(query).mockImplementation(async (sql) => {
+      const text = flat(sql);
+      // beeperTribe.js's own participant shaper — the "list/preview path"
+      // the audit found already correct.
+      if (text.startsWith('SELECT p.*, c.network')) {
+        return { rows: [softDeletedTribeParticipantRow] };
+      }
+      // This file's conversation/list participant shaper — the audit's
+      // "conversation payload shaper" finding.
+      if (text.includes('p.observed_via, tp.name AS tribe_person_name')) {
+        return { rows: [softDeletedConversationParticipantsRow] };
+      }
+      if (text.startsWith('SELECT c.*') && text.includes('WHERE c.id = $1')) {
+        return { rows: [conversationRow()] };
+      }
+      return { rows: [] };
+    });
+
+    const conversation = await getConversation(CONV_A);
+    expect(conversation.participants[0]).toMatchObject({ tribePersonId: null, tribePersonName: null });
+
+    const participant = await beeperTribe.getParticipant(CONV_A, 'user-1');
+    expect(participant.tribePersonId).toBeNull();
+    // The row's own network identity survives — re-linking still targets the
+    // same participant rather than a dead end.
+    expect(participant.sourceUserId).toBe('user-1');
+    expect(participant.handle).toBe('+15550100');
   });
 });
 

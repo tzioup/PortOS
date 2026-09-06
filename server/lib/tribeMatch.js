@@ -189,3 +189,25 @@ export function classifyNetworkHandle(value) {
   const handle = normalizeNetworkHandle(raw);
   return handle ? { kind: 'handle', handle } : null;
 }
+
+// ---------------------------------------------------------------------------
+// Soft-delete parity — a `tribe_person_id` cache column reads as "linked"
+// consistently everywhere a beeper_participants row is shaped.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `beeper_participants.tribe_person_id` cache column, plus the joined
+ * `tribe_people.deleted` flag it was read alongside, collapsed to ONE answer.
+ * `tribe.deletePerson` is a SOFT delete — it never fires the FK's ON DELETE
+ * CASCADE — so the raw column can go on pointing at a person who no longer
+ * counts as one. Every reader of a participant row (the conversation/list
+ * shaper in `services/beeperConversations.js`, and `services/beeperTribe.js`'s
+ * own row shaper) calls this SAME function so a soft-deleted link reads as
+ * unlinked everywhere at once: `null`, never a dead id with no re-link
+ * affordance in the UI. Extracted here rather than duplicated in both
+ * services precisely because two independent copies had already drifted —
+ * one nulled the id, the other did not.
+ */
+export function resolveLinkedPersonId(tribePersonId, tribePersonDeleted) {
+  return tribePersonId && !tribePersonDeleted ? tribePersonId : null;
+}

@@ -30,7 +30,9 @@
  */
 import { ensureSchema, query } from '../lib/db.js';
 import { ServerError } from '../lib/errorHandler.js';
-import { classifyNetworkHandle, buildPersonMatchIndex, matchPerson } from '../lib/tribeMatch.js';
+import {
+  classifyNetworkHandle, buildPersonMatchIndex, matchPerson, resolveLinkedPersonId,
+} from '../lib/tribeMatch.js';
 import * as tribe from './tribe.js';
 import * as tribeIdentities from './tribeIdentities.js';
 
@@ -51,7 +53,10 @@ function rowToParticipant(row) {
     // point at a person who no longer counts as one. Callers (below, and
     // upsertParticipant's "still empty" check) then correctly treat this
     // participant as unlinked rather than resolving onto a deleted person.
-    tribePersonId: (row.tribe_person_id && !row.tribe_person_deleted) ? row.tribe_person_id : null,
+    // `resolveLinkedPersonId` (`lib/tribeMatch.js`) is the SAME predicate
+    // `beeperConversations.js`'s conversation/list shaper applies to this same
+    // column, so the two cannot drift onto different answers again.
+    tribePersonId: resolveLinkedPersonId(row.tribe_person_id, row.tribe_person_deleted),
     // The Beeper NETWORK this participant's conversation belongs to — joined
     // from beeper_conversations.network, never client-supplied (#34 review:
     // a caller-supplied network let a username-shaped handle be linked under
