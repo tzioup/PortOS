@@ -37,7 +37,7 @@ import {
 // reads what it's handed rather than opening a second one.
 export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onRealtimeSeed, onBreakerCleared }) {
   const {
-    loading: settingsLoading, form, setForm, saving, dirty, save,
+    loading: settingsLoading, form, setForm, saving, dirty, save, loadFailed: settingsLoadFailed,
   } = useBeeperSettings();
   const [status, setStatus] = useState(null);
   // Distinguishes "the GET failed" from "the GET succeeded and says no token
@@ -164,6 +164,26 @@ export default function BeeperSettingsPanel({ realtime: realtimeProp = null, onR
   };
 
   if (settingsLoading) return <BrailleSpinner text="Loading Beeper settings" />;
+
+  // A failed GET must never render as though it read DEFAULTS off this
+  // install — `form`/`saved` inside the hook are the hardcoded fallback, not
+  // this install's actual config, so hiding the ingestion form (rather than
+  // showing it "successfully" pre-filled with defaults) and refusing Save is
+  // what keeps a retry from PUTting those defaults over whatever is really
+  // stored.
+  if (settingsLoadFailed) {
+    return (
+      <div className="bg-port-card border border-port-error/40 rounded-lg p-4 sm:p-6">
+        <div className="flex items-center gap-2 mb-2">
+          <ShieldAlert size={16} className="text-port-error" />
+          <h3 className="text-sm font-semibold text-white">Could not load Beeper settings</h3>
+        </div>
+        <p className="text-sm text-port-error">
+          Reload the page and try again — saving now would overwrite the stored configuration with defaults.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

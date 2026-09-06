@@ -312,6 +312,20 @@ describe('BeeperSettingsPanel — settings', () => {
     fireEvent.click(screen.getByLabelText('Enable scheduled Beeper sync'));
     expect(retryButton).toBeDisabled();
   });
+
+  // The regression: a failed settings GET used to fall through to DEFAULTS
+  // silently, so the form rendered as though it had read this install's real
+  // config — and the next Save PUT those defaults over whatever was actually
+  // stored. The card must show the failure instead of the (wrong) form.
+  it('shows the load-failed card instead of the form when settings fail to load, and never offers Save', async () => {
+    api.getSettings.mockRejectedValue(new Error('network error'));
+    api.getBeeperStatus.mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [] });
+    renderPanel();
+
+    expect(await screen.findByText('Could not load Beeper settings')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save' })).toBeNull();
+    expect(screen.queryByLabelText('Enable scheduled Beeper sync')).toBeNull();
+  });
 });
 
 describe('BeeperSettingsPanel — the connect flow (#31)', () => {
