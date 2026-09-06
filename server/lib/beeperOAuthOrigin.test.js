@@ -60,6 +60,30 @@ describe('resolveOAuthOrigin', () => {
     })).toMatchObject({ origin: 'https://host-example.example-tailnet.ts.net:5554', source: 'client' });
   });
 
+  // An https→http downgrade of the redirect origin: the request itself
+  // reached this install over TLS, so a client-supplied origin proposing to
+  // hand the authorization code back over plaintext HTTP is refused even
+  // though the host is otherwise recognized.
+  it('refuses an http origin on a non-loopback host when the request arrived over https', () => {
+    expect(resolveOAuthOrigin({
+      clientOrigin: 'http://host-example.example-tailnet.ts.net:5554',
+      requestOrigin: 'https://host-example.example-tailnet.ts.net:5555',
+      configuredOrigins: CONFIGURED,
+    })).toEqual({
+      origin: 'https://host-example.example-tailnet.ts.net:5555',
+      source: 'request',
+      rejectedClientOrigin: true,
+    });
+  });
+
+  it('still accepts an http origin on a loopback host even when the request arrived over https', () => {
+    expect(resolveOAuthOrigin({
+      clientOrigin: 'http://localhost:5554',
+      requestOrigin: REQUEST_ORIGIN,
+      configuredOrigins: CONFIGURED,
+    })).toEqual({ origin: 'http://localhost:5554', source: 'client', rejectedClientOrigin: false });
+  });
+
   it('refuses an unrecognized host and falls back to the request origin', () => {
     // Whatever lands in `redirect_uri` is where Beeper sends the authorization
     // code, so an origin this install does not answer on is never used.
