@@ -24,6 +24,7 @@
 
 import { query, withTransaction } from '../lib/db.js';
 import { ServerError } from '../lib/errorHandler.js';
+import { resolveLinkedPersonId } from '../lib/tribeMatch.js';
 import { updateChat } from './beeperClient.js';
 import {
   getConversationAttachmentBytes,
@@ -116,6 +117,14 @@ function shapeConversation(row) {
 }
 
 function shapeParticipant(row) {
+  // `resolveLinkedPersonId` (`lib/tribeMatch.js`) is the SAME soft-delete
+  // predicate `beeperTribe.js`'s own participant shaper applies to this same
+  // column — extracted so the two cannot drift onto different answers again.
+  // A soft-deleted Tribe person (`tribe.deletePerson` never fires the FK's ON
+  // DELETE CASCADE) must read as fully unlinked here: `null` id AND no name,
+  // so the thread's re-link control comes back instead of a dead
+  // "Linked · <deleted person>" the user can never recover from.
+  const tribePersonId = resolveLinkedPersonId(row.tribe_person_id, row.tribe_person_deleted);
   return {
     conversationId: row.conversation_id,
     sourceUserId: row.source_user_id,
@@ -123,8 +132,8 @@ function shapeParticipant(row) {
     handle: row.handle || '',
     // The cache column from #27/#34. `null` means "not linked", never "no
     // person exists" — the inline link action on the thread is what resolves it.
-    tribePersonId: row.tribe_person_id || null,
-    tribePersonName: row.tribe_person_name || null,
+    tribePersonId,
+    tribePersonName: tribePersonId ? (row.tribe_person_name || null) : null,
     observedVia: row.observed_via || '',
   };
 }
@@ -176,7 +185,8 @@ async function attachParticipants(conversations, { cap = LIST_PARTICIPANT_CAP } 
   const ids = conversations.map((c) => c.id);
   const result = await query(
     `SELECT p.conversation_id, p.source_user_id, p.display_name, p.handle,
-            p.tribe_person_id, p.observed_via, tp.name AS tribe_person_name
+            p.tribe_person_id, p.observed_via, tp.name AS tribe_person_name,
+            tp.deleted AS tribe_person_deleted
        FROM beeper_participants p
        LEFT JOIN tribe_people tp ON tp.id = p.tribe_person_id
       WHERE p.conversation_id = ANY($1::uuid[])

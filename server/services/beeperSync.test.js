@@ -64,9 +64,14 @@ vi.mock('./instanceFeatures.js', () => ({
 
 const upsertParticipantMock = vi.fn(async () => ({}));
 const logSenderTouchpointsMock = vi.fn(async () => ({ created: 0, matched: 0 }));
+// A stand-in roster index — its shape only matters to `buildPersonMatchIndex`
+// consumers, and `upsertParticipant` itself is mocked above, so an empty index
+// is enough to prove it is loaded once per sweep and threaded through.
+const loadRosterIndexMock = vi.fn(async () => ({ byIdentifier: new Map(), byPhone: new Map(), byName: new Map() }));
 vi.mock('./beeperTribe.js', () => ({
   upsertParticipant: (...args) => upsertParticipantMock(...args),
   logSenderTouchpoints: (...args) => logSenderTouchpointsMock(...args),
+  loadRosterIndex: (...args) => loadRosterIndexMock(...args),
 }));
 
 const {
@@ -130,6 +135,7 @@ beforeEach(() => {
   withTransactionMock.mockClear();
   upsertParticipantMock.mockClear();
   logSenderTouchpointsMock.mockClear();
+  loadRosterIndexMock.mockClear();
   isInstanceFeatureEnabledMock.mockResolvedValue(true);
   getSettingsMock.mockResolvedValue({
     beeper: { token: 'test-token', baseUrl: 'http://127.0.0.1:23373', enabled: true, intervalMinutes: 5 },

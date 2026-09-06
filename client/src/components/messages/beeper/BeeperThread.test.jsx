@@ -315,3 +315,66 @@ describe('BeeperThread — message bodies', () => {
     expect(screen.getByTestId('beeper-message')).toHaveTextContent('salt & pepper — 5 < 6');
   });
 });
+
+/**
+ * Audit cluster 05 (Tribe linkage): the server used to leak `tribePersonId`/
+ * `tribePersonName` for a participant whose Tribe person had been
+ * soft-deleted, so this row's `if (participant.tribePersonId)` branch read it
+ * as still linked and rendered "Linked · <deleted person>" with no way back —
+ * the re-link `<select>`/buttons never appeared. The server fix (parity test
+ * in `server/services/beeperConversations.test.js`) now sends such a
+ * participant with `tribePersonId: null` and no `tribePersonName`, exactly
+ * like a participant that was never linked at all. This pins the client's
+ * side of that contract: given that shape, the People drawer must render the
+ * re-link control, never a dead "Linked" label.
+ */
+describe('BeeperThread — participant Tribe link display', () => {
+  const PEOPLE = [{ id: 'person-1', name: 'Alex Example' }];
+
+  const openPeopleDrawer = () => fireEvent.click(screen.getByRole('button', { name: 'People' }));
+
+  it('renders the re-link control, not a dead "Linked" label, for a participant whose Tribe person was soft-deleted', () => {
+    renderThread({
+      conversation: {
+        ...CONVERSATION,
+        participants: [{
+          sourceUserId: 'user-1',
+          displayName: 'Sam Example',
+          handle: '+15550100',
+          tribePersonId: null,
+          tribePersonName: null,
+          observedVia: 'participant-list',
+        }],
+      },
+      people: PEOPLE,
+    });
+
+    openPeopleDrawer();
+
+    expect(screen.queryByText(/^Linked/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Link Sam Example to a Tribe person')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Link' })).toBeInTheDocument();
+  });
+
+  it('still shows the Linked label (and no re-link control) for a participant with an active link', () => {
+    renderThread({
+      conversation: {
+        ...CONVERSATION,
+        participants: [{
+          sourceUserId: 'user-1',
+          displayName: 'Sam Example',
+          handle: '+15550100',
+          tribePersonId: 'person-1',
+          tribePersonName: 'Alex Example',
+          observedVia: 'participant-list',
+        }],
+      },
+      people: PEOPLE,
+    });
+
+    openPeopleDrawer();
+
+    expect(screen.getByText('Linked · Alex Example')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Link Sam Example to a Tribe person')).not.toBeInTheDocument();
+  });
+});
