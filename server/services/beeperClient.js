@@ -43,10 +43,48 @@ import { resolveBeeperToken } from './beeperCredentials.js';
 
 export const DEFAULT_BASE_URL = 'http://127.0.0.1:23373';
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-// A live Beeper Desktop answers in single-digit-to-low-double-digit ms and a
-// closed loopback port refuses near-instantly, so 1s is generous headroom for
-// a liveness probe, not a real request budget.
-export const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
+// Fork issue #61, decision 7. The original 1s cap (a live Beeper Desktop
+// answers in single-digit-to-low-double-digit ms, and a closed loopback port
+// refuses near-instantly) turned out to be too tight on a loaded machine: a
+// Beeper Desktop that is genuinely up but briefly slow to answer the bare
+// liveness probe timed out and reported the same "unreachable" card as a
+// closed app, even seconds after it had handled a real request. 3s is still
+// well short of `DEFAULT_REQUEST_TIMEOUT_MS` (this stays a liveness probe, not
+// a request budget) but gives a momentarily busy app room to answer before the
+// card treats it as gone. A timeout on ITS OWN is still ambiguous, though —
+// nothing distinguishes "briefly slow" from "actually closed" from timing
+// alone — which is what `RECENT_SUCCESS_WINDOW_MS` below is for.
+export const DEFAULT_PROBE_TIMEOUT_MS = 3_000;
+// Paired with the cap above: a probe timeout is reported as `probeState:
+// 'slow'` (reachable stays true) rather than `'unreachable'` ONLY when a real
+// Beeper call — an authenticated API request through this client, or a
+// realtime-socket ping (server/services/beeperSocket.js) — succeeded within
+// this window. 60s comfortably survives one missed probe against the socket's
+// own ~30s ping cadence while staying short enough that an app closed for real
+// still reaches the unreachable card within a minute of going quiet — a probe
+// timeout with no recent success (nothing else has talked to Beeper lately
+// either) is exactly what "unreachable" means, promptly.
+export const RECENT_SUCCESS_WINDOW_MS = 60_000;
+
+// Last time ANY call through `beeperRequest` (a real API call, or a successful
+// probe) completed. `null` until the first one — `hasRecentBeeperSuccess`
+// reads that as "no recent success" rather than an epoch-zero false positive.
+let lastSuccessAt = null;
+
+function noteSuccess() {
+  lastSuccessAt = Date.now();
+}
+
+/** Whether a Beeper call has completed within `RECENT_SUCCESS_WINDOW_MS`. */
+export function hasRecentBeeperSuccess(nowMs = Date.now()) {
+  return typeof lastSuccessAt === 'number' && (nowMs - lastSuccessAt) <= RECENT_SUCCESS_WINDOW_MS;
+}
+
+// Test-only: `beeperStatus.test.js` and `beeperClient.test.js` need to drive
+// `hasRecentBeeperSuccess` without waiting on a real successful request first.
+export function __setLastBeeperSuccessAtForTests(value) {
+  lastSuccessAt = value;
+}
 // Reads may retry once on a replayable connection failure (Beeper Desktop
 // restarting mid-request); a fresh request-scoped budget on the replay, same
 // shape as fetchWithTimeout's own retry contract.
@@ -252,14 +290,27 @@ async function beeperRequest(path, {
       body: body === undefined ? undefined : JSON.stringify(body),
     }, timeoutMs, allowRetry ? READ_RETRY : {});
   } catch (err) {
-    throw new BeeperApiError(`Beeper request failed: ${describeFetchError(err)}`, {
+    const description = describeFetchError(err);
+    // AbortController firing (the timeout above, or a caller-supplied
+    // `signal`) is the one network failure that means "no answer arrived in
+    // time" rather than "nothing is listening" — the distinction
+    // `probeBeeperInfo` needs to tell `slow` from `unreachable` (fork issue
+    // #61, decision 7). Node/undici's own AbortError always carries "abort" in
+    // its name or message; `describeFetchError` folds both into this string.
+    const timedOut = /\babort/i.test(description);
+    throw new BeeperApiError(`Beeper request failed: ${description}`, {
       status: 0, code: 'NETWORK_ERROR', retryable: allowRetry && isReplayableConnectionError(err),
+      details: timedOut ? { timedOut: true } : undefined,
     });
   }
 
-  if (response.status === 204) return null;
+  if (response.status === 204) {
+    noteSuccess();
+    return null;
+  }
   const data = await readResponseJson(response, { fallback: (text) => ({ message: text }) });
   if (!response.ok) throw mapBeeperResponseError(response.status, data, { isAssetEndpoint, retryEligible: allowRetry });
+  noteSuccess();
   return data;
 }
 
@@ -301,21 +352,37 @@ export function assertValidInfoResponse(info) {
 }
 
 /**
- * Liveness probe with a 1s cap (#11) — generous headroom over a live Beeper
- * Desktop's actual response time, without being a real request budget. Never
- * throws — an unreachable/misconfigured install is a normal outcome for a
- * feature the user hasn't set up yet, not an exceptional one. A shape-invalid
- * 200 (see `assertValidInfoResponse`) reports `reachable: false` exactly like
- * a transport failure — a body that isn't Beeper's `/v1/info` never counts as
+ * Liveness probe with a `DEFAULT_PROBE_TIMEOUT_MS` cap (#11, revised at fork
+ * issue #61 decision 7) — generous headroom over a live Beeper Desktop's
+ * actual response time, without being a real request budget. Never throws —
+ * an unreachable/misconfigured install is a normal outcome for a feature the
+ * user hasn't set up yet, not an exceptional one. A shape-invalid 200 (see
+ * `assertValidInfoResponse`) reports `reachable: false` exactly like a
+ * transport failure — a body that isn't Beeper's `/v1/info` never counts as
  * "reachable" just because *something* answered.
+ *
+ * `timedOut` and `latencyMs` are additive fields for `beeperStatus.js` to
+ * derive `probeState: 'ok' | 'slow' | 'unreachable'` from — see
+ * `hasRecentBeeperSuccess` above. Every existing caller that reads only
+ * `reachable`/`info`/`error` is unaffected.
  */
 export async function probeBeeperInfo({ baseUrl, timeoutMs = DEFAULT_PROBE_TIMEOUT_MS } = {}) {
+  const startedAt = Date.now();
   try {
     const info = await getInfo({ baseUrl, timeoutMs });
     assertValidInfoResponse(info);
-    return { reachable: true, info, error: null };
+    return {
+      reachable: true, info, error: null, timedOut: false, latencyMs: Date.now() - startedAt,
+    };
   } catch (err) {
-    return { reachable: false, info: null, error: err instanceof BeeperApiError ? err.message : describeFetchError(err) };
+    const timedOut = err instanceof BeeperApiError && err.context?.details?.timedOut === true;
+    return {
+      reachable: false,
+      info: null,
+      error: err instanceof BeeperApiError ? err.message : describeFetchError(err),
+      timedOut,
+      latencyMs: Date.now() - startedAt,
+    };
   }
 }
 

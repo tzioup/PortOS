@@ -75,6 +75,19 @@ idempotency key on send, so a retried POST delivers a second real message to a r
 `BeeperApiError` carries a `retryable` flag callers key on rather than re-deriving from the
 status code.
 
+**The liveness probe caps at 3s** (`DEFAULT_PROBE_TIMEOUT_MS` in `server/services/beeperClient.js`
+— fork issue #61, decision 7; raised from 1s after that turned out too tight for a briefly-busy
+Beeper Desktop). A probe *timeout* specifically — never a fast refusal, which still means
+"unreachable" immediately — is ambiguous alone: nothing distinguishes "briefly slow" from
+"actually closed" by timing. Paired with a Beeper call that succeeded recently (a real API request
+through this client, or the realtime socket receiving a fresh ping) within `RECENT_SUCCESS_WINDOW_MS`
+(60s, same file), it reports `probeState: 'slow'` instead — `reachable` **stays `true`**, and the
+status card renders the connected card with the measured `probeLatencyMs` rather than jumping to
+the unreachable/actionable-fault card. With no recent activity, or for any other failure shape, a
+genuinely closed Beeper Desktop still reaches `probeState: 'unreachable'` (and `reachable: false`)
+on the very first probe. `reachable: null` (no token configured, the probe never ran) keeps its own
+distinct meaning throughout and never collapses into `slow`.
+
 ## Setup
 
 1. In **Settings > Features**, make sure the **Comms** group is on and turn on **Beeper**.
