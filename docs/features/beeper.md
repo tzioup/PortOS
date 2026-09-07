@@ -316,6 +316,27 @@ manual link survives every re-sync. Group touchpoints are derived from message *
 from the participant roster, because Beeper truncates that roster (20 in a list, 100 on a single
 GET, no cursor) and iterating it would invent contact with people who never messaged.
 
+### Unread badge
+
+`beeper_conversations.unread_count` is Beeper's own count, mirrored verbatim and overwritten
+wholesale by every sweep — so opening a thread in PortOS cannot clear it by zeroing that column
+directly; the very next sweep would put it right back. Fork issue #83's fix is a second, LOCAL
+column instead: `seen_at`, stamped with the server's own clock (`markConversationSeen` in
+`server/services/beeperConversations.js`) when the chat surface opens a thread, and again, cheaply,
+whenever a new message lands in a thread that is already open. Every read path that shows an
+unread count — the row badge, `unreadOnly` in `GET /api/beeper/conversations`, and both aggregates
+`GET /api/beeper/networks` returns — treats a conversation as read when `seen_at` is at or after
+its own `COALESCE(last_activity, created_at)`, and as unread again the moment newer activity lands,
+with no separate bookkeeping. Because the comparison happens at read time against a column the
+sweep never touches, the watermark survives every sweep by construction rather than by racing one.
+
+**This never writes to Beeper.** `POST /api/beeper/conversations/:id/seen` is a pure local update —
+no `PATCH`, no read receipt, nothing that reaches the source network or shows up on another device
+signed into the same account. A settings toggle to *also* send a real read receipt through Beeper's
+own API is deliberately out of scope for this change; `markConversationSeen` carries a `TODO(#83)`
+at the seam where that PATCH-then-mirror write would go, gated behind its own consent step and
+defaulting off, the same way the Archive and Low priority rail controls are wired today.
+
 ### Attachments
 
 The byte mirror is **lazy**. Ingestion writes the attachment's metadata and its durable `mxc_id`
@@ -548,7 +569,7 @@ its attachments, the token, and anything on the Socket.IO relay.
 
 ## API surface
 
-24 routes under `/api/beeper`, all mounted from `server/routes/beeper.js`.
+25 routes under `/api/beeper`, all mounted from `server/routes/beeper.js`.
 
 | Method | Route | What it does |
 | --- | --- | --- |
@@ -561,6 +582,7 @@ its attachments, the token, and anything on the Socket.IO relay.
 | `GET` | `/api/beeper/conversations/:id/messages` | Cursor-paginated messages, newest first |
 | `POST` | `/api/beeper/conversations/:id/archive` | Archive control — PATCHes Beeper first, mirrors the answer second |
 | `POST` | `/api/beeper/conversations/:id/low-priority` | Low priority control, same shape |
+| `POST` | `/api/beeper/conversations/:id/seen` | The local "seen in PortOS" watermark — never a Beeper write |
 | `DELETE` | `/api/beeper/conversations/:id` | Purge one conversation's local mirror and its bytes |
 | `GET` | `/api/beeper/attachments/summary` | Counts, bytes and the budget picture the consent step and the card need |
 | `POST` | `/api/beeper/attachments/backfill` | Bulk-mirror reference-only attachments, stopping at the budget |
@@ -587,7 +609,7 @@ Socket.IO events:
 | `beeper:realtime` | server → Beeper subscribers | The transport liveness snapshot: `state`, `lastEventAt`, `lastPingAt`, `reconnectAttempts`, `appState`, `appStateActionable`, `authRejected` |
 
 Both surfaces publish as **generated** contract entries. `/api/beeper` appears in
-`server/lib/apiRouteCatalog.generated.json` (24 operations) and in `docs/API.md`'s route-domain
+`server/lib/apiRouteCatalog.generated.json` (25 operations) and in `docs/API.md`'s route-domain
 index, and neither `server/lib/apiOperationContracts.js` nor
 `server/lib/socketEventContracts.js` models any Beeper operation or event — so the catalog and
 spec endpoints listed in [API_TOOL_CONTRACT.md](../API_TOOL_CONTRACT.md) report every one of them
