@@ -393,13 +393,18 @@ export async function ensureAttachmentBytes(messageId, idx, { force = false } = 
     throw err;
   });
 
+  // `sha256` is not persisted (audit cluster 06 decision 3): it was written
+  // here but never read back — the content-addressed path is built from the
+  // hash `streamAssetToStore` just computed, not from this column. The VALUE
+  // stays in `stored.sha256` / `stored.relativePath` for that path; only the
+  // column write goes.
   await query(
     `UPDATE beeper_attachments
-        SET local_path = $3, sha256 = $4, byte_length = $5,
+        SET local_path = $3, byte_length = $4,
             fetched_at = NOW(), last_viewed_at = NOW(),
             unavailable_at = NULL, fetch_error = NULL, updated_at = NOW()
       WHERE message_id = $1 AND idx = $2`,
-    [row.message_id, row.idx, stored.relativePath, stored.sha256, stored.bytes],
+    [row.message_id, row.idx, stored.relativePath, stored.bytes],
   );
   console.log(`🫧 Beeper attachment mirrored: ${stored.bytes} bytes for message ${row.message_id}#${row.idx}${stored.deduped ? ' (deduped)' : ''}`);
   return {
@@ -407,6 +412,11 @@ export async function ensureAttachmentBytes(messageId, idx, { force = false } = 
     mimeType: row.mime_type || '',
     fileName: row.file_name || '',
     cached: false,
+    // Whether this fetch's bytes were already on disk under another row
+    // (`link()`'s EEXIST) — `backfillAttachments` uses it to adjust its
+    // running byte total without re-querying the DISTINCT-on-`local_path`
+    // total after every attachment.
+    deduped: stored.deduped === true,
   };
 }
 
@@ -443,6 +453,15 @@ export async function setAttachmentKeep(messageId, idx, keep) {
  * Individual failures are COUNTED, not thrown: an aged-out attachment in the
  * middle of a 3,000-file run must not abandon the other 2,999, and each one
  * is stamped `unavailable_at` on the way past so the next run skips it.
+ *
+ * The running byte total is computed ONCE for the whole pass, then adjusted
+ * in memory as bytes land — not re-queried before every attachment.
+ * `storedBytes()` is a `DISTINCT ON (local_path)` scan of the full table, and
+ * re-running it per attachment turned an N-attachment backfill into N scans of
+ * a mirror that can hold tens of thousands of rows. `ensureAttachmentBytes`'s
+ * `deduped` flag keeps the in-memory total exact: a fetch that lands on bytes
+ * another row already mirrored (`link()`'s EEXIST) adds nothing to disk usage,
+ * the same DISTINCT-on-`local_path` accounting `storedBytes()` itself does.
  */
 export async function backfillAttachments({ limit = 500 } = {}) {
   const budgetBytes = await resolveBudgetBytes();
@@ -455,13 +474,14 @@ export async function backfillAttachments({ limit = 500 } = {}) {
     [BEEPER_ATTACHMENT_MAX_BYTES, Math.max(1, Math.min(Number(limit) || 500, 5000))],
   );
 
+  let used = (await storedBytes()).bytes;
+
   let fetched = 0;
   let failed = 0;
   let bytes = 0;
   let stoppedForBudget = false;
   for (const row of pending?.rows || []) {
-    const used = await storedBytes();
-    if (used.bytes >= budgetBytes) {
+    if (used >= budgetBytes) {
       stoppedForBudget = true;
       break;
     }
@@ -474,7 +494,9 @@ export async function backfillAttachments({ limit = 500 } = {}) {
     }
     fetched += 1;
     const stat_ = await stat(result.value.filePath).catch(() => null);
-    bytes += stat_?.size || 0;
+    const size = stat_?.size || 0;
+    bytes += size;
+    if (!result.value.deduped) used += size;
   }
   console.log(`🫧 Beeper attachment backfill: ${fetched} mirrored, ${failed} unavailable${stoppedForBudget ? ', stopped at budget' : ''}`);
   return { fetched, failed, bytes, stoppedForBudget, requested: (pending?.rows || []).length };

@@ -50,6 +50,7 @@ import {
   backfillAttachments,
   ensureAttachmentBytes,
   evictToBudget,
+  getAttachment,
   getAttachmentSummary,
   purgeConversationAttachments,
   shapeAttachment,
@@ -63,7 +64,6 @@ const attachmentRow = (overrides = {}) => ({
   message_id: 'msg-example-1',
   idx: 0,
   mxc_id: 'mxc://example.invalid/abc',
-  sha256: null,
   mime_type: 'image/png',
   byte_length: null,
   file_name: 'example.png',
@@ -134,7 +134,9 @@ describe('ensureAttachmentBytes — the lazy mirror', () => {
       const flat = String(sql).replace(/\s+/g, ' ');
       if (flat.includes('FROM beeper_attachments WHERE message_id')) return { rows: [row] };
       if (flat.includes('SET local_path = $3')) {
-        row = { ...row, local_path: params[2], sha256: params[3], byte_length: params[4] };
+        // No `sha256` column write (audit cluster 06 decision 3) — the UPDATE
+        // is `local_path, byte_length`, so `params` is 4-long.
+        row = { ...row, local_path: params[2], byte_length: params[3] };
         return { rows: [] };
       }
       return { rows: [] };
@@ -310,6 +312,21 @@ describe('ensureAttachmentBytes — the lazy mirror', () => {
   });
 });
 
+// LENS-3/PERF-2: the PK on beeper_attachments leads with `conversation_id`,
+// which every one of these lookups is written WITHOUT — this pins the query
+// shape (`message_id` leading, matching `idx_beeper_attachments_message`) so
+// a future edit can't silently regress it back onto a table scan. The actual
+// plan is proven against a real index in beeperConversations.db.test.js.
+describe('attachment lookups lead with message_id, matching the new index', () => {
+  it('getAttachment queries WHERE message_id = $1 AND idx = $2, in that column order', async () => {
+    respondTo([['FROM beeper_attachments WHERE message_id', { rows: [attachmentRow()] }]]);
+    await getAttachment('msg-example-1', 0);
+    const call = vi.mocked(query).mock.calls.find(([sql]) => String(sql).includes('FROM beeper_attachments WHERE message_id'));
+    expect(call).toBeTruthy();
+    expect(String(call[0]).replace(/\s+/g, ' ')).toContain('WHERE message_id = $1 AND idx = $2');
+  });
+});
+
 describe('evictToBudget — least-recently-viewed, guarded by a HEAD', () => {
   const relPath = `aa/${'a'.repeat(64)}.png`;
 
@@ -351,6 +368,35 @@ describe('evictToBudget — least-recently-viewed, guarded by a HEAD', () => {
           : { rows: [] };
       }
       if (flat.includes('SET local_path = NULL')) { candidateRemaining = false; used = 0; return { rows: [] }; }
+      if (flat.includes('WHERE local_path = $1 LIMIT 1')) return { rows: [] };
+      return { rows: [] };
+    });
+    vi.mocked(headAsset).mockResolvedValue({ bytes: 16 });
+
+    const result = await evictToBudget();
+    expect(result.evicted).toBe(1);
+    expect(existsSync(join(attachmentsRoot(), relPath))).toBe(false);
+  });
+
+  // LENS-4: the candidate index now orders `last_viewed_at ASC NULLS FIRST` —
+  // a never-viewed attachment is the BEST eviction candidate (least, not most,
+  // recently seen), and this pins that the service still evicts it cleanly
+  // when the query hands one back, rather than choking on the `null`.
+  it('evicts a never-viewed candidate (NULL last_viewed_at) exactly like any other', async () => {
+    seedFile(relPath);
+    let candidateRemaining = true;
+    vi.mocked(query).mockImplementation(async (sql) => {
+      const flat = String(sql).replace(/\s+/g, ' ');
+      if (flat.includes('unique_files')) return { rows: [{ bytes: String(10 * 1024 * 1024 * 1024), files: 1 }] };
+      if (flat.includes('ORDER BY last_viewed_at ASC NULLS FIRST')) {
+        return candidateRemaining
+          ? { rows: [{
+            message_id: 'msg-example-1', idx: 0, mxc_id: 'mxc://example.invalid/abc',
+            local_path: relPath, byte_length: 16, last_viewed_at: null,
+          }] }
+          : { rows: [] };
+      }
+      if (flat.includes('SET local_path = NULL')) { candidateRemaining = false; return { rows: [] }; }
       if (flat.includes('WHERE local_path = $1 LIMIT 1')) return { rows: [] };
       return { rows: [] };
     });
@@ -630,6 +676,33 @@ describe('the backfill census the consent step has to state', () => {
     const result = await backfillAttachments({});
     expect(result).toMatchObject({ fetched: 0, stoppedForBudget: true });
     expect(vi.mocked(fetchAssetStream)).not.toHaveBeenCalled();
+  });
+
+  // PERF-4: `storedBytes()` is a DISTINCT ON scan of the whole table — this
+  // pins that a multi-attachment pass costs ONE such scan, not one per row.
+  it('computes the byte-count total once per pass, not once per attachment', async () => {
+    const pending = [
+      { message_id: 'msg-example-1', idx: 0 },
+      { message_id: 'msg-example-2', idx: 0 },
+      { message_id: 'msg-example-3', idx: 0 },
+    ];
+    let uniqueFilesCalls = 0;
+    vi.mocked(query).mockImplementation(async (sql) => {
+      const flat = String(sql).replace(/\s+/g, ' ');
+      if (flat.includes('ORDER BY created_at ASC')) return { rows: pending };
+      if (flat.includes('unique_files')) {
+        uniqueFilesCalls += 1;
+        return { rows: [{ bytes: '0', files: 0 }] };
+      }
+      if (flat.includes('FROM beeper_attachments WHERE message_id')) return { rows: [attachmentRow()] };
+      return { rows: [] };
+    });
+    vi.mocked(headAsset).mockResolvedValue({ bytes: 4 });
+    vi.mocked(fetchAssetStream).mockImplementation(async () => streamResponse([new Uint8Array([1, 2, 3, 4])]));
+
+    const result = await backfillAttachments({ limit: 10 });
+    expect(result.fetched).toBe(3);
+    expect(uniqueFilesCalls).toBe(1);
   });
 });
 

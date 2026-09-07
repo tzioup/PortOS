@@ -109,7 +109,13 @@ describe('listConversations — keyset pagination', () => {
       last_activity: `2026-09-0${i + 1}T10:00:00.000Z`,
       ordering_ts: `2026-09-0${i + 1}T10:00:00.000Z`,
     }));
-    vi.mocked(query).mockResolvedValueOnce({ rows }).mockResolvedValueOnce({ rows: [] });
+    // Page query, then the batched preview query, then attachParticipants —
+    // three calls per listConversations() invocation since the preview LATERAL
+    // was split out of the page query (audit cluster 06).
+    vi.mocked(query)
+      .mockResolvedValueOnce({ rows })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
 
     const page = await listConversations({ limit: 2 });
     expect(page.conversations).toHaveLength(2);
@@ -117,14 +123,18 @@ describe('listConversations — keyset pagination', () => {
 
     vi.mocked(query).mockResolvedValue({ rows: [] });
     await listConversations({ limit: 2, cursor: page.nextCursor });
-    const [sql, params] = vi.mocked(query).mock.calls[2];
+    const [sql, params] = vi.mocked(query).mock.calls[3];
     expect(flat(sql)).toContain('(COALESCE(c.last_activity, c.created_at), c.id) <');
     expect(params[0]).toBe(rows[1].ordering_ts);
     expect(params[1]).toBe(rows[1].id);
   });
 
   it('has no next page when the result is short', async () => {
-    vi.mocked(query).mockResolvedValueOnce({ rows: [conversationRow()] }).mockResolvedValueOnce({ rows: [] });
+    // Page query, then the batched preview query, then attachParticipants.
+    vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [conversationRow()] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
     const page = await listConversations({ limit: 2 });
     expect(page.nextCursor).toBeNull();
   });
@@ -172,8 +182,9 @@ describe('listConversations — row shaping', () => {
       tribe_person_name: null,
     }));
     vi.mocked(query)
-      .mockResolvedValueOnce({ rows: [conversationRow()] })
-      .mockResolvedValueOnce({ rows: participants });
+      .mockResolvedValueOnce({ rows: [conversationRow()] }) // page
+      .mockResolvedValueOnce({ rows: [] }) // preview
+      .mockResolvedValueOnce({ rows: participants }); // participants
 
     const { conversations } = await listConversations({});
     expect(conversations[0].participants).toHaveLength(8);
@@ -182,17 +193,21 @@ describe('listConversations — row shaping', () => {
   });
 
   it('withholds the body of a tombstoned preview while keeping the row', async () => {
+    // The preview now comes back from a SEPARATE, page-scoped query — keyed
+    // on `conversation_id`, matched to the page row by id (audit cluster 06).
     vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [conversationRow()] }) // page
       .mockResolvedValueOnce({
-        rows: [conversationRow({
+        rows: [{
+          conversation_id: CONV_A,
           preview_id: 'msg-example-1',
           preview_body: 'placeholder body that must not ship',
           preview_sender_id: 'user-1',
           preview_sent_at: '2026-09-01T09:59:00.000Z',
           preview_unsent_at: '2026-09-01T10:00:00.000Z',
-        })],
-      })
-      .mockResolvedValueOnce({ rows: [] });
+        }],
+      }) // preview
+      .mockResolvedValueOnce({ rows: [] }); // participants
 
     const { conversations } = await listConversations({});
     expect(conversations[0].lastMessage).toMatchObject({ id: 'msg-example-1', body: '', isUnsent: true });
@@ -200,24 +215,27 @@ describe('listConversations — row shaping', () => {
 
   it('carries the preview\'s direction, so the row can show its leading state chip', async () => {
     vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [conversationRow()] }) // page
       .mockResolvedValueOnce({
-        rows: [conversationRow({
+        rows: [{
+          conversation_id: CONV_A,
           preview_id: 'msg-example-1',
           preview_body: 'placeholder body',
           preview_sender_id: 'user-me',
           preview_sent_at: '2026-09-01T09:59:00.000Z',
           preview_is_sender: true,
-        })],
-      })
-      .mockResolvedValueOnce({ rows: [] });
+        }],
+      }) // preview
+      .mockResolvedValueOnce({ rows: [] }); // participants
     const { conversations } = await listConversations({});
     expect(conversations[0].lastMessage.isSender).toBe(true);
   });
 
   it('reports a conversation with no mirrored message as lastMessage: null, not as an empty string', async () => {
     vi.mocked(query)
-      .mockResolvedValueOnce({ rows: [conversationRow()] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [conversationRow()] }) // page
+      .mockResolvedValueOnce({ rows: [] }) // preview
+      .mockResolvedValueOnce({ rows: [] }); // participants
     const { conversations } = await listConversations({});
     expect(conversations[0].lastMessage).toBeNull();
   });
