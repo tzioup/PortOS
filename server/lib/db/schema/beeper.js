@@ -82,7 +82,14 @@ export const beeperDdl = [
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (account_id, source_chat_id)
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_beeper_conversations_account_activity ON beeper_conversations (account_id, last_activity DESC)`,
+  // `idx_beeper_conversations_account_activity (account_id, last_activity DESC)`
+  // served no query: listConversations (services/beeperConversations.js) has
+  // no account_id filter, and its ORDER BY / keyset walk sorts on
+  // `COALESCE(last_activity, created_at)`, never the raw column — so every
+  // page was an unindexed sort. Repointed at the expression the keyset walk
+  // actually uses (audit cluster 06, indexes and query plans).
+  `DROP INDEX IF EXISTS idx_beeper_conversations_account_activity`,
+  `CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_keyset ON beeper_conversations ((COALESCE(last_activity, created_at)) DESC, id DESC)`,
 
   // Keyed on Beeper's own message id (TEXT — bridges do not guarantee a UUID
   // shape). Full bodies persist machine-local, per the store ADR.
@@ -113,7 +120,14 @@ export const beeperDdl = [
   // rather than NULL: an unbackfilled row renders as inbound, which is the
   // right way round for a mirror that is mostly other people's messages.
   `ALTER TABLE beeper_messages ADD COLUMN IF NOT EXISTS is_sender BOOLEAN NOT NULL DEFAULT FALSE`,
-  `CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_sort ON beeper_messages (conversation_id, sort_key)`,
+  // `idx_beeper_messages_conversation_sort (conversation_id, sort_key)` served
+  // no query — `sort_key` is written on ingest and never read back. A thread
+  // page (listMessages) and the "latest message" LATERAL each conversation
+  // row's list preview needs (listConversations) both order on
+  // `COALESCE(sent_at, created_at) DESC, id DESC` within one `conversation_id`,
+  // so ONE index serves both call sites (audit cluster 06).
+  `DROP INDEX IF EXISTS idx_beeper_messages_conversation_sort`,
+  `CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_order ON beeper_messages (conversation_id, (COALESCE(sent_at, created_at)) DESC, id DESC)`,
 
   // `observed_via` is required, not cosmetic: the Beeper API's participant
   // lists truncate (20 in a chat listing, 100 in a single-chat GET) with no
@@ -146,7 +160,6 @@ export const beeperDdl = [
     message_id TEXT NOT NULL REFERENCES beeper_messages (id) ON DELETE CASCADE,
     idx INTEGER NOT NULL,
     mxc_id TEXT,
-    sha256 TEXT,
     mime_type TEXT NOT NULL DEFAULT '',
     byte_length BIGINT,
     file_name TEXT NOT NULL DEFAULT '',
@@ -162,6 +175,13 @@ export const beeperDdl = [
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     PRIMARY KEY (conversation_id, message_id, idx)
   )`,
+  // Every attachment route addresses one row by `(message_id, idx)`
+  // (`beeperAttachments.js`'s `loadRow`, `setAttachmentKeep`, `markUnavailable`,
+  // the acquire/release paths) — the PK above leads with `conversation_id`,
+  // which none of those callers have on hand, so every lookup scanned the
+  // table. Leads with `message_id` to match the actual access pattern (audit
+  // cluster 06).
+  `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_message ON beeper_attachments (message_id, idx)`,
   // The byte-mirror columns (#37), declared inline above for a fresh install
   // and added here for one whose `beeper_attachments` predates them —
   // `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, the same
@@ -179,11 +199,29 @@ export const beeperDdl = [
   `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS fetched_at TIMESTAMPTZ`,
   `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS unavailable_at TIMESTAMPTZ`,
   `ALTER TABLE beeper_attachments ADD COLUMN IF NOT EXISTS fetch_error TEXT`,
-  // The budget sweep sums mirrored bytes and walks least-recently-viewed
-  // first; both only ever look at rows that HAVE bytes on disk.
+  // `sha256` was written on every fetch (`ensureAttachmentBytes`) but never
+  // read back anywhere — the content-addressed path is built from the hash
+  // `streamAssetToStore` just computed, not from this column. Dropped; the
+  // sha256 VALUE stays in use for the content-addressed path (`local_path`),
+  // only the column goes (audit cluster 06 decision 3).
+  `ALTER TABLE beeper_attachments DROP COLUMN IF EXISTS sha256`,
+  `DROP INDEX IF EXISTS idx_beeper_attachments_sha256`,
+  // The budget sweep sums mirrored bytes (`idx_beeper_attachments_local`) and
+  // walks least-recently-viewed first among rows that HAVE bytes on disk
+  // (`idx_beeper_attachments_eviction_candidates`) — `evictToBudget`'s
+  // candidate query filters `local_path IS NOT NULL AND keep = FALSE AND
+  // unavailable_at IS NULL AND mxc_id IS NOT NULL` and orders by
+  // `last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST` (a
+  // never-viewed row is the BEST eviction candidate, not the worst — it is
+  // ordered first on purpose). The old index below was predicated on
+  // `keep = FALSE` alone (no `local_path IS NOT NULL`, so a bytes-less row
+  // could rank into the scan) with the btree default NULLS LAST for an
+  // ascending column, the opposite of what the query asks for — it could not
+  // serve this ORDER BY at all. Predicate and NULLS placement now match the
+  // query exactly (audit cluster 06).
   `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_local ON beeper_attachments (local_path) WHERE local_path IS NOT NULL`,
-  `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction ON beeper_attachments (last_viewed_at) WHERE keep = FALSE`,
-  `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_sha256 ON beeper_attachments (sha256) WHERE sha256 IS NOT NULL`,
+  `DROP INDEX IF EXISTS idx_beeper_attachments_eviction`,
+  `CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction_candidates ON beeper_attachments (last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST) WHERE keep = FALSE AND local_path IS NOT NULL`,
 
   // `chat_id` is the Beeper-side chat id (matches `source_chat_id` above),
   // not the synthetic `beeper_conversations.id` — the backfill sweep calls

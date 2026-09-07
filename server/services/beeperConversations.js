@@ -234,6 +234,16 @@ async function attachParticipants(conversations, { cap = LIST_PARTICIPANT_CAP } 
  * Archive and Low-priority scopes ask for the positive. Collapsing absent into
  * false would make the unified scope silently hide archived chats with no way
  * to ask for them (root AGENTS.md, absent-vs-empty).
+ *
+ * The page is fetched FIRST — filtered, ordered, and limited on
+ * `idx_beeper_conversations_activity_keyset` alone — and the "last message"
+ * preview is a SECOND query scoped to just that page's ids. Folding the
+ * preview LATERAL into the same WHERE/ORDER BY/LIMIT query (the old shape) let
+ * the planner evaluate it once per FILTERED conversation rather than once per
+ * PAGE row; splitting the preview into its own query, batched over the page's
+ * ids the way `attachParticipants` already batches participants, makes
+ * "page-sized" a property of the SQL shape rather than a plan the optimizer
+ * happens to choose (audit cluster 06, indexes and query plans).
  */
 export async function listConversations({
   network, unreadOnly, archived, lowPriority, limit, cursor,
@@ -263,36 +273,51 @@ export async function listConversations({
   }
 
   params.push(pageSize + 1);
-  const result = await query(
-    `SELECT c.*,
-            lm.id AS preview_id, lm.body AS preview_body, lm.sender_id AS preview_sender_id,
-            lm.sent_at AS preview_sent_at, lm.unsent_at AS preview_unsent_at,
-            lm.is_sender AS preview_is_sender,
-            COALESCE(c.last_activity, c.created_at) AS ordering_ts
+  const pageResult = await query(
+    `SELECT c.*, COALESCE(c.last_activity, c.created_at) AS ordering_ts
        FROM beeper_conversations c
-       LEFT JOIN LATERAL (
-         SELECT m.id, m.body, m.sender_id, m.sent_at, m.unsent_at, m.is_sender
-           FROM beeper_messages m
-          WHERE m.conversation_id = c.id
-          ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC
-          LIMIT 1
-       ) lm ON TRUE
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY COALESCE(c.last_activity, c.created_at) DESC, c.id DESC
       LIMIT $${params.length}`,
     params,
   );
 
-  const rows = result?.rows || [];
+  const rows = pageResult?.rows || [];
   const page = rows.slice(0, pageSize);
-  const conversations = await attachParticipants(page.map(shapeConversation));
   const last = page[page.length - 1];
-  return {
-    conversations,
-    // `null`, not an empty string: "there is no next page" is a different
-    // answer from "here is a cursor that returns nothing".
-    nextCursor: rows.length > pageSize && last ? encodeCursor(last.ordering_ts, last.id) : null,
-  };
+  // `null`, not an empty string: "there is no next page" is a different
+  // answer from "here is a cursor that returns nothing".
+  const nextCursor = rows.length > pageSize && last ? encodeCursor(last.ordering_ts, last.id) : null;
+
+  if (page.length === 0) {
+    return { conversations: [], nextCursor };
+  }
+
+  // Batched over the PAGE's ids, never the filtered set — this is what keeps
+  // the preview lookup bounded to `pageSize` rows no matter how many
+  // conversations the filters above matched.
+  const previewResult = await query(
+    `SELECT ids.conversation_id, lm.id AS preview_id, lm.body AS preview_body,
+            lm.sender_id AS preview_sender_id, lm.sent_at AS preview_sent_at,
+            lm.unsent_at AS preview_unsent_at, lm.is_sender AS preview_is_sender
+       FROM unnest($1::uuid[]) AS ids(conversation_id)
+       LEFT JOIN LATERAL (
+         SELECT m.id, m.body, m.sender_id, m.sent_at, m.unsent_at, m.is_sender
+           FROM beeper_messages m
+          WHERE m.conversation_id = ids.conversation_id
+          ORDER BY COALESCE(m.sent_at, m.created_at) DESC, m.id DESC
+          LIMIT 1
+       ) lm ON TRUE`,
+    [page.map((row) => row.id)],
+  );
+  const previewByConversation = new Map(
+    (previewResult?.rows || []).map((row) => [row.conversation_id, row]),
+  );
+
+  const conversations = await attachParticipants(
+    page.map((row) => shapeConversation({ ...row, ...(previewByConversation.get(row.id) || {}) })),
+  );
+  return { conversations, nextCursor };
 }
 
 /** One conversation, with its FULL mirrored participant set (no list cap). */

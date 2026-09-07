@@ -1697,7 +1697,12 @@ CREATE TABLE IF NOT EXISTS beeper_conversations (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE (account_id, source_chat_id)
 );
-CREATE INDEX IF NOT EXISTS idx_beeper_conversations_account_activity ON beeper_conversations (account_id, last_activity DESC);
+-- Repointed at the ordering expression the keyset walk actually uses — no
+-- query filters on account_id, and the ORDER BY / cursor predicate both sort
+-- on COALESCE(last_activity, created_at), never the raw column (audit
+-- cluster 06, indexes and query plans). Mirrors the block in
+-- server/lib/db/schema/beeper.js.
+CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_keyset ON beeper_conversations ((COALESCE(last_activity, created_at)) DESC, id DESC);
 CREATE TABLE IF NOT EXISTS beeper_messages (
   id TEXT PRIMARY KEY,
   conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
@@ -1714,7 +1719,11 @@ CREATE TABLE IF NOT EXISTS beeper_messages (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_sort ON beeper_messages (conversation_id, sort_key);
+-- Repointed: sort_key is written on ingest and never read back. A thread page
+-- and the "latest message" preview LATERAL both order on
+-- COALESCE(sent_at, created_at) DESC, id DESC within one conversation_id, so
+-- one index serves both (audit cluster 06). Mirrors beeper.js.
+CREATE INDEX IF NOT EXISTS idx_beeper_messages_conversation_order ON beeper_messages (conversation_id, (COALESCE(sent_at, created_at)) DESC, id DESC);
 CREATE TABLE IF NOT EXISTS beeper_participants (
   conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,
   source_user_id TEXT NOT NULL,
@@ -1732,7 +1741,6 @@ CREATE TABLE IF NOT EXISTS beeper_attachments (
   message_id TEXT NOT NULL REFERENCES beeper_messages (id) ON DELETE CASCADE,
   idx INTEGER NOT NULL,
   mxc_id TEXT,
-  sha256 TEXT,
   mime_type TEXT NOT NULL DEFAULT '',
   byte_length BIGINT,
   file_name TEXT NOT NULL DEFAULT '',
@@ -1753,9 +1761,20 @@ CREATE TABLE IF NOT EXISTS beeper_attachments (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (conversation_id, message_id, idx)
 );
+-- Every attachment route addresses one row by (message_id, idx) — the PK
+-- above leads with conversation_id, which none of those callers have on
+-- hand, so every lookup scanned the table (audit cluster 06).
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_message ON beeper_attachments (message_id, idx);
 CREATE INDEX IF NOT EXISTS idx_beeper_attachments_local ON beeper_attachments (local_path) WHERE local_path IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction ON beeper_attachments (last_viewed_at) WHERE keep = FALSE;
-CREATE INDEX IF NOT EXISTS idx_beeper_attachments_sha256 ON beeper_attachments (sha256) WHERE sha256 IS NOT NULL;
+-- evictToBudget's candidate query filters local_path IS NOT NULL AND
+-- keep = FALSE AND unavailable_at IS NULL AND mxc_id IS NOT NULL, and orders
+-- by last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST (a
+-- never-viewed row is the BEST eviction candidate, ordered first on purpose).
+-- Predicate and NULLS placement match that query exactly (audit cluster 06).
+-- `sha256` (and its index) is dropped, not shipped fresh: it was written on
+-- every fetch but never read back — the content-addressed path is built from
+-- the freshly computed hash, not from this column (decision 3).
+CREATE INDEX IF NOT EXISTS idx_beeper_attachments_eviction_candidates ON beeper_attachments (last_viewed_at ASC NULLS FIRST, fetched_at ASC NULLS FIRST) WHERE keep = FALSE AND local_path IS NOT NULL;
 CREATE TABLE IF NOT EXISTS beeper_sync_cursors (
   account_id TEXT NOT NULL REFERENCES beeper_accounts (account_id) ON DELETE CASCADE,
   chat_id TEXT NOT NULL,
