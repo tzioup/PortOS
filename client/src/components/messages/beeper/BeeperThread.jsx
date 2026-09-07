@@ -776,7 +776,7 @@ export default function BeeperThread({
         <button
           type="button"
           aria-label="Attach a file"
-          title="Attachments are not wired yet"
+          title="Attachments aren't supported yet"
           disabled
           className="shrink-0 rounded-full p-2 text-gray-600"
         >

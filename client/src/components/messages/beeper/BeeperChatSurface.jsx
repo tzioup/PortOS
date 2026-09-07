@@ -130,7 +130,7 @@ function InertControl({ icon: Icon, label, className }) {
       type="button"
       disabled
       aria-label={label}
-      title={`${label} — not wired yet`}
+      title={`${label} — not available yet`}
       className={`${className} cursor-not-allowed opacity-35`}
     >
       <Icon size={17} />

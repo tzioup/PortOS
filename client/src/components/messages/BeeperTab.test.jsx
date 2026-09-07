@@ -356,14 +356,14 @@ describe('the pinned grid is Beeper’s own isPinned, mirrored', () => {
 });
 
 describe('deferred controls render inert rather than absent', () => {
-  it('disables Requests, Later, add-scope and the overflow menu, each saying it is not wired', async () => {
+  it('disables Requests, Later, add-scope and the overflow menu, each saying it is not available yet', async () => {
     renderTab();
     await screen.findByText('Nothing here');
 
     for (const label of ['Requests', 'Later', 'Add scope', 'More scope options']) {
       const control = screen.getByRole('button', { name: label });
       expect(control).toBeDisabled();
-      expect(control).toHaveAttribute('title', `${label} — not wired yet`);
+      expect(control).toHaveAttribute('title', `${label} — not available yet`);
     }
   });
 
@@ -372,6 +372,27 @@ describe('deferred controls render inert rather than absent', () => {
     await screen.findByText('Nothing here');
     expect(screen.getByRole('button', { name: 'Archive' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Low priority' })).toBeEnabled();
+  });
+});
+
+/**
+ * Audit cluster 08 (COPY-2): "not wired yet" is implementation vocabulary
+ * leaking into shipped copy — the InertControl tooltip template and the
+ * composer's attach button both used it. Upstream's own convention is
+ * "Coming soon — …" (ImportTab.jsx); this file's fix lands on
+ * "not available yet" / "aren't supported yet" instead. Scans the rendered
+ * DOM rather than one control at a time, so a leftover site anywhere would
+ * still fail this even if a future edit missed it.
+ */
+describe('no leftover "not wired" copy anywhere in the surface', () => {
+  it('renders no title or text containing "not wired", across the rail and the composer', async () => {
+    api.getBeeperConversation.mockResolvedValue(conversation({ title: 'Example Contact', network: 'whatsapp' }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+    await screen.findByLabelText('Message Example Contact on WhatsApp');
+
+    const titled = [...document.querySelectorAll('[title]')].map((el) => el.getAttribute('title') || '');
+    expect(titled.some((title) => title.toLowerCase().includes('not wired'))).toBe(false);
+    expect(document.body.textContent.toLowerCase()).not.toContain('not wired');
   });
 });
 
