@@ -15,9 +15,9 @@
  *     `beeper_participants.tribe_person_id` is then the sole, hand-set truth
  *     (`linkParticipant` / `createPersonAndLinkParticipant`).
  *
- * `upsertParticipant` is the participant-row writer a future ingestion sweep
- * (#32) will call on every sync pass — its ON CONFLICT clause deliberately
- * never touches `tribe_person_id`, so a manual link on the 13%-no-handle case
+ * `upsertParticipant` is the participant-row writer the ingestion sweep (#32)
+ * calls on every sync pass — its ON CONFLICT clause deliberately never
+ * touches `tribe_person_id`, so a manual link on the 13%-no-handle case
  * survives every re-sync (#34 acceptance).
  *
  * Touchpoints: `logSenderTouchpoints` relates a GROUP conversation by message
