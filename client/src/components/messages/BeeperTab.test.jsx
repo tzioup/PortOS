@@ -197,7 +197,8 @@ describe('deep linking', () => {
 });
 
 describe('rendering at every install size', () => {
-  it('renders with zero conversations, and says an empty list is often correct', async () => {
+  it('renders with zero conversations, and says an empty list is often correct when networks are mirrored and the list loaded fine', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
     renderTab();
     expect(await screen.findByText('Nothing here')).toBeInTheDocument();
     expect(screen.getByText(/often correct rather than broken/)).toBeInTheDocument();
@@ -243,6 +244,44 @@ describe('rendering at every install size', () => {
     api.getBeeperNetworks.mockResolvedValue({ networks: [{ network: 'somenewbridge', unreadCount: 0, conversationCount: 1, accountIds: [] }] });
     renderTab();
     expect(await screen.findByRole('button', { name: 'somenewbridge' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Audit cluster 08 (A11Y-3): the empty conversation list always stated
+ * "{networks.length} network(s) mirrored ... often correct rather than
+ * broken", even when the networks fetch had failed (networks lands at []
+ * either way) — rendering "0 networks mirrored" as settled fact directly
+ * under the visible error banner it contradicted. The fix branches the
+ * second paragraph on whether anything is actually known to be wrong or
+ * filtered, rather than always reciting the same reassurance.
+ */
+describe('the honest empty state (A11Y-3)', () => {
+  it('shows no networks-mirrored reassurance and offers the settings link when no networks are mirrored', async () => {
+    api.getBeeperNetworks.mockRejectedValue(new Error('network fetch failed'));
+    renderTab();
+    await screen.findByText('Nothing here');
+    expect(screen.queryByText(/network.*mirrored/i)).toBeNull();
+    expect(screen.getByRole('button', { name: /open beeper settings/i })).toBeInTheDocument();
+  });
+
+  it('names the unread filter instead of the reassurance when unreadOnly is on', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
+    renderTab('/messages/beeper?unread=1');
+    await screen.findByText('Nothing here');
+    expect(screen.getByText(/filter is on/i)).toBeInTheDocument();
+    expect(screen.queryByText(/often correct rather than broken/)).toBeNull();
+  });
+
+  it('suppresses the reassurance entirely when the conversation list itself failed to load', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
+    api.getBeeperConversations.mockRejectedValue(new Error('Could not load conversations'));
+    renderTab();
+    await screen.findByText('Nothing here');
+    expect(screen.queryByText(/network.*mirrored/i)).toBeNull();
+    expect(screen.queryByText(/often correct rather than broken/)).toBeNull();
+    expect(screen.queryByText(/nothing is mirrored yet/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /open beeper settings/i })).toBeNull();
   });
 });
 

@@ -769,10 +769,36 @@ export default function BeeperChatSurface({
         ) : conversations.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-1 p-6 text-center">
             <p className="text-sm text-gray-300">Nothing here</p>
-            <p className="text-[11px] text-gray-500">
-              {networks.length} network{networks.length === 1 ? '' : 's'} mirrored. History depth varies enormously per
-              network, so an empty list is often correct rather than broken.
-            </p>
+            {/* The reassurance below only makes sense once the list itself is
+                known-good (#3/A11Y-3): a failed fetch already explains itself
+                via the error banner above, and repeating "often correct" right
+                under it read as a contradiction. Zero mirrored networks and an
+                active unread filter are their own, more useful answers than a
+                generic count. */}
+            {!listError && (
+              <p className="text-[11px] text-gray-500">
+                {networks.length === 0 ? (
+                  <>
+                    Nothing is mirrored yet.{' '}
+                    <button
+                      type="button"
+                      onClick={onOpenSettings}
+                      className="text-port-accent underline underline-offset-2"
+                    >
+                      Open Beeper settings
+                    </button>{' '}
+                    to connect a network.
+                  </>
+                ) : unreadOnly ? (
+                  'The unread filter is on — nothing unread here.'
+                ) : (
+                  <>
+                    {networks.length} network{networks.length === 1 ? '' : 's'} mirrored. History depth varies
+                    enormously per network, so an empty list is often correct rather than broken.
+                  </>
+                )}
+              </p>
+            )}
           </div>
         ) : (
           <div className="min-h-0 flex-1 divide-y divide-port-border/50 overflow-y-auto">
