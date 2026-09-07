@@ -183,13 +183,26 @@ const NETWORK_ALIASES = {
   messengergo: 'facebook',
 };
 
+// The live Facebook-bridge display string has never been observed directly
+// (no fixture in this repo, none in any captured log, live mirror off
+// limits), so rather than guess one more exact spelling for `NETWORK_ALIASES`
+// above, this ordered contains-rule against the normalized id is what makes
+// the mapping robust to whichever spelling ("Facebook Messenger",
+// "Messenger (Go)", ...) the bridge actually emits — checked only after the
+// exact map so a future precise alias still wins.
+const NETWORK_ALIAS_RULES = [
+  [/facebook|messenger/, 'facebook'],
+];
+
 // Beeper reports a network as a lowercase id; normalize defensively so a
 // bridge that reports "WhatsApp" or "google-messages" still finds its mark
 // instead of silently degrading to the initial chip, then fold known aliases
 // onto the one id each has a mark/label for.
 const normalize = (network) => {
   const raw = String(network || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  return NETWORK_ALIASES[raw] || raw;
+  if (NETWORK_ALIASES[raw]) return NETWORK_ALIASES[raw];
+  const rule = NETWORK_ALIAS_RULES.find(([pattern]) => pattern.test(raw));
+  return rule ? rule[1] : raw;
 };
 
 /** A human label for a network id, for the composer, the header and titles. */

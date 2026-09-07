@@ -45,8 +45,10 @@ describe('BeeperNetworkLogo — Google Messages vs. Signal', () => {
 });
 
 describe('BeeperNetworkLogo — Beeper mark', () => {
-  it('renders a dedicated Beeper mark instead of falling back', () => {
-    render(<NetworkLogo network="beeper" />);
+  const beeperIds = ['beeper', 'Beeper'];
+
+  it.each(beeperIds)('renders a dedicated Beeper mark instead of falling back for %s', (rawId) => {
+    render(<NetworkLogo network={rawId} />);
     const mark = screen.getByRole('img', { name: 'Beeper' });
     expect(mark.querySelector('path')).toBeTruthy();
     // Not the neutral grey fallback chip's single-letter span.
@@ -59,7 +61,22 @@ describe('BeeperNetworkLogo — Beeper mark', () => {
 });
 
 describe('BeeperNetworkLogo — Facebook/Messenger id normalisation', () => {
-  const aliases = ['facebook', 'facebookgo', 'messenger', 'messengergo', 'Facebook Go', 'MESSENGER'];
+  const aliases = [
+    'facebook',
+    'facebookgo',
+    'messenger',
+    'messengergo',
+    'Facebook Go',
+    'MESSENGER',
+    // Beeper reports a display name, not a stable id, and the live
+    // Facebook-bridge string has never been observed (#84) — these pin the
+    // contains-rule fallback (`NETWORK_ALIAS_RULES`) that catches whichever
+    // spelling the bridge actually emits, none of which hit the exact map.
+    'Facebook Messenger',
+    'facebook-messenger',
+    'Facebook (Go)',
+    'Messenger (Go)',
+  ];
 
   it.each(aliases)('resolves %s to the Messenger mark', (rawId) => {
     render(<NetworkLogo network={rawId} />);
