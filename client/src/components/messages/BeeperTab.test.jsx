@@ -26,6 +26,8 @@ const api = vi.hoisted(() => ({
   getBeeperMessages: vi.fn(),
   setBeeperConversationArchived: vi.fn(),
   setBeeperConversationLowPriority: vi.fn(),
+  // The LOCAL "seen in PortOS" watermark (#83) — never a Beeper write.
+  markBeeperConversationSeen: vi.fn(),
   linkBeeperParticipant: vi.fn(),
   createTribePersonFromBeeper: vi.fn(),
   getTribePeople: vi.fn(),
@@ -130,6 +132,7 @@ beforeEach(() => {
   api.getBeeperConversations.mockResolvedValue({ conversations: [], nextCursor: null });
   api.getBeeperConversation.mockResolvedValue(conversation());
   api.getBeeperMessages.mockResolvedValue({ messages: [], nextCursor: null });
+  api.markBeeperConversationSeen.mockResolvedValue(conversation());
   api.getTribePeople.mockResolvedValue([]);
   apiBeeper.listOutboxEntries.mockResolvedValue({ entries: [] });
   apiBeeper.discardOutboxEntry.mockResolvedValue(undefined);
@@ -1082,6 +1085,71 @@ describe('the two wired rail controls', () => {
 
     await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper request failed: connection refused'));
     expect(api.setBeeperConversationLowPriority).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The LOCAL "seen in PortOS" watermark (#83) — the fix for opening an unread
+// thread leaving its badge untouched. This NEVER reaches Beeper: no PATCH,
+// no read receipt — see `markBeeperConversationSeen` (`apiBeeper.js`) and its
+// server-side `markConversationSeen`.
+describe('the local "seen in PortOS" watermark (#83)', () => {
+  it('clears the row\'s own badge on open and calls the local mark-seen endpoint, never a Beeper write', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [conversation({ title: 'Example Unread', unreadCount: 3 })],
+      nextCursor: null,
+    });
+    api.getBeeperConversation.mockResolvedValue(conversation({ title: 'Example Unread', unreadCount: 3 }));
+
+    renderTab();
+
+    const row = (await screen.findByText('Example Unread')).closest('button');
+    expect(within(row).getByText('3')).toBeInTheDocument();
+
+    fireEvent.click(row);
+
+    await waitFor(() => expect(api.markBeeperConversationSeen).toHaveBeenCalledWith(CONV_A, { silent: true }));
+    // Optimistic: the row's own badge is gone as soon as the thread has
+    // loaded, without waiting on the mark-seen POST's own round trip.
+    await waitFor(() => expect(within(row).queryByText('3')).toBeNull());
+    // Never a write to Beeper — this is a local read-model change only.
+    expect(api.setBeeperConversationArchived).not.toHaveBeenCalled();
+    expect(api.setBeeperConversationLowPriority).not.toHaveBeenCalled();
+  });
+
+  it('re-marks seen when a new message lands in the thread that is already open', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderTab(`/messages/beeper/${CONV_A}`);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => {});
+      await waitFor(() => expect(api.markBeeperConversationSeen).toHaveBeenCalledWith(CONV_A, { silent: true }));
+      api.markBeeperConversationSeen.mockClear();
+
+      api.getBeeperMessages.mockResolvedValueOnce({
+        messages: [{
+          id: 'm-new', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder new message',
+          sentAt: '2026-09-01T11:00:00.000Z', attachments: [],
+        }],
+        nextCursor: null,
+      });
+      act(() => {
+        for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+          fn({ kind: 'message.upserted', chatID: 'chat-example-1', ids: ['m-new'], seq: 10 });
+        }
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+
+      await waitFor(() => expect(api.markBeeperConversationSeen).toHaveBeenCalledWith(CONV_A, { silent: true }));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not let a failed mark-seen call break opening the thread', async () => {
+    api.markBeeperConversationSeen.mockRejectedValue(new Error('offline'));
+    api.getBeeperConversation.mockResolvedValue(conversation({ title: 'Example Contact' }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+    expect(await screen.findByText('Example Contact')).toBeInTheDocument();
   });
 });
 
