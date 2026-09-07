@@ -103,17 +103,18 @@ describe('readBeeperCredential', () => {
 });
 
 describe('resolveBeeperToken', () => {
-  it('prefers the vaulted credential over anything in settings', async () => {
-    vi.mocked(query).mockResolvedValue({ rows: [{ token_enc: CIPHERTEXT, token_expires_at: null, scopes: '', source: 'oauth', client_id: '' }] });
+  it('prefers the vaulted credential over anything in settings, scopes included', async () => {
+    vi.mocked(query).mockResolvedValue({ rows: [{ token_enc: CIPHERTEXT, token_expires_at: null, scopes: 'read write', source: 'oauth', client_id: '' }] });
     vi.mocked(getSettings).mockResolvedValue({ beeper: { token: 'legacy-plaintext-token' } });
-    await expect(resolveBeeperToken()).resolves.toMatchObject({ token: TOKEN, tokenSource: 'oauth' });
+    await expect(resolveBeeperToken()).resolves.toMatchObject({ token: TOKEN, tokenSource: 'oauth', tokenScopes: ['read', 'write'] });
     expect(getSettings).not.toHaveBeenCalled();
   });
 
   // The #29 call site stays readable so an install that hand-edited a token
   // into settings.json before the vault existed keeps working. Nothing writes
-  // it any more.
-  it('falls back to the legacy plaintext settings token for READS', async () => {
+  // it any more. It has no scopes to report — fork issue #78's "unknown"
+  // sentinel, same as a pasted token.
+  it('falls back to the legacy plaintext settings token for READS, with tokenScopes: []', async () => {
     vi.mocked(query).mockResolvedValue({ rows: [] });
     vi.mocked(getSettings).mockResolvedValue({
       beeper: { token: 'legacy-plaintext-token', tokenExpiresAt: '2026-12-01T00:00:00.000Z' },
@@ -121,6 +122,7 @@ describe('resolveBeeperToken', () => {
     await expect(resolveBeeperToken()).resolves.toEqual({
       token: 'legacy-plaintext-token',
       tokenExpiresAt: '2026-12-01T00:00:00.000Z',
+      tokenScopes: [],
       tokenSource: 'legacy-settings',
     });
   });

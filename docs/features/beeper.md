@@ -162,8 +162,8 @@ ciphertext via `server/lib/vaultCrypto.js`, decrypted only at the moment of use.
 grants read *and* send across every bridged network and `DELETE /v1/chats/…/messages/…` defaults
 to unsending for everyone, so it does not follow the plaintext-settings precedent that root
 `AGENTS.md`'s free-service carve-out covers. The token value is never logged, never put into an
-error message, and never returned to a route: `GET /api/beeper/status` reports presence, expiry
-and provenance only.
+error message, and never returned to a route: `GET /api/beeper/status` reports presence, expiry,
+provenance and granted scopes only.
 
 The honest limit, stated rather than overclaimed: `ensureVaultKey()` writes the vault key to the
 install-root `.env`, on the same disk as the ciphertext. That bounds database dumps, backup
@@ -573,7 +573,7 @@ its attachments, the token, and anything on the Socket.IO relay.
 
 | Method | Route | What it does |
 | --- | --- | --- |
-| `GET` | `/api/beeper/status` | The status card's read model: token presence/expiry/provenance, a cached reachability probe, the account roster, realtime state, outbox breaker, sweep progress (`sweep: { running, startedAt, finishedAt, reason, accountsDone, accountsTotal, chats, messages }`, fork issue #80) |
+| `GET` | `/api/beeper/status` | The status card's read model: token presence/expiry/provenance/`tokenScopes` (array of strings, `[]` when unknown — a pasted token, fork issue #78), a cached reachability probe, the account roster, realtime state, outbox breaker, sweep progress (`sweep: { running, startedAt, finishedAt, reason, accountsDone, accountsTotal, chats, messages }`, fork issue #80) |
 | `POST` | `/api/beeper/status/check` | Live uncached probe with a coded error per failure mode |
 | `POST` | `/api/beeper/sync` | Run one watermark-bounded sweep now; a sweep already in flight reports `skipped: true` |
 | `GET` | `/api/beeper/conversations` | Rail list for one scope (network, unread-only, archived, low-priority), cursor-paginated |

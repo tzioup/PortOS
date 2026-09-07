@@ -121,14 +121,21 @@ export async function deleteBeeperCredential() {
  * an unrelated save. An install that hand-edited a token into `settings.json`
  * before #31 keeps working; a fresh connect lands in the vault instead.
  *
- * Returns `{ token, tokenExpiresAt, tokenSource }`, or `null` when neither
- * store holds one — distinct from a throw, which means the vault itself is
- * unreadable and the caller must not treat it as "not connected".
+ * Returns `{ token, tokenExpiresAt, tokenScopes, tokenSource }`, or `null`
+ * when neither store holds one — distinct from a throw, which means the
+ * vault itself is unreadable and the caller must not treat it as "not
+ * connected". `tokenScopes` is always an array, `[]` when unknown — a pasted
+ * token (#78) and the legacy plaintext path both have nothing to report.
  */
 export async function resolveBeeperToken() {
   const vaulted = await readBeeperCredential();
   if (vaulted?.token) {
-    return { token: vaulted.token, tokenExpiresAt: vaulted.tokenExpiresAt, tokenSource: vaulted.tokenSource };
+    return {
+      token: vaulted.token,
+      tokenExpiresAt: vaulted.tokenExpiresAt,
+      tokenScopes: vaulted.tokenScopes,
+      tokenSource: vaulted.tokenSource,
+    };
   }
   const settings = await getSettings().catch(() => null);
   const legacy = normalizeToken(settings?.beeper?.token);
@@ -136,6 +143,7 @@ export async function resolveBeeperToken() {
   return {
     token: legacy,
     tokenExpiresAt: toIsoOrNull(settings?.beeper?.tokenExpiresAt),
+    tokenScopes: [],
     tokenSource: LEGACY_TOKEN_SOURCE,
   };
 }

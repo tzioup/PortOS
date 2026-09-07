@@ -85,6 +85,60 @@ describe('BeeperSettingsPanel — status card states', () => {
     expect(screen.getByTestId('beeper-roster-empty')).toBeInTheDocument();
   });
 
+  // Fork issue #78: the granted scopes render beside the expiry line, and a
+  // grant that includes `write` gets no read-only warning.
+  it('renders the granted scopes on the connected card', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, lastProbeError: null, accounts: [],
+      tokenScopes: ['read', 'write'],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
+    expect(screen.getByText('Scopes: read, write')).toBeInTheDocument();
+    expect(screen.queryByText(/read-only grant/i)).toBeNull();
+  });
+
+  // A grant missing `write` is exactly the read-only-token case #78 exists to
+  // surface BEFORE a send fails, not after.
+  it('warns that sending will fail when the grant is missing the write scope', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, lastProbeError: null, accounts: [],
+      tokenScopes: ['read'],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Scopes: read')).toBeInTheDocument();
+    expect(screen.getByText('Read-only grant — sending will fail.')).toBeInTheDocument();
+  });
+
+  // A pasted token (#11 decision 3) never carries scopes back from Beeper's
+  // own paste UI, so an empty array there is said out loud rather than
+  // rendered as if nothing were known.
+  it('says scopes are unknown for a pasted token with no scopes', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, tokenSource: 'pasted', reachable: true, lastProbeError: null, accounts: [],
+      tokenScopes: [],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
+    expect(screen.getByText('Scopes unknown (pasted token).')).toBeInTheDocument();
+  });
+
+  // An empty scopes array from anywhere else (the legacy plaintext path) has
+  // nothing worth claiming — this must not render a bogus "no scopes" line.
+  it('renders nothing for an empty scopes list that is not a pasted token', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, tokenSource: 'legacy-settings', reachable: true, lastProbeError: null, accounts: [],
+      tokenScopes: [],
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Beeper Desktop connected')).toBeInTheDocument();
+    expect(screen.queryByText(/Scopes/)).toBeNull();
+  });
+
   // The drawer card's own copy of the list header's sweep-visibility strip
   // (#80) — same status payload, different surface.
   it('shows a running sweep on the drawer card', async () => {
