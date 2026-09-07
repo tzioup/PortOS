@@ -106,10 +106,11 @@ attachmentBudgetGb, allowNonLoopbackBaseUrl}` — `enabled` false, 5 minutes, th
 5 GB, and the non-loopback opt-in off. The schema (`beeperSettingsSchema`) is `.strict()` and has
 no token field at all, so a credential can never ride the generic settings route.
 
-Storing a credential, or flipping the Beeper feature or the Comms group, arms or disarms both
-the sweep scheduler and the realtime transport immediately — `reconcileBeeperIngestion()` in
-`server/services/beeperArming.js` is called from every one of those paths, so no restart is
-needed and a disconnect stops the relay rather than leaving it running on a revoked token.
+Storing a credential, flipping the Beeper feature or the Comms group, or saving a change to
+**Enable scheduled Beeper sync** itself, arms or disarms both the sweep scheduler and the
+realtime transport immediately — `reconcileBeeperIngestion()` in `server/services/beeperArming.js`
+is called from every one of those paths, so no restart is needed and a disconnect stops the relay
+rather than leaving it running on a revoked token.
 
 ## Connecting
 

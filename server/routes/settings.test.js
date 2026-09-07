@@ -850,6 +850,77 @@ describe('Settings routes — beeper slice (#30)', () => {
   });
 });
 
+// The general settings PUT persists `settings.beeper.enabled` but, unlike the
+// feature and comms-group toggles above, used to never reconcile arming — so a
+// save made right after connecting (enabled still false at that point) left
+// the sweep unregistered until the next restart. These pin the fix: reconcile
+// only fires when the effective (boolean-coerced) value actually changes.
+describe('Settings routes — beeper sync-toggle arming', () => {
+  beforeEach(() => {
+    store = {};
+    vi.clearAllMocks();
+  });
+
+  it('reconciles once, after the settings are persisted, when enabled flips false→true', async () => {
+    store = { beeper: { enabled: false, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 5 } });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledTimes(1);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'sync-toggle' });
+    // Ordering: the write must land before the reconcile fires, so the
+    // scheduler's own settings re-read (and the reconcile itself) see the
+    // value that was actually persisted, not the request body.
+    const [writeOrder] = updateSettingsWith.mock.invocationCallOrder;
+    const [reconcileOrder] = reconcileBeeperIngestion.mock.invocationCallOrder;
+    expect(writeOrder).toBeLessThan(reconcileOrder);
+  });
+
+  // Registering the scheduler is `reconcileBeeperArming`'s job; stopping it on
+  // a true→false flip is not — `reconcileBeeperIngestion` only disarms on the
+  // feature+token gate, not on this opt-in (see beeperArming.js), so it is the
+  // scheduler's own per-tick `getBeeperSyncConfig()` re-read that actually
+  // stops runs here. This still calls reconcile, for symmetry and so the
+  // transition is logged/serialized on the same tail as every other trigger.
+  it('reconciles once when enabled flips true→false', async () => {
+    store = { beeper: { enabled: true, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: false, intervalMinutes: 5 } });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledTimes(1);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'sync-toggle' });
+  });
+
+  it('does not reconcile when a save leaves enabled unchanged (interval-only)', async () => {
+    store = { beeper: { enabled: true, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 15 } });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).not.toHaveBeenCalled();
+  });
+
+  it('does not fail the PUT when the reconcile rejects', async () => {
+    reconcileBeeperIngestion.mockRejectedValueOnce(new Error('boom'));
+    store = { beeper: { enabled: false, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 5 } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.beeper.enabled).toBe(true);
+  });
+});
+
 describe('Settings routes — credential inventory', () => {
   it('returns presence and source without secret values', async () => {
     const { getCredentialInventory } = await import('../services/credentialInventory.js');
