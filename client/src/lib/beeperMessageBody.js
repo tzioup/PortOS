@@ -19,7 +19,7 @@
  * outside the allowlist cannot execute, load, or style anything — it is simply
  * dropped, keeping its text.
  *
- * The allowlist is exactly what was observed: `p`, `br`, `blockquote`,
+ * The allowlist is exactly what was observed: `p`, `div`, `br`, `blockquote`,
  * `strong`/`b`, `em`/`i`, `a[href]`. Everything else contributes its text and
  * nothing more.
  *
@@ -66,6 +66,11 @@ export const decodeHtmlEntities = (str) => {
 // loses its markup.
 const BLOCK_TAGS = new Set(['p', 'div', 'blockquote']);
 const INLINE_MARKS = { strong: 'bold', b: 'bold', em: 'italic', i: 'italic' };
+// The full tag-name surface the parser dispatches on: BLOCK_TAGS, INLINE_MARKS,
+// plus the two handled by name below (`br`, `a`). Exported so a test can pin
+// the module docblock's allowlist sentence to this set instead of the two
+// drifting apart again (audit cluster 10, finding F10).
+export const ALL_ALLOWED_TAGS = new Set(['br', 'a', ...BLOCK_TAGS, ...Object.keys(INLINE_MARKS)]);
 const HTML_TAG_RE = /<\/?(p|div|br|blockquote|strong|b|em|i|a)(\s[^>]*)?\/?>/i;
 // A tag name must follow `<` immediately, and an attribute run may not contain
 // another `<` — otherwise `a < b and <p>x</p>` parses as one enormous `<b …>`

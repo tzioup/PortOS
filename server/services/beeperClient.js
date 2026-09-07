@@ -674,8 +674,9 @@ export async function markUnread(chatId, { messageID } = {}, { baseUrl, token, t
  * — so both failure shapes converge on the same caller-facing error. The
  * `502`-on-`assets/serve` case (`GET`/`HEAD`, see below) is unrelated and
  * still goes through `mapBeeperResponseError`'s status branch. Byte streaming
- * (`GET /v1/assets/serve`) and disk mirroring are #37's scope, not
- * implemented here.
+ * (`GET /v1/assets/serve`, implemented below as `fetchAssetStream`/
+ * `headAsset`) and disk mirroring (`beeperAttachments.js`) are not
+ * implemented in `downloadAsset`.
  */
 export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
   const data = await beeperRequest('/v1/assets/download', {
@@ -707,10 +708,11 @@ export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
  * the RAW `Response`, whose body the mirror streams to disk.
  *
  * What they do NOT skip is the error mapping. `serve` answers `502` for media
- * the network has aged out, exactly like `assets/download` does, so both run
- * through `mapBeeperResponseError` with `isAssetEndpoint: true` — a terminal
- * `ASSET_UNAVAILABLE`, never the ordinarily-retryable `UPSTREAM_ERROR` a
- * generic "5xx is transient" policy would loop on forever.
+ * the network has aged out — unlike `POST /v1/assets/download`, which answers
+ * 200 with an { error } body — so both run through `mapBeeperResponseError`
+ * with `isAssetEndpoint: true` — a terminal `ASSET_UNAVAILABLE`, never the
+ * ordinarily-retryable `UPSTREAM_ERROR` a generic "5xx is transient" policy
+ * would loop on forever.
  */
 // Time to the RESPONSE HEADERS, not to the last byte: `fetchWithTimeout` clears
 // its abort timer once `fetch` resolves, which is the moment the headers land.

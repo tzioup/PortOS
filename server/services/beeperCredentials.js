@@ -74,28 +74,6 @@ export async function readBeeperCredential() {
 }
 
 /**
- * The client-safe half of the credential: presence, expiry, and provenance —
- * never the value, never the scopes, never `clientId`. `GET /api/beeper/status`
- * renders from exactly this.
- *
- * Reads the ciphertext column's presence rather than decrypting, so the common
- * status poll never touches the vault key at all.
- */
-export async function getBeeperCredentialMeta() {
-  const result = await query(
-    `SELECT token_expires_at, source FROM beeper_credentials WHERE id = $1`,
-    [CREDENTIAL_ID],
-  );
-  const row = result?.rows?.[0];
-  if (!row) return { tokenConfigured: false, tokenExpiresAt: null, tokenSource: null };
-  return {
-    tokenConfigured: true,
-    tokenExpiresAt: toIsoOrNull(row.token_expires_at),
-    tokenSource: row.source,
-  };
-}
-
-/**
  * Encrypt and store the ONE credential, replacing whatever was there.
  *
  * `expiresAt: null` is a real value, not an absence — it is the no-expiry token
@@ -157,23 +135,6 @@ export async function resolveBeeperToken() {
   if (!legacy) return null;
   return {
     token: legacy,
-    tokenExpiresAt: toIsoOrNull(settings?.beeper?.tokenExpiresAt),
-    tokenSource: LEGACY_TOKEN_SOURCE,
-  };
-}
-
-/**
- * `resolveBeeperToken` reduced to presence + expiry + provenance for the status
- * card, including the legacy plaintext fallback so a pre-#31 install still
- * reports `tokenConfigured: true`. Never returns the value.
- */
-export async function resolveBeeperTokenMeta() {
-  const meta = await getBeeperCredentialMeta();
-  if (meta.tokenConfigured) return meta;
-  const settings = await getSettings().catch(() => null);
-  if (!normalizeToken(settings?.beeper?.token)) return meta;
-  return {
-    tokenConfigured: true,
     tokenExpiresAt: toIsoOrNull(settings?.beeper?.tokenExpiresAt),
     tokenSource: LEGACY_TOKEN_SOURCE,
   };

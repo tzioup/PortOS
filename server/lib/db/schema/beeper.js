@@ -1,8 +1,10 @@
 // Beeper conversation mirror DDL (#27). Machine-local mirror of the Beeper
 // Desktop API (accounts, conversations, messages, participants, attachment
-// metadata, and per-chat sync cursors). Carries the schema decisions from the
-// Beeper wayfinder map (#1); rationale lives on #7 (store shape), #10 (Tribe
-// handles), #12 (transport), #13 (attachments) — not repeated here.
+// metadata, and per-chat sync cursors), plus two tables that are not mirror
+// data: the credential vault (`beeper_credentials`, #31) and the send outbox
+// (`beeper_outbox`). Carries the schema decisions from the Beeper wayfinder
+// map (#1); rationale lives on #7 (store shape), #10 (Tribe handles), #12
+// (transport), #13 (attachments) — not repeated here.
 //
 // NEVER FEDERATED — enforced by beeperNeverFederates.test.js. No table here
 // gets a `sync_sequence` column, a PEER_SUBSCRIBABLE_KINDS entry, a dataSync

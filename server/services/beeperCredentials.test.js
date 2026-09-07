@@ -12,8 +12,8 @@ import { query } from '../lib/db.js';
 import { decryptValue, encryptValue, ensureVaultKey } from '../lib/vaultCrypto.js';
 import { getSettings } from './settings.js';
 import {
-  deleteBeeperCredential, getBeeperCredentialMeta, readBeeperCredential,
-  resolveBeeperToken, resolveBeeperTokenMeta, saveBeeperCredential,
+  deleteBeeperCredential, readBeeperCredential,
+  resolveBeeperToken, saveBeeperCredential,
 } from './beeperCredentials.js';
 
 // A placeholder that is obviously not a real credential, per the repo's
@@ -102,23 +102,6 @@ describe('readBeeperCredential', () => {
   });
 });
 
-describe('getBeeperCredentialMeta', () => {
-  it('reports presence, expiry and provenance without ever decrypting', async () => {
-    vi.mocked(query).mockResolvedValue({ rows: [{ token_expires_at: null, source: 'pasted' }] });
-    await expect(getBeeperCredentialMeta()).resolves.toEqual({
-      tokenConfigured: true, tokenExpiresAt: null, tokenSource: 'pasted',
-    });
-    expect(decryptValue).not.toHaveBeenCalled();
-  });
-
-  it('reports tokenConfigured:false with no row', async () => {
-    vi.mocked(query).mockResolvedValue({ rows: [] });
-    await expect(getBeeperCredentialMeta()).resolves.toEqual({
-      tokenConfigured: false, tokenExpiresAt: null, tokenSource: null,
-    });
-  });
-});
-
 describe('resolveBeeperToken', () => {
   it('prefers the vaulted credential over anything in settings', async () => {
     vi.mocked(query).mockResolvedValue({ rows: [{ token_enc: CIPHERTEXT, token_expires_at: null, scopes: '', source: 'oauth', client_id: '' }] });
@@ -145,16 +128,6 @@ describe('resolveBeeperToken', () => {
   it('resolves null when neither store holds a credential', async () => {
     vi.mocked(query).mockResolvedValue({ rows: [] });
     await expect(resolveBeeperToken()).resolves.toBeNull();
-  });
-});
-
-describe('resolveBeeperTokenMeta', () => {
-  it('reports a legacy plaintext token as configured, so a pre-vault install is not told to connect', async () => {
-    vi.mocked(query).mockResolvedValue({ rows: [] });
-    vi.mocked(getSettings).mockResolvedValue({ beeper: { token: 'legacy-plaintext-token' } });
-    await expect(resolveBeeperTokenMeta()).resolves.toEqual({
-      tokenConfigured: true, tokenExpiresAt: null, tokenSource: 'legacy-settings',
-    });
   });
 });
 

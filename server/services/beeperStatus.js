@@ -10,7 +10,7 @@
  *   - a liveness probe against the local Beeper Desktop API;
  *   - the read-only account roster mirrored by fork issue #27's schema, so
  *     the card renders something even with Beeper Desktop closed (accounts
- *     survive from the last ingestion sweep, once #32 lands).
+ *     survive from the last ingestion sweep, #32).
  *
  * Two flags stay distinct, per the fork issue #11 decision #30 carries
  * forward: the INSTANCE FEATURE (`instanceFeatureRegistry.js` `beeper`)
@@ -54,9 +54,9 @@ function tokenExpiryInfo(tokenExpiresAt) {
 /**
  * The read-only account roster mirrored by fork issue #27's schema, so the
  * status card can render even with Beeper Desktop closed. Always an array —
- * an empty result is a trustworthy "no accounts synced yet", not a fault:
- * fork issue #32 (the ingestion sweep) is what populates this table and
- * hasn't landed yet, so an install on this slice alone always sees `[]`.
+ * an empty result is a trustworthy "no accounts synced yet", not a fault: the
+ * ingestion sweep (#32) populates this table, so a fresh install sees `[]`
+ * until its first sync pass completes.
  */
 export async function listBeeperAccounts() {
   const result = await query(
@@ -109,13 +109,13 @@ export async function getBeeperStatus() {
   // Deliberately NOT wrapped in a catch: an unreadable vault throws (#11
   // decision 8), and the card renders its "could not read status" branch
   // rather than telling a connected install to connect again. This has to be
-  // `resolveBeeperToken()` (which decrypts the row), not the cheaper
-  // `resolveBeeperTokenMeta()` (which only reads the row's PRESENCE): the
-  // cheap check can never notice a corrupt vault — a row whose ciphertext
-  // cannot be decrypted still has a row — which is exactly how this used to
-  // report `tokenConfigured: true, reachable: true` for a credential nobody
-  // could actually authenticate with. Never reads `stored.token` beyond this
-  // line: only presence, source and expiry ever reach the response below.
+  // `resolveBeeperToken()` (which decrypts the row), not a cheaper
+  // presence-only read: a row whose ciphertext cannot be decrypted still has
+  // a row, so a presence-only check can never notice a corrupt vault — which
+  // is exactly how this used to report `tokenConfigured: true, reachable:
+  // true` for a credential nobody could actually authenticate with. Never
+  // reads `stored.token` beyond this line: only presence, source and expiry
+  // ever reach the response below.
   const stored = await resolveBeeperToken();
   const credential = {
     tokenConfigured: Boolean(stored),

@@ -107,8 +107,9 @@ export async function getBeeperSyncConfig() {
  *
  * The token is read through `resolveBeeperConfig`, the client's single
  * credential call site, so this works unchanged whether the token still lives
- * in `settings.beeper.token` or in the encrypted vault #31 lands behind that
- * same function. The token value itself is never returned, logged or stored.
+ * in `settings.beeper.token` or behind the encrypted vault (#31), which sits
+ * behind that same function. The token value itself is never returned, logged
+ * or stored.
  */
 export async function isBeeperIngestionArmed() {
   const featureEnabled = await isInstanceFeatureEnabled('beeper').catch(() => false);

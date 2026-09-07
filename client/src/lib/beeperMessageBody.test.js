@@ -1,5 +1,12 @@
+import { readFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { describe, expect, it } from 'vitest';
-import { decodeHtmlEntities, messagePreviewText, parseMessageBody } from './beeperMessageBody';
+import {
+  ALL_ALLOWED_TAGS, decodeHtmlEntities, messagePreviewText, parseMessageBody,
+} from './beeperMessageBody';
+
+const MODULE_FILE = join(dirname(fileURLToPath(import.meta.url)), 'beeperMessageBody.js');
 
 /**
  * #35 real-browser pass (#59): a message body containing an ampersand rendered
@@ -127,6 +134,26 @@ describe('parseMessageBody', () => {
 
   it('returns no blocks for an HTML body with no text at all', () => {
     expect(parseMessageBody('<p></p>')).toEqual([]);
+  });
+});
+
+/**
+ * Pins the module docblock's allowlist sentence to the tag set the parser
+ * actually dispatches on, so the two cannot drift apart again the way they
+ * did when `div` joined BLOCK_TAGS without the sentence naming it (audit
+ * cluster 10, finding F10).
+ */
+describe('docblock allowlist', () => {
+  it('names exactly the tags the parser treats as meaningful', () => {
+    const source = readFileSync(MODULE_FILE, 'utf8');
+    const sentence = source.match(/The allowlist is exactly what was observed:([^.]*)\./);
+    expect(sentence).not.toBeNull();
+    const namedTags = new Set(
+      [...sentence[1].matchAll(/`([^`]+)`/g)]
+        .flatMap((match) => match[1].split('/'))
+        .map((tag) => tag.replace(/\[.*\]$/, '')),
+    );
+    expect(namedTags).toEqual(ALL_ALLOWED_TAGS);
   });
 });
 
