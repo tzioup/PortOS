@@ -465,6 +465,25 @@ export default function BeeperChatSurface({
     loadNetworks();
   }, [loadList, loadNetworks, mountedRef]);
 
+  // LOCAL "seen in PortOS" watermark (#83): fire the mark-seen POST and clear
+  // the row's own badge immediately (optimistic), rather than waiting on the
+  // next list/networks refetch to reflect it. NEVER touches Beeper — the POST
+  // is a local `seen_at` stamp, not a read receipt (see the TODO on
+  // `markConversationSeen` server-side for the deferred toggle that would add
+  // one). The call is fire-and-forget: a failure just means the badge is
+  // whatever Beeper's own `unread_count` says until the next successful call,
+  // which is the same "eventually correct" posture every other mirror read
+  // here already has.
+  const markSeen = useCallback((id) => {
+    if (!id) return;
+    api.markBeeperConversationSeen(id, { silent: true }).catch(() => {});
+    setConversations((prev) => (
+      prev.some((row) => row.id === id && row.unreadCount > 0)
+        ? prev.map((row) => (row.id === id ? { ...row, unreadCount: 0 } : row))
+        : prev
+    ));
+  }, []);
+
   const loadThread = useCallback(async (id) => {
     if (!id) {
       setConversation(null);
@@ -498,9 +517,14 @@ export default function BeeperChatSurface({
       setConversation(detail);
       setMessages(Array.isArray(page?.messages) ? page.messages : []);
       setMessageCursor(page?.nextCursor || null);
+      // Opening the thread is what "seen" means here (#83) — mark it every
+      // time a thread successfully loads, not only on the first open, so
+      // re-navigating back into an already-open conversation still clears a
+      // badge a sweep put back.
+      markSeen(id);
     }
     setThreadLoading(false);
-  }, [mountedRef]);
+  }, [mountedRef, markSeen]);
 
   // The ADDITIVE counterpart to `loadThread` above, for a frame-scoped
   // invalidation refetch (findings PERF-6/BEEP-5): fetch just the first page
@@ -530,7 +554,13 @@ export default function BeeperChatSurface({
       const rest = prev.filter((message) => !incomingIds.has(message.id));
       return [...incoming, ...rest];
     });
-  }, [mountedRef]);
+    // A new message just landed in the thread the user already has open —
+    // re-stamp the watermark (#83) so the sweep that mirrored it doesn't leave
+    // this conversation's badge showing again on the next list/networks
+    // refetch, which would otherwise read as "unread" a thread that is
+    // visibly on screen right now.
+    markSeen(id);
+  }, [mountedRef, markSeen]);
 
   useEffect(() => { loadNetworks(); }, [loadNetworks]);
   useEffect(() => { loadList(); }, [loadList]);
