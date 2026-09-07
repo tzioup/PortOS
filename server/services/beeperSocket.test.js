@@ -274,6 +274,39 @@ describe('beeperSocket — silence watchdog (injected time)', () => {
     expect(state.lastPingAt).toBe(new Date(100_500).toISOString());
   });
 
+  // PERF-7: every 30s protocol ping used to call `emitState()` unconditionally,
+  // re-broadcasting `beeper:realtime` — and re-rendering every open chat
+  // surface — for a payload that reads identically to the last one, since a
+  // bare ping changes nothing the payload carries except a timestamp no
+  // socket listener even renders (`useBeeperRealtime.js`'s only client reads
+  // `state`/`appState`/`authRejected`). The fix drops the `emitState()` call
+  // from the ping handler outright, leaving liveness split across its two real
+  // consumers: the watchdog (via `noteFrame()`) and the HTTP status route
+  // (which reads `lastPingAt` straight off this module's own variable, not off
+  // an emitted event).
+  it('a protocol ping with no state change emits no state broadcast, though the watchdog still counts it and the status stays fresh', async () => {
+    await start();
+    latest().handshake();
+    const first = latest();
+
+    const broadcasts = [];
+    const onState = (state) => broadcasts.push(state);
+    beeperSocketEvents.on('state', onState);
+
+    clock.advance(10_500);
+    first.fire('ping');
+
+    expect(broadcasts).toHaveLength(0);
+    // `GET /api/beeper/status` reads this straight off the module, with no
+    // broadcast in the path — it is fresh regardless of the assertion above.
+    expect(getBeeperRealtimeState().lastPingAt).toBe(new Date(10_500).toISOString());
+    // The watchdog still counted it: exactly one still-armed timer (the
+    // ping's own re-arm via `noteFrame()`), not zero.
+    expect(clock.runTimersWithDelay(SILENCE_TIMEOUT_MS)).toBe(1);
+
+    beeperSocketEvents.off('state', onState);
+  });
+
   it('reconnects with jitter inside the exponential window, never at a fixed cadence', async () => {
     await start();
     latest().handshake();
