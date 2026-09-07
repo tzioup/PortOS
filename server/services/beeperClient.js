@@ -707,10 +707,11 @@ export async function downloadAsset(url, { baseUrl, token, timeoutMs } = {}) {
  * the RAW `Response`, whose body the mirror streams to disk.
  *
  * What they do NOT skip is the error mapping. `serve` answers `502` for media
- * the network has aged out, exactly like `assets/download` does, so both run
- * through `mapBeeperResponseError` with `isAssetEndpoint: true` — a terminal
- * `ASSET_UNAVAILABLE`, never the ordinarily-retryable `UPSTREAM_ERROR` a
- * generic "5xx is transient" policy would loop on forever.
+ * the network has aged out — unlike `POST /v1/assets/download`, which answers
+ * 200 with an { error } body — so both run through `mapBeeperResponseError`
+ * with `isAssetEndpoint: true` — a terminal `ASSET_UNAVAILABLE`, never the
+ * ordinarily-retryable `UPSTREAM_ERROR` a generic "5xx is transient" policy
+ * would loop on forever.
  */
 // Time to the RESPONSE HEADERS, not to the last byte: `fetchWithTimeout` clears
 // its abort timer once `fetch` resolves, which is the moment the headers land.
