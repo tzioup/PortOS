@@ -465,6 +465,25 @@ export default function BeeperChatSurface({
     loadNetworks();
   }, [loadList, loadNetworks, mountedRef]);
 
+  // LOCAL "seen in PortOS" watermark (#83): fire the mark-seen POST and clear
+  // the row's own badge immediately (optimistic), rather than waiting on the
+  // next list/networks refetch to reflect it. NEVER touches Beeper — the POST
+  // is a local `seen_at` stamp, not a read receipt (see the TODO on
+  // `markConversationSeen` server-side for the deferred toggle that would add
+  // one). The call is fire-and-forget: a failure just means the badge is
+  // whatever Beeper's own `unread_count` says until the next successful call,
+  // which is the same "eventually correct" posture every other mirror read
+  // here already has.
+  const markSeen = useCallback((id) => {
+    if (!id) return;
+    api.markBeeperConversationSeen(id, { silent: true }).catch(() => {});
+    setConversations((prev) => (
+      prev.some((row) => row.id === id && row.unreadCount > 0)
+        ? prev.map((row) => (row.id === id ? { ...row, unreadCount: 0 } : row))
+        : prev
+    ));
+  }, []);
+
   const loadThread = useCallback(async (id) => {
     if (!id) {
       setConversation(null);
@@ -498,9 +517,14 @@ export default function BeeperChatSurface({
       setConversation(detail);
       setMessages(Array.isArray(page?.messages) ? page.messages : []);
       setMessageCursor(page?.nextCursor || null);
+      // Opening the thread is what "seen" means here (#83) — mark it every
+      // time a thread successfully loads, not only on the first open, so
+      // re-navigating back into an already-open conversation still clears a
+      // badge a sweep put back.
+      markSeen(id);
     }
     setThreadLoading(false);
-  }, [mountedRef]);
+  }, [mountedRef, markSeen]);
 
   // The ADDITIVE counterpart to `loadThread` above, for a frame-scoped
   // invalidation refetch (findings PERF-6/BEEP-5): fetch just the first page
@@ -522,6 +546,17 @@ export default function BeeperChatSurface({
     if (!mountedRef.current || generation !== threadGenRef.current || !page) return;
     const incoming = Array.isArray(page.messages) ? page.messages : [];
     if (incoming.length === 0) return;
+    // Whether this refetch actually surfaced a message the thread did not
+    // already have — computed against the CURRENT `messages` state before the
+    // merge below, not inside `setMessages`'s own updater (whose timing is
+    // not something to build a side-effect decision on). PR 86's sweep emits
+    // an invalidation frame with `chatID: null` once per account, and this
+    // surface's debounce treats that as "could be about anything" and
+    // refetches the open thread regardless — so a 9-account sweep with
+    // nothing new in THIS thread would otherwise fire ~9 no-op mark-seen
+    // POSTs (an UPDATE plus a full `getConversation` read each) below.
+    const existingIds = new Set(messages.map((message) => message.id));
+    const hasNewMessage = incoming.some((message) => !existingIds.has(message.id));
     setMessages((prev) => {
       const incomingIds = new Set(incoming.map((message) => message.id));
       // A message already present is updated in place (the fresh copy wins)
@@ -530,7 +565,16 @@ export default function BeeperChatSurface({
       const rest = prev.filter((message) => !incomingIds.has(message.id));
       return [...incoming, ...rest];
     });
-  }, [mountedRef]);
+    // A new message just landed in the thread the user already has open —
+    // re-stamp the watermark (#83) so the sweep that mirrored it doesn't leave
+    // this conversation's badge showing again on the next list/networks
+    // refetch, which would otherwise read as "unread" a thread that is
+    // visibly on screen right now. Skipped when nothing was actually new: an
+    // UPDATED copy of an already-known message (an edit, or the eventual
+    // `message.upserted` confirmation of something already rendered) is not
+    // new activity for this purpose.
+    if (hasNewMessage) markSeen(id);
+  }, [mountedRef, markSeen, messages]);
 
   useEffect(() => { loadNetworks(); }, [loadNetworks]);
   useEffect(() => { loadList(); }, [loadList]);

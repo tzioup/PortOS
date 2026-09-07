@@ -486,6 +486,7 @@ describe('catalog DDL parity (init-db.sql ↔ db.js ensureSchema)', () => {
     for (const { table, columns } of [
       { table: 'beeper_messages', columns: ['is_sender'] },
       { table: 'beeper_attachments', columns: ['local_path', 'fetched_at', 'unavailable_at', 'fetch_error'] },
+      { table: 'beeper_conversations', columns: ['seen_at'] },
     ]) {
       for (const column of columns) {
         const re = new RegExp(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column}\\b`, 'i');

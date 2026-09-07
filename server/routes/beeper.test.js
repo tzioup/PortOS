@@ -25,6 +25,7 @@ vi.mock('../services/beeperConversations.js', () => ({
   getConversation: vi.fn(),
   listMessages: vi.fn(),
   listNetworks: vi.fn(),
+  markConversationSeen: vi.fn(),
   purgeConversation: vi.fn(),
   setConversationArchived: vi.fn(),
   setConversationLowPriority: vi.fn(),
@@ -61,6 +62,7 @@ import {
   getConversation,
   listMessages,
   listNetworks,
+  markConversationSeen,
   purgeConversation,
   setConversationArchived,
   setConversationLowPriority,
@@ -730,6 +732,37 @@ describe('archive / low-priority write paths', () => {
       .post(`/api/beeper/conversations/${CONV_ID}/archive`)
       .send({ archived: false });
     expect(setConversationArchived).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The LOCAL "seen in PortOS" watermark (#83) — the opposite risk profile from
+// the archive/low-priority block above: this route never reaches Beeper, so
+// what's worth pinning is the id validation and that the service, not the
+// route, decides the response shape.
+describe('POST /api/beeper/conversations/:id/seen', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('marks the conversation seen through the service and returns the updated conversation', async () => {
+    vi.mocked(markConversationSeen).mockResolvedValue({ id: CONV_ID, unreadCount: 0 });
+    const res = await request(buildApp()).post(`/api/beeper/conversations/${CONV_ID}/seen`);
+    expect(res.status).toBe(200);
+    expect(markConversationSeen).toHaveBeenCalledWith(CONV_ID);
+    expect(res.body).toEqual({ id: CONV_ID, unreadCount: 0 });
+  });
+
+  it('rejects a non-uuid conversation id before it reaches the service', async () => {
+    const res = await request(buildApp()).post('/api/beeper/conversations/not-a-uuid/seen');
+    expect(res.status).toBe(400);
+    expect(markConversationSeen).not.toHaveBeenCalled();
+  });
+
+  it('404s an unknown conversation', async () => {
+    vi.mocked(markConversationSeen).mockRejectedValue(
+      new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' }),
+    );
+    const res = await request(buildApp()).post(`/api/beeper/conversations/${CONV_ID}/seen`);
+    expect(res.status).toBe(404);
+    expect(res.body.code).toBe('NOT_FOUND');
   });
 });
 

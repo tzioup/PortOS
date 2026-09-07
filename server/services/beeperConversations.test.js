@@ -37,6 +37,7 @@ import {
   getConversation,
   listMessages,
   listNetworks,
+  markConversationSeen,
   purgeConversation,
   setConversationArchived,
   setConversationLowPriority,
@@ -62,6 +63,10 @@ const conversationRow = (overrides = {}) => ({
   last_activity: '2026-09-01T10:00:00.000Z',
   created_at: '2026-08-01T10:00:00.000Z',
   unread_count: 2,
+  // LOCAL "seen in PortOS" watermark (#83) — `null` by default (never opened
+  // in PortOS), so the default fixture reads as unread exactly like it did
+  // before the column existed.
+  seen_at: null,
   ordering_ts: '2026-09-01T10:00:00.000Z',
   preview_id: null,
   ...overrides,
@@ -92,12 +97,16 @@ describe('listConversations — filters are tri-state by omission', () => {
     expect(params).toEqual([false, false, 51]);
   });
 
-  it('scopes to one network and to unread rows', async () => {
+  it('scopes to one network and to unread rows, honouring the local seen watermark (#83)', async () => {
     vi.mocked(query).mockResolvedValue({ rows: [] });
     await listConversations({ network: 'examplenet', unreadOnly: true });
     const [sql, params] = vi.mocked(query).mock.calls[0];
     expect(flat(sql)).toContain('c.network = $1');
-    expect(flat(sql)).toContain('c.unread_count > 0');
+    // A conversation Beeper still reports unread does not count as
+    // `unreadOnly` once its local `seen_at` catches up to its own activity.
+    expect(flat(sql)).toContain(
+      'c.unread_count > 0 AND (c.seen_at IS NULL OR c.seen_at < COALESCE(c.last_activity, c.created_at))',
+    );
     expect(params).toEqual(['examplenet', 51]);
   });
 });
@@ -283,6 +292,44 @@ describe('listConversations — row shaping', () => {
     const { conversations } = await listConversations({});
     expect(conversations[0]).toMatchObject({ lastMessage: null, lastActivity: '2026-09-02T09:00:00.000Z' });
   });
+
+  // The LOCAL "seen in PortOS" watermark (#83) — `shapeConversation`'s own
+  // logic, exercised through `listConversations` since the shaper is not
+  // itself exported. Beeper's mirrored `unread_count` is deliberately left
+  // non-zero on every row below: the watermark hides the badge at the READ
+  // boundary, never by mutating what the sweep wrote.
+  describe('the local "seen" watermark hides/shows the badge (#83)', () => {
+    it('hides the badge when seen_at is at or after the conversation\'s last activity', async () => {
+      vi.mocked(query)
+        .mockResolvedValueOnce({
+          rows: [conversationRow({ unread_count: 5, last_activity: '2026-09-01T10:00:00.000Z', seen_at: '2026-09-01T10:00:00.000Z' })],
+        })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+      const { conversations } = await listConversations({});
+      expect(conversations[0].unreadCount).toBe(0);
+    });
+
+    it('shows the badge again once new activity lands after the watermark', async () => {
+      vi.mocked(query)
+        .mockResolvedValueOnce({
+          rows: [conversationRow({ unread_count: 3, last_activity: '2026-09-01T12:00:00.000Z', seen_at: '2026-09-01T10:00:00.000Z' })],
+        })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+      const { conversations } = await listConversations({});
+      expect(conversations[0].unreadCount).toBe(3);
+    });
+
+    it('reads a conversation never opened in PortOS (seen_at NULL) as whatever Beeper says', async () => {
+      vi.mocked(query)
+        .mockResolvedValueOnce({ rows: [conversationRow({ unread_count: 7, seen_at: null })] })
+        .mockResolvedValueOnce({ rows: [] })
+        .mockResolvedValueOnce({ rows: [] });
+      const { conversations } = await listConversations({});
+      expect(conversations[0].unreadCount).toBe(7);
+    });
+  });
 });
 
 describe('getConversation', () => {
@@ -453,7 +500,7 @@ describe('listNetworks', () => {
     });
     const networks = await listNetworks();
     const [sql] = vi.mocked(query).mock.calls[0];
-    expect(flat(sql)).toContain('FILTER (WHERE c.is_archived = FALSE)');
+    expect(flat(sql)).toContain('FILTER (WHERE c.is_archived = FALSE AND (c.seen_at IS NULL OR c.seen_at < COALESCE(c.last_activity, c.created_at)))');
     expect(networks).toEqual([{
       network: 'examplenet',
       conversationCount: 3,
@@ -475,8 +522,33 @@ describe('listNetworks', () => {
     const [sql] = vi.mocked(query).mock.calls[0];
     const flatSql = flat(sql);
     expect(flatSql).toContain('MAX(c.last_activity) AS last_activity');
-    expect(flatSql).not.toContain('c.created_at');
-    expect(flatSql).not.toContain('epoch');
+    // Narrowed to the `last_activity` aggregate expression itself (#83): the
+    // seen watermark's `UNSEEN_SQL` guard legitimately references
+    // `c.created_at` elsewhere in this same query, as the activity floor for
+    // the two UNREAD aggregates — a blanket "the whole SQL never mentions
+    // created_at" no longer holds, so this checks only the MAX(...) that
+    // produces `last_activity`.
+    const lastActivityExpr = /MAX\(([^)]*)\) AS last_activity/.exec(flatSql)?.[1];
+    expect(lastActivityExpr).toBe('c.last_activity');
+    expect(lastActivityExpr).not.toContain('COALESCE');
+    expect(lastActivityExpr).not.toContain('epoch');
+  });
+
+  // The LOCAL "seen" watermark (#83) must gate BOTH aggregates the rail reads
+  // — the summed `unread_count` and the `unread_conversations` count — not
+  // just one of them, or a network chip and its own conversation count would
+  // disagree about whether a just-opened thread is still unread.
+  it('gates both the summed unread_count and the unread_conversations count on the watermark', async () => {
+    vi.mocked(query).mockResolvedValue({ rows: [] });
+    await listNetworks();
+    const [sql] = vi.mocked(query).mock.calls[0];
+    const text = flat(sql);
+    expect(text).toContain(
+      'SUM(c.unread_count) FILTER (WHERE c.is_archived = FALSE AND (c.seen_at IS NULL OR c.seen_at < COALESCE(c.last_activity, c.created_at)))',
+    );
+    expect(text).toContain(
+      'COUNT(*) FILTER (WHERE c.unread_count > 0 AND c.is_archived = FALSE AND (c.seen_at IS NULL OR c.seen_at < COALESCE(c.last_activity, c.created_at)))',
+    );
   });
 });
 
@@ -520,6 +592,33 @@ describe('the two wired rail controls', () => {
   it('404s on an unknown conversation without calling Beeper at all', async () => {
     vi.mocked(query).mockResolvedValueOnce({ rows: [] });
     await expect(setConversationArchived(CONV_B, true)).rejects.toMatchObject({ status: 404 });
+    expect(updateChat).not.toHaveBeenCalled();
+  });
+});
+
+// `markConversationSeen` (#83) — the LOCAL "seen in PortOS" watermark write.
+// Unlike the two wired rail controls above, this never calls Beeper at all:
+// there is no PATCH to assert an order against, only that an unknown id 404s
+// before any UPDATE, and that a known one is stamped and re-read.
+describe('markConversationSeen — the local watermark write, never a Beeper call', () => {
+  it('stamps seen_at and returns the freshly-read conversation', async () => {
+    vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [{ id: CONV_A }] }) // existence check
+      .mockResolvedValueOnce({ rows: [] }) // the UPDATE
+      .mockResolvedValueOnce({ rows: [conversationRow({ seen_at: '2026-09-01T10:00:00.000Z' })] }) // getConversation
+      .mockResolvedValueOnce({ rows: [] }); // participants
+
+    const conversation = await markConversationSeen(CONV_A);
+    const update = callFor('UPDATE beeper_conversations SET seen_at = NOW()');
+    expect(update[1]).toEqual([CONV_A]);
+    expect(conversation.id).toBe(CONV_A);
+    expect(updateChat).not.toHaveBeenCalled();
+  });
+
+  it('404s on an unknown conversation without writing anything', async () => {
+    vi.mocked(query).mockResolvedValueOnce({ rows: [] });
+    await expect(markConversationSeen(CONV_B)).rejects.toMatchObject({ status: 404, code: 'NOT_FOUND' });
+    expect(callFor('UPDATE beeper_conversations')).toBeUndefined();
     expect(updateChat).not.toHaveBeenCalled();
   });
 });

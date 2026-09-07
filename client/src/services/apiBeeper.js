@@ -67,6 +67,16 @@ export const setBeeperConversationLowPriority = (conversationId, lowPriority, op
     ...options,
   });
 
+// The LOCAL "seen in PortOS" watermark (#83) — the opposite shape from the two
+// above: it never reaches Beeper. No body: the server stamps `seen_at` from
+// its own clock. Called when a thread is opened and, cheaply, again when a
+// new message lands in the open thread.
+export const markBeeperConversationSeen = (conversationId, options = {}) =>
+  request(`/beeper/conversations/${encodeURIComponent(conversationId)}/seen`, {
+    method: 'POST',
+    ...options,
+  });
+
 // Connect flow (#31). PortOS runs OAuth itself (PKCE S256, dynamic client
 // registration); `startBeeperOAuth` returns the authorization URL for the
 // browser to open, and the redirect lands on the server callback, never here.
