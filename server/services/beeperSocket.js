@@ -453,15 +453,18 @@ async function connect() {
   // `lastPingAt`, which `getBeeperRealtimeState()` reads live off this
   // module's own variable — so `GET /api/beeper/status` and
   // `hasRecentBeeperActivity()` (`beeperStatus.js`) both still see a fresh
-  // value with no broadcast involved. Every field the socket-pushed
-  // `beeper:realtime` payload actually carries (`state`, `appState`,
-  // `appStateActionable`, `authRejected`, `reconnectAttempts`) is unchanged by
-  // a plain ping, and the one client reader of that event
-  // (`useBeeperRealtime.js` → `ConnectionStatusDot`) renders only `state`, so
-  // broadcasting a payload that reads identically to the last one was pure
-  // re-render cost 2-3 times a minute on every open tab, for nothing anyone
-  // could see change. `noteFrame()` still re-arms the watchdog, so the ping
-  // continues to count as liveness exactly as before.
+  // value with no broadcast involved. The socket-pushed `beeper:realtime`
+  // payload is that same `getBeeperRealtimeState()` object, so it DOES carry
+  // `lastPingAt` (and `lastEventAt`) — but no client reader renders either
+  // timestamp from the push: the surfaces that consume the event
+  // (`useBeeperRealtime.js` → the connection dot and the settings panel's
+  // realtime row) read only `state`, `appState`, `appStateActionable` and
+  // `authRejected`, none of which a plain ping changes. Broadcasting a
+  // payload whose visible fields
+  // read identically to the last one was pure re-render cost 2-3 times a
+  // minute on every open tab, for nothing anyone could see change.
+  // `noteFrame()` still re-arms the watchdog, so the ping continues to count
+  // as liveness exactly as before.
   instance.on('ping', guard('ping', () => {
     lastPingAt = runtime.now();
     noteFrame();
