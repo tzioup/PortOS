@@ -91,7 +91,17 @@ export const beeperDdl = [
   // page was an unindexed sort. Repointed at the expression the keyset walk
   // actually uses (audit cluster 06, indexes and query plans).
   `DROP INDEX IF EXISTS idx_beeper_conversations_account_activity`,
-  `CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_keyset ON beeper_conversations ((COALESCE(last_activity, created_at)) DESC, id DESC)`,
+  // #81: `COALESCE(last_activity, created_at)` fell back to the MIRROR ROW's
+  // mint time for a chat with no real Beeper activity, not to "this chat has
+  // no activity" — so a batch of chats swept (and left activity-less) in the
+  // same pass sorted at the TOP of the Inbox by their shared, recent
+  // `created_at`, exactly the symptom #81 reported. `'epoch'::timestamptz` is
+  // the sentinel that fixes it: it keeps the row-value keyset tuple shape (a
+  // real `NULLS LAST` cannot — see `listConversations`), and being older than
+  // any real timestamp sorts every activity-less chat LAST under `DESC`
+  // instead of wherever its row happened to be minted.
+  `DROP INDEX IF EXISTS idx_beeper_conversations_activity_keyset`,
+  `CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_epoch_keyset ON beeper_conversations ((COALESCE(last_activity, 'epoch'::timestamptz)) DESC, id DESC)`,
 
   // Keyed on Beeper's own message id (TEXT — bridges do not guarantee a UUID
   // shape). Full bodies persist machine-local, per the store ADR.
