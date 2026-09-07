@@ -323,10 +323,11 @@ describe('Layout — instance feature gating', () => {
 describe('Layout — Comms section (Beeper)', () => {
   // #30 / real-browser pass: the Beeper row never rendered in the sidebar Comms
   // section, feature on or off, because NAV_PRESENTATION had no '/messages/beeper'
-  // key — navRowForPath() throws for any manifest path missing from that map, so
-  // the row was silently absent (in Vitest's jsdom that surfaces as the row never
-  // appearing rather than a crash, since the throwing path is only ever reached
-  // for paths that exist in NAV_PRESENTATION).
+  // key. navRowForPath() throws the other way around — for a NAV_PRESENTATION
+  // path with no matching NAV_COMMANDS entry — so a path missing from
+  // NAV_PRESENTATION itself never reaches navRowForPath at all (presentedNavRows
+  // only maps over NAV_PRESENTATION's own keys), and the row was silently absent
+  // rather than a crash.
   it('lists Beeper in the Comms section alongside the other messaging rows when the feature is on', async () => {
     await renderLayout('/messages/inbox');
 
