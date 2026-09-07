@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import {
-  Archive, BellOff, ChevronDown, Clock, Filter, Inbox, Loader2, Mail, MoreHorizontal,
+  Archive, BellOff, Clock, Filter, Inbox, Loader2, Mail, MoreHorizontal,
   PenSquare, Plus, RefreshCw, Search, Settings, TrendingDown,
 } from 'lucide-react';
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
@@ -728,8 +728,10 @@ export default function BeeperChatSurface({
 
         <div className="flex shrink-0 items-center gap-1 px-3 py-2.5">
           <span className="flex min-w-0 items-center gap-1 text-sm font-semibold text-white">
+            {/* No chevron here (audit cluster 08, COPY-3): a scope-picker menu
+                does not exist, and an inert control that looks live is worse
+                than an absent one — the file's own governing rule. */}
             <span className="truncate">{scopeLabel}</span>
-            <ChevronDown size={13} className="shrink-0 text-gray-600" aria-hidden="true" />
           </span>
           <button
             type="button"

@@ -396,6 +396,21 @@ describe('no leftover "not wired" copy anywhere in the surface', () => {
   });
 });
 
+/**
+ * Audit cluster 08 (COPY-3): the scope heading rendered a ChevronDown inside
+ * a non-interactive span, implying a scope-picker menu that does not exist —
+ * against the file's own docstring ("an inert control that looks live is
+ * worse than an absent one"). The fix drops the chevron outright.
+ */
+describe('the scope heading has no control that looks interactive but has no handler', () => {
+  it('renders the scope label with no chevron or icon beside it', async () => {
+    renderTab();
+    await screen.findByText('Nothing here');
+    const label = screen.getByText('Inbox');
+    expect(label.parentElement.querySelector('svg')).toBeNull();
+  });
+});
+
 describe('the composer', () => {
   it('names the network it would send on and keeps the draft buffer', async () => {
     api.getBeeperConversation.mockResolvedValue(conversation({ network: 'whatsapp', title: 'Example Contact' }));
