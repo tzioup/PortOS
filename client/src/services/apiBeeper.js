@@ -10,6 +10,13 @@ import { API_BASE, request } from './apiCore.js';
 export const getBeeperStatus = (options = {}) => request('/beeper/status', options);
 export const checkBeeperConnection = (options = {}) => request('/beeper/status/check', { method: 'POST', ...options });
 
+// The "Sync now" list-header action (#79). Runs one watermark-bounded sweep
+// immediately rather than waiting out the configured interval; the server
+// reports `skipped: true` instead of an error when a sweep is already in
+// flight. The caller re-fetches the list and networks once this resolves —
+// this call alone never refreshes anything the surface renders.
+export const syncBeeperNow = (options = {}) => request('/beeper/sync', { method: 'POST', ...options });
+
 // ---------------------------------------------------------------------------
 // Chat surface (#35) — everything below reads the PortOS MIRROR, not Beeper.
 // The sweep (#32) and the socket relay (#33) keep the mirror current, so the

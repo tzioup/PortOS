@@ -12,6 +12,7 @@ import useMounted from '../../../hooks/useMounted';
 import useBeeperOutbox from '../../../hooks/useBeeperOutbox';
 import { messagePreviewText } from '../../../lib/beeperMessageBody';
 import { safeReadJsonStorage, safeWriteJsonStorage } from '../../../lib/safeStorage';
+import { formatClockTime } from '../../../utils/formatters';
 import * as api from '../../../services/api';
 
 /**
@@ -120,6 +121,33 @@ function Avatar({ name, size = 40 }) {
       aria-hidden="true"
     >
       {initials(name)}
+    </div>
+  );
+}
+
+/**
+ * The list header's sweep-visibility strip (#80): "Syncing… N of M accounts"
+ * while a sweep runs, "Last synced HH:MM" once one has finished, and nothing
+ * at all before the first sweep has ever run (a fresh install with no `sweep`
+ * snapshot yet, or one whose `accountsTotal` is not known yet mid-sweep still
+ * says "Syncing…" alone rather than "0 of null accounts").
+ */
+function SyncStrip({ sweep }) {
+  if (!sweep) return null;
+  if (sweep.running) {
+    const total = Number.isFinite(sweep.accountsTotal) ? sweep.accountsTotal : null;
+    const done = Number.isFinite(sweep.accountsDone) ? sweep.accountsDone : 0;
+    return (
+      <div className="flex shrink-0 items-center gap-1.5 border-b border-port-border/60 px-3 py-1.5 text-[11px] text-gray-400">
+        <Loader2 size={11} className="animate-spin" />
+        {total === null ? 'Syncing…' : `Syncing… ${done} of ${total} account${total === 1 ? '' : 's'}`}
+      </div>
+    );
+  }
+  if (!sweep.finishedAt) return null;
+  return (
+    <div className="shrink-0 border-b border-port-border/60 px-3 py-1.5 text-[11px] text-gray-500">
+      Last synced {formatClockTime(sweep.finishedAt, { seconds: false })}
     </div>
   );
 }
@@ -305,7 +333,8 @@ function ConversationRow({ conversation, unified, selected, onSelect }) {
 /* ---------------------------------------------------------------- surface -- */
 
 export default function BeeperChatSurface({
-  conversationId = null, realtime = null, invalidationSeq = 0, invalidationFrames = null, breaker = null, onOpenSettings,
+  conversationId = null, realtime = null, invalidationSeq = 0, invalidationFrames = null, breaker = null,
+  sweep = null, tokenConfigured = false, onOpenSettings,
 }) {
   const navigate = useNavigate();
   const mountedRef = useMounted();
@@ -385,6 +414,27 @@ export default function BeeperChatSurface({
     }
     setListLoading(false);
   }, [filters, mountedRef]);
+
+  // "Sync now" (#79): the list-header action used to be a pure re-fetch of
+  // whatever the mirror already held (`loadList` + `loadNetworks`), which is
+  // why it never visibly did anything — those are plain SELECTs. This runs
+  // one sweep first, then refetches, so the button's own label matches what
+  // it does. `skipped: true` (a sweep was already in flight — the scheduled
+  // one, most likely) still refetches: whatever that sweep has written so far
+  // is worth showing.
+  const [syncing, setSyncing] = useState(false);
+  const syncNow = useCallback(async () => {
+    setSyncing(true);
+    const result = await api.syncBeeperNow({ silent: true }).catch((err) => {
+      toast.error(err?.message || 'Beeper sync failed');
+      return null;
+    });
+    if (!mountedRef.current) return;
+    setSyncing(false);
+    if (result?.skipped) toast('A sync is already running');
+    loadList();
+    loadNetworks();
+  }, [loadList, loadNetworks, mountedRef]);
 
   const loadThread = useCallback(async (id) => {
     if (!id) {
@@ -726,6 +776,8 @@ export default function BeeperChatSurface({
           </div>
         )}
 
+        <SyncStrip sweep={sweep} />
+
         <div className="flex shrink-0 items-center gap-1 px-3 py-2.5">
           <span className="flex min-w-0 items-center gap-1 text-sm font-semibold text-white">
             {/* No chevron here (audit cluster 08, COPY-3): a scope-picker menu
@@ -745,12 +797,13 @@ export default function BeeperChatSurface({
           </button>
           <button
             type="button"
-            onClick={() => { loadList(); loadNetworks(); }}
-            title="Refresh"
-            aria-label="Refresh conversations"
-            className="rounded p-1.5 text-gray-500 hover:text-white"
+            onClick={syncNow}
+            disabled={syncing}
+            title="Sync now — runs a Beeper sweep immediately, then refreshes this list"
+            aria-label="Sync now"
+            className="rounded p-1.5 text-gray-500 hover:text-white disabled:opacity-50"
           >
-            <RefreshCw size={15} className={listLoading ? 'animate-spin' : undefined} />
+            <RefreshCw size={15} className={syncing || listLoading ? 'animate-spin' : undefined} />
           </button>
           <InertControl icon={Search} label="Search conversations" className="rounded p-1.5 text-gray-500" />
           <InertControl icon={PenSquare} label="New conversation" className="rounded p-1.5 text-gray-500" />
@@ -780,17 +833,27 @@ export default function BeeperChatSurface({
             {!listError && (
               <p className="text-[11px] text-gray-500">
                 {networks.length === 0 ? (
-                  <>
-                    Nothing is mirrored yet.{' '}
-                    <button
-                      type="button"
-                      onClick={onOpenSettings}
-                      className="text-port-accent underline underline-offset-2"
-                    >
-                      Open Beeper settings
-                    </button>{' '}
-                    to connect a network.
-                  </>
+                  // Branches on `tokenConfigured` (#80), not on `networks.length`
+                  // alone: a connected install whose first sweep just hasn't
+                  // written a network row yet is a different state from one
+                  // that was never told to connect anything, and telling the
+                  // first case to "open settings" sends a user who already did
+                  // that back to the same drawer for no reason.
+                  tokenConfigured ? (
+                    'First sync in progress — give it a moment and mirrored networks will start appearing here.'
+                  ) : (
+                    <>
+                      Nothing is mirrored yet.{' '}
+                      <button
+                        type="button"
+                        onClick={onOpenSettings}
+                        className="text-port-accent underline underline-offset-2"
+                      >
+                        Open Beeper settings
+                      </button>{' '}
+                      to connect a network.
+                    </>
+                  )
                 ) : unreadOnly ? (
                   'The unread filter is on — nothing unread here.'
                 ) : (

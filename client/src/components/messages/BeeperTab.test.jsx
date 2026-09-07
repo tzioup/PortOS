@@ -19,6 +19,7 @@ import { MemoryRouter, Route, Routes } from 'react-router';
 
 const api = vi.hoisted(() => ({
   getBeeperStatus: vi.fn(),
+  syncBeeperNow: vi.fn(),
   getBeeperNetworks: vi.fn(),
   getBeeperConversations: vi.fn(),
   getBeeperConversation: vi.fn(),
@@ -124,6 +125,7 @@ beforeEach(() => {
   socketMock.handlers.clear();
   socketMock.emitted.length = 0;
   api.getBeeperStatus.mockResolvedValue({ tokenConfigured: true, reachable: true, accounts: [], realtime: { state: 'connected' } });
+  api.syncBeeperNow.mockResolvedValue({ skipped: false, accounts: 0, chats: 0, messages: 0 });
   api.getBeeperNetworks.mockResolvedValue({ networks: [] });
   api.getBeeperConversations.mockResolvedValue({ conversations: [], nextCursor: null });
   api.getBeeperConversation.mockResolvedValue(conversation());
@@ -257,7 +259,11 @@ describe('rendering at every install size', () => {
  * filtered, rather than always reciting the same reassurance.
  */
 describe('the honest empty state (A11Y-3)', () => {
-  it('shows no networks-mirrored reassurance and offers the settings link when no networks are mirrored', async () => {
+  it('shows no networks-mirrored reassurance and offers the settings link when no networks are mirrored and Beeper is not connected', async () => {
+    // #80: the empty state branches on `tokenConfigured`, not on
+    // `networks.length` alone — the settings-link copy this test pins is the
+    // NOT-CONNECTED branch, so it needs a not-connected status.
+    api.getBeeperStatus.mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [], realtime: null });
     api.getBeeperNetworks.mockRejectedValue(new Error('network fetch failed'));
     renderTab();
     await screen.findByText('Nothing here');
@@ -282,6 +288,108 @@ describe('the honest empty state (A11Y-3)', () => {
     expect(screen.queryByText(/often correct rather than broken/)).toBeNull();
     expect(screen.queryByText(/nothing is mirrored yet/i)).toBeNull();
     expect(screen.queryByRole('button', { name: /open beeper settings/i })).toBeNull();
+  });
+
+  // The other half of #80's branch: connected but nothing mirrored yet is a
+  // DIFFERENT state from never-connected, and used to render the same
+  // "connect a network" prompt to a user who already had.
+  it('says a first sync is in progress, with no settings link, when Beeper is connected but nothing is mirrored yet', async () => {
+    api.getBeeperStatus.mockResolvedValue({ tokenConfigured: true, reachable: true, accounts: [], realtime: null });
+    api.getBeeperNetworks.mockResolvedValue({ networks: [] });
+    renderTab();
+    await screen.findByText('Nothing here');
+    expect(screen.getByText(/first sync in progress/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /open beeper settings/i })).toBeNull();
+  });
+});
+
+/**
+ * "Sync now" (#79): the list-header refresh action used to call only
+ * `loadList()`/`loadNetworks()` — both pure SELECTs against the mirror — so
+ * clicking it never actually triggered a sweep. It now runs one sweep first.
+ */
+describe('Sync now', () => {
+  it('runs a sweep, then refetches the list and the networks', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
+    renderTab();
+    await screen.findByText('Nothing here');
+    api.getBeeperConversations.mockClear();
+    api.getBeeperNetworks.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: /sync now/i }));
+
+    await waitFor(() => expect(api.syncBeeperNow).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.getBeeperConversations).toHaveBeenCalled());
+    expect(api.getBeeperNetworks).toHaveBeenCalled();
+    // The sweep must land BEFORE the refetch, or the refetch could race a
+    // sweep that has not written anything yet.
+    const [syncOrder] = api.syncBeeperNow.mock.invocationCallOrder;
+    const [listOrder] = api.getBeeperConversations.mock.invocationCallOrder;
+    expect(syncOrder).toBeLessThan(listOrder);
+  });
+
+  it('still refetches, without an error toast, when the sweep reports skipped: true', async () => {
+    api.syncBeeperNow.mockResolvedValue({ skipped: true });
+    renderTab();
+    await screen.findByText('Nothing here');
+    api.getBeeperConversations.mockClear();
+
+    fireEvent.click(screen.getByRole('button', { name: /sync now/i }));
+
+    await waitFor(() => expect(api.getBeeperConversations).toHaveBeenCalled());
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it('toasts and still re-enables the button when the sweep request itself fails', async () => {
+    api.syncBeeperNow.mockRejectedValue(new Error('Beeper sweep failed for all 3 accounts'));
+    renderTab();
+    await screen.findByText('Nothing here');
+
+    const button = screen.getByRole('button', { name: /sync now/i });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper sweep failed for all 3 accounts'));
+    expect(button).toBeEnabled();
+  });
+});
+
+/**
+ * The list header's sweep-visibility strip (#80): "Syncing… N of M accounts"
+ * while a sweep runs, "Last synced HH:MM" once idle. Both ride the same
+ * `GET /api/beeper/status` fetch `realtime`/`breaker` already used, seeded at
+ * mount — no separate polling loop.
+ */
+describe('the syncing / last-synced strip', () => {
+  it('shows "Syncing… N of M accounts" while a sweep is running', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, accounts: [], realtime: null,
+      sweep: {
+        running: true, startedAt: '2026-09-05T10:00:00.000Z', finishedAt: null, reason: 'scheduler',
+        accountsDone: 3, accountsTotal: 9, chats: 40, messages: 812,
+      },
+    });
+    renderTab();
+    expect(await screen.findByText('Syncing… 3 of 9 accounts')).toBeInTheDocument();
+  });
+
+  it('shows "Last synced HH:MM" once idle, formatted from finishedAt', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, accounts: [], realtime: null,
+      sweep: {
+        running: false, startedAt: '2026-09-05T10:00:00.000Z', finishedAt: '2026-09-05T10:04:00.000Z', reason: 'manual',
+        accountsDone: 9, accountsTotal: 9, chats: 210, messages: 4032,
+      },
+    });
+    renderTab();
+    expect(await screen.findByText(/Last synced \d{1,2}:\d{2}/)).toBeInTheDocument();
+  });
+
+  it('shows neither line before any sweep has ever run', async () => {
+    api.getBeeperStatus.mockResolvedValue({ tokenConfigured: true, reachable: true, accounts: [], realtime: null, sweep: null });
+    renderTab();
+    await screen.findByText('Nothing here');
+    expect(screen.queryByText(/Syncing…/)).toBeNull();
+    expect(screen.queryByText(/Last synced/)).toBeNull();
   });
 });
 
