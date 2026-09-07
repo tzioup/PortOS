@@ -386,6 +386,43 @@ describe('BeeperThread — participant Tribe link display', () => {
  * newest message. The fix tracks the newest message actually on screen in a
  * ref and scrolls only when THAT changes (or the conversation does).
  */
+/**
+ * Audit cluster 08 (A11Y-5): the first-contact confirmation used to reveal
+ * with no `autoFocus` and no accessible name, and the Send button dropped
+ * itself to `disabled` mid-send — moving focus to `<body>` — so neither a
+ * keyboard nor a screen-reader user was ever told the row had appeared.
+ * `InlineConfirmRow` already supports `autoFocus` (see
+ * `ui/UnsavedChangesConfirm.jsx`, the sibling caller); the fix wires it here
+ * and swaps the Send button's `disabled` for `aria-disabled` so a mid-send
+ * state change never steals focus away from it.
+ */
+describe('BeeperThread — first-contact confirmation is accessible', () => {
+  it('moves focus into the revealed row and names the conversation as its accessible name', () => {
+    renderThread({
+      outboxEntries: [OUTBOX_ENTRY],
+      confirmation: { entry: OUTBOX_ENTRY, message: 'first contact' },
+    });
+
+    const row = screen.getByLabelText(/Confirm sending the first message/);
+    expect(row).toHaveFocus();
+    expect(row).toHaveAccessibleName(expect.stringContaining('Example Contact'));
+  });
+
+  it('keeps focus on Send when it becomes aria-disabled mid-send, never the native disabled attribute', () => {
+    const { rerender } = renderThread({ draft: 'hello', sending: false });
+    const send = screen.getByRole('button', { name: 'Send' });
+    send.focus();
+    expect(send).toHaveFocus();
+
+    rerender(<BeeperThread {...BASE_PROPS} draft="hello" sending />);
+
+    const sendAfter = screen.getByRole('button', { name: 'Send' });
+    expect(sendAfter).toHaveAttribute('aria-disabled', 'true');
+    expect(sendAfter).not.toHaveAttribute('disabled');
+    expect(sendAfter).toHaveFocus();
+  });
+});
+
 describe('BeeperThread — scroll anchoring', () => {
   const olderMessage = (id, sentAt) => ({
     id, body: `Placeholder body ${id}`, sentAt, isSender: false, senderId: 'user-1', attachments: [],

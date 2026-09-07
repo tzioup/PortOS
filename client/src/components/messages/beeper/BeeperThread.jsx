@@ -762,6 +762,8 @@ export default function BeeperThread({
         <InlineConfirmRow
           variant="separator"
           tone="warning"
+          autoFocus
+          aria-label={`Confirm sending the first message to ${conversation.title || 'this contact'}`}
           question={`This is the first message PortOS has sent to ${conversation.title || 'this contact'} on ${networkLabel(conversation.network)} — send it?`}
           confirmText="Send anyway"
           cancelText="Cancel"
@@ -798,10 +800,12 @@ export default function BeeperThread({
         <button
           type="button"
           onClick={handleSendClick}
-          disabled={!canSend}
+          aria-disabled={!canSend}
           aria-label="Send"
           title={sendDisabledReason}
-          className="shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 disabled:cursor-not-allowed disabled:bg-port-accent/40 disabled:hover:bg-port-accent/40"
+          className={`shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 ${
+            !canSend ? 'cursor-not-allowed bg-port-accent/40 hover:bg-port-accent/40' : ''
+          }`}
         >
           {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
         </button>
