@@ -230,7 +230,10 @@ router.post('/features/eidoverse/host', asyncHandler(async (_req, res) => {
 // turning the feature on left realtime down and no sweep registered until the
 // next restart (fork issue #1, final live pass). Reconciling here closes that
 // half; the credential paths close the other. Beeper sits in the `comms` group,
-// so the group toggle moves the same gate.
+// so the group toggle moves the same gate — and so does the general settings
+// PUT below, when it flips the user's own `settings.beeper.enabled` sync
+// toggle: that save used to persist silently and never reach
+// `startBeeperScheduler()` until a restart.
 //
 // Imported lazily inside the handler: a feature toggle is a rare path, and the
 // arming module reaches the whole Beeper service graph (`ws` included), which
@@ -480,11 +483,28 @@ router.put('/', asyncHandler(async (req, res) => {
   // `actor: 'user'` is what separates a save made HERE — a human on the Settings
   // page — from every other `save()` caller (schedulers, sync hooks, feature
   // writes), which keep the `'system'` default in the operator-action ledger (#5594).
-  let merged = await updateSettingsWith((current) =>
-    preserveExternallyOwnedKeys(
+  let previousBeeperEnabled;
+  let merged = await updateSettingsWith((current) => {
+    // Read inside the queue, against the freshest persisted snapshot (same
+    // reasoning as `mergeFederationSlice` above) — a stale pre-image here could
+    // read a no-op as a flip, or a real flip as a no-op.
+    previousBeeperEnabled = current?.beeper?.enabled === true;
+    return preserveExternallyOwnedKeys(
       mergeFederationSlice({ ...current, ...settingsPatch }, current),
       current,
-    ), { actor: 'user' });
+    );
+  }, { actor: 'user' });
+  // A beeper save that flips `enabled` never armed the scheduler until a
+  // restart. `startBeeperScheduler()` is the only thing that registers the
+  // sweep, and it's reached exclusively through `reconcileBeeperArming` —
+  // which the feature and comms-group toggles call, but this generic PUT path
+  // never did. `undefined` counts as `false` on both sides, matching how
+  // `getBeeperSyncConfig()` reads the stored flag, so an install that has
+  // never touched the Beeper card doesn't read as a flip. Fires AFTER the
+  // write above so the reconcile (and the scheduler's own re-read) see the
+  // value that was actually persisted, not the request body.
+  const nextBeeperEnabled = merged?.beeper?.enabled === true;
+  if (nextBeeperEnabled !== previousBeeperEnabled) await reconcileBeeperArming('sync-toggle');
   if (subscriptionCostsPatch !== undefined) {
     const costs = await saveSubscriptionCosts(subscriptionCostsPatch, { actor: 'user' });
     merged = { ...merged, subscriptionCosts: costs };

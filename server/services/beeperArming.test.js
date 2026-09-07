@@ -196,4 +196,33 @@ describe('reconcileBeeperIngestion', () => {
     expect(socket.running).toBe(false);
     expect(getEvent('beeper-sync')).toBeFalsy();
   });
+
+  // Pins the arming-level half of the settings-route sync-toggle fix
+  // (server/routes/settings.js): saving `settings.beeper.enabled` now calls
+  // `reconcileBeeperIngestion({ reason: 'sync-toggle' })` when the flag
+  // actually changes. Registering the sweep on that call is this module's
+  // job; STOPPING it on a false flip is not — `reconcileOnce` only disarms
+  // when the feature+token gate itself is false, so a sync-toggle reconcile
+  // with the gate still armed must leave an already-running sweep alone. The
+  // scheduler's own per-tick `getBeeperSyncConfig()` re-read is what actually
+  // stops runs in that case (see server/routes/settings.test.js's
+  // true→false case for the route side of this).
+  it('registers the scheduler on a sync-toggle reconcile when enabled is true, but does not stop it when enabled flips false while still armed', async () => {
+    captureLogs();
+
+    const armedResult = await reconcileBeeperIngestion({ reason: 'sync-toggle' });
+
+    expect(socket.running).toBe(true);
+    expect(getEvent('beeper-sync')).toBeTruthy();
+    expect(armedResult).toMatchObject({ armed: true, schedulerRegistered: true, changed: true });
+
+    // The gate (feature + token) stays armed; only the user's own sync opt-in
+    // flips off. A reconcile here must not disarm anything.
+    state.config = { enabled: false, intervalMinutes: 5 };
+    const disabledResult = await reconcileBeeperIngestion({ reason: 'sync-toggle' });
+
+    expect(getEvent('beeper-sync')).toBeTruthy();
+    expect(socket.running).toBe(true);
+    expect(disabledResult.changed).toBe(false);
+  });
 });
