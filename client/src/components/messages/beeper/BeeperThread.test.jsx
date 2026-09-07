@@ -423,6 +423,24 @@ describe('BeeperThread — first-contact confirmation is accessible', () => {
   });
 });
 
+/**
+ * Audit cluster 08 (A11Y-6): the inline error paragraphs carried no role, and
+ * every fetch behind them passes `{ silent: true }`, so a screen-reader user
+ * got no signal at all when the thread failed to open or a fetch behind an
+ * already-open thread errored.
+ */
+describe('BeeperThread — inline errors are announced', () => {
+  it('exposes the could-not-open error as an alert', () => {
+    renderThread({ conversation: null, error: 'Could not reach the mirror' });
+    expect(screen.getByText('Could not reach the mirror')).toHaveAttribute('role', 'alert');
+  });
+
+  it('exposes the in-thread error banner as an alert', () => {
+    renderThread({ error: 'Could not load newer messages' });
+    expect(screen.getByText('Could not load newer messages')).toHaveAttribute('role', 'alert');
+  });
+});
+
 describe('BeeperThread — scroll anchoring', () => {
   const olderMessage = (id, sentAt) => ({
     id, body: `Placeholder body ${id}`, sentAt, isSender: false, senderId: 'user-1', attachments: [],

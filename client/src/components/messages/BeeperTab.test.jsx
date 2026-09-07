@@ -285,6 +285,20 @@ describe('the honest empty state (A11Y-3)', () => {
   });
 });
 
+/**
+ * Audit cluster 08 (A11Y-6): the list-error banner carried no role, and
+ * `getBeeperConversations` is fetched silent, so a screen-reader user got no
+ * signal that the list had failed to load.
+ */
+describe('the conversation list error banner is announced', () => {
+  it('exposes the list-fetch failure with role="alert"', async () => {
+    api.getBeeperConversations.mockRejectedValue(new Error('Could not load conversations'));
+    renderTab();
+
+    expect(await screen.findByText('Could not load conversations')).toHaveAttribute('role', 'alert');
+  });
+});
+
 describe('message direction', () => {
   it('puts own messages on the other side of the thread, from the mirrored isSender', async () => {
     api.getBeeperConversation.mockResolvedValue(conversation({

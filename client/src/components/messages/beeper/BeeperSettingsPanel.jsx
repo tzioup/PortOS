@@ -504,7 +504,7 @@ function AccountRoster({ accounts, error }) {
     return (
       <div className="space-y-1.5">
         <p className="text-[11px] uppercase tracking-wide text-gray-500">Mirrored accounts</p>
-        <p data-testid="beeper-roster-unknown" className="text-sm text-port-error">{error}</p>
+        <p role="alert" data-testid="beeper-roster-unknown" className="text-sm text-port-error">{error}</p>
       </div>
     );
   }
@@ -545,7 +545,7 @@ function BeeperStatusCard({
           <ShieldAlert size={16} className="text-port-error" />
           <h3 className="text-sm font-semibold text-white">Could not read Beeper status</h3>
         </div>
-        <p className="text-sm text-port-error">{error}</p>
+        <p role="alert" className="text-sm text-port-error">{error}</p>
         <button
           type="button"
           onClick={onRetryStatus}

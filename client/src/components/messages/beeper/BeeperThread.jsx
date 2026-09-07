@@ -469,7 +469,7 @@ export default function BeeperThread({
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
         <p className="text-sm text-gray-300">Could not open this conversation</p>
-        <p className="max-w-sm text-[11px] text-port-error">{error}</p>
+        <p role="alert" className="max-w-sm text-[11px] text-port-error">{error}</p>
         <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
           {onRetry && (
             <button
@@ -667,7 +667,7 @@ export default function BeeperThread({
           </div>
         )}
 
-        {error && <p className="py-2 text-center text-xs text-port-error">{error}</p>}
+        {error && <p role="alert" className="py-2 text-center text-xs text-port-error">{error}</p>}
 
         {loading && ordered.length === 0 && (
           <p className="py-6 text-center text-xs text-gray-500">Loading messages…</p>

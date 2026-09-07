@@ -755,7 +755,7 @@ export default function BeeperChatSurface({
         </div>
 
         {listError && (
-          <p className="mx-3 mb-2 rounded border border-port-error/40 bg-port-error/10 px-2 py-1.5 text-[11px] text-port-error">
+          <p role="alert" className="mx-3 mb-2 rounded border border-port-error/40 bg-port-error/10 px-2 py-1.5 text-[11px] text-port-error">
             {listError}
           </p>
         )}
