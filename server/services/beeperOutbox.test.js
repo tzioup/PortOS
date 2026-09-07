@@ -56,12 +56,23 @@ vi.mock('./beeperSync.js', () => ({
   }),
 }));
 
-// --- in-memory stand-in for the two tables this service touches -------------
+// --- in-memory stand-in for the tables this service touches -----------------
 const outbox = new Map();
 const conversations = new Map();
 const mirrored = [];
 const mirroredSql = [];
+// The mirrored thread's own outbound history — separate from `mirrored`
+// above, which only ever holds what THIS module's own `mirrorSentMessage`
+// wrote. `isFirstContact` (#82) also has to see history a sync sweep mirrored
+// from the user's phone or another client, which `seedMirroredMessage` below
+// stands in for.
+const mirroredMessages = [];
 let nextId = 1;
+
+/** A `beeper_messages` row synced in from Beeper, never through this outbox. */
+function seedMirroredMessage(conversationId, { isSender = true } = {}) {
+  mirroredMessages.push({ conversationId, isSender });
+}
 
 const entryView = (row) => ({ ...row });
 
@@ -93,6 +104,11 @@ const query = vi.fn(async (sql, params = []) => {
     const contacted = [...outbox.values()]
       .filter((row) => row.conversationId === params[0] && params[1].includes(row.state));
     return { rows: contacted.map(() => ({ '?column?': 1 })), rowCount: contacted.length };
+  }
+  if (/SELECT 1 FROM beeper_messages\s+WHERE conversation_id = \$1 AND is_sender = TRUE/.test(sql)) {
+    const sent = mirroredMessages
+      .filter((message) => message.conversationId === params[0] && message.isSender === true);
+    return { rows: sent.map(() => ({ '?column?': 1 })), rowCount: sent.length };
   }
   // The boot reconcile's two statements. Both are keyed on a STATE rather than
   // on an id, so they sit ahead of the single-row branches whose patterns they
@@ -273,6 +289,7 @@ beforeEach(() => {
   conversations.clear();
   mirrored.length = 0;
   mirroredSql.length = 0;
+  mirroredMessages.length = 0;
   nextId = 1;
   conversations.set(CONVERSATION_ID, CHAT_ID);
   conversations.set(OTHER_CONVERSATION_ID, 'example-chat-2');
@@ -406,6 +423,11 @@ describe('sendOutboxEntry — the human gates', () => {
 // a send that left the machine but never confirmed — which is the NORMAL
 // resting state of an unresolved send, since that case deliberately stays
 // `awaiting-confirmation` rather than being marked failed.
+//
+// Fork issue #82: a contact is known when EITHER source has outbound history
+// — a mirrored `is_sender` message (any client, not just this install) OR a
+// prior PortOS outbox send — scoped to the one conversation being sent to.
+// The confirmation is reserved for a chat neither source has ever addressed.
 describe('isFirstContact — has PortOS addressed this conversation before', () => {
   it.each(['sent', 'awaiting-confirmation', 'sending'])(
     'treats a prior %s row as contact already made, so no confirmation is asked',
@@ -420,13 +442,41 @@ describe('isFirstContact — has PortOS addressed this conversation before', () 
     },
   );
 
-  it('still asks when nothing PortOS composed ever reached Beeper', async () => {
+  it('treats a mirrored isSender message alone as contact already made, with no PortOS send on record', async () => {
+    seedMirroredMessage(CONVERSATION_ID, { isSender: true });
+
+    expect(await isFirstContact(CONVERSATION_ID)).toBe(false);
+
+    const entry = await approvedEntry('a reply');
+    await expect(sendOutboxEntry(entry.id)).resolves.toMatchObject({ state: 'awaiting-confirmation' });
+  });
+
+  it('still asks when nothing PortOS composed ever reached Beeper and the mirror holds no outbound message', async () => {
     const failed = await approvedEntry('never left');
     outbox.get(failed.id).state = 'failed';
     await approvedEntry('still queued');
 
     expect(await isFirstContact(CONVERSATION_ID)).toBe(true);
     expect(await isFirstContact(OTHER_CONVERSATION_ID)).toBe(true);
+  });
+
+  it('still asks first contact when the mirrored thread holds only inbound messages', async () => {
+    seedMirroredMessage(CONVERSATION_ID, { isSender: false });
+    seedMirroredMessage(CONVERSATION_ID, { isSender: false });
+
+    expect(await isFirstContact(CONVERSATION_ID)).toBe(true);
+
+    const entry = await approvedEntry();
+    await expect(sendOutboxEntry(entry.id)).rejects.toMatchObject({
+      code: 'FIRST_CONTACT_CONFIRMATION_REQUIRED', status: 409,
+    });
+  });
+
+  it('scopes the mirrored-message check to the conversation being sent to', async () => {
+    seedMirroredMessage(OTHER_CONVERSATION_ID, { isSender: true });
+
+    expect(await isFirstContact(CONVERSATION_ID)).toBe(true);
+    expect(await isFirstContact(OTHER_CONVERSATION_ID)).toBe(false);
   });
 });
 
