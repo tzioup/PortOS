@@ -28,8 +28,8 @@ import ContactsTab from '../components/messages/ContactsTab';
 export const TABS = [
   { id: 'inbox', label: 'Inbox', icon: Mail, needsAccounts: true },
   { id: 'drafts', label: 'Drafts', icon: Mail, needsAccounts: true },
-  { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true, recordParam: true },
-  { id: 'signal', label: 'Signal', icon: MessageSquare },
+  { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true, recordParam: true, feature: 'imessage' },
+  { id: 'signal', label: 'Signal', icon: MessageSquare, feature: 'signal' },
   { id: 'beeper', label: 'Beeper', icon: MessageCircle, fullBleed: true, recordParam: true, feature: 'beeper' },
   { id: 'contacts', label: 'Contacts', icon: Users },
   { id: 'sync', label: 'Sync', icon: RefreshCw, needsAccounts: true },

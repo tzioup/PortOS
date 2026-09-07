@@ -75,6 +75,52 @@ describe('Messages — Beeper tab gating', () => {
   });
 });
 
+describe('Messages — Comms group gating (iMessage, Signal)', () => {
+  // F3: iMessage and Signal joined the Comms group's nav-manifest gate (#40)
+  // but the Messages tab strip only tagged the Beeper row with `feature`, so
+  // the pills stayed visible and clickable with the group off — the exact
+  // inconsistency the Beeper pill's own comment says must not exist.
+  it('hides the iMessage and Signal pills from the tab strip when the comms group is off', async () => {
+    featureMock.features = [
+      { id: 'imessage', label: 'iMessage', enabled: false },
+      { id: 'signal', label: 'Signal', enabled: false },
+      { id: 'beeper', label: 'Beeper', enabled: false },
+    ];
+
+    renderAt('/messages/inbox');
+
+    // A non-comms pill stays put as the control.
+    expect(await screen.findByRole('tab', { name: 'Inbox' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: /iMessage/i })).toBeNull();
+    expect(screen.queryByRole('tab', { name: /^Signal$/i })).toBeNull();
+  });
+
+  it('shows only the Signal pill when iMessage is overridden off and Signal is on', async () => {
+    featureMock.features = [
+      { id: 'imessage', label: 'iMessage', enabled: false },
+      { id: 'signal', label: 'Signal', enabled: true },
+    ];
+
+    renderAt('/messages/inbox');
+
+    expect(await screen.findByRole('tab', { name: /^Signal$/i })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: /iMessage/i })).toBeNull();
+  });
+
+  // Parity with Beeper (#30/#40): the feature gates the tab strip and the
+  // sidebar, never the <Route> itself, so a direct/bookmarked visit still
+  // renders the tab body while the feature is off — see the equivalent Beeper
+  // case in 'Messages — Beeper tab gating' above. iMessage matches that
+  // existing behavior rather than gaining a new, stricter route-level gate.
+  it('still renders the iMessage panel for a direct/bookmarked link even with the feature off', async () => {
+    featureMock.features = [{ id: 'imessage', label: 'iMessage', enabled: false }];
+
+    renderAt('/messages/imessage');
+
+    expect(await screen.findByText('imessage panel')).toBeTruthy();
+  });
+});
+
 describe('Messages — header account count scope (#30/#35)', () => {
   // The header's "N accounts" reads the generic email-provider account list
   // (Gmail/Outlook/Teams), not Beeper's own roster — it must not render on a
