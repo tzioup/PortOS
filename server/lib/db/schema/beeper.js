@@ -80,10 +80,31 @@ export const beeperDdl = [
     is_muted BOOLEAN NOT NULL DEFAULT FALSE,
     last_activity TIMESTAMPTZ,
     unread_count INTEGER NOT NULL DEFAULT 0,
+    seen_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (account_id, source_chat_id)
   )`,
+  // Additive, for an install whose `beeper_conversations` predates the
+  // column — same shape as `beeper_messages.is_sender` below. `seen_at` is
+  // the LOCAL "seen in PortOS" watermark (#83), and unlike every other column
+  // on this row it is never written by the sweep (`upsertConversation` in
+  // beeperSync.js never touches it) and never mirrored from Beeper: opening a
+  // thread stamps it with `NOW()` (`beeperConversations.markConversationSeen`)
+  // and nothing else does. The read model compares it against
+  // `COALESCE(last_activity, created_at)` at every surface that shows an
+  // unread badge (`shapeConversation`, `listConversations`'s `unreadOnly`
+  // filter, `listNetworks`'s aggregates) — `seen_at >= that activity` means
+  // "nothing has landed since the user last opened this", which is what
+  // survives the sweep overwriting `unread_count` wholesale on every run: a
+  // watermark that instead zeroed `unread_count` directly would be reverted
+  // by the very next sweep, and one that lived only in the browser would not
+  // reach the rail aggregates or a second device. NULL means "never opened in
+  // PortOS", which reads as unread whenever Beeper's own `unread_count` says
+  // so. This NEVER writes to Beeper — no read receipt crosses the wire; a
+  // settings toggle to also send one is out of scope here (see the TODO on
+  // `markConversationSeen`).
+  `ALTER TABLE beeper_conversations ADD COLUMN IF NOT EXISTS seen_at TIMESTAMPTZ`,
   // `idx_beeper_conversations_account_activity (account_id, last_activity DESC)`
   // served no query: listConversations (services/beeperConversations.js) has
   // no account_id filter, and its ORDER BY / keyset walk sorts on

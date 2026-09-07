@@ -98,6 +98,30 @@ export function decodeCursor(cursor, { idPattern } = {}) {
 
 const toIso = (value) => (value ? new Date(value).toISOString() : null);
 
+// LOCAL "seen in PortOS" watermark (#83). `row.seen_at` is stamped by
+// `markConversationSeen` when a thread is opened here, and NEVER by the sweep
+// (`beeperSync.js`'s `upsertConversation` writes every other column on this
+// row from Beeper's own `Chat`, but not this one). A watermark at or after the
+// conversation's own last activity means nothing has landed since the user
+// last opened it, even though Beeper's mirrored `unread_count` — overwritten
+// wholesale on every sweep — still says otherwise; new activity after the
+// watermark reads as unread again with no extra bookkeeping. `created_at` is
+// the fallback activity floor for a conversation the mirror has never dated.
+function isSeenLocally(row) {
+  if (!row.seen_at) return false;
+  const activity = row.last_activity || row.created_at;
+  if (!activity) return false;
+  return new Date(row.seen_at).getTime() >= new Date(activity).getTime();
+}
+
+// The SQL twin of `isSeenLocally`, for the two queries that decide "is this
+// genuinely unread" inside the database rather than after shaping a row in
+// JS (`listConversations`'s `unreadOnly` filter and `listNetworks`'s
+// aggregates, neither of which materializes a full `beeper_conversations`
+// row per conversation). Kept as one string so the two call sites cannot
+// drift onto different comparisons.
+const UNSEEN_SQL = '(c.seen_at IS NULL OR c.seen_at < COALESCE(c.last_activity, c.created_at))';
+
 function shapeConversation(row) {
   return {
     id: row.id,
@@ -112,7 +136,7 @@ function shapeConversation(row) {
     isLowPriority: row.is_low_priority === true,
     isMuted: row.is_muted === true,
     lastActivity: toIso(row.last_activity),
-    unreadCount: Number(row.unread_count) || 0,
+    unreadCount: isSeenLocally(row) ? 0 : (Number(row.unread_count) || 0),
     // `null` = this conversation has no mirrored message yet, which is
     // frequently CORRECT rather than pending: history depth varies enormously
     // per network (#3), so the surface says so instead of spinning.
@@ -256,7 +280,11 @@ export async function listConversations({
     params.push(network);
     where.push(`c.network = $${params.length}`);
   }
-  if (unreadOnly === true) where.push('c.unread_count > 0');
+  // The LOCAL watermark (#83) gates `unreadOnly` the same way it gates the
+  // badge: a conversation Beeper still reports as unread but that carries a
+  // `seen_at` at or after its own last activity is not shown, because nothing
+  // has landed here since it was opened in PortOS.
+  if (unreadOnly === true) where.push(`c.unread_count > 0 AND ${UNSEEN_SQL}`);
   if (typeof archived === 'boolean') {
     params.push(archived);
     where.push(`c.is_archived = $${params.length}`);
@@ -418,6 +446,12 @@ export async function listMessages(conversationId, { limit, cursor } = {}) {
  *
  * Unread is aggregated over NON-ARCHIVED rows only: the rail badge answers
  * "how much is waiting in my inbox", and an archived chat is by definition not.
+ *
+ * Both aggregates also honour the LOCAL "seen in PortOS" watermark (#83) via
+ * `UNSEEN_SQL`: a conversation the user has opened here, with nothing new
+ * since, contributes 0 to `unread_count` and does not count toward
+ * `unread_conversations`, even though Beeper's own mirrored `unread_count`
+ * still says otherwise.
  */
 export async function listNetworks() {
   const result = await query(
@@ -430,8 +464,8 @@ export async function listNetworks() {
     // aggregate never has to compare against a null).
     `SELECT c.network,
             COUNT(*)::int AS conversation_count,
-            COALESCE(SUM(c.unread_count) FILTER (WHERE c.is_archived = FALSE), 0)::int AS unread_count,
-            COUNT(*) FILTER (WHERE c.unread_count > 0 AND c.is_archived = FALSE)::int AS unread_conversations,
+            COALESCE(SUM(c.unread_count) FILTER (WHERE c.is_archived = FALSE AND ${UNSEEN_SQL}), 0)::int AS unread_count,
+            COUNT(*) FILTER (WHERE c.unread_count > 0 AND c.is_archived = FALSE AND ${UNSEEN_SQL})::int AS unread_conversations,
             ARRAY_AGG(DISTINCT c.account_id) AS account_ids,
             MAX(c.last_activity) AS last_activity
        FROM beeper_conversations c
@@ -447,6 +481,42 @@ export async function listNetworks() {
     accountIds: Array.isArray(row.account_ids) ? row.account_ids.filter(Boolean) : [],
     lastActivity: toIso(row.last_activity),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Local "seen" watermark (#83) — NOT a Beeper write
+// ---------------------------------------------------------------------------
+
+/**
+ * Stamp the LOCAL "seen in PortOS" watermark on one conversation. Called when
+ * the chat surface opens a thread (`BeeperChatSurface.jsx`'s `loadThread`) and,
+ * cheaply, again when a new message lands in the open thread.
+ *
+ * This is the opposite shape from `setConversationFlag` below: it NEVER calls
+ * Beeper. The reading model this decision shipped has no side effects on the
+ * source network — no read receipt, no `PATCH`, nothing that could surprise
+ * someone checking Beeper Desktop on another device. `seen_at` is set to
+ * `NOW()` unconditionally rather than `GREATEST(seen_at, NOW())`: wall-clock
+ * time only moves forward across calls to the same row, so the two are
+ * equivalent here and the plain assignment says that more plainly.
+ *
+ * TODO(#83): a settings toggle to also send a real read receipt through
+ * Beeper's own API is the natural next wave — it would PATCH-then-mirror the
+ * same way `setConversationFlag` does, gated behind that toggle and its own
+ * consent step, and default OFF. Out of scope for this change.
+ */
+export async function markConversationSeen(conversationId) {
+  const found = await query(
+    'SELECT id FROM beeper_conversations WHERE id = $1',
+    [conversationId],
+  );
+  if (!found?.rows?.[0]) throw new ServerError('Conversation not found', { status: 404, code: 'NOT_FOUND' });
+
+  await query(
+    'UPDATE beeper_conversations SET seen_at = NOW(), updated_at = NOW() WHERE id = $1',
+    [conversationId],
+  );
+  return getConversation(conversationId);
 }
 
 // ---------------------------------------------------------------------------

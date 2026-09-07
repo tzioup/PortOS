@@ -1693,6 +1693,12 @@ CREATE TABLE IF NOT EXISTS beeper_conversations (
   is_muted BOOLEAN NOT NULL DEFAULT FALSE,
   last_activity TIMESTAMPTZ,
   unread_count INTEGER NOT NULL DEFAULT 0,
+  -- LOCAL "seen in PortOS" watermark (#83). Never mirrored from Beeper and
+  -- never written by the sweep — opening a thread stamps it with NOW(), and
+  -- the read model compares it against COALESCE(last_activity, created_at)
+  -- to decide whether the unread badge still shows. Mirrors the ALTER in
+  -- server/lib/db/schema/beeper.js (for existing installs).
+  seen_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE (account_id, source_chat_id)

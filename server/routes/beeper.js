@@ -20,6 +20,7 @@ import {
   getConversation,
   listMessages,
   listNetworks,
+  markConversationSeen,
   purgeConversation,
   setConversationArchived,
   setConversationLowPriority,
@@ -261,6 +262,20 @@ router.post('/conversations/:id/low-priority', asyncHandler(async (req, res) => 
   const { lowPriority } = validateRequest(lowPrioritySchema, req.body);
   const conversation = await setConversationLowPriority(id, lowPriority)
     .catch((err) => { throw mapBeeperWriteError(err); });
+  res.json(conversation);
+}));
+
+// POST /api/beeper/conversations/:id/seen — the LOCAL "seen in PortOS"
+// watermark (#83), the fix for opening an unread thread leaving its badge
+// untouched. Unlike archive/low-priority above, this NEVER calls Beeper: no
+// PATCH, no read receipt, nothing that reaches the source network — just a
+// local `seen_at` stamp the read model compares against the conversation's
+// own activity (`markConversationSeen`). No request body: it is called with
+// nothing to validate beyond the id, on every thread open and, cheaply, again
+// when a new message lands in the open thread.
+router.post('/conversations/:id/seen', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(conversationParamsSchema, req.params);
+  const conversation = await markConversationSeen(id);
   res.json(conversation);
 }));
 
