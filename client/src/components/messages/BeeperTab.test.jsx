@@ -425,7 +425,10 @@ describe('the composer', () => {
     renderTab(`/messages/beeper/${CONV_A}`);
 
     const send = await screen.findByRole('button', { name: 'Send' });
-    expect(send).toBeDisabled();
+    // aria-disabled (A11Y-5), not the native disabled attribute — the button
+    // must stay focusable so focus survives a mid-send disable.
+    expect(send).toHaveAttribute('aria-disabled', 'true');
+    expect(send).not.toHaveAttribute('disabled');
     expect(send.getAttribute('title')).toBe('Type a message to send');
   });
 });
@@ -596,7 +599,10 @@ describe('the composer sends', () => {
     const composer = await openComposer();
 
     const send = screen.getByRole('button', { name: 'Send' });
-    await waitFor(() => expect(send).toBeDisabled());
+    // aria-disabled (A11Y-5): the button stays focusable — clicking it is a
+    // no-op because handleSendClick itself checks canSend, not because the
+    // click never reaches the handler.
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'true'));
     expect(send.getAttribute('title')).toMatch(/runaway breaker/);
     expect(composer).toHaveValue(OUTBOUND_TEXT);
 
@@ -617,7 +623,7 @@ describe('the composer sends', () => {
     await openComposer();
 
     const send = screen.getByRole('button', { name: 'Send' });
-    await waitFor(() => expect(send).toBeEnabled());
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'false'));
 
     api.getBeeperStatus.mockResolvedValue(status({ tripped: true, reason: 'synthetic loop', trippedAt: '2026-09-01T09:00:00.000Z' }));
     act(() => {
@@ -626,7 +632,7 @@ describe('the composer sends', () => {
       }
     });
 
-    await waitFor(() => expect(send).toBeDisabled());
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'true'));
     expect(send.getAttribute('title')).toMatch(/runaway breaker/);
     expect(send.getAttribute('title')).toContain('synthetic loop');
   });
