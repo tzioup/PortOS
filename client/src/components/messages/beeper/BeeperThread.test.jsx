@@ -378,3 +378,59 @@ describe('BeeperThread — participant Tribe link display', () => {
     expect(screen.queryByLabelText('Link Sam Example to a Tribe person')).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Findings PERF-8/A11Y-2: the scroll-to-bottom effect keyed on `ordered.length`
+ * directly, which "Load earlier messages" changes on every click (it only
+ * prepends OLDER messages) — so every page-in yanked the reader back to the
+ * newest message. The fix tracks the newest message actually on screen in a
+ * ref and scrolls only when THAT changes (or the conversation does).
+ */
+describe('BeeperThread — scroll anchoring', () => {
+  const olderMessage = (id, sentAt) => ({
+    id, body: `Placeholder body ${id}`, sentAt, isSender: false, senderId: 'user-1', attachments: [],
+  });
+
+  it('leaves the scroll position on the fetched history when older messages page in', () => {
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const newest = olderMessage('m2', '2026-09-01T10:00:00.000Z');
+    const { rerender } = renderThread({ messages: [newest], hasMore: true });
+    const callsAfterMount = scrollSpy.mock.calls.length;
+    expect(callsAfterMount).toBeGreaterThan(0);
+
+    // Exactly what `loadMoreMessages` does on the real component: an OLDER
+    // page appended to the TAIL of `messages` — the newest entry (and its id)
+    // is untouched.
+    const olderPage = olderMessage('m1', '2026-09-01T09:00:00.000Z');
+    rerender(<BeeperThread {...BASE_PROPS} messages={[newest, olderPage]} hasMore={false} />);
+
+    expect(scrollSpy.mock.calls.length).toBe(callsAfterMount);
+    scrollSpy.mockRestore();
+  });
+
+  it('still scrolls to the bottom when a genuinely new newest message arrives', () => {
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const first = olderMessage('m1', '2026-09-01T09:00:00.000Z');
+    const { rerender } = renderThread({ messages: [first] });
+    const callsAfterMount = scrollSpy.mock.calls.length;
+
+    // A brand new message is NEWEST-first, so it lands at index 0.
+    const brandNew = olderMessage('m2', '2026-09-01T10:00:00.000Z');
+    rerender(<BeeperThread {...BASE_PROPS} messages={[brandNew, first]} />);
+
+    expect(scrollSpy.mock.calls.length).toBeGreaterThan(callsAfterMount);
+    scrollSpy.mockRestore();
+  });
+
+  it('scrolls on a conversation switch even when the newest message id is unchanged', () => {
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    const shared = olderMessage('m1', '2026-09-01T09:00:00.000Z');
+    const { rerender } = renderThread({ messages: [shared] });
+    const callsAfterMount = scrollSpy.mock.calls.length;
+
+    rerender(<BeeperThread {...BASE_PROPS} conversation={{ ...CONVERSATION, id: 'convo-2' }} messages={[shared]} />);
+
+    expect(scrollSpy.mock.calls.length).toBeGreaterThan(callsAfterMount);
+    scrollSpy.mockRestore();
+  });
+});
