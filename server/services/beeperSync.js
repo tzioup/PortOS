@@ -53,18 +53,30 @@
  *
  * **A chat's first-page fetch is retried once if it comes back empty (#81).**
  * A brand-new chat's first sweep takes exactly one `direction: 'before'` page
- * (step 3 above), and a live-instance investigation (#81) found that page
- * coming back with zero items for a real share of chats — not from a
- * message-kind filter (there is none) and not from the page/budget caps
- * (those only bound the forward `'after'` catch-up walk on a chat that
- * already has a cursor). The old behavior committed the chat's watermark
- * regardless, so a chat that happened to get nothing back on its one shot
- * stayed "No messages mirrored yet" forever. `sweepChat` now withholds the
- * cursor and watermark the first time this happens (the same mechanism a
- * truncated forward walk already used), so `chatNeedsSweep` retries the same
- * first page next pass; if the retry is ALSO empty, the real watermark
- * commits (so a genuinely history-less chat still reaches the steady state
- * `chatNeedsSweep`'s docblock describes) and one warn-level line records it.
+ * (step 3 above). `sweepChat` withholds the cursor and watermark the first
+ * time that page comes back with zero items (the same mechanism a truncated
+ * forward walk already used), so `chatNeedsSweep` retries the same first page
+ * next pass; if the retry is ALSO empty, the real watermark commits (so a
+ * genuinely history-less chat still reaches the steady state `chatNeedsSweep`'s
+ * docblock describes) and one warn-level line records it.
+ *
+ * **This retry does not reach every chat #81's live-instance investigation
+ * found empty.** `chatNeedsSweep` only re-selects a chat once `chat.lastActivity`
+ * is truthy, and the investigation's *entire observed population* was chats
+ * Beeper itself never reports any activity for — `chat.lastActivity` null on
+ * every sweep, not merely an empty first page. Those chats are swept exactly
+ * once, commit `lastActivity: null`, and are never re-selected; the retry
+ * above only covers a chat whose `chat.lastActivity` IS truthy but whose
+ * first page still came back empty (a transient fetch hiccup, or a
+ * history-less chat gaining its first-ever activity right as it enters the
+ * mirror). What actually fixed the *reported* symptom — empty rows sorting
+ * above threads with recent messages — for the observed population is the
+ * ORDER BY in `beeperConversations.js`: it no longer falls back to the
+ * mirror row's `created_at` for an activity-less chat (which made a whole
+ * batch of them look freshly active because they were freshly SWEPT), so
+ * they sort LAST instead of first. See `sweepChat`'s inline comment for the
+ * full account of why the two null/null-producing paths are handled
+ * identically rather than being told apart.
  */
 
 import { query, withTransaction } from '../lib/db.js';
@@ -544,17 +556,32 @@ async function sweepChat({
   // so `fetchNewMessages` took the `direction: 'before'` branch) that comes
   // back with zero items is NOT the same as "caught up" — `truncated` is
   // never set on that branch, so falling through to the normal commit below
-  // would watermark the chat as done on one empty page and never look again
-  // (the #81 log-backed verdict: this, not a message-kind filter or the
-  // sweep budget, is what leaves a real share of chats permanently empty).
+  // would watermark the chat as done on one empty page and never look again.
+  //
+  // IMPORTANT — this retry does NOT reach every empty chat. `chatNeedsSweep`
+  // only re-selects a chat once `chat.lastActivity` is truthy; a chat Beeper
+  // itself never reports any activity for (`chat.lastActivity` stays null
+  // forever, which is the *entire observed population* on the live instance
+  // #81 investigated) is swept exactly once, commits null/null below, and is
+  // then never re-selected — the retry cannot fire because there is nothing
+  // for `chatNeedsSweep` to compare a "gained activity" transition against.
+  // That population's empty-row-sorts-first symptom is fixed separately, in
+  // `beeperConversations.js`'s ORDER BY (an activity-less chat now sorts
+  // LAST instead of by its mirror row's mint time). This retry instead
+  // covers the case `chat.lastActivity` IS truthy but the first page still
+  // came back empty — a transient fetch hiccup, or a chat that gains its
+  // first-ever activity right as it enters the mirror.
   //
   // `hadEmptyFirstPageAttempt` recognizes the state a WITHHELD commit leaves
   // behind: a cursor row that exists but carries neither a cursor nor a
-  // watermark. That is not a state any other path in this module produces —
-  // a genuinely history-less chat still commits its real (possibly-null)
-  // `chat.lastActivity`, so this exact null/null combination only arises
-  // from the withholding branch below — which makes it a safe, storage-free
-  // "already retried once" marker with no new column or migration needed.
+  // watermark. That state is NOT exclusive to the withholding branch below —
+  // a chat with `chat.lastActivity` null commits exactly the same null/null
+  // shape on an ordinary first sweep (see above). The two are handled
+  // identically on purpose: whether this null/null row is a prior withhold
+  // or a history-less chat that has just gained its first real activity,
+  // the right move is the same — one retry, then commit-and-warn if it is
+  // still empty — so nothing here needs to (or can, from one sweep's
+  // evidence) tell the two apart. No new DB column or migration needed.
   const isFirstPageAttempt = !stored?.cursor;
   const emptyFirstPage = isFirstPageAttempt && messages.length === 0;
   const hadEmptyFirstPageAttempt = Boolean(stored) && !stored.cursor && !stored.lastActivity;
