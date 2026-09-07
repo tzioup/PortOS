@@ -1145,6 +1145,47 @@ describe('the local "seen in PortOS" watermark (#83)', () => {
     }
   });
 
+  // PR 86's sweep emits an invalidation frame with `chatID: null` once per
+  // account, which this surface's debounce treats as "could be about
+  // anything" and refetches the open thread regardless — so a refetch that
+  // comes back with nothing genuinely new (an UPDATED copy of an
+  // already-rendered message, e.g. an edit or the eventual `message.upserted`
+  // confirmation of a message already on screen) must not re-POST mark-seen.
+  // Without this a multi-account sweep would fire one no-op mark-seen call
+  // per account for a thread with nothing new in it.
+  it('does not re-mark seen when an invalidation refetch returns only already-known messages', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const known = {
+        id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder known message',
+        sentAt: '2026-09-01T10:00:00.000Z', attachments: [],
+      };
+      api.getBeeperMessages.mockResolvedValue({ messages: [known], nextCursor: null });
+
+      renderTab(`/messages/beeper/${CONV_A}`);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => {});
+      await waitFor(() => expect(api.markBeeperConversationSeen).toHaveBeenCalledWith(CONV_A, { silent: true }));
+      api.markBeeperConversationSeen.mockClear();
+
+      // Same id back, just an updated body — not new activity.
+      api.getBeeperMessages.mockResolvedValueOnce({
+        messages: [{ ...known, body: 'Placeholder known message, edited' }],
+        nextCursor: null,
+      });
+      act(() => {
+        for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+          fn({ kind: 'chat.upserted', chatID: null, ids: [], seq: 11 });
+        }
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+
+      expect(api.markBeeperConversationSeen).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not let a failed mark-seen call break opening the thread', async () => {
     api.markBeeperConversationSeen.mockRejectedValue(new Error('offline'));
     api.getBeeperConversation.mockResolvedValue(conversation({ title: 'Example Contact' }));

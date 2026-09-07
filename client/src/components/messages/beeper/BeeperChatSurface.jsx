@@ -546,6 +546,17 @@ export default function BeeperChatSurface({
     if (!mountedRef.current || generation !== threadGenRef.current || !page) return;
     const incoming = Array.isArray(page.messages) ? page.messages : [];
     if (incoming.length === 0) return;
+    // Whether this refetch actually surfaced a message the thread did not
+    // already have — computed against the CURRENT `messages` state before the
+    // merge below, not inside `setMessages`'s own updater (whose timing is
+    // not something to build a side-effect decision on). PR 86's sweep emits
+    // an invalidation frame with `chatID: null` once per account, and this
+    // surface's debounce treats that as "could be about anything" and
+    // refetches the open thread regardless — so a 9-account sweep with
+    // nothing new in THIS thread would otherwise fire ~9 no-op mark-seen
+    // POSTs (an UPDATE plus a full `getConversation` read each) below.
+    const existingIds = new Set(messages.map((message) => message.id));
+    const hasNewMessage = incoming.some((message) => !existingIds.has(message.id));
     setMessages((prev) => {
       const incomingIds = new Set(incoming.map((message) => message.id));
       // A message already present is updated in place (the fresh copy wins)
@@ -558,9 +569,12 @@ export default function BeeperChatSurface({
     // re-stamp the watermark (#83) so the sweep that mirrored it doesn't leave
     // this conversation's badge showing again on the next list/networks
     // refetch, which would otherwise read as "unread" a thread that is
-    // visibly on screen right now.
-    markSeen(id);
-  }, [mountedRef, markSeen]);
+    // visibly on screen right now. Skipped when nothing was actually new: an
+    // UPDATED copy of an already-known message (an edit, or the eventual
+    // `message.upserted` confirmation of something already rendered) is not
+    // new activity for this purpose.
+    if (hasNewMessage) markSeen(id);
+  }, [mountedRef, markSeen, messages]);
 
   useEffect(() => { loadNetworks(); }, [loadNetworks]);
   useEffect(() => { loadList(); }, [loadList]);
