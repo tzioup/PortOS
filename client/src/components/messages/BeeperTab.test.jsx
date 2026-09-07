@@ -602,6 +602,113 @@ describe('realtime', () => {
   });
 });
 
+describe('thread pagination', () => {
+  it('sends the cursor on the second call and renders both pages', async () => {
+    api.getBeeperMessages.mockResolvedValueOnce({
+      messages: [{ id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder page one', sentAt: '2026-09-01T10:00:00.000Z', attachments: [] }],
+      nextCursor: 'cursor-1',
+    });
+    renderTab(`/messages/beeper/${CONV_A}`);
+    await screen.findByText('Placeholder page one');
+
+    api.getBeeperMessages.mockResolvedValueOnce({
+      messages: [{ id: 'm0', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder page two', sentAt: '2026-09-01T09:00:00.000Z', attachments: [] }],
+      nextCursor: null,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Load earlier messages' }));
+
+    await screen.findByText('Placeholder page two');
+    expect(api.getBeeperMessages).toHaveBeenLastCalledWith(CONV_A, { cursor: 'cursor-1' }, { silent: true });
+    expect(screen.getByText('Placeholder page one')).toBeInTheDocument();
+    // The cursor came back null, so there is nothing further to page in.
+    expect(screen.queryByRole('button', { name: 'Load earlier messages' })).toBeNull();
+  });
+
+  // Finding T3: the thread-pagination generation guard used to return early
+  // on a stale response WITHOUT clearing `loadingMore`, so "Load earlier
+  // messages" rendered permanently disabled from that point on — even for a
+  // conversation switched to AFTER the stale request was issued.
+  it('leaves Load-more enabled on the new conversation when an old load-more resolves after a conversation switch', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [
+        conversation({ id: CONV_A, title: 'Example A', sourceChatId: 'chat-example-1' }),
+        conversation({ id: CONV_B, title: 'Example B', sourceChatId: 'chat-example-2' }),
+      ],
+      nextCursor: null,
+    });
+    api.getBeeperConversation.mockImplementation((id) => Promise.resolve(
+      id === CONV_B
+        ? conversation({ id: CONV_B, title: 'Example B', sourceChatId: 'chat-example-2' })
+        : conversation({ id: CONV_A, title: 'Example A', sourceChatId: 'chat-example-1' }),
+    ));
+
+    let releaseOldPage;
+    const oldPage = new Promise((resolve) => { releaseOldPage = resolve; });
+    api.getBeeperMessages.mockImplementation((id, opts) => {
+      if (id === CONV_A && !opts?.cursor) {
+        return Promise.resolve({
+          messages: [{ id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder A newest', sentAt: '2026-09-01T10:00:00.000Z', attachments: [] }],
+          nextCursor: 'cursor-a',
+        });
+      }
+      if (id === CONV_A && opts?.cursor === 'cursor-a') return oldPage;
+      if (id === CONV_B) {
+        return Promise.resolve({
+          messages: [{ id: 'm2', conversationId: CONV_B, senderId: 'user-1', body: 'Placeholder B newest', sentAt: '2026-09-01T09:00:00.000Z', attachments: [] }],
+          nextCursor: 'cursor-b',
+        });
+      }
+      return Promise.resolve({ messages: [], nextCursor: null });
+    });
+
+    renderTab(`/messages/beeper/${CONV_A}`);
+    await screen.findByText('Placeholder A newest');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load earlier messages' }));
+    await waitFor(() => expect(api.getBeeperMessages).toHaveBeenLastCalledWith(CONV_A, { cursor: 'cursor-a' }, { silent: true }));
+
+    // Switch conversations while A's load-more is still in flight.
+    fireEvent.click(screen.getByText('Example B'));
+    await screen.findByText('Placeholder B newest');
+    const loadMoreForB = await screen.findByRole('button', { name: 'Load earlier messages' });
+
+    releaseOldPage({
+      messages: [{ id: 'm-old', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder A older', sentAt: '2026-09-01T08:00:00.000Z', attachments: [] }],
+      nextCursor: null,
+    });
+    // The finally clause must clear `loadingMore` even though the generation
+    // guard drops the stale response itself.
+    await waitFor(() => expect(loadMoreForB).toBeEnabled());
+    expect(screen.queryByText('Placeholder A older')).toBeNull();
+  });
+});
+
+describe('list pagination (Load more)', () => {
+  // Finding T5: `loadMoreConversations` had no in-flight latch — mirroring
+  // `submittingRef` in `useBeeperOutbox.js` — so two clicks landing inside one
+  // render both read "not loading yet" and both fired the same cursor page.
+  it('issues exactly one extra page request when Load more is clicked twice inside one act()', async () => {
+    api.getBeeperConversations
+      .mockResolvedValueOnce({ conversations: [conversation({ id: CONV_A, title: 'Example A' })], nextCursor: 'cursor-1' })
+      .mockResolvedValueOnce({ conversations: [conversation({ id: CONV_B, title: 'Example B' })], nextCursor: null });
+
+    renderTab();
+    await screen.findByText('Example A');
+    const loadMore = screen.getByRole('button', { name: 'Load more' });
+
+    await act(async () => {
+      fireEvent.click(loadMore);
+      fireEvent.click(loadMore);
+      await Promise.resolve();
+    });
+
+    await screen.findByText('Example B');
+    // One mount-time load plus exactly one page fetch — not two.
+    expect(api.getBeeperConversations).toHaveBeenCalledTimes(2);
+    expect(screen.getAllByText('Example B')).toHaveLength(1);
+  });
+});
+
 describe('the two wired rail controls', () => {
   it('archives through the API and reflects the value the server returned', async () => {
     api.getBeeperConversation.mockResolvedValue(conversation({ title: 'Example Contact' }));

@@ -486,23 +486,43 @@ export default function BeeperChatSurface({
     if (!conversationId || !messageCursor) return;
     const generation = threadGenRef.current;
     setLoadingMore(true);
-    const page = await api.getBeeperMessages(conversationId, { cursor: messageCursor }, { silent: true }).catch(() => null);
-    if (!mountedRef.current || generation !== threadGenRef.current) return;
-    if (page) {
-      setMessages((prev) => [...prev, ...(Array.isArray(page.messages) ? page.messages : [])]);
-      setMessageCursor(page.nextCursor || null);
+    try {
+      const page = await api.getBeeperMessages(conversationId, { cursor: messageCursor }, { silent: true }).catch(() => null);
+      // A conversation switch mid-load bumps `threadGenRef` (via `loadThread`),
+      // and this response belongs to the conversation the reader left — it
+      // must not land, but `loadingMore` still has to come back down, or
+      // "Load earlier messages" on the NEW conversation renders permanently
+      // disabled (finding T3). The `finally` below is what guarantees that.
+      if (!mountedRef.current || generation !== threadGenRef.current) return;
+      if (page) {
+        setMessages((prev) => [...prev, ...(Array.isArray(page.messages) ? page.messages : [])]);
+        setMessageCursor(page.nextCursor || null);
+      }
+    } finally {
+      if (mountedRef.current) setLoadingMore(false);
     }
-    setLoadingMore(false);
   }, [conversationId, messageCursor, mountedRef]);
 
+  // A synchronous in-flight latch, mirroring `submittingRef` in
+  // `useBeeperOutbox.js` (finding T5): `listGenRef`/`listLoading` alone do not
+  // stop two clicks landing inside the same render from both reading "not
+  // loading yet" and both firing the same cursor page, appending it twice.
+  // The ref latches before the first `await`, so the second call returns
+  // immediately no matter how close together the two clicks are.
+  const loadingListRef = useRef(false);
   const loadMoreConversations = useCallback(async () => {
-    if (!listCursor) return;
+    if (!listCursor || loadingListRef.current) return;
+    loadingListRef.current = true;
     const generation = listGenRef.current;
-    const page = await api.getBeeperConversations({ ...filters, cursor: listCursor }, { silent: true }).catch(() => null);
-    if (!mountedRef.current || generation !== listGenRef.current) return;
-    if (page) {
-      setConversations((prev) => [...prev, ...(Array.isArray(page.conversations) ? page.conversations : [])]);
-      setListCursor(page.nextCursor || null);
+    try {
+      const page = await api.getBeeperConversations({ ...filters, cursor: listCursor }, { silent: true }).catch(() => null);
+      if (!mountedRef.current || generation !== listGenRef.current) return;
+      if (page) {
+        setConversations((prev) => [...prev, ...(Array.isArray(page.conversations) ? page.conversations : [])]);
+        setListCursor(page.nextCursor || null);
+      }
+    } finally {
+      loadingListRef.current = false;
     }
   }, [filters, listCursor, mountedRef]);
 
