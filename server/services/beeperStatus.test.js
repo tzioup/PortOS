@@ -36,6 +36,7 @@ import {
   probeBeeperInfo, getInfo, BeeperApiError, __setLastBeeperSuccessAtForTests,
 } from './beeperClient.js';
 import { getBeeperStatus, checkBeeperConnection, listBeeperAccounts } from './beeperStatus.js';
+import { getBeeperSweepProgress, updateBeeperSweepProgress, __resetBeeperSweepProgressForTests } from './beeperSweepProgress.js';
 
 const DOWN_REALTIME_STATE = {
   state: 'down', lastEventAt: null, lastPingAt: null, reconnectAttempts: 0, appState: null, appStateActionable: false, authRejected: false,
@@ -108,6 +109,7 @@ describe('getBeeperStatus', () => {
     // reset this explicitly so the ping-recency test below can't leak its
     // override into a later test that assumes the default "never pinged" state.
     vi.mocked(getBeeperRealtimeState).mockReturnValue(DOWN_REALTIME_STATE);
+    __resetBeeperSweepProgressForTests();
   });
 
   it('reports reachable:null (never false) and skips the probe entirely when no token is configured', async () => {
@@ -306,6 +308,49 @@ describe('getBeeperStatus', () => {
     expect(status.tokenExpired).toBe(false);
     expect(status.tokenExpiringSoon).toBe(false);
     expect(status.tokenExpiresAt).toBeNull();
+  });
+
+  // Sweep visibility (#80) — this fails on the old code, which had no `sweep`
+  // key on the status payload at all.
+  describe('sweep state', () => {
+    it('reports an idle shape when no sweep has ever run', async () => {
+      noCredential();
+
+      const status = await getBeeperStatus();
+
+      expect(status.sweep).toEqual({
+        running: false, startedAt: null, finishedAt: null, reason: null,
+        accountsDone: 0, accountsTotal: null, chats: 0, messages: 0,
+      });
+    });
+
+    it('reports a running shape mid-sweep', async () => {
+      noCredential();
+      updateBeeperSweepProgress({
+        running: true, startedAt: '2026-09-05T10:00:00.000Z', finishedAt: null, reason: 'scheduler',
+        accountsDone: 2, accountsTotal: 9, chats: 40, messages: 812,
+      });
+
+      const status = await getBeeperStatus();
+
+      expect(status.sweep).toMatchObject({
+        running: true, accountsDone: 2, accountsTotal: 9, chats: 40, messages: 812,
+      });
+    });
+
+    it('reports the last completed pass once a sweep has finished, not zeroed counts', async () => {
+      noCredential();
+      updateBeeperSweepProgress({
+        running: false, startedAt: '2026-09-05T10:00:00.000Z', finishedAt: '2026-09-05T10:04:12.000Z',
+        reason: 'manual', accountsDone: 9, accountsTotal: 9, chats: 210, messages: 4032,
+      });
+
+      const status = await getBeeperStatus();
+
+      expect(status.sweep).toMatchObject({
+        running: false, finishedAt: '2026-09-05T10:04:12.000Z', accountsDone: 9, accountsTotal: 9, chats: 210, messages: 4032,
+      });
+    });
   });
 });
 

@@ -78,6 +78,8 @@ const {
   runBeeperSweep, isBeeperIngestionArmed, getBeeperSyncConfig, chatNeedsSweep,
   normalizeAccountRow, normalizeMessageRow, normalizeAttachmentRows, DEFAULT_INTERVAL_MINUTES,
 } = await import('./beeperSync.js');
+const { getBeeperSweepProgress, __resetBeeperSweepProgressForTests } = await import('./beeperSweepProgress.js');
+const { beeperSocketEvents } = await import('./beeperSocketEvents.js');
 
 // ---------------------------------------------------------------------------
 // Fetch routing
@@ -142,6 +144,7 @@ beforeEach(() => {
   });
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
+  __resetBeeperSweepProgressForTests();
 });
 
 afterEach(() => {
@@ -196,6 +199,85 @@ describe('runBeeperSweep without a token', () => {
     installFetch();
     await expect(runBeeperSweep({ reason: 'manual' })).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
     expect(fetchedUrls).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sweep progress + invalidation frames (#80) — this fails on the old code,
+// which never touched `beeperSweepProgress.js` or `beeperSocketEvents` at all.
+// ---------------------------------------------------------------------------
+
+describe('sweep progress', () => {
+  it('is idle before any sweep has run', () => {
+    expect(getBeeperSweepProgress()).toMatchObject({
+      running: false, startedAt: null, finishedAt: null, accountsTotal: null, accountsDone: 0, chats: 0, messages: 0,
+    });
+  });
+
+  it('flips back to idle with the final counts once a sweep completes', async () => {
+    installFetch({ chatPages: [{ items: [], hasMore: false }] });
+
+    const result = await runBeeperSweep({ reason: 'manual' });
+
+    const progress = getBeeperSweepProgress();
+    expect(progress.running).toBe(false);
+    expect(progress.startedAt).toEqual(expect.any(String));
+    expect(progress.finishedAt).toEqual(expect.any(String));
+    // ACCOUNTS fixture carries exactly one account.
+    expect(progress.accountsTotal).toBe(1);
+    expect(progress.accountsDone).toBe(1);
+    expect(progress.chats).toBe(result.chats);
+    expect(progress.messages).toBe(result.messages);
+  });
+
+  it('still flips running back to false when the sweep throws before it can start (no token)', async () => {
+    getSettingsMock.mockResolvedValue({ beeper: {} });
+    installFetch();
+
+    await expect(runBeeperSweep({ reason: 'manual' })).rejects.toMatchObject({ code: 'NOT_CONFIGURED' });
+
+    const progress = getBeeperSweepProgress();
+    expect(progress.running).toBe(false);
+    expect(progress.finishedAt).toEqual(expect.any(String));
+  });
+
+  it('still flips running back to false when every account fails (SWEEP_FAILED)', async () => {
+    const fetchMock = vi.fn(async (url) => {
+      fetchedUrls.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname === '/v1/accounts') return jsonResponse(ACCOUNTS);
+      if (parsed.pathname === '/v1/bridges') return jsonResponse(BRIDGES);
+      if (parsed.pathname === '/v1/chats') return { ok: false, status: 502, text: async () => '{"error":"down"}' };
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(runBeeperSweep({ reason: 'manual' })).rejects.toMatchObject({ code: 'SWEEP_FAILED' });
+
+    const progress = getBeeperSweepProgress();
+    expect(progress.running).toBe(false);
+    // The account was attempted (and failed) before the whole-sweep throw.
+    expect(progress.accountsDone).toBe(1);
+    expect(progress.finishedAt).toEqual(expect.any(String));
+  });
+
+  it('emits one invalidation frame per account, plus one when the total is known and one on completion', async () => {
+    installFetch({ chatPages: [{ items: [], hasMore: false }] });
+    const frames = [];
+    const onInvalidate = (frame) => frames.push(frame);
+    beeperSocketEvents.on('invalidate', onInvalidate);
+
+    try {
+      await runBeeperSweep({ reason: 'manual' });
+    } finally {
+      beeperSocketEvents.off('invalidate', onInvalidate);
+    }
+
+    // One account: the "accountsTotal known" frame, one per-account frame, and
+    // the finish frame in the `finally` — three, in order.
+    expect(frames).toHaveLength(3);
+    expect(frames.every((frame) => frame.kind === 'beeper-sweep' && frame.chatID === null)).toBe(true);
+    expect(frames.every((frame) => typeof frame.ts === 'string')).toBe(true);
   });
 });
 

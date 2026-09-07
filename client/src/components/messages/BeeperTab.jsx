@@ -25,6 +25,9 @@ import BeeperSettingsPanel from './beeper/BeeperSettingsPanel';
  *     plus an invalidation counter (and the frames behind it, for
  *     `BeeperChatSurface`'s own frame-scoped thread refetch) are handed down
  *     as props, so the settings drawer never needs a subscription of its own.
+ *     Sweep state (`sweep`) and `tokenConfigured` ride the same status fetch
+ *     (#80) — no second poller, and every invalidation frame the sweep itself
+ *     fires as it goes (see `beeperSync.js`) refreshes it here too.
  *  2. **The settings drawer.** #30's status card is not removed by the chat
  *     surface landing — it moves behind a header action, deep-linked as
  *     `?settings=1` exactly like the iMessage ingestion drawer, so ⌘K and voice
@@ -78,6 +81,18 @@ export default function BeeperTab() {
   // the chat surface, which #12 decision 4 reserves for the settings card.
   const [breaker, setBreaker] = useState(null);
 
+  // Sweep visibility (#80): running/idle, started/finished, accounts done of
+  // the total, chats and messages mirrored so far — the list header's
+  // "Syncing… N of M accounts" / "Last synced HH:MM" strip reads this, and
+  // `tokenConfigured` is what the empty state branches on instead of
+  // `networks.length` alone. Both ride the SAME status fetch as `realtime`
+  // and `breaker` below, reusing the existing mount + invalidation-frame
+  // triggers rather than adding a second poller — a sweep's own per-account
+  // progress reaches here because `beeperSync.js` fires an invalidation frame
+  // as it goes (see beeperSync.js's `emitSweepInvalidation`).
+  const [sweep, setSweep] = useState(null);
+  const [tokenConfigured, setTokenConfigured] = useState(false);
+
   // Seeded from the page, not from the settings drawer: `beeper:subscribe`
   // does not push the current transport state, and the drawer's own status
   // fetch only runs once it is opened — so without this the rail's dot would
@@ -90,6 +105,8 @@ export default function BeeperTab() {
         if (!mountedRef.current) return;
         if (status?.realtime) seedRealtime(status.realtime);
         setBreaker(status?.outbox?.breaker || null);
+        setSweep(status?.sweep || null);
+        setTokenConfigured(status?.tokenConfigured === true);
       })
       .catch(() => {});
   }, [seedRealtime, mountedRef]);
@@ -138,6 +155,8 @@ export default function BeeperTab() {
         invalidationSeq={invalidationSeq}
         invalidationFrames={invalidationFramesRef}
         breaker={breaker}
+        sweep={sweep}
+        tokenConfigured={tokenConfigured}
         onOpenSettings={() => setSettingsParam('1')}
       />
 

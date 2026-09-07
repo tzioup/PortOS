@@ -110,7 +110,12 @@ Storing a credential, flipping the Beeper feature or the Comms group, or saving 
 **Enable scheduled Beeper sync** itself, arms or disarms both the sweep scheduler and the
 realtime transport immediately — `reconcileBeeperIngestion()` in `server/services/beeperArming.js`
 is called from every one of those paths, so no restart is needed and a disconnect stops the relay
-rather than leaving it running on a revoked token.
+rather than leaving it running on a revoked token. **Arming also runs one sweep right away**
+(fork issue #79): before this, connecting (or turning a toggle on) registered the interval timer
+but the mirror stayed empty until a full interval had elapsed. Changing just the sync interval —
+no toggle flip — takes effect the same way, without a restart: `PUT /api/settings` restarts the
+scheduler's registration when `beeper.intervalMinutes` changes on its own (see
+[The mirror](#the-mirror) below).
 
 ## Connecting
 
@@ -217,8 +222,24 @@ deliberately different things:
 - `settings.beeper.enabled` — the **user's ingestion opt-in**, re-read on every tick, so
   turning it off mid-session stops runs without a restart.
 
-The first run is one interval after registration, never at boot. The interval is locked at
-registration; changing it takes effect at the next process start.
+The registered event's own first tick lands one interval after registration, never at boot — a
+process restart never fires a network sweep by itself, and neither does a plain re-registration
+(the interval-change path below re-registers without touching this). Fork issue #79's fix sits
+ONE layer up: `beeperArming.js`'s `reconcileBeeperIngestion()` fires `runBeeperSweep({ reason:
+'arm' })` directly, fire-and-forget, whenever a reconcile is the one that newly registers the
+scheduler — connecting, or turning the Beeper feature or the sync toggle on — never on the boot
+call in `bootstrap.js`, which never reaches that reconcile at all. So a fresh arm gets one sweep
+right away and the registered interval fires on its own schedule after that, unaffected.
+
+The interval itself is read fresh at every *registration*, but a **running** registration does not
+notice a settings change mid-flight — changing `intervalMinutes` alone used to take effect only at
+the next process restart. `restartBeeperScheduler()` (`server/services/beeperScheduler.js`) is the
+fix: cancel the current registration and register a fresh one, which reads
+`getBeeperSyncConfig()` again. `PUT /api/settings` calls it when a save changes
+`beeper.intervalMinutes` without also flipping `enabled` (an `enabled` flip already gets a fresh
+registration — and therefore the just-persisted interval — through `reconcileBeeperIngestion()`).
+Deliberately no immediate sweep on this path: only arming kicks one, and firing a sweep on every
+interval edit would surprise a user who is just tuning a number.
 
 Per account, one sweep:
 
@@ -343,6 +364,42 @@ global emit would cross the wire to other installs. Frames carry ids, kinds and 
 liveness. They never carry message bodies, display names or handles; the browser refetches from
 the PortOS mirror, which is the read path.
 
+### Sweep visibility and the list header
+
+Before fork issue #80, nothing on screen distinguished "connected, first sync running" from
+"nothing connected" — the empty inbox told a user who had just connected nine accounts to go
+connect one. Two pieces close that gap:
+
+- **`server/services/beeperSweepProgress.js`** is a small standalone leaf module (same reason
+  `beeperSocketEvents.js` is one: a read-only status route has no business importing the sweep's
+  whole DB/HTTP dependency graph just to report a few numbers) holding one in-memory, process-wide
+  snapshot: `running`, `startedAt`, `finishedAt`, `reason`, `accountsDone`, `accountsTotal`,
+  `chats`, `messages`. `executeSweep` in `beeperSync.js` updates it as it goes — `running: true`
+  before the first HTTP call, `accountsTotal` once the roster is known, `accountsDone`/`chats`/
+  `messages` after every account, `running: false` in a `finally` so a thrown `NOT_CONFIGURED` or
+  `SWEEP_FAILED` still flips it back. `beeperStatus.js` reads it into `GET /api/beeper/status`'s
+  `sweep` field (see [API surface](#api-surface)).
+- **The sweep fires an invalidation frame** — the exact `{ kind, chatID, ids, seq, ts }` shape
+  #33's realtime relay already uses, with `kind: 'beeper-sweep'` and `chatID: null` — once the
+  account count is known and again after every account finishes, reusing `beeperSocketEvents`
+  rather than opening a second channel. `BeeperTab.jsx` already re-fetches `GET
+  /api/beeper/status` on every invalidation frame (the same fetch that seeds the realtime dot and
+  the outbox breaker flag), so the list header's strip and the settings drawer's status card both
+  move as the sweep progresses with no separate poller anywhere.
+
+The list header (`BeeperChatSurface.jsx`) renders `"Syncing… N of M accounts"` while `sweep.running`
+is true and `"Last synced HH:MM"` (from `sweep.finishedAt`) once idle; nothing before a sweep has
+ever run. The settings drawer's status card shows the identical two lines beside the realtime dot.
+The empty state also branches on `tokenConfigured` rather than on `networks.length` alone:
+connected but nothing mirrored yet reads **"First sync in progress"**; never connected keeps the
+"Open Beeper settings" prompt.
+
+**"Sync now"** replaces what used to be a plain refresh button (fork issue #79): the list header's
+icon button now calls `POST /api/beeper/sync` first and re-fetches the conversation list and the
+network rail once that resolves (`skipped: true` — a sweep already in flight, most likely the
+scheduled one — still triggers the re-fetch, since whatever that sweep already wrote is worth
+showing).
+
 ## Sending
 
 There is exactly one send path and it is a human one, in two steps and two routes, mirroring the
@@ -456,7 +513,7 @@ its attachments, the token, and anything on the Socket.IO relay.
 
 | Method | Route | What it does |
 | --- | --- | --- |
-| `GET` | `/api/beeper/status` | The status card's read model: token presence/expiry/provenance, a cached reachability probe, the account roster, realtime state, outbox breaker |
+| `GET` | `/api/beeper/status` | The status card's read model: token presence/expiry/provenance, a cached reachability probe, the account roster, realtime state, outbox breaker, sweep progress (`sweep: { running, startedAt, finishedAt, reason, accountsDone, accountsTotal, chats, messages }`, fork issue #80) |
 | `POST` | `/api/beeper/status/check` | Live uncached probe with a coded error per failure mode |
 | `POST` | `/api/beeper/sync` | Run one watermark-bounded sweep now; a sweep already in flight reports `skipped: true` |
 | `GET` | `/api/beeper/conversations` | Rail list for one scope (network, unread-only, archived, low-priority), cursor-paginated |
@@ -487,7 +544,7 @@ Socket.IO events:
 | --- | --- | --- |
 | `beeper:subscribe` | client → server | Join the Beeper broadcast set (re-emitted on every socket `connect`) |
 | `beeper:unsubscribe` | client → server | Leave it |
-| `beeper:invalidate` | server → Beeper subscribers | `{ kind, chatID, ids, seq, ts }` — ids and kinds only, never content |
+| `beeper:invalidate` | server → Beeper subscribers | `{ kind, chatID, ids, seq, ts }` — ids and kinds only, never content. `kind: 'beeper-sweep'` (`chatID: null`) is the sweep's own progress frame, fork issue #80 |
 | `beeper:realtime` | server → Beeper subscribers | The transport liveness snapshot: `state`, `lastEventAt`, `lastPingAt`, `reconnectAttempts`, `appState`, `appStateActionable`, `authRejected` |
 
 Both surfaces publish as **generated** contract entries. `/api/beeper` appears in
@@ -528,12 +585,18 @@ analysis:
   thread with an uncached image load in Chrome and confirm nothing reflows.
 - **The conversation-not-found 404's `severity: 'warning'` path** was verified by the server
   suite and by static analysis of the socket and hook chain, not observed running.
+- **The arming-kicks-a-sweep and sweep-progress-strip fixes (fork issues #79/#80)** were built and
+  tested against a mocked `beeperClient.js` — the immediate sweep on connect, the interval taking
+  effect without a restart, and the list header's "Syncing… N of M accounts" strip moving as a real
+  multi-account sweep progresses have not been watched against a live Beeper Desktop with several
+  connected accounts.
 
 ## Files
 
 - `server/services/beeperClient.js` — the HTTP client, pagination, error mapping, asset streaming
 - `server/services/beeperOAuth.js`, `beeperCredentials.js` — connect, disconnect, the vault
 - `server/services/beeperSync.js`, `beeperScheduler.js`, `beeperArming.js` — the sweep and its gates
+- `server/services/beeperSweepProgress.js` — the sweep-progress leaf module `beeperStatus.js` reads
 - `server/services/beeperSocket.js`, `beeperSocketEvents.js` — the realtime transport and its bus
 - `server/services/beeperConversations.js`, `beeperAttachments.js`, `beeperAttachmentGc.js` — the read model, the byte mirror, the housekeeping sweep
 - `server/services/beeperOutbox.js`, `beeperStatus.js`, `beeperTribe.js` — sending, the status card, identity linking

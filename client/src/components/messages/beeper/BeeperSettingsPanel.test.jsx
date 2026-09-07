@@ -85,6 +85,34 @@ describe('BeeperSettingsPanel — status card states', () => {
     expect(screen.getByTestId('beeper-roster-empty')).toBeInTheDocument();
   });
 
+  // The drawer card's own copy of the list header's sweep-visibility strip
+  // (#80) — same status payload, different surface.
+  it('shows a running sweep on the drawer card', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, lastProbeError: null, accounts: [],
+      sweep: {
+        running: true, startedAt: '2026-09-05T10:00:00.000Z', finishedAt: null, reason: 'scheduler',
+        accountsDone: 3, accountsTotal: 9, chats: 40, messages: 812,
+      },
+    });
+    renderPanel();
+
+    expect(await screen.findByText('Syncing… 3 of 9 accounts')).toBeInTheDocument();
+  });
+
+  it('shows the last-synced time on the drawer card once idle', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, lastProbeError: null, accounts: [],
+      sweep: {
+        running: false, startedAt: '2026-09-05T10:00:00.000Z', finishedAt: '2026-09-05T10:04:00.000Z', reason: 'manual',
+        accountsDone: 9, accountsTotal: 9, chats: 210, messages: 4032,
+      },
+    });
+    renderPanel();
+
+    expect(await screen.findByText(/Last synced \d{1,2}:\d{2}/)).toBeInTheDocument();
+  });
+
   // The mirrored roster comes from `beeper_accounts`, not from a live call —
   // which is why #27 stores it. Hiding it whenever the probe fails threw away
   // what the install already knew and made an unreachable app look like an

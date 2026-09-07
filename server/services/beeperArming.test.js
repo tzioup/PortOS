@@ -54,6 +54,7 @@ vi.mock('./beeperSocket.js', () => ({
 }));
 
 const { reconcileBeeperIngestion } = await import('./beeperArming.js');
+const { runBeeperSweep } = await import('./beeperSync.js');
 const { cancel, getEvent } = await import('./eventScheduler.js');
 
 function captureLogs() {
@@ -71,6 +72,7 @@ beforeEach(() => {
   socket.stops = 0;
   socket.gate = Promise.resolve();
   socket.onStart = () => {};
+  runBeeperSweep.mockClear();
 });
 
 afterEach(() => {
@@ -224,5 +226,66 @@ describe('reconcileBeeperIngestion', () => {
     expect(getEvent('beeper-sync')).toBeTruthy();
     expect(socket.running).toBe(true);
     expect(disabledResult.changed).toBe(false);
+  });
+
+  // Fork issue #79: before this, connecting (or flipping a feature/sync
+  // toggle on) registered the interval timer but fired nothing until a full
+  // interval had elapsed. This fails on the old code — which never called
+  // `runBeeperSweep` from `reconcileOnce` at all.
+  describe('immediate sweep on arm (#79)', () => {
+    it('kicks one sweep immediately when a reconcile newly registers the scheduler', async () => {
+      captureLogs();
+
+      await reconcileBeeperIngestion({ reason: 'oauth-connect' });
+
+      expect(runBeeperSweep).toHaveBeenCalledTimes(1);
+      expect(runBeeperSweep).toHaveBeenCalledWith({ reason: 'arm' });
+    });
+
+    it('does not kick a second sweep on a reconcile that finds the scheduler already registered', async () => {
+      captureLogs();
+      await reconcileBeeperIngestion({ reason: 'oauth-connect' });
+      runBeeperSweep.mockClear();
+
+      await reconcileBeeperIngestion({ reason: 'feature-toggle' });
+
+      expect(runBeeperSweep).not.toHaveBeenCalled();
+    });
+
+    it('does not kick a sweep when the gate is armed but the user has scheduled sync off', async () => {
+      state.config = { enabled: false, intervalMinutes: 5 };
+      captureLogs();
+
+      await reconcileBeeperIngestion({ reason: 'oauth-connect' });
+
+      expect(getEvent('beeper-sync')).toBeFalsy();
+      expect(runBeeperSweep).not.toHaveBeenCalled();
+    });
+
+    it('does not kick a sweep on disarm', async () => {
+      captureLogs();
+      await reconcileBeeperIngestion({ reason: 'oauth-connect' });
+      runBeeperSweep.mockClear();
+
+      state.armed = false;
+      await reconcileBeeperIngestion({ reason: 'disconnect' });
+
+      expect(runBeeperSweep).not.toHaveBeenCalled();
+    });
+
+    // A rejected kick is logged, not thrown — the fire-and-forget promise
+    // must never turn a completed arm into a caller-visible failure.
+    it('logs rather than throws when the kicked sweep rejects', async () => {
+      runBeeperSweep.mockRejectedValueOnce(new Error('boom'));
+      const logs = captureLogs();
+
+      const result = await reconcileBeeperIngestion({ reason: 'oauth-connect' });
+
+      expect(result.armed).toBe(true);
+      // Give the unawaited rejection's `.catch` a turn of the microtask queue.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(logs.some((line) => line.includes('immediate sweep on arm failed'))).toBe(true);
+    });
   });
 });

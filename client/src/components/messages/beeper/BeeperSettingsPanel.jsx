@@ -7,7 +7,7 @@ import { useBeeperSettings } from '../../../hooks/useBeeperSettings';
 import useMounted from '../../../hooks/useMounted';
 import ConnectionStatusDot from '../../ui/ConnectionStatusDot';
 import BeeperOutboxBreakerBanner from './BeeperOutboxBreakerBanner';
-import { formatBytes } from '../../../utils/formatters';
+import { formatBytes, formatClockTime } from '../../../utils/formatters';
 import {
   getBeeperStatus, checkBeeperConnection, startBeeperOAuth, saveBeeperToken, disconnectBeeper,
   getBeeperAttachmentSummary, backfillBeeperAttachments,
@@ -481,6 +481,35 @@ function BeeperRealtimeRow({ realtime, showRemedy = true }) {
 }
 
 /**
+ * The sweep-visibility row (#80), rendered in EVERY reachability state
+ * alongside `BeeperRealtimeRow` — the drawer card's own copy of the same
+ * "Syncing… N of M accounts" / "Last synced HH:MM" strip the chat surface's
+ * list header shows, so a user who opened settings instead of the chat
+ * surface still sees whether ingestion is doing anything. `null` (no sweep
+ * has ever run on this install) renders nothing, same absent-vs-never rule
+ * `BeeperRealtimeRow` follows for a transport that has not reported yet.
+ */
+function SweepStatusRow({ sweep }) {
+  if (!sweep) return null;
+  if (sweep.running) {
+    const total = Number.isFinite(sweep.accountsTotal) ? sweep.accountsTotal : null;
+    const done = Number.isFinite(sweep.accountsDone) ? sweep.accountsDone : 0;
+    return (
+      <p className="text-xs text-gray-400 flex items-center gap-1.5">
+        <Loader2 size={12} className="animate-spin" />
+        {total === null ? 'Syncing…' : `Syncing… ${done} of ${total} account${total === 1 ? '' : 's'}`}
+      </p>
+    );
+  }
+  if (!sweep.finishedAt) return null;
+  return (
+    <p className="text-xs text-gray-500">
+      Last synced {formatClockTime(sweep.finishedAt, { seconds: false })}
+    </p>
+  );
+}
+
+/**
  * The mirrored account roster (#30), rendered in EVERY reachability state.
  *
  * These rows come from `beeper_accounts` — PortOS's own mirror — not from a
@@ -610,6 +639,7 @@ function BeeperStatusCard({
         <p className="text-xs text-gray-500 mt-1">Checked against {status.baseUrl}.</p>
         <TokenExpiryNotice status={status} />
         <div className="mt-2"><BeeperRealtimeRow realtime={realtime} /></div>
+        <div className="mt-1"><SweepStatusRow sweep={status.sweep} /></div>
         {/* The mirror still knows which accounts exist even with Beeper closed. */}
         <div className="mt-3"><AccountRoster accounts={status.accounts} error={status.accountsError} /></div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -653,6 +683,7 @@ function BeeperStatusCard({
         )}
         <TokenExpiryNotice status={status} />
         <BeeperRealtimeRow realtime={realtime} />
+        <SweepStatusRow sweep={status.sweep} />
         <AccountRoster accounts={status.accounts} error={status.accountsError} />
         <div className="flex flex-wrap items-center gap-2">
           <button
@@ -681,6 +712,7 @@ function BeeperStatusCard({
         <h3 className="text-sm font-semibold text-white">Checking Beeper Desktop…</h3>
       </div>
       <BeeperRealtimeRow realtime={realtime} />
+      <SweepStatusRow sweep={status.sweep} />
       <AccountRoster accounts={status.accounts} error={status.accountsError} />
     </div>
   );
