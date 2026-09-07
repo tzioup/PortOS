@@ -42,6 +42,14 @@
  * No AI provider call happens anywhere on this path — ingestion is
  * deterministic — so AGENTS.md's "No cold-bootstrap LLM calls" does not gate
  * it, exactly as `imessageScheduler.js` records for the same shape.
+ *
+ * **Progress (fork issue #80).** `executeSweep` keeps `beeperSweepProgress.js`
+ * current as it goes — running/idle, started/finished, accounts done of the
+ * total, chats and messages mirrored so far — and `beeperStatus.js` reads it
+ * into the status payload the list header and the drawer card render from. It
+ * also fires an invalidation frame on `beeperSocketEvents` after the account
+ * count is known and after every account finishes, reusing #33's existing
+ * push path rather than adding a client-side poller.
  */
 
 import { query, withTransaction } from '../lib/db.js';
@@ -55,6 +63,8 @@ import {
 import { upsertParticipant, logSenderTouchpoints, loadRosterIndex } from './beeperTribe.js';
 import { isInstanceFeatureEnabled } from './instanceFeatures.js';
 import { getSettings } from './settings.js';
+import { updateBeeperSweepProgress } from './beeperSweepProgress.js';
+import { beeperSocketEvents } from './beeperSocketEvents.js';
 
 export const DEFAULT_INTERVAL_MINUTES = 5;
 
@@ -659,64 +669,104 @@ async function sweepAccount(account, clientOptions, observedAt, personIndex) {
 // already fetching everything the newcomer would have.
 let inFlightSweep = null;
 
+/**
+ * One invalidation frame, reusing the exact shape `beeperSocket.js` emits for
+ * a live domain frame (`{ kind, chatID, ids, seq, ts }`, fork issue #33) so
+ * the browser side needs no new handling: `useBeeperRealtime` already relays
+ * every frame's `kind` untouched, and `BeeperChatSurface`'s debounce treats a
+ * `chatID: null` frame as "could be about anything" and refetches the list —
+ * exactly right here, since one sweep can touch any number of conversations.
+ * This is fork issue #80's "reuse the existing push path instead of adding a
+ * client poller": `BeeperTab.jsx` already re-fetches `GET /api/beeper/status`
+ * on every invalidation frame, so a frame here is what makes the "Syncing… N
+ * of M accounts" strip move and the "Last synced" timestamp update live,
+ * without a second polling loop anywhere.
+ */
+function emitSweepInvalidation() {
+  beeperSocketEvents.emit('invalidate', {
+    kind: 'beeper-sweep', chatID: null, ids: [], seq: null, ts: new Date().toISOString(),
+  });
+}
+
 async function executeSweep(reason) {
-  const clientOptions = await resolveBeeperConfig();
-  if (!clientOptions.token) {
-    throw new BeeperApiError('Beeper access token is not configured', {
-      status: 401, code: 'NOT_CONFIGURED', retryable: false,
-    });
+  updateBeeperSweepProgress({
+    running: true, startedAt: new Date().toISOString(), finishedAt: null, reason,
+    accountsDone: 0, accountsTotal: null, chats: 0, messages: 0,
+  });
+  try {
+    const clientOptions = await resolveBeeperConfig();
+    if (!clientOptions.token) {
+      throw new BeeperApiError('Beeper access token is not configured', {
+        status: 401, code: 'NOT_CONFIGURED', retryable: false,
+      });
+    }
+
+    const startedAt = Date.now();
+    const observedAt = new Date(startedAt).toISOString();
+    const accounts = await refreshAccounts(clientOptions);
+    updateBeeperSweepProgress({ accountsTotal: accounts.length });
+    emitSweepInvalidation();
+
+    // Loaded ONCE for the whole sweep pass, across every account/chat/participant
+    // below — not once per participant. `upsertParticipant`'s phone-match
+    // fallback reindexes the entire Tribe roster on a miss, and a sweep touches
+    // every participant of every changed chat on every account.
+    const personIndex = await loadRosterIndex();
+
+    let chats = 0;
+    let messages = 0;
+    let accountsDone = 0;
+    let failedAccounts = 0;
+    let failedChats = 0;
+    for (const account of accounts) {
+      // eslint-disable-next-line no-await-in-loop -- accounts are swept in order; each owns its own cursors
+      const result = await sweepAccount(account, clientOptions, observedAt, personIndex).catch((err) => {
+        failedAccounts++;
+        console.error(`❌ ${LOG_PREFIX}: account ${account.accountId} failed: ${err.message}`);
+        return null;
+      });
+      if (result) {
+        chats += result.chatsSwept;
+        messages += result.messagesWritten;
+        failedChats += result.failedChats;
+      }
+      // #80: one account done, whether it succeeded or failed — "N of M" counts
+      // accounts attempted, not accounts that mirrored something.
+      accountsDone++;
+      updateBeeperSweepProgress({ accountsDone, chats, messages });
+      emitSweepInvalidation();
+    }
+
+    // Every account failing is a FAILED sweep, not a successful one that wrote
+    // nothing. Resolving here would have `eventScheduler` record a green run and
+    // `POST /api/beeper/sync` answer 200 while nothing was ingested at all —
+    // with only the `failedAccounts` count in the payload to say otherwise.
+    // Partial failure still resolves: the accounts that worked kept their pass.
+    if (accounts.length > 0 && failedAccounts === accounts.length) {
+      throw new BeeperApiError(`Beeper sweep failed for all ${accounts.length} accounts`, {
+        status: 502, code: 'SWEEP_FAILED', retryable: true,
+      });
+    }
+
+    const durationMs = Date.now() - startedAt;
+    console.log(`${LOG_PREFIX} (${reason}): ${accounts.length} accounts, ${chats} chats, ${messages} messages in ${durationMs}ms`);
+    return {
+      skipped: false,
+      reason,
+      accounts: accounts.length,
+      chats,
+      messages,
+      failedAccounts,
+      failedChats,
+      durationMs,
+    };
+  } finally {
+    // Always runs — a thrown NOT_CONFIGURED or SWEEP_FAILED must flip `running`
+    // back to false exactly like a clean resolve, or the status card would show
+    // a sweep in progress forever after the first failure.
+    updateBeeperSweepProgress({ running: false, finishedAt: new Date().toISOString() });
+    emitSweepInvalidation();
   }
-
-  const startedAt = Date.now();
-  const observedAt = new Date(startedAt).toISOString();
-  const accounts = await refreshAccounts(clientOptions);
-
-  // Loaded ONCE for the whole sweep pass, across every account/chat/participant
-  // below — not once per participant. `upsertParticipant`'s phone-match
-  // fallback reindexes the entire Tribe roster on a miss, and a sweep touches
-  // every participant of every changed chat on every account.
-  const personIndex = await loadRosterIndex();
-
-  let chats = 0;
-  let messages = 0;
-  let failedAccounts = 0;
-  let failedChats = 0;
-  for (const account of accounts) {
-    // eslint-disable-next-line no-await-in-loop -- accounts are swept in order; each owns its own cursors
-    const result = await sweepAccount(account, clientOptions, observedAt, personIndex).catch((err) => {
-      failedAccounts++;
-      console.error(`❌ ${LOG_PREFIX}: account ${account.accountId} failed: ${err.message}`);
-      return null;
-    });
-    if (!result) continue;
-    chats += result.chatsSwept;
-    messages += result.messagesWritten;
-    failedChats += result.failedChats;
-  }
-
-  // Every account failing is a FAILED sweep, not a successful one that wrote
-  // nothing. Resolving here would have `eventScheduler` record a green run and
-  // `POST /api/beeper/sync` answer 200 while nothing was ingested at all —
-  // with only the `failedAccounts` count in the payload to say otherwise.
-  // Partial failure still resolves: the accounts that worked kept their pass.
-  if (accounts.length > 0 && failedAccounts === accounts.length) {
-    throw new BeeperApiError(`Beeper sweep failed for all ${accounts.length} accounts`, {
-      status: 502, code: 'SWEEP_FAILED', retryable: true,
-    });
-  }
-
-  const durationMs = Date.now() - startedAt;
-  console.log(`${LOG_PREFIX} (${reason}): ${accounts.length} accounts, ${chats} chats, ${messages} messages in ${durationMs}ms`);
-  return {
-    skipped: false,
-    reason,
-    accounts: accounts.length,
-    chats,
-    messages,
-    failedAccounts,
-    failedChats,
-    durationMs,
-  };
 }
 
 /**

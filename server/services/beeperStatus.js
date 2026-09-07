@@ -25,6 +25,7 @@ import {
 import { getBeeperRealtimeState } from './beeperSocket.js';
 import { getOutboxStatus } from './beeperOutbox.js';
 import { resolveBeeperToken } from './beeperCredentials.js';
+import { getBeeperSweepProgress } from './beeperSweepProgress.js';
 
 const TOKEN_EXPIRY_WARNING_DAYS = 7;
 
@@ -186,6 +187,14 @@ export async function getBeeperStatus() {
     outbox: getOutboxStatus(),
     accounts: accountsResult.accounts,
     accountsError: accountsResult.accountsError,
+    // Sweep visibility (#80): running/idle, started/finished, accounts done of
+    // the total, chats and messages mirrored so far. Read from the standalone
+    // `beeperSweepProgress.js` leaf module rather than `beeperSync.js` itself —
+    // same reasoning as importing `beeperSocketEvents.js` instead of
+    // `beeperSocket.js` above: a read-only status card has no business
+    // dragging the whole sweep's DB/HTTP dependency graph in just to report a
+    // few numbers.
+    sweep: getBeeperSweepProgress(),
   };
 }
 
