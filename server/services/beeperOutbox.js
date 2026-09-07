@@ -275,17 +275,34 @@ const CONTACTED_STATES = ['sent', 'awaiting-confirmation', 'sending'];
  * mis-resolved handle on a possibly wrong network — and it is the only one,
  * because confirming every reply trains the user to click through.
  *
- * Keyed on the outbox rather than on a mirrored `isSender` message: the mirror
- * records what the USER sent from their phone, which is not evidence that this
- * PortOS install has ever addressed the conversation correctly.
+ * Keyed on EITHER source of outbound history, not the outbox alone (fork
+ * issue #82): a mirrored `beeper_messages` row with `is_sender` true means the
+ * user has messaged this chat from some client, which is exactly the "have I
+ * addressed this recipient and network before" question the confirmation
+ * exists to answer — restricting it to sends this particular PortOS install
+ * made re-asked the question on every chat with older phone/desktop history,
+ * which is precisely the "fires when it should not" case #82 reports. The
+ * outbox arm stays for the gap the mirror cannot see: a send whose POST left
+ * this machine but has not (yet, or ever) come back through the mirror as an
+ * `isSender` message — `awaiting-confirmation` and `sending` are exactly that
+ * gap, per `CONTACTED_STATES` above. Either source alone is sufficient; the
+ * confirmation is reserved for a conversation neither source has any
+ * outbound history for.
  */
 export async function isFirstContact(conversationId) {
-  const result = await query(
+  const outboxSend = await query(
     `SELECT 1 FROM beeper_outbox
      WHERE conversation_id = $1 AND state = ANY($2::text[]) LIMIT 1`,
     [conversationId, CONTACTED_STATES],
   );
-  return (result?.rows?.length ?? 0) === 0;
+  if ((outboxSend?.rows?.length ?? 0) > 0) return false;
+
+  const mirroredSend = await query(
+    `SELECT 1 FROM beeper_messages
+     WHERE conversation_id = $1 AND is_sender = TRUE LIMIT 1`,
+    [conversationId],
+  );
+  return (mirroredSend?.rows?.length ?? 0) === 0;
 }
 
 async function markFailed(id, code, message) {
