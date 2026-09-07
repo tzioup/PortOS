@@ -803,9 +803,7 @@ export default function BeeperThread({
           aria-disabled={!canSend}
           aria-label="Send"
           title={sendDisabledReason}
-          className={`shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 ${
-            !canSend ? 'cursor-not-allowed bg-port-accent/40 hover:bg-port-accent/40' : ''
-          }`}
+          className="shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 aria-disabled:cursor-not-allowed aria-disabled:bg-port-accent/40 aria-disabled:hover:bg-port-accent/40"
         >
           {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
         </button>
