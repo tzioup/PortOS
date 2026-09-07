@@ -239,6 +239,21 @@ describe('listConversations — row shaping', () => {
     const { conversations } = await listConversations({});
     expect(conversations[0].lastMessage).toBeNull();
   });
+
+  // #81: the client's row preview falls back to "Syncing…" for a recent
+  // `lastActivity` with no mirrored message, and to the honest "No messages
+  // mirrored yet" otherwise (`BeeperChatSurface.jsx`'s `isRecentActivity`).
+  // That fallback has nothing else to key on, so `lastActivity` must keep
+  // passing through untouched — not coerced to the conversation's
+  // `created_at`, not dropped — even while `lastMessage` stays `null`.
+  it('still reports the conversation-level lastActivity alongside a null lastMessage, so the client can tell "still syncing" from "no history"', async () => {
+    vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [conversationRow({ last_activity: '2026-09-02T09:00:00.000Z' })] }) // page
+      .mockResolvedValueOnce({ rows: [] }) // preview
+      .mockResolvedValueOnce({ rows: [] }); // participants
+    const { conversations } = await listConversations({});
+    expect(conversations[0]).toMatchObject({ lastMessage: null, lastActivity: '2026-09-02T09:00:00.000Z' });
+  });
 });
 
 describe('getConversation', () => {

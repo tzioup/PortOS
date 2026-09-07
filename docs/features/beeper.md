@@ -263,6 +263,27 @@ and finishes catching up on the next sweep instead of being skipped as caught-up
 
 No AI provider call happens anywhere on this path. Ingestion is deterministic.
 
+**An empty first page is retried once, not marked done (#81).** A brand-new chat's first sweep
+takes exactly one page in the newest-first (`before`) direction. A live-instance investigation
+found a real share of freshly-mirrored chats getting zero messages back on that one page and
+staying empty forever — not from a message-kind filter (there is none) and not from the safety
+caps above (they only bound the forward catch-up walk on a chat that already has a stored
+cursor). The old code committed the chat's watermark on that result regardless, which is exactly
+what marked it done. The sweep now withholds the cursor and watermark the first time a chat's
+first page comes back empty, so the next sweep retries the same page; if the retry is *also*
+empty, the real watermark commits (so a genuinely history-less chat still reaches a stable,
+not-re-swept state) and one warn-level log line records it — chat id only, no content.
+
+**The Inbox row while a chat is still catching up.** `beeper_conversations.last_activity` is
+Beeper's own chat-level watermark, mirrored independently of whether any message has actually
+been mirrored — so a row can carry a recent `last_activity` while `lastMessage` is still `null`.
+Beeper's own `Chat` payload carries no preview or snippet text to show in that gap, so the rail
+row (`BeeperChatSurface.jsx`) reads it off `last_activity` instead: a conversation with no
+mirrored message and a `last_activity` inside the last 24 hours shows **"Syncing…"**; anything
+older, or with no `last_activity` at all, keeps the honest **"No messages mirrored yet"** copy.
+Sort order is unchanged — still `COALESCE(last_activity, created_at)` recency — the fallback only
+changes what the empty row *says* while it is near the top for a legitimate reason.
+
 **What is mirrored:** accounts, conversations, messages, participants, attachment *metadata* and
 per-chat sync cursors, across eight `beeper_*` tables. **What is not:** `loginID` is stripped
 from every account and bridge row before it reaches any caller (it is the bridge login

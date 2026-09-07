@@ -76,6 +76,14 @@ const INVALIDATION_DEBOUNCE_MS = 350;
 // into one refetch, tight enough that a busy account's view is never more
 // than two seconds stale.
 const INVALIDATION_MAX_WAIT_MS = 2000;
+// #81: how long a conversation with no mirrored message is still read as
+// "the mirror hasn't caught up yet" rather than "genuinely has no history".
+// The mirror sweep (`beeperSync.js`) now retries an empty first page exactly
+// once and settles within a sweep pass or two (minutes, not hours), so this
+// is deliberately generous rather than tuned to that — it exists to cover a
+// slow initial sweep across many accounts/chats, not to model the retry
+// timing precisely.
+const RECENT_ACTIVITY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** The filter set one scope means. Absent keys are absent FILTERS, not `false`. */
 function filtersForScope(scope, unreadOnly) {
@@ -102,6 +110,18 @@ const rowTime = (iso) => {
   if (days === 1) return 'Yesterday';
   if (days < 7) return date.toLocaleDateString([], { weekday: 'short' });
   return date.toLocaleDateString([], { day: 'numeric', month: 'short' });
+};
+
+// #81: `lastActivity` is Beeper's own chat-level watermark, mirrored
+// regardless of whether any message has been mirrored yet (`beeperSync.js`'s
+// `normalizeChatRow`) — so a row can carry a recent one while `lastMessage`
+// is still `null`. That combination is what distinguishes "still syncing"
+// from "this chat has no history", and is the ONLY thing that does: nothing
+// else in the row shape says whether the mirror has caught up.
+const isRecentActivity = (iso) => {
+  if (!iso) return false;
+  const ts = new Date(iso).getTime();
+  return Number.isFinite(ts) && Date.now() - ts < RECENT_ACTIVITY_WINDOW_MS;
 };
 
 const initials = (name) => String(name || '?')
@@ -285,9 +305,18 @@ function ConversationRow({ conversation, unified, selected, onSelect }) {
   const preview = conversation.lastMessage;
   // The same body the thread renders, flattened to one line: some networks
   // deliver HTML, and this row used to show the tags literally.
+  //
+  // #81: no mirrored message does not always mean "there is nothing to
+  // mirror" — a chat whose first sweep came back empty is retried, and until
+  // that lands the row used to look identical to a chat that is genuinely
+  // history-less forever, sorting at the top (recency) while reading like a
+  // stale placeholder. Beeper's Chat payload carries no preview/snippet text
+  // of its own to show instead (only `beeperSync.js`'s own mirrored messages
+  // do), so a recent `lastActivity` with no `lastMessage` reads as still
+  // syncing; the honest copy is kept for everything else.
   const previewText = preview
     ? (preview.isUnsent ? 'Message unsent' : messagePreviewText(preview.body))
-    : 'No messages mirrored yet';
+    : (isRecentActivity(conversation.lastActivity) ? 'Syncing…' : 'No messages mirrored yet');
   // The reference's leading state chip. Direction is the mirrored `isSender`,
   // never a comparison against the local user — there is nothing to compare
   // `senderId` against (#2).

@@ -1316,6 +1316,53 @@ describe('the rail preview', () => {
 
     expect(await screen.findByText('salt & pepper')).toBeInTheDocument();
   });
+
+  // #81: a chat with no mirrored message yet used to read as "No messages
+  // mirrored yet" whether it was genuinely history-less or simply not caught
+  // up — indistinguishable from a stale placeholder, and sorted at the top by
+  // recency regardless. `lastActivity` is Beeper's own chat-level watermark,
+  // mirrored independently of message content, so a recent one with no
+  // `lastMessage` is the one signal that the row is still syncing.
+  it('shows "Syncing…" for a conversation with recent activity and no mirrored message yet', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [conversation({
+        lastMessage: null,
+        lastActivity: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      })],
+      nextCursor: null,
+    });
+
+    renderTab();
+
+    expect(await screen.findByText('Syncing…')).toBeInTheDocument();
+    expect(screen.queryByText('No messages mirrored yet')).not.toBeInTheDocument();
+  });
+
+  it('keeps the honest "No messages mirrored yet" copy when there is no mirrored message and no recent activity', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [conversation({
+        lastMessage: null,
+        lastActivity: '2020-01-01T00:00:00.000Z',
+      })],
+      nextCursor: null,
+    });
+
+    renderTab();
+
+    expect(await screen.findByText('No messages mirrored yet')).toBeInTheDocument();
+    expect(screen.queryByText('Syncing…')).not.toBeInTheDocument();
+  });
+
+  it('keeps the honest empty copy when there is neither a mirrored message nor any activity at all', async () => {
+    api.getBeeperConversations.mockResolvedValue({
+      conversations: [conversation({ lastMessage: null, lastActivity: null })],
+      nextCursor: null,
+    });
+
+    renderTab();
+
+    expect(await screen.findByText('No messages mirrored yet')).toBeInTheDocument();
+  });
 });
 
 // A guard, not a formality: this file is the one place a real conversation,
