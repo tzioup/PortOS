@@ -589,6 +589,145 @@ describe('realtime', () => {
     }
   });
 
+  // PERF-6/BEEP-5: the open thread used to refetch on ANY frame, discarding
+  // paged-in history for traffic in some other chat entirely — `onInvalidate`
+  // ignored the frame `useBeeperRealtime` already handed it. The list and
+  // networks still refetch unconditionally (their previews/unread counts DO
+  // change for any chat); only the thread refetch is now frame-scoped.
+  it('does not refetch the open thread on an invalidation frame for another chat', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderTab(`/messages/beeper/${CONV_A}`);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => {});
+      const listCalls = api.getBeeperConversations.mock.calls.length;
+      const threadCalls = api.getBeeperMessages.mock.calls.length;
+
+      act(() => {
+        for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+          // CONV_A's fixture sourceChatId is 'chat-example-1' — this names a
+          // different chat entirely.
+          fn({ kind: 'message.upserted', chatID: 'chat-some-other-chat', ids: ['m9'], seq: 5 });
+        }
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+
+      expect(api.getBeeperConversations.mock.calls.length).toBeGreaterThan(listCalls);
+      expect(api.getBeeperMessages.mock.calls.length).toBe(threadCalls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refetches the open thread on a frame naming its chat, or with no chatID at all', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderTab(`/messages/beeper/${CONV_A}`);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => {});
+
+      let threadCalls = api.getBeeperMessages.mock.calls.length;
+      act(() => {
+        for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+          fn({ kind: 'message.upserted', chatID: 'chat-example-1', ids: ['m1'], seq: 6 });
+        }
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+      expect(api.getBeeperMessages.mock.calls.length).toBeGreaterThan(threadCalls);
+
+      // A frame this vague (no chatID at all) could be about anything, so the
+      // safe read is "maybe this thread" rather than "not this thread".
+      threadCalls = api.getBeeperMessages.mock.calls.length;
+      act(() => {
+        for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+          fn({ kind: 'chat.upserted', chatID: null, ids: [], seq: 7 });
+        }
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+      expect(api.getBeeperMessages.mock.calls.length).toBeGreaterThan(threadCalls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // PERF-6/BEEP-5, the additive half: a frame in scope must not replace the
+  // thread wholesale — that discards whatever "Load earlier messages" already
+  // paged in and resets the cursor. The fix fetches just the first page and
+  // merges it into the HEAD by id.
+  it('merges an in-scope invalidation refetch into the head, keeping paged-in history and the cursor', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const newest = {
+        id: 'm1', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder newest message',
+        sentAt: '2026-09-01T10:00:00.000Z', attachments: [],
+      };
+      const older = {
+        id: 'm-older', conversationId: CONV_A, senderId: 'user-1', body: 'Placeholder older message',
+        sentAt: '2026-09-01T08:00:00.000Z', attachments: [],
+      };
+      api.getBeeperMessages.mockResolvedValueOnce({ messages: [newest], nextCursor: 'cursor-1' });
+      renderTab(`/messages/beeper/${CONV_A}`);
+      await screen.findByText('Placeholder newest message');
+
+      api.getBeeperMessages.mockResolvedValueOnce({ messages: [older], nextCursor: null });
+      fireEvent.click(screen.getByRole('button', { name: 'Load earlier messages' }));
+      await screen.findByText('Placeholder older message');
+
+      // The refresh brings back an UPDATED copy of the same newest message —
+      // same id, new body — and nothing else new.
+      api.getBeeperMessages.mockResolvedValueOnce({
+        messages: [{ ...newest, body: 'Placeholder newest message, edited' }],
+        nextCursor: 'should-be-ignored-by-a-head-only-merge',
+      });
+      act(() => {
+        for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+          fn({ kind: 'message.upserted', chatID: 'chat-example-1', ids: ['m1'], seq: 9 });
+        }
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+
+      expect(await screen.findByText('Placeholder newest message, edited')).toBeInTheDocument();
+      // Updated in place, not duplicated.
+      expect(screen.queryByText('Placeholder newest message')).toBeNull();
+      // The paged-in older message survives the merge.
+      expect(screen.getByText('Placeholder older message')).toBeInTheDocument();
+      // The cursor from the additive refresh is ignored — it was already
+      // nulled by the earlier "Load earlier messages" and stays that way.
+      expect(screen.queryByRole('button', { name: 'Load earlier messages' })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // PERF-10: the debounce had no maximum wait, so a sustained frame stream —
+  // each one arriving inside the previous frame's 350ms coalescing window —
+  // reset it forever and the view never refreshed at all.
+  it('still refetches within the bounded max wait despite a sustained stream of invalidation frames', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      renderTab(`/messages/beeper/${CONV_A}`);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      await act(async () => {});
+      const listCalls = api.getBeeperConversations.mock.calls.length;
+
+      // A frame every 200ms, well inside the 350ms debounce, for 2.4s total —
+      // past the 2s ceiling.
+      for (let i = 0; i < 12; i += 1) {
+        act(() => {
+          for (const fn of socketMock.handlers.get('beeper:invalidate') || []) {
+            fn({ kind: 'message.upserted', chatID: 'chat-example-1', ids: [`m${i}`], seq: i + 1 });
+          }
+        });
+        // eslint-disable-next-line no-await-in-loop
+        await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      }
+
+      expect(api.getBeeperConversations.mock.calls.length).toBeGreaterThan(listCalls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('renders the liveness dot from the transport state and never as offline before it reports', async () => {
     api.getBeeperStatus.mockResolvedValue({ tokenConfigured: true, reachable: true, accounts: [], realtime: null });
     renderTab();

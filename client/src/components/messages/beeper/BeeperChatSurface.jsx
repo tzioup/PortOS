@@ -66,6 +66,15 @@ const DRAFTS_STORAGE_KEY = 'portos-beeper-drafts';
 // emit several per second; refetching per frame would hammer the mirror for a
 // list that has not finished rendering the previous answer.
 const INVALIDATION_DEBOUNCE_MS = 350;
+// A CEILING on how long the debounce above may keep resetting itself, anchored
+// to the FIRST frame of the current window rather than the last. Without this
+// a sustained stream (the "several per second" case the comment above already
+// warns about) never goes quiet for 350ms, so the coalescing timer restarts
+// forever and the list/thread never refresh at all (finding PERF-10). 2s is
+// six debounce windows: loose enough that an ordinary burst still coalesces
+// into one refetch, tight enough that a busy account's view is never more
+// than two seconds stale.
+const INVALIDATION_MAX_WAIT_MS = 2000;
 
 /** The filter set one scope means. Absent keys are absent FILTERS, not `false`. */
 function filtersForScope(scope, unreadOnly) {
@@ -296,7 +305,7 @@ function ConversationRow({ conversation, unified, selected, onSelect }) {
 /* ---------------------------------------------------------------- surface -- */
 
 export default function BeeperChatSurface({
-  conversationId = null, realtime = null, invalidationSeq = 0, breaker = null, onOpenSettings,
+  conversationId = null, realtime = null, invalidationSeq = 0, invalidationFrames = null, breaker = null, onOpenSettings,
 }) {
   const navigate = useNavigate();
   const mountedRef = useMounted();
@@ -414,6 +423,36 @@ export default function BeeperChatSurface({
     setThreadLoading(false);
   }, [mountedRef]);
 
+  // The ADDITIVE counterpart to `loadThread` above, for a frame-scoped
+  // invalidation refetch (findings PERF-6/BEEP-5): fetch just the first page
+  // and merge it into the HEAD of `messages` by id, rather than replacing the
+  // thread wholesale. `loadThread` is still correct for a real navigation (a
+  // brand new conversation has no history to preserve); this one exists so an
+  // invalidation on the OPEN thread never discards what the reader already
+  // paged in — `messageCursor` is deliberately left untouched, since it still
+  // points at the oldest page already loaded.
+  //
+  // Guarded like `loadMoreMessages` below (generation CAPTURED, not bumped):
+  // this is compatible with an in-flight load-more for the same conversation,
+  // and only needs to detect a real conversation SWITCH landing mid-fetch —
+  // which `loadThread` marks by incrementing `threadGenRef` itself.
+  const refreshThreadHead = useCallback(async (id) => {
+    if (!id) return;
+    const generation = threadGenRef.current;
+    const page = await api.getBeeperMessages(id, {}, { silent: true }).catch(() => null);
+    if (!mountedRef.current || generation !== threadGenRef.current || !page) return;
+    const incoming = Array.isArray(page.messages) ? page.messages : [];
+    if (incoming.length === 0) return;
+    setMessages((prev) => {
+      const incomingIds = new Set(incoming.map((message) => message.id));
+      // A message already present is updated in place (the fresh copy wins)
+      // rather than duplicated; everything genuinely older survives untouched
+      // behind it, in whatever order `loadMoreMessages` paged it in.
+      const rest = prev.filter((message) => !incomingIds.has(message.id));
+      return [...incoming, ...rest];
+    });
+  }, [mountedRef]);
+
   useEffect(() => { loadNetworks(); }, [loadNetworks]);
   useEffect(() => { loadList(); }, [loadList]);
   useEffect(() => { loadThread(conversationId); }, [conversationId, loadThread]);
@@ -427,19 +466,47 @@ export default function BeeperChatSurface({
   // correct reaction is to re-read the mirror. Deferred work is guarded twice:
   // the timer is cleared on unmount, and `mountedRef` stops a fetch that
   // resolves into a torn-down view.
-  const refetchRef = useRef({ loadList, loadThread, loadNetworks, conversationId });
-  refetchRef.current = { loadList, loadThread, loadNetworks, conversationId };
+  //
+  // The list and networks refetch on ANY frame — other chats' previews and
+  // unread counts genuinely do change. The OPEN THREAD is different: traffic
+  // in any of the install's other chats used to reset it too (PERF-6/BEEP-5),
+  // discarding whatever the reader had paged in. It now refetches only when
+  // some frame seen in this window names this thread's `sourceChatId`, or
+  // carries no chatID at all (a frame this vague could be about anything, so
+  // the safe read is "maybe this thread" rather than "not this thread") — and
+  // even then, additively via `refreshThreadHead`, never via `loadThread`.
+  const refetchRef = useRef({
+    loadList, loadThread, loadNetworks, refreshThreadHead, conversationId, sourceChatId: conversation?.sourceChatId ?? null,
+  });
+  refetchRef.current = {
+    loadList, loadThread, loadNetworks, refreshThreadHead, conversationId, sourceChatId: conversation?.sourceChatId ?? null,
+  };
+  // Anchors the MAX-WAIT ceiling to the first frame of the current window; see
+  // `INVALIDATION_MAX_WAIT_MS`. Reset only when a timer actually fires, never
+  // by the effect's own cleanup — the cleanup fires on every frame in a burst
+  // just to reschedule, and resetting there would defeat the ceiling entirely.
+  const invalidationWindowStartRef = useRef(null);
   useEffect(() => {
     if (!invalidationSeq) return undefined;
+    const now = Date.now();
+    if (invalidationWindowStartRef.current === null) invalidationWindowStartRef.current = now;
+    const elapsed = now - invalidationWindowStartRef.current;
+    const wait = Math.max(0, Math.min(INVALIDATION_DEBOUNCE_MS, INVALIDATION_MAX_WAIT_MS - elapsed));
     const timer = setTimeout(() => {
+      invalidationWindowStartRef.current = null;
       if (!mountedRef.current) return;
       const current = refetchRef.current;
       current.loadList();
       current.loadNetworks();
-      if (current.conversationId) current.loadThread(current.conversationId);
-    }, INVALIDATION_DEBOUNCE_MS);
+      const frames = invalidationFrames?.current || [];
+      if (invalidationFrames) invalidationFrames.current = [];
+      const inScope = frames.some((frame) => (
+        !frame || frame.chatID === null || frame.chatID === undefined || frame.chatID === current.sourceChatId
+      ));
+      if (current.conversationId && inScope) current.refreshThreadHead(current.conversationId);
+    }, wait);
     return () => clearTimeout(timer);
-  }, [invalidationSeq, mountedRef]);
+  }, [invalidationSeq, mountedRef, invalidationFrames]);
 
   // The scope and the unread filter ride along on every selection change, so a
   // shared conversation link reopens the list the sender was looking at.
