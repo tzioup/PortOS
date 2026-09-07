@@ -974,10 +974,15 @@ describe('the OAuth outcome carried back on the URL', () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
-  it('reports a failure and opens the settings drawer, where the connect card that fixes it lives', async () => {
+  it('reports a mapped failure sentence for access_denied, with the code only as a parenthetical, and opens the settings drawer', async () => {
     renderTab('/messages/beeper?beeperOauthError=access_denied');
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect failed: access_denied'));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect was not approved (access_denied)'));
     expect(await screen.findByRole('heading', { name: 'Beeper Settings' })).toBeInTheDocument();
+  });
+
+  it('falls back to a generic sentence plus the code for an unrecognized OAuth error', async () => {
+    renderTab('/messages/beeper?beeperOauthError=temporarily_unavailable');
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect failed (temporarily_unavailable)'));
   });
 });
 
