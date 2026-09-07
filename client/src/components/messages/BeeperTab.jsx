@@ -34,6 +34,20 @@ import BeeperSettingsPanel from './beeper/BeeperSettingsPanel';
  * The open conversation is the route param on `/messages/beeper/:conversationId`
  * (Messages routes it as the shared `:chatKey` segment), never local state.
  */
+
+// The OAuth 2.0 error codes Beeper's own consent screen can send back,
+// mapped to a plain sentence rather than shown raw — the bare code read as
+// implementation detail with no remedy. An unrecognized code still gets a
+// generic sentence rather than disappearing, with the raw code kept as a
+// trailing parenthetical either way so the exact server-reported reason is
+// never lost, only never led with.
+const OAUTH_ERROR_SENTENCES = {
+  access_denied: 'Beeper connect was not approved',
+  invalid_scope: 'Beeper could not grant the access PortOS asked for',
+  server_error: 'Beeper reported a server error during connect',
+};
+const oauthErrorSentence = (code) => `${OAUTH_ERROR_SENTENCES[code] || 'Beeper connect failed'} (${code})`;
+
 export default function BeeperTab() {
   const { chatKey } = useParams();
   const [settingsParam, setSettingsParam] = useDrawerTab('settings', null, ['1']);
@@ -102,7 +116,7 @@ export default function BeeperTab() {
   const oauthError = searchParams.get('beeperOauthError');
   useEffect(() => {
     if (!oauthConnected && !oauthError) return;
-    if (oauthError) toast.error(`Beeper connect failed: ${oauthError}`);
+    if (oauthError) toast.error(oauthErrorSentence(oauthError));
     else {
       toast.success('Beeper connected');
       seedStatus();

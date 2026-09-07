@@ -197,7 +197,8 @@ describe('deep linking', () => {
 });
 
 describe('rendering at every install size', () => {
-  it('renders with zero conversations, and says an empty list is often correct', async () => {
+  it('renders with zero conversations, and says an empty list is often correct when networks are mirrored and the list loaded fine', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
     renderTab();
     expect(await screen.findByText('Nothing here')).toBeInTheDocument();
     expect(screen.getByText(/often correct rather than broken/)).toBeInTheDocument();
@@ -243,6 +244,58 @@ describe('rendering at every install size', () => {
     api.getBeeperNetworks.mockResolvedValue({ networks: [{ network: 'somenewbridge', unreadCount: 0, conversationCount: 1, accountIds: [] }] });
     renderTab();
     expect(await screen.findByRole('button', { name: 'somenewbridge' })).toBeInTheDocument();
+  });
+});
+
+/**
+ * Audit cluster 08 (A11Y-3): the empty conversation list always stated
+ * "{networks.length} network(s) mirrored ... often correct rather than
+ * broken", even when the networks fetch had failed (networks lands at []
+ * either way) — rendering "0 networks mirrored" as settled fact directly
+ * under the visible error banner it contradicted. The fix branches the
+ * second paragraph on whether anything is actually known to be wrong or
+ * filtered, rather than always reciting the same reassurance.
+ */
+describe('the honest empty state (A11Y-3)', () => {
+  it('shows no networks-mirrored reassurance and offers the settings link when no networks are mirrored', async () => {
+    api.getBeeperNetworks.mockRejectedValue(new Error('network fetch failed'));
+    renderTab();
+    await screen.findByText('Nothing here');
+    expect(screen.queryByText(/network.*mirrored/i)).toBeNull();
+    expect(screen.getByRole('button', { name: /open beeper settings/i })).toBeInTheDocument();
+  });
+
+  it('names the unread filter instead of the reassurance when unreadOnly is on', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
+    renderTab('/messages/beeper?unread=1');
+    await screen.findByText('Nothing here');
+    expect(screen.getByText(/filter is on/i)).toBeInTheDocument();
+    expect(screen.queryByText(/often correct rather than broken/)).toBeNull();
+  });
+
+  it('suppresses the reassurance entirely when the conversation list itself failed to load', async () => {
+    api.getBeeperNetworks.mockResolvedValue({ networks: [NINE_NETWORKS[0]] });
+    api.getBeeperConversations.mockRejectedValue(new Error('Could not load conversations'));
+    renderTab();
+    await screen.findByText('Nothing here');
+    expect(screen.queryByText(/network.*mirrored/i)).toBeNull();
+    expect(screen.queryByText(/often correct rather than broken/)).toBeNull();
+    expect(screen.queryByText(/nothing is mirrored yet/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /open beeper settings/i })).toBeNull();
+  });
+});
+
+/**
+ * Audit cluster 08 (A11Y-6): the list-error banner carried no role, and
+ * `getBeeperConversations` is fetched silent, so a screen-reader user got no
+ * signal that the list had failed to load.
+ */
+describe('the conversation list error banner is announced', () => {
+  it('exposes the list-fetch failure with role="alert"', async () => {
+    api.getBeeperConversations.mockRejectedValue(new Error('Could not load conversations'));
+    renderTab();
+
+    expect(await screen.findByText('Could not load conversations')).toHaveAttribute('role', 'alert');
   });
 });
 
@@ -303,14 +356,14 @@ describe('the pinned grid is Beeper’s own isPinned, mirrored', () => {
 });
 
 describe('deferred controls render inert rather than absent', () => {
-  it('disables Requests, Later, add-scope and the overflow menu, each saying it is not wired', async () => {
+  it('disables Requests, Later, add-scope and the overflow menu, each saying it is not available yet', async () => {
     renderTab();
     await screen.findByText('Nothing here');
 
     for (const label of ['Requests', 'Later', 'Add scope', 'More scope options']) {
       const control = screen.getByRole('button', { name: label });
       expect(control).toBeDisabled();
-      expect(control).toHaveAttribute('title', `${label} — not wired yet`);
+      expect(control).toHaveAttribute('title', `${label} — not available yet`);
     }
   });
 
@@ -319,6 +372,42 @@ describe('deferred controls render inert rather than absent', () => {
     await screen.findByText('Nothing here');
     expect(screen.getByRole('button', { name: 'Archive' })).toBeEnabled();
     expect(screen.getByRole('button', { name: 'Low priority' })).toBeEnabled();
+  });
+});
+
+/**
+ * Audit cluster 08 (COPY-2): "not wired yet" is implementation vocabulary
+ * leaking into shipped copy — the InertControl tooltip template and the
+ * composer's attach button both used it. Upstream's own convention is
+ * "Coming soon — …" (ImportTab.jsx); this file's fix lands on
+ * "not available yet" / "aren't supported yet" instead. Scans the rendered
+ * DOM rather than one control at a time, so a leftover site anywhere would
+ * still fail this even if a future edit missed it.
+ */
+describe('no leftover "not wired" copy anywhere in the surface', () => {
+  it('renders no title or text containing "not wired", across the rail and the composer', async () => {
+    api.getBeeperConversation.mockResolvedValue(conversation({ title: 'Example Contact', network: 'whatsapp' }));
+    renderTab(`/messages/beeper/${CONV_A}`);
+    await screen.findByLabelText('Message Example Contact on WhatsApp');
+
+    const titled = [...document.querySelectorAll('[title]')].map((el) => el.getAttribute('title') || '');
+    expect(titled.some((title) => title.toLowerCase().includes('not wired'))).toBe(false);
+    expect(document.body.textContent.toLowerCase()).not.toContain('not wired');
+  });
+});
+
+/**
+ * Audit cluster 08 (COPY-3): the scope heading rendered a ChevronDown inside
+ * a non-interactive span, implying a scope-picker menu that does not exist —
+ * against the file's own docstring ("an inert control that looks live is
+ * worse than an absent one"). The fix drops the chevron outright.
+ */
+describe('the scope heading has no control that looks interactive but has no handler', () => {
+  it('renders the scope label with no chevron or icon beside it', async () => {
+    renderTab();
+    await screen.findByText('Nothing here');
+    const label = screen.getByText('Inbox');
+    expect(label.parentElement.querySelector('svg')).toBeNull();
   });
 });
 
@@ -336,7 +425,10 @@ describe('the composer', () => {
     renderTab(`/messages/beeper/${CONV_A}`);
 
     const send = await screen.findByRole('button', { name: 'Send' });
-    expect(send).toBeDisabled();
+    // aria-disabled (A11Y-5), not the native disabled attribute — the button
+    // must stay focusable so focus survives a mid-send disable.
+    expect(send).toHaveAttribute('aria-disabled', 'true');
+    expect(send).not.toHaveAttribute('disabled');
     expect(send.getAttribute('title')).toBe('Type a message to send');
   });
 });
@@ -507,7 +599,10 @@ describe('the composer sends', () => {
     const composer = await openComposer();
 
     const send = screen.getByRole('button', { name: 'Send' });
-    await waitFor(() => expect(send).toBeDisabled());
+    // aria-disabled (A11Y-5): the button stays focusable — clicking it is a
+    // no-op because handleSendClick itself checks canSend, not because the
+    // click never reaches the handler.
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'true'));
     expect(send.getAttribute('title')).toMatch(/runaway breaker/);
     expect(composer).toHaveValue(OUTBOUND_TEXT);
 
@@ -528,7 +623,7 @@ describe('the composer sends', () => {
     await openComposer();
 
     const send = screen.getByRole('button', { name: 'Send' });
-    await waitFor(() => expect(send).toBeEnabled());
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'false'));
 
     api.getBeeperStatus.mockResolvedValue(status({ tripped: true, reason: 'synthetic loop', trippedAt: '2026-09-01T09:00:00.000Z' }));
     act(() => {
@@ -537,7 +632,7 @@ describe('the composer sends', () => {
       }
     });
 
-    await waitFor(() => expect(send).toBeDisabled());
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'true'));
     expect(send.getAttribute('title')).toMatch(/runaway breaker/);
     expect(send.getAttribute('title')).toContain('synthetic loop');
   });
@@ -921,10 +1016,15 @@ describe('the OAuth outcome carried back on the URL', () => {
     expect(toast.error).not.toHaveBeenCalled();
   });
 
-  it('reports a failure and opens the settings drawer, where the connect card that fixes it lives', async () => {
+  it('reports a mapped failure sentence for access_denied, with the code only as a parenthetical, and opens the settings drawer', async () => {
     renderTab('/messages/beeper?beeperOauthError=access_denied');
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect failed: access_denied'));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect was not approved (access_denied)'));
     expect(await screen.findByRole('heading', { name: 'Beeper Settings' })).toBeInTheDocument();
+  });
+
+  it('falls back to a generic sentence plus the code for an unrecognized OAuth error', async () => {
+    renderTab('/messages/beeper?beeperOauthError=temporarily_unavailable');
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith('Beeper connect failed (temporarily_unavailable)'));
   });
 });
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router';
 import {
-  Archive, BellOff, ChevronDown, Clock, Filter, Inbox, Loader2, Mail, MoreHorizontal,
+  Archive, BellOff, Clock, Filter, Inbox, Loader2, Mail, MoreHorizontal,
   PenSquare, Plus, RefreshCw, Search, Settings, TrendingDown,
 } from 'lucide-react';
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
@@ -130,7 +130,7 @@ function InertControl({ icon: Icon, label, className }) {
       type="button"
       disabled
       aria-label={label}
-      title={`${label} — not wired yet`}
+      title={`${label} — not available yet`}
       className={`${className} cursor-not-allowed opacity-35`}
     >
       <Icon size={17} />
@@ -728,8 +728,10 @@ export default function BeeperChatSurface({
 
         <div className="flex shrink-0 items-center gap-1 px-3 py-2.5">
           <span className="flex min-w-0 items-center gap-1 text-sm font-semibold text-white">
+            {/* No chevron here (audit cluster 08, COPY-3): a scope-picker menu
+                does not exist, and an inert control that looks live is worse
+                than an absent one — the file's own governing rule. */}
             <span className="truncate">{scopeLabel}</span>
-            <ChevronDown size={13} className="shrink-0 text-gray-600" aria-hidden="true" />
           </span>
           <button
             type="button"
@@ -755,7 +757,7 @@ export default function BeeperChatSurface({
         </div>
 
         {listError && (
-          <p className="mx-3 mb-2 rounded border border-port-error/40 bg-port-error/10 px-2 py-1.5 text-[11px] text-port-error">
+          <p role="alert" className="mx-3 mb-2 rounded border border-port-error/40 bg-port-error/10 px-2 py-1.5 text-[11px] text-port-error">
             {listError}
           </p>
         )}
@@ -769,10 +771,36 @@ export default function BeeperChatSurface({
         ) : conversations.length === 0 ? (
           <div className="flex flex-1 flex-col items-center justify-center gap-1 p-6 text-center">
             <p className="text-sm text-gray-300">Nothing here</p>
-            <p className="text-[11px] text-gray-500">
-              {networks.length} network{networks.length === 1 ? '' : 's'} mirrored. History depth varies enormously per
-              network, so an empty list is often correct rather than broken.
-            </p>
+            {/* The reassurance below only makes sense once the list itself is
+                known-good (#3/A11Y-3): a failed fetch already explains itself
+                via the error banner above, and repeating "often correct" right
+                under it read as a contradiction. Zero mirrored networks and an
+                active unread filter are their own, more useful answers than a
+                generic count. */}
+            {!listError && (
+              <p className="text-[11px] text-gray-500">
+                {networks.length === 0 ? (
+                  <>
+                    Nothing is mirrored yet.{' '}
+                    <button
+                      type="button"
+                      onClick={onOpenSettings}
+                      className="text-port-accent underline underline-offset-2"
+                    >
+                      Open Beeper settings
+                    </button>{' '}
+                    to connect a network.
+                  </>
+                ) : unreadOnly ? (
+                  'The unread filter is on — nothing unread here.'
+                ) : (
+                  <>
+                    {networks.length} network{networks.length === 1 ? '' : 's'} mirrored. History depth varies
+                    enormously per network, so an empty list is often correct rather than broken.
+                  </>
+                )}
+              </p>
+            )}
           </div>
         ) : (
           <div className="min-h-0 flex-1 divide-y divide-port-border/50 overflow-y-auto">

@@ -469,7 +469,7 @@ export default function BeeperThread({
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center">
         <p className="text-sm text-gray-300">Could not open this conversation</p>
-        <p className="max-w-sm text-[11px] text-port-error">{error}</p>
+        <p role="alert" className="max-w-sm text-[11px] text-port-error">{error}</p>
         <div className="mt-1 flex flex-wrap items-center justify-center gap-2">
           {onRetry && (
             <button
@@ -667,7 +667,7 @@ export default function BeeperThread({
           </div>
         )}
 
-        {error && <p className="py-2 text-center text-xs text-port-error">{error}</p>}
+        {error && <p role="alert" className="py-2 text-center text-xs text-port-error">{error}</p>}
 
         {loading && ordered.length === 0 && (
           <p className="py-6 text-center text-xs text-gray-500">Loading messages…</p>
@@ -762,6 +762,8 @@ export default function BeeperThread({
         <InlineConfirmRow
           variant="separator"
           tone="warning"
+          autoFocus
+          aria-label={`Confirm sending the first message to ${conversation.title || 'this contact'}`}
           question={`This is the first message PortOS has sent to ${conversation.title || 'this contact'} on ${networkLabel(conversation.network)} — send it?`}
           confirmText="Send anyway"
           cancelText="Cancel"
@@ -774,7 +776,7 @@ export default function BeeperThread({
         <button
           type="button"
           aria-label="Attach a file"
-          title="Attachments are not wired yet"
+          title="Attachments aren't supported yet"
           disabled
           className="shrink-0 rounded-full p-2 text-gray-600"
         >
@@ -798,10 +800,10 @@ export default function BeeperThread({
         <button
           type="button"
           onClick={handleSendClick}
-          disabled={!canSend}
+          aria-disabled={!canSend}
           aria-label="Send"
           title={sendDisabledReason}
-          className="shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 disabled:cursor-not-allowed disabled:bg-port-accent/40 disabled:hover:bg-port-accent/40"
+          className="shrink-0 rounded-full bg-port-accent p-2 text-port-bg transition-colors hover:bg-port-accent/85 aria-disabled:cursor-not-allowed aria-disabled:bg-port-accent/40 aria-disabled:hover:bg-port-accent/40"
         >
           {sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
         </button>

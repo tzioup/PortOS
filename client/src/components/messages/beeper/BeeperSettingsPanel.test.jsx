@@ -292,6 +292,30 @@ describe('BeeperSettingsPanel — status card states', () => {
   });
 });
 
+/**
+ * Audit cluster 08 (A11Y-6): both inline error paragraphs on this panel
+ * carried no role, and the fetches behind them are silent, so a
+ * screen-reader user got no signal that the status read or the account
+ * roster read had failed.
+ */
+describe('BeeperSettingsPanel — inline errors are announced', () => {
+  it('exposes the status-fetch failure with role="alert"', async () => {
+    api.getBeeperStatus.mockRejectedValue(new Error('network down'));
+    renderPanel();
+
+    expect(await screen.findByText('network down')).toHaveAttribute('role', 'alert');
+  });
+
+  it('exposes the account-roster failure with role="alert"', async () => {
+    api.getBeeperStatus.mockResolvedValue({
+      tokenConfigured: true, reachable: true, lastProbeError: null, accounts: null, accountsError: 'Could not read the mirrored account roster',
+    });
+    renderPanel();
+
+    expect(await screen.findByTestId('beeper-roster-unknown')).toHaveAttribute('role', 'alert');
+  });
+});
+
 describe('BeeperSettingsPanel — settings', () => {
   it('saves the complete settings slice and disables Save until dirty', async () => {
     api.getBeeperStatus.mockResolvedValue({ tokenConfigured: false, reachable: null, accounts: [] });
