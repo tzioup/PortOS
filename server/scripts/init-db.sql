@@ -1698,11 +1698,15 @@ CREATE TABLE IF NOT EXISTS beeper_conversations (
   UNIQUE (account_id, source_chat_id)
 );
 -- Repointed at the ordering expression the keyset walk actually uses — no
--- query filters on account_id, and the ORDER BY / cursor predicate both sort
--- on COALESCE(last_activity, created_at), never the raw column (audit
--- cluster 06, indexes and query plans). Mirrors the block in
--- server/lib/db/schema/beeper.js.
-CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_keyset ON beeper_conversations ((COALESCE(last_activity, created_at)) DESC, id DESC);
+-- query filters on account_id. #81: the ORDER BY / cursor predicate sort on
+-- COALESCE(last_activity, 'epoch'::timestamptz), never the raw column and
+-- never a created_at fallback — created_at is the MIRROR ROW's mint time,
+-- not chat activity, so falling back to it sorted a batch of activity-less
+-- chats swept in the same pass at the top of the Inbox by their shared,
+-- recent creation time. The epoch sentinel keeps the row-value keyset tuple
+-- shape (a real NULLS LAST cannot) while sorting every activity-less chat
+-- LAST under DESC instead. Mirrors the block in server/lib/db/schema/beeper.js.
+CREATE INDEX IF NOT EXISTS idx_beeper_conversations_activity_epoch_keyset ON beeper_conversations ((COALESCE(last_activity, 'epoch'::timestamptz)) DESC, id DESC);
 CREATE TABLE IF NOT EXISTS beeper_messages (
   id TEXT PRIMARY KEY,
   conversation_id UUID NOT NULL REFERENCES beeper_conversations (id) ON DELETE CASCADE,

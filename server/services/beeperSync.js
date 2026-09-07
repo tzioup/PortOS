@@ -50,6 +50,33 @@
  * also fires an invalidation frame on `beeperSocketEvents` after the account
  * count is known and after every account finishes, reusing #33's existing
  * push path rather than adding a client-side poller.
+ *
+ * **A chat's first-page fetch is retried once if it comes back empty (#81).**
+ * A brand-new chat's first sweep takes exactly one `direction: 'before'` page
+ * (step 3 above). `sweepChat` withholds the cursor and watermark the first
+ * time that page comes back with zero items (the same mechanism a truncated
+ * forward walk already used), so `chatNeedsSweep` retries the same first page
+ * next pass; if the retry is ALSO empty, the real watermark commits (so a
+ * genuinely history-less chat still reaches the steady state `chatNeedsSweep`'s
+ * docblock describes) and one warn-level line records it.
+ *
+ * **This retry does not reach every chat #81's live-instance investigation
+ * found empty.** `chatNeedsSweep` only re-selects a chat once `chat.lastActivity`
+ * is truthy, and the investigation's *entire observed population* was chats
+ * Beeper itself never reports any activity for — `chat.lastActivity` null on
+ * every sweep, not merely an empty first page. Those chats are swept exactly
+ * once, commit `lastActivity: null`, and are never re-selected; the retry
+ * above only covers a chat whose `chat.lastActivity` IS truthy but whose
+ * first page still came back empty (a transient fetch hiccup, or a
+ * history-less chat gaining its first-ever activity right as it enters the
+ * mirror). What actually fixed the *reported* symptom — empty rows sorting
+ * above threads with recent messages — for the observed population is the
+ * ORDER BY in `beeperConversations.js`: it no longer falls back to the
+ * mirror row's `created_at` for an activity-less chat (which made a whole
+ * batch of them look freshly active because they were freshly SWEPT), so
+ * they sort LAST instead of first. See `sweepChat`'s inline comment for the
+ * full account of why the two null/null-producing paths are handled
+ * identically rather than being told apart.
  */
 
 import { query, withTransaction } from '../lib/db.js';
@@ -525,6 +552,60 @@ async function sweepChat({
     normalized.sourceChatId, stored?.cursor, clientOptions,
   );
 
+  // #81: a first-page anchor fetch (no stored cursor to walk forward from,
+  // so `fetchNewMessages` took the `direction: 'before'` branch) that comes
+  // back with zero items is NOT the same as "caught up" — `truncated` is
+  // never set on that branch, so falling through to the normal commit below
+  // would watermark the chat as done on one empty page and never look again.
+  //
+  // IMPORTANT — this retry does NOT reach every empty chat. `chatNeedsSweep`
+  // only re-selects a chat once `chat.lastActivity` is truthy; a chat Beeper
+  // itself never reports any activity for (`chat.lastActivity` stays null
+  // forever, which is the *entire observed population* on the live instance
+  // #81 investigated) is swept exactly once, commits null/null below, and is
+  // then never re-selected — the retry cannot fire because there is nothing
+  // for `chatNeedsSweep` to compare a "gained activity" transition against.
+  // That population's empty-row-sorts-first symptom is fixed separately, in
+  // `beeperConversations.js`'s ORDER BY (an activity-less chat now sorts
+  // LAST instead of by its mirror row's mint time). This retry instead
+  // covers the case `chat.lastActivity` IS truthy but the first page still
+  // came back empty — a transient fetch hiccup, or a chat that gains its
+  // first-ever activity right as it enters the mirror.
+  //
+  // `hadEmptyFirstPageAttempt` recognizes the state a WITHHELD commit leaves
+  // behind: a cursor row that exists but carries neither a cursor nor a
+  // watermark. That state is NOT exclusive to the withholding branch below —
+  // a chat with `chat.lastActivity` null commits exactly the same null/null
+  // shape on an ordinary first sweep (see above). The two are handled
+  // identically on purpose: whether this null/null row is a prior withhold
+  // or a history-less chat that has just gained its first real activity,
+  // the right move is the same — one retry, then commit-and-warn if it is
+  // still empty — so nothing here needs to (or can, from one sweep's
+  // evidence) tell the two apart. No new DB column or migration needed.
+  const isFirstPageAttempt = !stored?.cursor;
+  const emptyFirstPage = isFirstPageAttempt && messages.length === 0;
+  const hadEmptyFirstPageAttempt = Boolean(stored) && !stored.cursor && !stored.lastActivity;
+
+  let commitCursor = cursor || stored?.cursor || null;
+  let commitLastActivity = truncated ? null : normalized.lastActivity;
+
+  if (emptyFirstPage) {
+    if (hadEmptyFirstPageAttempt) {
+      // Still empty after one retry: commit the real watermark so the chat
+      // stops being re-swept every pass (mirroring the "genuinely empty
+      // chat" steady state `chatNeedsSweep` already protects), and log once
+      // so an operator can tell a chat landed here versus simply having no
+      // history. Chat id only — never message content.
+      console.warn(`${LOG_PREFIX}: chat ${normalized.sourceChatId} still has no mirrored messages after a retry`);
+    } else {
+      // First time this chat has come back empty. Withhold the cursor and
+      // watermark so `chatNeedsSweep` picks it back up next pass and retries
+      // the same first-page fetch, exactly once.
+      commitCursor = null;
+      commitLastActivity = null;
+    }
+  }
+
   // Roster first, then senders: a message-sender observation carries a richer
   // handle than a truncated roster entry, and `upsertParticipant` COALESCEs
   // the handle rather than overwriting it, so the better one wins either way.
@@ -580,7 +661,6 @@ async function sweepChat({
     accountId: normalized.accountId,
     sourceChatId: normalized.sourceChatId,
     rows,
-    cursor: cursor || stored?.cursor || null,
     // A truncated forward walk advanced the cursor but did NOT reach the
     // chat's newest message, so the watermark must stay where it was: a null
     // here hits `COALESCE(EXCLUDED.last_activity, beeper_sync_cursors.…)` in
@@ -588,8 +668,11 @@ async function sweepChat({
     // sees the chat as newer than its watermark next pass and resumes from the
     // advanced cursor. Committing `normalized.lastActivity` instead would make
     // the two timestamps equal, end the account walk at this chat, and strand
-    // the un-fetched backlog until unrelated new activity arrived.
-    lastActivity: truncated ? null : normalized.lastActivity,
+    // the un-fetched backlog until unrelated new activity arrived. An empty
+    // first-page attempt withholds both for the same reason — see
+    // `emptyFirstPage` / `hadEmptyFirstPageAttempt` above (#81).
+    cursor: commitCursor,
+    lastActivity: commitLastActivity,
   });
 
   return { messages: rows.length };

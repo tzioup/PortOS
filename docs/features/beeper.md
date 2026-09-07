@@ -263,6 +263,41 @@ and finishes catching up on the next sweep instead of being skipped as caught-up
 
 No AI provider call happens anywhere on this path. Ingestion is deterministic.
 
+**An empty first page is retried once, not marked done (#81).** A brand-new chat's first sweep
+takes exactly one page in the newest-first (`before`) direction. The sweep withholds the cursor
+and watermark the first time that page comes back with zero messages, so the next sweep retries
+the same page; if the retry is *also* empty, the real watermark commits (so a genuinely
+history-less chat still reaches a stable, not-re-swept state) and one warn-level log line records
+it — chat id only, no content. **This retry does not reach every empty chat.**
+`chatNeedsSweep` only re-selects a chat once Beeper reports it as active again, and a live-instance
+investigation found its *entire observed population* of empty chats were ones Beeper itself never
+reports any activity for at all — not a message-kind filter (there is none) and not the safety
+caps above (they only bound the forward catch-up walk on a chat that already has a stored cursor).
+Those chats are swept exactly once and then correctly left alone; the retry instead covers a chat
+whose activity IS real but whose first page still came back empty (a transient fetch hiccup, or a
+history-less chat gaining its first-ever activity right as it enters the mirror).
+
+**Sort order: an activity-less chat sorts last, not by when the mirror happened to sweep it
+(#81).** The list ordering used to fall back to the conversation row's `created_at` for a chat with
+no real Beeper activity. Every row in a fresh mirror is minted in the same short sweep window, so a
+whole batch of activity-less chats shared a recent `created_at` and sorted at the **top** of the
+Inbox, above populated threads with older real activity — this, not a mirroring gap, is what
+actually produced the reported symptom for the observed population above. The fallback is now
+`'epoch'::timestamptz` instead of `created_at`: older than any real timestamp, so an activity-less
+chat sorts **last** under the existing `DESC` order rather than wherever its row happened to be
+created. The network rail's own last-activity aggregate is a plain `MAX(c.last_activity)` — no
+`created_at` fallback and no epoch sentinel, since `MAX` already ignores `NULL`s and returns `NULL`
+when every conversation in the network has none, which is the honest answer.
+
+**The Inbox row while a chat is still catching up.** `beeper_conversations.last_activity` is
+Beeper's own chat-level watermark, mirrored independently of whether any message has actually
+been mirrored — so a row can carry a recent `last_activity` while `lastMessage` is still `null`.
+Beeper's own `Chat` payload carries no preview or snippet text to show in that gap, so the rail
+row (`BeeperChatSurface.jsx`) reads it off `last_activity` instead: a conversation with no
+mirrored message and a `last_activity` inside the last 24 hours shows **"Syncing…"**; anything
+older, or with no `last_activity` at all, keeps the honest **"No messages mirrored yet"** copy.
+This only changes what an empty row *says*; the sort fix above is what changes *where* it sits.
+
 **What is mirrored:** accounts, conversations, messages, participants, attachment *metadata* and
 per-chat sync cursors, across eight `beeper_*` tables. **What is not:** `loginID` is stripped
 from every account and bridge row before it reaches any caller (it is the bridge login

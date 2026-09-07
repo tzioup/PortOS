@@ -145,6 +145,7 @@ beforeEach(() => {
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
   __resetBeeperSweepProgressForTests();
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -788,6 +789,129 @@ describe('a forward walk the server stalls with hasMore but no usable cursor', (
     await runBeeperSweep({ reason: 'manual' });
 
     expect(committedCursorRow().lastActivity).toBe(CHAT_ACTIVITY);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #81: a first-page anchor fetch that comes back empty is retried once, not
+// silently marked done — not a message-kind filter (there is none in
+// `beeperClient.js`) and not the sweep/page budget (it only bounds the
+// forward `'after'` catch-up walk on a chat that already has a cursor). The
+// old code simply committed `normalized.lastActivity` on ANY first-page
+// result, empty or not, so a chat that got nothing back on its one shot never
+// got a second look. This retry covers a chat whose activity IS real but
+// whose first page still came back empty (a transient fetch hiccup, or a
+// history-less chat gaining its first-ever activity right as it enters the
+// mirror) — NOT the population the read-only live-instance investigation on
+// fork issue #81 actually observed empty (chats Beeper itself never reports
+// activity for at all, so `chatNeedsSweep` never re-selects them regardless
+// of this retry). That population's reported symptom — empty rows sorting
+// above recent threads — is fixed by the sort fallback in
+// `beeperConversations.js`, not by this retry.
+// ---------------------------------------------------------------------------
+
+describe('#81 — first page comes back with zero messages', () => {
+  const CHAT_ID = 'chat-empty-first-page';
+  const CHAT_ACTIVITY = '2026-09-02T10:00:00.000Z';
+
+  const chatPage = () => ({
+    items: [{
+      id: CHAT_ID,
+      accountID: 'acct-a',
+      network: 'Example Net',
+      title: 'Example Chat',
+      type: 'single',
+      lastActivity: CHAT_ACTIVITY,
+      participants: { hasMore: false, total: 0, items: [] },
+    }],
+    hasMore: false,
+  });
+
+  it('withholds the cursor and watermark on a never-swept chat whose first page returns nothing, instead of marking it done', async () => {
+    storedCursorRows = [];
+    installFetch({
+      chatPages: [chatPage()],
+      messagePages: { [CHAT_ID]: { items: [], hasMore: false } },
+    });
+
+    const result = await runBeeperSweep({ reason: 'manual' });
+
+    expect(messageRequests()).toHaveLength(1);
+    expect(result).toMatchObject({ skipped: false, chats: 1, messages: 0 });
+    // Both withheld — the OLD code committed `normalized.lastActivity`
+    // unconditionally here, which is exactly what marked the chat
+    // permanently done on one empty page.
+    expect(committedCursorRow()).toEqual({ cursor: null, lastActivity: null });
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it('retries a chat left in the withheld state and commits normally once messages actually come back', async () => {
+    // The state a withheld first pass leaves behind: a cursor row that exists
+    // but carries neither a cursor nor a watermark — the storage-free "already
+    // retried once" marker `sweepChat` reads back.
+    storedCursorRows = [{ chat_id: CHAT_ID, cursor: null, last_activity: null }];
+    installFetch({
+      chatPages: [chatPage()],
+      messagePages: {
+        [CHAT_ID]: {
+          items: [{
+            id: 'msg-1', senderID: 'user-1', text: 'Example message',
+            timestamp: '2026-09-02T09:59:00.000Z', sortKey: '1',
+          }],
+          hasMore: false,
+          newestCursor: 'cursor-retry',
+        },
+      },
+    });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    // Retried the SAME first-page fetch (no stored cursor to walk forward
+    // from), and this time it worked — commits like any other first sweep.
+    const firstMessageRequest = new URL(messageRequests()[0]);
+    expect(firstMessageRequest.searchParams.get('direction')).toBe('before');
+    expect(committedCursorRow()).toEqual({ cursor: 'cursor-retry', lastActivity: CHAT_ACTIVITY });
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it('gives up and logs once when the retry is ALSO empty, so the chat is not re-swept forever', async () => {
+    storedCursorRows = [{ chat_id: CHAT_ID, cursor: null, last_activity: null }];
+    installFetch({
+      chatPages: [chatPage()],
+      messagePages: { [CHAT_ID]: { items: [], hasMore: false } },
+    });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    // The real (non-null) watermark commits this time, so `chatNeedsSweep`
+    // reaches the same steady state a genuinely history-less chat already
+    // does — no more retries — and exactly one warn line names the chat
+    // (id only, never content).
+    expect(committedCursorRow()).toEqual({ cursor: null, lastActivity: CHAT_ACTIVITY });
+    expect(chatNeedsSweep({ lastActivity: CHAT_ACTIVITY }, { lastActivity: CHAT_ACTIVITY })).toBe(false);
+    expect(console.warn).toHaveBeenCalledTimes(1);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(CHAT_ID));
+  });
+
+  it('does not withhold when the first page returns a message, even with hasMore/newestCursor absent', async () => {
+    // Guards the boundary: `emptyFirstPage` must key on `messages.length`, not
+    // on the presence of a cursor — a first page can legitimately answer
+    // `hasMore: false` with no `newestCursor` at all once it has content.
+    storedCursorRows = [];
+    installFetch({
+      chatPages: [chatPage()],
+      messagePages: {
+        [CHAT_ID]: {
+          items: [{ id: 'msg-1', senderID: 'user-1', text: 'hi', timestamp: '2026-09-02T09:59:00.000Z', sortKey: '1' }],
+          hasMore: false,
+        },
+      },
+    });
+
+    await runBeeperSweep({ reason: 'manual' });
+
+    expect(committedCursorRow()).toEqual({ cursor: null, lastActivity: CHAT_ACTIVITY });
+    expect(console.warn).not.toHaveBeenCalled();
   });
 });
 

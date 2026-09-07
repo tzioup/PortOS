@@ -236,7 +236,7 @@ async function attachParticipants(conversations, { cap = LIST_PARTICIPANT_CAP } 
  * to ask for them (root AGENTS.md, absent-vs-empty).
  *
  * The page is fetched FIRST — filtered, ordered, and limited on
- * `idx_beeper_conversations_activity_keyset` alone — and the "last message"
+ * `idx_beeper_conversations_activity_epoch_keyset` alone — and the "last message"
  * preview is a SECOND query scoped to just that page's ids. Folding the
  * preview LATERAL into the same WHERE/ORDER BY/LIMIT query (the old shape) let
  * the planner evaluate it once per FILTERED conversation rather than once per
@@ -269,15 +269,25 @@ export async function listConversations({
   const decoded = decodeCursor(cursor, { idPattern: UUID_PATTERN });
   if (decoded) {
     params.push(decoded.ts, decoded.id);
-    where.push(`(COALESCE(c.last_activity, c.created_at), c.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`);
+    where.push(`(COALESCE(c.last_activity, 'epoch'::timestamptz), c.id) < ($${params.length - 1}::timestamptz, $${params.length}::uuid)`);
   }
 
   params.push(pageSize + 1);
   const pageResult = await query(
-    `SELECT c.*, COALESCE(c.last_activity, c.created_at) AS ordering_ts
+    // #81: falling back to `c.created_at` here sorted a chat with no real
+    // Beeper activity by the MIRROR ROW's mint time, not by "this chat has no
+    // activity" — a batch of chats swept (and left activity-less) in the same
+    // pass shared a recent `created_at` and sorted at the TOP of the Inbox,
+    // exactly the reported symptom. `'epoch'::timestamptz` sorts every
+    // activity-less chat LAST instead: older than any real timestamp, so it
+    // ranks last under `DESC`, while keeping the row-value keyset tuple shape
+    // a real `NULLS LAST` cannot (the keyset predicate above needs a value to
+    // compare against, not a null). Matches
+    // `idx_beeper_conversations_activity_epoch_keyset`.
+    `SELECT c.*, COALESCE(c.last_activity, 'epoch'::timestamptz) AS ordering_ts
        FROM beeper_conversations c
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-      ORDER BY COALESCE(c.last_activity, c.created_at) DESC, c.id DESC
+      ORDER BY COALESCE(c.last_activity, 'epoch'::timestamptz) DESC, c.id DESC
       LIMIT $${params.length}`,
     params,
   );
@@ -411,12 +421,19 @@ export async function listMessages(conversationId, { limit, cursor } = {}) {
  */
 export async function listNetworks() {
   const result = await query(
+    // #81: `COALESCE(…, c.created_at)` reported a network holding only
+    // activity-less chats as "active just now" (the mirror row's mint time),
+    // not honestly having none. This is a plain MAX, not the page/keyset walk
+    // above — MAX ignores NULLs and itself yields NULL when every row in the
+    // group is NULL, which is already the honest value, so no sentinel is
+    // needed (unlike the row-value keyset tuple in listConversations, this
+    // aggregate never has to compare against a null).
     `SELECT c.network,
             COUNT(*)::int AS conversation_count,
             COALESCE(SUM(c.unread_count) FILTER (WHERE c.is_archived = FALSE), 0)::int AS unread_count,
             COUNT(*) FILTER (WHERE c.unread_count > 0 AND c.is_archived = FALSE)::int AS unread_conversations,
             ARRAY_AGG(DISTINCT c.account_id) AS account_ids,
-            MAX(COALESCE(c.last_activity, c.created_at)) AS last_activity
+            MAX(c.last_activity) AS last_activity
        FROM beeper_conversations c
       WHERE c.network <> ''
       GROUP BY c.network

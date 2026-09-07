@@ -72,13 +72,18 @@ beforeAll(async () => {
   const now = Date.now();
   for (let i = 0; i < CONV_COUNT; i += 1) {
     // Conversations 0..8 carry a real last_activity, freshest first (i=0
-    // newest). Conversations 9..11 exercise the COALESCE(created_at)
-    // fallback — last_activity NULL, and an explicit created_at that keeps
-    // them older than every last_activity above so the DESC order across the
-    // whole set stays predictable: conv0..conv8, then conv9, conv10, conv11.
+    // newest). Conversations 9..11 have NO last_activity at all — #81's
+    // fallback is `'epoch'::timestamptz`, not `created_at`, so all three tie
+    // on the same sentinel ordering value and sort LAST as a group,
+    // regardless of when their row was minted. `created_at` is set to a
+    // point in the FUTURE here deliberately: if the ordering ever regressed
+    // to the old `COALESCE(last_activity, created_at)` fallback, these three
+    // would sort ahead of every real-activity conversation instead of behind
+    // all of them, and the "sorts last" test below would fail loudly rather
+    // than passing on a coincidence of timing.
     const nullActivity = i >= 9;
     const lastActivity = nullActivity ? null : new Date(now - i * 60_000).toISOString();
-    const createdAt = nullActivity ? new Date(now - (100 + i) * 60_000).toISOString() : null;
+    const createdAt = nullActivity ? new Date(now + (100 + i) * 60_000).toISOString() : null;
     // eslint-disable-next-line no-await-in-loop -- deterministic seed order
     const { rows } = await query(
       `INSERT INTO beeper_conversations
@@ -134,25 +139,25 @@ afterAll(async () => {
 describe.skipIf(!runDb)('beeper conversation/message list query plans (audit cluster 06)', () => {
   it('pages the conversation list on the activity-ordering index, with no separate Sort node', async () => {
     const basePlan = await explainPlan(
-      `SELECT c.*, COALESCE(c.last_activity, c.created_at) AS ordering_ts
+      `SELECT c.*, COALESCE(c.last_activity, 'epoch'::timestamptz) AS ordering_ts
          FROM beeper_conversations c
-        ORDER BY COALESCE(c.last_activity, c.created_at) DESC, c.id DESC
+        ORDER BY COALESCE(c.last_activity, 'epoch'::timestamptz) DESC, c.id DESC
         LIMIT $1`,
       [6],
     );
-    expect(basePlan).toMatch(/Index Scan.*idx_beeper_conversations_activity_keyset/s);
+    expect(basePlan).toMatch(/Index Scan.*idx_beeper_conversations_activity_epoch_keyset/s);
     expect(basePlan).not.toMatch(/\bSort\b/);
 
     // A keyset-paginated page (the cursor predicate) is served the same way.
     const keysetPlan = await explainPlan(
-      `SELECT c.*, COALESCE(c.last_activity, c.created_at) AS ordering_ts
+      `SELECT c.*, COALESCE(c.last_activity, 'epoch'::timestamptz) AS ordering_ts
          FROM beeper_conversations c
-        WHERE (COALESCE(c.last_activity, c.created_at), c.id) < ($1::timestamptz, $2::uuid)
-        ORDER BY COALESCE(c.last_activity, c.created_at) DESC, c.id DESC
+        WHERE (COALESCE(c.last_activity, 'epoch'::timestamptz), c.id) < ($1::timestamptz, $2::uuid)
+        ORDER BY COALESCE(c.last_activity, 'epoch'::timestamptz) DESC, c.id DESC
         LIMIT $3`,
       [new Date().toISOString(), conversationIds[0], 6],
     );
-    expect(keysetPlan).toMatch(/Index Scan.*idx_beeper_conversations_activity_keyset/s);
+    expect(keysetPlan).toMatch(/Index Scan.*idx_beeper_conversations_activity_epoch_keyset/s);
     expect(keysetPlan).not.toMatch(/\bSort\b/);
   });
 
@@ -193,7 +198,27 @@ describe.skipIf(!runDb)('beeper conversation/message list query plans (audit clu
     expect(page1[0].lastMessage.id).toBe(msgId(0, MESSAGES_PER_CONV - 1));
 
     const { conversations: page2 } = await listConversations({ network: NETWORK, limit: 5, cursor: nextCursor });
-    expect(page2.map((c) => c.id)).toEqual(conversationIds.slice(5, 10));
+    // conv5..conv8 (real, decreasing last_activity) keep a fixed, deterministic
+    // order; conv9..conv11 all tie on the epoch sentinel, so only ONE of them
+    // fills the page's 5th slot and which one is an implementation detail of
+    // the id tiebreak, not a contract this test should pin.
+    expect(page2.slice(0, 4).map((c) => c.id)).toEqual(conversationIds.slice(5, 9));
+    expect(conversationIds.slice(9, 12)).toContain(page2[4].id);
+  });
+
+  // #81: an activity-less conversation sorts LAST as a group, never
+  // interleaved with (or ahead of) a conversation with real activity — the
+  // fix for the reported symptom (empty rows sorting above recent threads).
+  it('sorts every activity-less conversation after every conversation with real activity', async () => {
+    const { conversations: all } = await listConversations({ network: NETWORK, limit: CONV_COUNT });
+    expect(all).toHaveLength(CONV_COUNT);
+    expect(all.slice(0, 9).map((c) => c.id)).toEqual(conversationIds.slice(0, 9));
+    // The last three are exactly the activity-less set, in ANY order — their
+    // relative order is an id tiebreak, not a product contract.
+    expect(new Set(all.slice(9).map((c) => c.id))).toEqual(new Set(conversationIds.slice(9, 12)));
+    for (const conv of all.slice(9)) {
+      expect(conv.lastActivity).toBeNull();
+    }
   });
 
   it('pages a thread on the conversation+order index, without sorting the whole history', async () => {

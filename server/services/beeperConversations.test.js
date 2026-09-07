@@ -124,7 +124,9 @@ describe('listConversations — keyset pagination', () => {
     vi.mocked(query).mockResolvedValue({ rows: [] });
     await listConversations({ limit: 2, cursor: page.nextCursor });
     const [sql, params] = vi.mocked(query).mock.calls[3];
-    expect(flat(sql)).toContain('(COALESCE(c.last_activity, c.created_at), c.id) <');
+    // #81: the epoch sentinel, not `c.created_at` — see the dedicated
+    // ordering describe block below for why.
+    expect(flat(sql)).toContain("(COALESCE(c.last_activity, 'epoch'::timestamptz), c.id) <");
     expect(params[0]).toBe(rows[1].ordering_ts);
     expect(params[1]).toBe(rows[1].id);
   });
@@ -167,6 +169,33 @@ describe('listConversations — keyset pagination', () => {
     // Without a pattern (the shape `listMessages` uses — Beeper message ids are
     // arbitrary bridge strings, never uuids) the same cursor still decodes.
     expect(decodeCursor(garbled)).toEqual({ ts: '2026-09-01T10:00:00.000Z', id: 'not-a-uuid' });
+  });
+});
+
+// #81: `COALESCE(c.last_activity, c.created_at)` fell back to the mirror
+// row's mint time for a chat with no real Beeper activity, not to "this chat
+// has no activity" — so a batch of chats swept (and left activity-less) in
+// the same pass shared a recent `created_at` and sorted at the TOP of the
+// Inbox, above populated threads with older real activity. This is what the
+// read-only live-instance investigation on fork issue #81 (counts only)
+// found driving the reported symptom for the observed population — the
+// retry fix does not touch chats Beeper itself never reports activity for.
+describe('listConversations — activity-less chats sort last, not by mint time', () => {
+  it('sorts on the epoch sentinel, never on created_at, in the page query and ORDER BY', async () => {
+    vi.mocked(query).mockResolvedValue({ rows: [] });
+    await listConversations({});
+    const [sql] = vi.mocked(query).mock.calls[0];
+    const flatSql = flat(sql);
+    expect(flatSql).toContain("COALESCE(c.last_activity, 'epoch'::timestamptz) AS ordering_ts");
+    expect(flatSql).toContain("ORDER BY COALESCE(c.last_activity, 'epoch'::timestamptz) DESC, c.id DESC");
+    expect(flatSql).not.toContain('c.created_at');
+  });
+
+  it('sorts on the same epoch sentinel in the keyset predicate', async () => {
+    vi.mocked(query).mockResolvedValue({ rows: [] });
+    await listConversations({ cursor: encodeCursor('2026-09-01T10:00:00.000Z', CONV_A) });
+    const [sql] = vi.mocked(query).mock.calls[0];
+    expect(flat(sql)).toContain("(COALESCE(c.last_activity, 'epoch'::timestamptz), c.id) <");
   });
 });
 
@@ -238,6 +267,21 @@ describe('listConversations — row shaping', () => {
       .mockResolvedValueOnce({ rows: [] }); // participants
     const { conversations } = await listConversations({});
     expect(conversations[0].lastMessage).toBeNull();
+  });
+
+  // #81: the client's row preview falls back to "Syncing…" for a recent
+  // `lastActivity` with no mirrored message, and to the honest "No messages
+  // mirrored yet" otherwise (`BeeperChatSurface.jsx`'s `isRecentActivity`).
+  // That fallback has nothing else to key on, so `lastActivity` must keep
+  // passing through untouched — not coerced to the conversation's
+  // `created_at`, not dropped — even while `lastMessage` stays `null`.
+  it('still reports the conversation-level lastActivity alongside a null lastMessage, so the client can tell "still syncing" from "no history"', async () => {
+    vi.mocked(query)
+      .mockResolvedValueOnce({ rows: [conversationRow({ last_activity: '2026-09-02T09:00:00.000Z' })] }) // page
+      .mockResolvedValueOnce({ rows: [] }) // preview
+      .mockResolvedValueOnce({ rows: [] }); // participants
+    const { conversations } = await listConversations({});
+    expect(conversations[0]).toMatchObject({ lastMessage: null, lastActivity: '2026-09-02T09:00:00.000Z' });
   });
 });
 
@@ -418,6 +462,21 @@ describe('listNetworks', () => {
       accountIds: ['acct-example-1'],
       lastActivity: '2026-09-01T10:00:00.000Z',
     }]);
+  });
+
+  // #81: a network holding only activity-less chats used to report
+  // `lastActivity` as "just now" (the fallback to created_at), not honestly
+  // having none. Unlike listConversations' keyset walk, this is a plain MAX
+  // over the group — MAX ignores NULLs and yields NULL when every row is
+  // NULL, which is already the honest value, so no epoch sentinel is needed.
+  it('aggregates the last-activity as a plain MAX, never falling back to created_at or an epoch sentinel', async () => {
+    vi.mocked(query).mockResolvedValue({ rows: [] });
+    await listNetworks();
+    const [sql] = vi.mocked(query).mock.calls[0];
+    const flatSql = flat(sql);
+    expect(flatSql).toContain('MAX(c.last_activity) AS last_activity');
+    expect(flatSql).not.toContain('c.created_at');
+    expect(flatSql).not.toContain('epoch');
   });
 });
 
