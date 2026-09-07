@@ -65,11 +65,13 @@ function mockDb({ credentialRow = null, accountsRows = [], accountsError = null 
 
 const noCredential = (opts = {}) => mockDb({ credentialRow: null, ...opts });
 
-const credential = ({ tokenExpiresAt = null, tokenSource = 'oauth', ...opts } = {}) => {
+const credential = ({
+  tokenExpiresAt = null, tokenSource = 'oauth', scopes = '', ...opts
+} = {}) => {
   vi.mocked(decryptValue).mockReturnValue(TOKEN);
   return mockDb({
     credentialRow: {
-      token_enc: CIPHERTEXT, token_expires_at: tokenExpiresAt, scopes: '', source: tokenSource, client_id: '',
+      token_enc: CIPHERTEXT, token_expires_at: tokenExpiresAt, scopes, source: tokenSource, client_id: '',
     },
     ...opts,
   });
@@ -120,6 +122,7 @@ describe('getBeeperStatus', () => {
     expect(status.tokenConfigured).toBe(false);
     expect(status.reachable).toBeNull();
     expect(status.probeState).toBe('unknown');
+    expect(status.tokenScopes).toEqual([]);
     expect(probeBeeperInfo).not.toHaveBeenCalled();
   });
 
@@ -283,6 +286,35 @@ describe('getBeeperStatus', () => {
     const status = await getBeeperStatus();
     expect(status.tokenSource).toBe('pasted');
     expect(Object.keys(status)).not.toContain('token');
+  });
+
+  // Fork issue #78: the credential row's `scopes` column reaches the status
+  // payload as `tokenScopes`, the same array shape `beeperCredentials.js`
+  // already parses it into — so a read-only grant is visible before a send
+  // fails, and the raw token value never rides along with it.
+  it('surfaces the granted OAuth scopes as an array, and never the token value', async () => {
+    credential({ tokenSource: 'oauth', scopes: 'read write' });
+    vi.mocked(probeBeeperInfo).mockResolvedValue({
+      reachable: true, info: {}, error: null, timedOut: false, latencyMs: 5,
+    });
+
+    const status = await getBeeperStatus();
+    expect(status.tokenScopes).toEqual(['read', 'write']);
+    expect(JSON.stringify(status)).not.toContain(TOKEN);
+  });
+
+  // A pasted token (#11 decision 3) never carries scopes back from Beeper's
+  // own paste UI — `beeperOAuth.js` stores `scopes: []` for that path — so the
+  // status payload must report an honest empty array, never `null` or a
+  // fabricated grant.
+  it('reports an empty tokenScopes array for a pasted token', async () => {
+    credential({ tokenSource: 'pasted', scopes: '' });
+    vi.mocked(probeBeeperInfo).mockResolvedValue({
+      reachable: true, info: {}, error: null, timedOut: false, latencyMs: 5,
+    });
+
+    const status = await getBeeperStatus();
+    expect(status.tokenScopes).toEqual([]);
   });
 
   // There is no refresh grant, so an expired token is its own actionable

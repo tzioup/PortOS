@@ -437,6 +437,37 @@ function TokenExpiryNotice({ status }) {
   );
 }
 
+// The granted-scopes line (fork issue #78): sits beside `TokenExpiryNotice`
+// for the same reason — a read-only grant is exactly the kind of thing that
+// should be visible on the card BEFORE a send fails, not discovered from the
+// error it causes. `tokenScopes` is always an array (`[]` when unknown), the
+// absent-vs-empty rule applied to a source rather than a value: a pasted
+// token (#11 decision 3) never carries scopes back from Beeper's own paste
+// UI, so `[]` there is honest and gets said out loud; `[]` from anywhere else
+// (the legacy plaintext path) has nothing worth claiming, so this renders
+// nothing rather than a bogus "no scopes granted" line.
+function TokenScopesNotice({ status }) {
+  const scopes = Array.isArray(status?.tokenScopes) ? status.tokenScopes : [];
+  if (scopes.length === 0) {
+    if (status?.tokenSource !== 'pasted') return null;
+    return (
+      <p className="text-xs text-gray-500">Scopes unknown (pasted token).</p>
+    );
+  }
+  const readOnly = !scopes.includes('write');
+  return (
+    <div className="space-y-1">
+      <p className="text-xs text-gray-500">Scopes: {scopes.join(', ')}</p>
+      {readOnly && (
+        <p className="text-xs text-port-warning flex items-center gap-1.5">
+          <ShieldAlert size={12} />
+          Read-only grant — sending will fail.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // The transport liveness row (#33 decision 4): a Moltworld-shape dot, and — on
 // the same card, never in a global banner — the one `app.state` value a human
 // has to act on. Rendered in EVERY branch where a token is configured, not only
@@ -638,6 +669,7 @@ function BeeperStatusCard({
         <p className="text-sm text-port-error">{status.lastProbeError || 'Could not reach Beeper Desktop.'}</p>
         <p className="text-xs text-gray-500 mt-1">Checked against {status.baseUrl}.</p>
         <TokenExpiryNotice status={status} />
+        <TokenScopesNotice status={status} />
         <div className="mt-2"><BeeperRealtimeRow realtime={realtime} /></div>
         <div className="mt-1"><SweepStatusRow sweep={status.sweep} /></div>
         {/* The mirror still knows which accounts exist even with Beeper closed. */}
@@ -682,6 +714,7 @@ function BeeperStatusCard({
           </p>
         )}
         <TokenExpiryNotice status={status} />
+        <TokenScopesNotice status={status} />
         <BeeperRealtimeRow realtime={realtime} />
         <SweepStatusRow sweep={status.sweep} />
         <AccountRoster accounts={status.accounts} error={status.accountsError} />

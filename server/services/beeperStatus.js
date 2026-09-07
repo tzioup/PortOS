@@ -122,6 +122,10 @@ export async function getBeeperStatus() {
     tokenConfigured: Boolean(stored),
     tokenSource: stored?.tokenSource ?? null,
     tokenExpiresAt: stored?.tokenExpiresAt ?? null,
+    // Granted scopes (fork issue #78) — an array of strings, `[]` when
+    // unknown (a pasted token, or the legacy plaintext path). Read off
+    // `resolveBeeperToken()` alongside source/expiry; never the token value.
+    tokenScopes: Array.isArray(stored?.tokenScopes) ? stored.tokenScopes : [],
   };
   const expiry = tokenExpiryInfo(credential.tokenExpiresAt);
 
@@ -163,9 +167,12 @@ export async function getBeeperStatus() {
   return {
     tokenConfigured: credential.tokenConfigured,
     // 'oauth' | 'pasted' | 'legacy-settings' | null — provenance, never the
-    // value. This is the ONLY credential detail a client payload ever carries
-    // besides presence and expiry.
+    // value.
     tokenSource: credential.tokenSource,
+    // Fork issue #78: array of strings, `[]` when unknown (a pasted token
+    // never carries scopes back from Beeper's own paste UI). Never the token
+    // value itself — same provenance-only rule as `tokenSource` above.
+    tokenScopes: credential.tokenScopes,
     baseUrl: resolvedBaseUrl,
     reachable,
     probeState,
