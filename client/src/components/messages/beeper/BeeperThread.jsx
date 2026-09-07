@@ -419,9 +419,26 @@ export default function BeeperThread({
   };
   const handleDismiss = (entry) => { dismissOutboxEntry?.(entry); };
 
+  // Scrolls to the bottom only when what is actually AT the bottom changed —
+  // the newest mirrored message, or (once one exists) the newest pending
+  // send — or the conversation itself changed. Tracked in a ref rather than
+  // read off `ordered.length`/`visibleOutbox.length` as dependencies (the
+  // original bug, PERF-8/A11Y-2): "Load earlier messages" only grows `ordered`
+  // by prepending OLDER messages, which changes `ordered.length` on every
+  // click without moving `ordered[ordered.length - 1]` — the newest message —
+  // at all, so keying on the length alone yanked the reader back to the
+  // bottom on every page-in of history. `ordered` is oldest-first (see
+  // above), so its newest entry is the LAST one; outbox rows render after it
+  // and are the true bottom while a send is still pending.
+  const latestBottomRef = useRef(null);
   useEffect(() => {
+    const newestMessageId = ordered.length ? ordered[ordered.length - 1].id : null;
+    const newestOutboxId = visibleOutbox.length ? visibleOutbox[visibleOutbox.length - 1].id : null;
+    const bottomKey = `${conversation?.id ?? ''}:${newestOutboxId ?? ''}:${newestMessageId ?? ''}`;
+    if (latestBottomRef.current === bottomKey) return;
+    latestBottomRef.current = bottomKey;
     bottomRef.current?.scrollIntoView({ block: 'end' });
-  }, [conversation?.id, ordered.length, visibleOutbox.length]);
+  }, [conversation?.id, ordered, visibleOutbox]);
 
   // A typed confirmation must never survive the conversation it was typed for:
   // switching threads with the panel open would otherwise leave a primed Purge

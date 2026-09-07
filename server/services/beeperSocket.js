@@ -448,10 +448,23 @@ async function connect() {
   }));
   // `ws` exposes the protocol ping the built-in WebSocket hides, and auto-replies
   // pong. Measured cadence: 10.5s after open, then every 30s.
+  //
+  // No `emitState()` here (finding PERF-7): a bare ping changes nothing but
+  // `lastPingAt`, which `getBeeperRealtimeState()` reads live off this
+  // module's own variable — so `GET /api/beeper/status` and
+  // `hasRecentBeeperActivity()` (`beeperStatus.js`) both still see a fresh
+  // value with no broadcast involved. Every field the socket-pushed
+  // `beeper:realtime` payload actually carries (`state`, `appState`,
+  // `appStateActionable`, `authRejected`, `reconnectAttempts`) is unchanged by
+  // a plain ping, and the one client reader of that event
+  // (`useBeeperRealtime.js` → `ConnectionStatusDot`) renders only `state`, so
+  // broadcasting a payload that reads identically to the last one was pure
+  // re-render cost 2-3 times a minute on every open tab, for nothing anyone
+  // could see change. `noteFrame()` still re-arms the watchdog, so the ping
+  // continues to count as liveness exactly as before.
   instance.on('ping', guard('ping', () => {
     lastPingAt = runtime.now();
     noteFrame();
-    emitState();
   }));
   instance.on('pong', guard('pong', () => noteFrame()));
   instance.on('message', guard('message', (data) => {

@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import {
+  useCallback, useEffect, useRef, useState,
+} from 'react';
 import { useParams, useSearchParams } from 'react-router';
 import toast from '../ui/Toast';
 import Drawer from '../Drawer';
@@ -20,8 +22,9 @@ import BeeperSettingsPanel from './beeper/BeeperSettingsPanel';
  *     `BeeperChatSurface`, mounts its own instance to refetch the outbox on a
  *     `message.upserted` invalidation (`client/src/hooks/README.md` sanctions
  *     this). This is the ONE that owns the status card: its liveness snapshot
- *     plus an invalidation counter are handed down as props, so the settings
- *     drawer never needs a subscription of its own.
+ *     plus an invalidation counter (and the frames behind it, for
+ *     `BeeperChatSurface`'s own frame-scoped thread refetch) are handed down
+ *     as props, so the settings drawer never needs a subscription of its own.
  *  2. **The settings drawer.** #30's status card is not removed by the chat
  *     surface landing — it moves behind a header action, deep-linked as
  *     `?settings=1` exactly like the iMessage ingestion drawer, so ⌘K and voice
@@ -34,13 +37,25 @@ import BeeperSettingsPanel from './beeper/BeeperSettingsPanel';
 export default function BeeperTab() {
   const { chatKey } = useParams();
   const [settingsParam, setSettingsParam] = useDrawerTab('settings', null, ['1']);
-  // A counter rather than the frame itself: the frames are invalidation-only
-  // (#33) and carry no rows, so the only information the surface needs from one
-  // is "something changed, re-read the mirror".
+  // `invalidationSeq` is the "something changed, re-read the mirror" pulse —
+  // still a bare counter, because the list/networks refetch it drives (design
+  // decision: other chats' previews and unread counts always refresh) needs no
+  // frame detail. `invalidationFramesRef` rides alongside it as a MAILBOX, not
+  // React state: `BeeperChatSurface` needs each frame's own `chatID` to decide
+  // whether the OPEN THREAD is in scope for a refetch (audit cluster 07,
+  // findings PERF-6/BEEP-5) — a counter alone cannot tell "another chat
+  // changed" from "this one did". It is a ref rather than state because the
+  // surface drains it itself once it has scheduled a refetch for everything
+  // currently in it, so relaying frames down costs no extra render and needs
+  // no hand-back of "how many did you consume".
+  const invalidationFramesRef = useRef([]);
   const [invalidationSeq, setInvalidationSeq] = useState(0);
 
   const mountedRef = useMounted();
-  const onInvalidate = useCallback(() => setInvalidationSeq((seq) => seq + 1), []);
+  const onInvalidate = useCallback((frame) => {
+    invalidationFramesRef.current.push(frame ?? null);
+    setInvalidationSeq((seq) => seq + 1);
+  }, []);
   const { realtime, seedRealtime } = useBeeperRealtime({ onInvalidate });
 
   // The outbound runaway breaker's read model (#36, decided on #8). The
@@ -107,6 +122,7 @@ export default function BeeperTab() {
         conversationId={chatKey || null}
         realtime={realtime}
         invalidationSeq={invalidationSeq}
+        invalidationFrames={invalidationFramesRef}
         breaker={breaker}
         onOpenSettings={() => setSettingsParam('1')}
       />
