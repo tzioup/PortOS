@@ -794,13 +794,20 @@ describe('a forward walk the server stalls with hasMore but no usable cursor', (
 
 // ---------------------------------------------------------------------------
 // #81: a first-page anchor fetch that comes back empty is retried once, not
-// silently marked done. Investigation (a live-instance pm2 log + read-only DB
-// count pass, `ht-81-investigation.md`) ruled out a message-kind filter (there
-// is none in `beeperClient.js`) and the sweep/page budget (it only bounds the
-// forward `'after'` catch-up walk on a chat that already has a cursor) — the
+// silently marked done — not a message-kind filter (there is none in
+// `beeperClient.js`) and not the sweep/page budget (it only bounds the
+// forward `'after'` catch-up walk on a chat that already has a cursor). The
 // old code simply committed `normalized.lastActivity` on ANY first-page
 // result, empty or not, so a chat that got nothing back on its one shot never
-// got a second look.
+// got a second look. This retry covers a chat whose activity IS real but
+// whose first page still came back empty (a transient fetch hiccup, or a
+// history-less chat gaining its first-ever activity right as it enters the
+// mirror) — NOT the population the read-only live-instance investigation on
+// fork issue #81 actually observed empty (chats Beeper itself never reports
+// activity for at all, so `chatNeedsSweep` never re-selects them regardless
+// of this retry). That population's reported symptom — empty rows sorting
+// above recent threads — is fixed by the sort fallback in
+// `beeperConversations.js`, not by this retry.
 // ---------------------------------------------------------------------------
 
 describe('#81 — first page comes back with zero messages', () => {
@@ -833,7 +840,7 @@ describe('#81 — first page comes back with zero messages', () => {
     expect(result).toMatchObject({ skipped: false, chats: 1, messages: 0 });
     // Both withheld — the OLD code committed `normalized.lastActivity`
     // unconditionally here, which is exactly what marked the chat
-    // permanently done on one empty page (the #81 log-backed verdict).
+    // permanently done on one empty page.
     expect(committedCursorRow()).toEqual({ cursor: null, lastActivity: null });
     expect(console.warn).not.toHaveBeenCalled();
   });

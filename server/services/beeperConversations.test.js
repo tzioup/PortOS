@@ -177,9 +177,9 @@ describe('listConversations — keyset pagination', () => {
 // has no activity" — so a batch of chats swept (and left activity-less) in
 // the same pass shared a recent `created_at` and sorted at the TOP of the
 // Inbox, above populated threads with older real activity. This is what the
-// live-instance investigation (`ht-81-investigation.md`) found driving the
-// reported symptom for the observed population — the retry fix does not
-// touch chats Beeper itself never reports activity for.
+// read-only live-instance investigation on fork issue #81 (counts only)
+// found driving the reported symptom for the observed population — the
+// retry fix does not touch chats Beeper itself never reports activity for.
 describe('listConversations — activity-less chats sort last, not by mint time', () => {
   it('sorts on the epoch sentinel, never on created_at, in the page query and ORDER BY', async () => {
     vi.mocked(query).mockResolvedValue({ rows: [] });
