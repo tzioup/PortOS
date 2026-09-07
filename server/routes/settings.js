@@ -247,6 +247,21 @@ async function reconcileBeeperArming(reason) {
     .catch((err) => console.error(`❌ Beeper ingestion reconcile (${reason}) failed: ${err.message}`));
 }
 
+// An interval-only Beeper save (no `enabled` flip) used to take effect only
+// at the next process restart: the registered event's `intervalMs` is read
+// once, at `schedule()` time (`createSettingsGatedSyncScheduler.js`), and
+// `startBeeperScheduler()` deliberately no-ops once `beeper-sync` is already
+// registered (fork issue #79). `restartBeeperScheduler()` is the fix — cancel
+// and register fresh, which reads `getBeeperSyncConfig()` again and picks up
+// whatever interval was just persisted. Lazily imported for the same reason
+// `reconcileBeeperArming` above is: this is a rare save, and the scheduler
+// module reaches the whole Beeper service graph.
+async function restartBeeperSchedulerForIntervalChange(reason) {
+  const { restartBeeperScheduler } = await import('../services/beeperScheduler.js');
+  await restartBeeperScheduler()
+    .catch((err) => console.error(`❌ Beeper scheduler restart (${reason}) failed: ${err.message}`));
+}
+
 // PUT /api/settings/features/:featureId
 // `enabled` is nullable: null clears a grouped feature's override back to
 // "inherit" (see instanceFeatureUpdateSchema and updateInstanceFeature).
@@ -484,11 +499,13 @@ router.put('/', asyncHandler(async (req, res) => {
   // page — from every other `save()` caller (schedulers, sync hooks, feature
   // writes), which keep the `'system'` default in the operator-action ledger (#5594).
   let previousBeeperEnabled;
+  let previousBeeperIntervalMinutes;
   let merged = await updateSettingsWith((current) => {
     // Read inside the queue, against the freshest persisted snapshot (same
     // reasoning as `mergeFederationSlice` above) — a stale pre-image here could
     // read a no-op as a flip, or a real flip as a no-op.
     previousBeeperEnabled = current?.beeper?.enabled === true;
+    previousBeeperIntervalMinutes = current?.beeper?.intervalMinutes;
     return preserveExternallyOwnedKeys(
       mergeFederationSlice({ ...current, ...settingsPatch }, current),
       current,
@@ -504,7 +521,16 @@ router.put('/', asyncHandler(async (req, res) => {
   // write above so the reconcile (and the scheduler's own re-read) see the
   // value that was actually persisted, not the request body.
   const nextBeeperEnabled = merged?.beeper?.enabled === true;
-  if (nextBeeperEnabled !== previousBeeperEnabled) await reconcileBeeperArming('sync-toggle');
+  if (nextBeeperEnabled !== previousBeeperEnabled) {
+    await reconcileBeeperArming('sync-toggle');
+  } else if (merged?.beeper?.intervalMinutes !== previousBeeperIntervalMinutes) {
+    // Fork issue #79: an interval-only change (no `enabled` flip) still has to
+    // take effect without a restart. The `enabled`-flip branch above already
+    // gets a fresh registration — and therefore the just-persisted interval —
+    // through `reconcileBeeperArming`, so this `else` only has work to do when
+    // that branch did not run.
+    await restartBeeperSchedulerForIntervalChange('interval-change');
+  }
   if (subscriptionCostsPatch !== undefined) {
     const costs = await saveSubscriptionCosts(subscriptionCostsPatch, { actor: 'user' });
     merged = { ...merged, subscriptionCosts: costs };

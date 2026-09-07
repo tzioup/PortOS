@@ -17,13 +17,26 @@
  *     and logs the same "disabled in settings" line every other domain does.
  *
  * `type: 'interval'` means the first run is one interval AFTER registration,
- * never at boot — intended: boot should not fire a network sweep. A throwing
- * handler cannot kill the interval either; `eventScheduler.runEvent` catches
- * the rejection, records the failed run and re-arms.
+ * never at boot — intended: boot should not fire a network sweep.
+ * `bootstrap.js` calls `startBeeperScheduler()` directly for exactly that
+ * reason, never through `beeperArming.js`'s `reconcileBeeperIngestion()` — the
+ * one and only place that kicks an immediate sweep on ARMING (fork issue #79)
+ * is that reconcile, which runs only off a live trigger (connect, a feature
+ * toggle, the sync toggle), never off boot. A throwing handler cannot kill the
+ * interval either; `eventScheduler.runEvent` catches the rejection, records
+ * the failed run and re-arms.
  *
- * The interval is LOCKED at registration (the factory's documented carry-over
- * from the four hand-written originals), so changing `intervalMinutes` takes
- * effect at the next process start.
+ * The interval is read fresh at every REGISTRATION (the factory's documented
+ * carry-over from the four hand-written originals still locks it between
+ * registrations — a running interval does not notice a settings change
+ * mid-flight). Fork issue #79's fix for "a new interval only takes effect
+ * after a restart" is therefore `restartBeeperScheduler()` below: cancel the
+ * current registration and register a fresh one, which reads
+ * `getBeeperSyncConfig()` again and picks up whatever is stored right now.
+ * `server/routes/settings.js` calls it when a save changes only the interval
+ * (an `enabled` flip already gets a fresh registration through
+ * `reconcileBeeperIngestion()`, so calling this too would just cancel and
+ * re-register a second time for nothing).
  *
  * No LLM calls happen on this path — ingestion is deterministic — so the
  * no-cold-bootstrap AI policy does not gate it; the opt-in is about the user's
@@ -74,4 +87,29 @@ export async function startBeeperScheduler() {
  */
 export function stopBeeperScheduler() {
   return cancel(SCHEDULER_EVENT_ID);
+}
+
+/**
+ * Cancel and re-register the sweep scheduler against whatever
+ * `getBeeperSyncConfig()` reads right now — the interval-change half of fork
+ * issue #79. `startBeeperScheduler()` deliberately no-ops once `beeper-sync`
+ * is already registered (see its own docblock: a second `schedule()` call
+ * resets `nextRunAt` a whole interval into the future, which is exactly wrong
+ * for a toggle that did not touch the cadence). An interval change is the one
+ * case that guard must NOT swallow, so this cancels first and lets
+ * `startBeeperScheduler()` register fresh.
+ *
+ * Deliberately does not kick an immediate sweep — only ARMING does that
+ * (`beeperArming.js`'s `reconcileBeeperIngestion()`). Changing the cadence of
+ * an already-running scheduler is a different event, and firing a sweep on
+ * every interval edit would surprise a user who is just tuning a number.
+ *
+ * A no-op, like `startBeeperScheduler()`, when the feature is off or no token
+ * is configured: `stopBeeperScheduler()` cancels whatever was registered (or
+ * nothing, harmlessly), and the re-registration attempt then declines the
+ * same way `startBeeperScheduler()` always has.
+ */
+export async function restartBeeperScheduler() {
+  stopBeeperScheduler();
+  await startBeeperScheduler();
 }

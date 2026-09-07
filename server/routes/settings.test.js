@@ -68,9 +68,18 @@ vi.mock('../services/credentialInventory.js', () => ({
 vi.mock('../services/beeperArming.js', () => ({
   reconcileBeeperIngestion: vi.fn(async () => ({ armed: false, changed: false })),
 }));
+// The interval-change half of fork issue #79: a Beeper save that changes only
+// `intervalMinutes` restarts the scheduler directly rather than going through
+// `reconcileBeeperIngestion` (that stays reserved for an `enabled` flip). Mocked
+// for the same reason `beeperArming.js` is above — what a restart actually does
+// is covered by services/beeperScheduler.test.js.
+vi.mock('../services/beeperScheduler.js', () => ({
+  restartBeeperScheduler: vi.fn(async () => {}),
+}));
 
 import settingsRoutes from './settings.js';
 import { reconcileBeeperIngestion } from '../services/beeperArming.js';
+import { restartBeeperScheduler } from '../services/beeperScheduler.js';
 import { updateSettingsWith } from '../services/settings.js';
 import { hasConfiguredInstances as hasConfiguredDatadogInstances } from '../services/datadog.js';
 import { hasConfiguredInstances as hasConfiguredJiraInstances } from '../services/jira.js';
@@ -897,7 +906,7 @@ describe('Settings routes — beeper sync-toggle arming', () => {
     expect(reconcileBeeperIngestion).toHaveBeenCalledWith({ reason: 'sync-toggle' });
   });
 
-  it('does not reconcile when a save leaves enabled unchanged (interval-only)', async () => {
+  it('does not reconcile arming when a save leaves enabled unchanged (interval-only)', async () => {
     store = { beeper: { enabled: true, intervalMinutes: 5 } };
 
     const res = await request(buildApp())
@@ -918,6 +927,77 @@ describe('Settings routes — beeper sync-toggle arming', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.beeper.enabled).toBe(true);
+  });
+});
+
+// Fork issue #79's other half: an interval-only save (no `enabled` flip) used
+// to take effect only at the next process restart, because the registered
+// event's `intervalMs` is locked in at `schedule()` time and
+// `startBeeperScheduler()` deliberately no-ops once `beeper-sync` is already
+// registered. `restartBeeperScheduler()` (cancel, then register fresh) is the
+// fix; this describe block pins WHEN the route calls it, not what it does —
+// that lives in services/beeperScheduler.test.js.
+describe('Settings routes — beeper interval change', () => {
+  beforeEach(() => {
+    store = {};
+    vi.clearAllMocks();
+  });
+
+  it('restarts the scheduler, after the settings are persisted, when only the interval changes', async () => {
+    store = { beeper: { enabled: true, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 15 } });
+
+    expect(res.status).toBe(200);
+    expect(restartBeeperScheduler).toHaveBeenCalledTimes(1);
+    expect(reconcileBeeperIngestion).not.toHaveBeenCalled();
+    // Same ordering requirement as the arming reconcile: the restart has to
+    // read the interval AFTER it lands on disk, or a fast save/restart race
+    // could re-register against the value that was about to be overwritten.
+    const [writeOrder] = updateSettingsWith.mock.invocationCallOrder;
+    const [restartOrder] = restartBeeperScheduler.mock.invocationCallOrder;
+    expect(writeOrder).toBeLessThan(restartOrder);
+  });
+
+  it('does not restart the scheduler when the interval is unchanged', async () => {
+    store = { beeper: { enabled: true, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 5 } });
+
+    expect(res.status).toBe(200);
+    expect(restartBeeperScheduler).not.toHaveBeenCalled();
+  });
+
+  // The `enabled`-flip branch already gets a fresh registration — and
+  // therefore the just-persisted interval — through `reconcileBeeperIngestion`,
+  // so restarting the scheduler too would just cancel and re-register a
+  // second time for nothing.
+  it('does not also restart the scheduler when enabled flips, even if the interval changed in the same save', async () => {
+    store = { beeper: { enabled: false, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 15 } });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledTimes(1);
+    expect(restartBeeperScheduler).not.toHaveBeenCalled();
+  });
+
+  it('does not fail the PUT when the scheduler restart rejects', async () => {
+    restartBeeperScheduler.mockRejectedValueOnce(new Error('boom'));
+    store = { beeper: { enabled: true, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 20 } });
+
+    expect(res.status).toBe(200);
+    expect(res.body.beeper.intervalMinutes).toBe(20);
   });
 });
 

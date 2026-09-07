@@ -32,9 +32,26 @@
  * Logging is transition-only, which keeps #32's "a fresh install narrates
  * nothing it does not have" acceptance intact: reconciling an install with the
  * feature off and no token stops nothing, starts nothing and says nothing.
+ *
+ * **Arming also kicks one sweep immediately (fork issue #79).** Before this,
+ * connecting Beeper (or flipping the feature or sync toggle on) registered the
+ * scheduler's interval timer but fired nothing until a full interval had
+ * elapsed — up to the configured cadence, several minutes on a default
+ * install, with an empty inbox the whole time. `reconcileOnce` below fires
+ * `runBeeperSweep({ reason: 'arm' })` — fire-and-forget, never awaited — the
+ * moment a reconcile is the one that newly registers the scheduler
+ * (`schedulerStarted`), never on a reconcile that finds it already
+ * registered. This is deliberately NOT routed through `eventScheduler`'s
+ * `triggerNow`: a direct call keeps the registered event's own `nextRunAt`
+ * exactly where `schedule()` set it (registration time + one interval), so
+ * the very next scheduled tick lands one full interval after the immediate
+ * kick rather than being pulled forward by it — "kicks one sweep immediately,
+ * THEN the interval," not "resets the interval." It shares `runBeeperSweep`'s
+ * own re-entrancy guard with the timer and the manual sync route, so it can
+ * never race a sweep already in flight.
  */
 
-import { isBeeperIngestionArmed } from './beeperSync.js';
+import { isBeeperIngestionArmed, runBeeperSweep } from './beeperSync.js';
 import { isBeeperSchedulerRegistered, startBeeperScheduler, stopBeeperScheduler } from './beeperScheduler.js';
 import { isBeeperSocketRunning, startBeeperSocket, stopBeeperSocket } from './beeperSocket.js';
 
@@ -77,6 +94,19 @@ async function reconcileOnce(reason) {
   if (!isBeeperSchedulerRegistered()) {
     await startBeeperScheduler();
     schedulerStarted = isBeeperSchedulerRegistered();
+  }
+
+  // #79: a fresh registration on a LIVE trigger — never on boot, which calls
+  // `startBeeperScheduler()` directly and never reaches this reconcile at all
+  // — earns one immediate sweep. Wrapped in `Promise.resolve(...)` so a test
+  // double that returns `undefined` instead of a promise cannot throw on
+  // `.catch`, and never awaited: a sweep can run long, and `reconcileOnce`
+  // calls are serialized on `tail` above — blocking here would stall a fast
+  // toggle-off landing right behind this one.
+  if (schedulerStarted) {
+    Promise.resolve(runBeeperSweep({ reason: 'arm' })).catch((err) => {
+      console.error(`${LOG_PREFIX}: immediate sweep on arm failed: ${err.message}`);
+    });
   }
 
   const changed = socketStarted || schedulerStarted;

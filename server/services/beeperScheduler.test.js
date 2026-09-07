@@ -18,7 +18,7 @@ vi.mock('./beeperSync.js', () => ({
   runBeeperSweep: (...args) => state.sweep(...args),
 }));
 
-const { startBeeperScheduler } = await import('./beeperScheduler.js');
+const { startBeeperScheduler, restartBeeperScheduler } = await import('./beeperScheduler.js');
 const { cancel, getEvent, getHistory } = await import('./eventScheduler.js');
 
 function captureLogs() {
@@ -120,5 +120,56 @@ describe('the armed interval', () => {
 
     expect(state.sweep).not.toHaveBeenCalled();
     expect(logs).toContain('🫧 Beeper sync scheduler: disabled since registration — skipping run');
+  });
+});
+
+// Fork issue #79's "changing the interval takes effect without a restart":
+// `startBeeperScheduler()` alone deliberately no-ops once `beeper-sync` is
+// already registered (the test right above it pins that no-op), which is
+// exactly why a plain interval change through it never took effect until the
+// process restarted. `restartBeeperScheduler()` is the fix.
+describe('restartBeeperScheduler', () => {
+  it('cancels the current registration and re-registers with the interval getBeeperSyncConfig reads NOW', async () => {
+    captureLogs();
+    await startBeeperScheduler();
+    expect(getEvent('beeper-sync').intervalMs).toBe(60_000);
+
+    // This fails on the old code path (`startBeeperScheduler()` called a
+    // second time): already registered, it would no-op and leave `intervalMs`
+    // at 60_000 — the change stuck until a restart.
+    state.config = { enabled: true, intervalMinutes: 10 };
+    await restartBeeperScheduler();
+
+    const event = getEvent('beeper-sync');
+    expect(event).toBeTruthy();
+    expect(event.intervalMs).toBe(10 * 60_000);
+  });
+
+  it('does not kick an immediate sweep on an interval change — only arming does that (beeperArming.js)', async () => {
+    captureLogs();
+    await startBeeperScheduler();
+    state.config = { enabled: true, intervalMinutes: 10 };
+
+    await restartBeeperScheduler();
+
+    expect(state.sweep).not.toHaveBeenCalled();
+  });
+
+  it('registers fresh when nothing was registered yet, same as startBeeperScheduler', async () => {
+    captureLogs();
+
+    await restartBeeperScheduler();
+
+    expect(getEvent('beeper-sync')).toBeTruthy();
+  });
+
+  it('is a no-op when the feature is off or no token is configured', async () => {
+    state.armed = false;
+    const logs = captureLogs();
+
+    await restartBeeperScheduler();
+
+    expect(getEvent('beeper-sync')).toBeFalsy();
+    expect(logs).toEqual([]);
   });
 });
