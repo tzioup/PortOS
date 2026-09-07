@@ -71,12 +71,34 @@ const MARKS = {
       )}
     </Wrap>
   ),
+  // Signal's real mark is a dotted/dashed ring, not a speech bubble — drawn as
+  // a stroked circle with a dash pattern so it stays unmistakable from the
+  // solid Google Messages bubble at rail size (#84).
   signal: ({ size }) => (
     <Wrap size={size} bg="#3A76F0" title="Signal">
       {svg(
+        <circle
+          cx="12"
+          cy="12"
+          r="7.6"
+          fill="none"
+          stroke="#fff"
+          strokeWidth="2.4"
+          strokeLinecap="round"
+          strokeDasharray="2.6 3.4"
+        />,
+      )}
+    </Wrap>
+  ),
+  // Beeper's own mark, for chats Beeper attributes to itself rather than a
+  // bridged network (#84) — a four-point sparkle keeps the silhouette
+  // distinct from every rounded/circular network bubble above.
+  beeper: ({ size }) => (
+    <Wrap size={size} rounded bg="#7C5CFC" title="Beeper">
+      {svg(
         <path
           fill="#fff"
-          d="M12 3.2c-4.9 0-8.8 3.5-8.8 7.8 0 2 .8 3.8 2.2 5.2l-.9 3.9 4.2-1.3c1 .3 2.1.5 3.3.5 4.9 0 8.8-3.5 8.8-7.8S16.9 3.2 12 3.2Z"
+          d="M12 2.3c.7 3.6 1.7 4.6 5.3 5.3-3.6.7-4.6 1.7-5.3 5.3-.7-3.6-1.7-4.6-5.3-5.3 3.6-.7 4.6-1.7 5.3-5.3Zm6.8 10.4c.4 1.9.9 2.4 2.9 2.8-2 .4-2.5.9-2.9 2.8-.4-1.9-.9-2.4-2.9-2.8 2-.4 2.5-.9 2.9-2.8Z"
         />,
       )}
     </Wrap>
@@ -139,6 +161,7 @@ const LABELS = {
   telegram: 'Telegram',
   slack: 'Slack',
   x: 'X',
+  beeper: 'Beeper',
 };
 
 /** Any network PortOS has no mark for still renders: initial on a neutral chip. */
@@ -148,15 +171,63 @@ const Fallback = ({ size, label }) => (
   </Wrap>
 );
 
+// Beeper's Facebook/Messenger bridge reports several distinct ids for the
+// same one `facebook` mark and label depending on bridge generation and
+// login mode (#84): the legacy bridge, its Go rewrite, and the
+// Messenger-mode login all land on the same network. Keyed post-normalize
+// (lowercase, punctuation stripped), so "Facebook Go" and "facebook-go" both
+// match `facebookgo`.
+const NETWORK_ALIASES = {
+  facebookgo: 'facebook',
+  messenger: 'facebook',
+  messengergo: 'facebook',
+};
+
+// The live Facebook-bridge display string has never been observed directly
+// (no fixture in this repo, none in any captured log, live mirror off
+// limits), so rather than guess one more exact spelling for `NETWORK_ALIASES`
+// above, this ordered contains-rule against the normalized id is what makes
+// the mapping robust to whichever spelling ("Facebook Messenger",
+// "Messenger (Go)", ...) the bridge actually emits — checked only after the
+// exact map so a future precise alias still wins.
+const NETWORK_ALIAS_RULES = [
+  [/facebook|messenger/, 'facebook'],
+];
+
 // Beeper reports a network as a lowercase id; normalize defensively so a
 // bridge that reports "WhatsApp" or "google-messages" still finds its mark
-// instead of silently degrading to the initial chip.
-const normalize = (network) => String(network || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+// instead of silently degrading to the initial chip, then fold known aliases
+// onto the one id each has a mark/label for.
+const normalize = (network) => {
+  const raw = String(network || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (NETWORK_ALIASES[raw]) return NETWORK_ALIASES[raw];
+  const rule = NETWORK_ALIAS_RULES.find(([pattern]) => pattern.test(raw));
+  return rule ? rule[1] : raw;
+};
 
 /** A human label for a network id, for the composer, the header and titles. */
 export const networkLabel = (network) => LABELS[normalize(network)] || network || 'Unknown network';
 
+// A network id PortOS has no mark for is expected (#9: the roster is
+// whatever the mirror holds, never a hardcoded list) but should still be
+// visible to a developer diagnosing why a network fell back to a letter
+// chip. Log it once per normalized id, dev-only, so a rail full of one
+// unrecognized network doesn't spam the console on every render.
+const loggedUnknownNetworks = new Set();
+
+function logUnknownNetworkOnce(rawNetwork, normalized) {
+  if (!import.meta.env.DEV) return;
+  if (!normalized || loggedUnknownNetworks.has(normalized)) return;
+  loggedUnknownNetworks.add(normalized);
+  console.warn(`⚠️ Beeper network "${rawNetwork}" (normalized "${normalized}") has no rail mark — falling back to a letter chip`);
+}
+
 export default function NetworkLogo({ network, label, size = 16 }) {
-  const Mark = MARKS[normalize(network)];
-  return Mark ? <Mark size={size} /> : <Fallback size={size} label={label || networkLabel(network)} />;
+  const normalized = normalize(network);
+  const Mark = MARKS[normalized];
+  if (!Mark) {
+    logUnknownNetworkOnce(network, normalized);
+    return <Fallback size={size} label={label || networkLabel(network)} />;
+  }
+  return <Mark size={size} />;
 }
