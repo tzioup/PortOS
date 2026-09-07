@@ -109,13 +109,13 @@ export async function getBeeperStatus() {
   // Deliberately NOT wrapped in a catch: an unreadable vault throws (#11
   // decision 8), and the card renders its "could not read status" branch
   // rather than telling a connected install to connect again. This has to be
-  // `resolveBeeperToken()` (which decrypts the row), not the cheaper
-  // `resolveBeeperTokenMeta()` (which only reads the row's PRESENCE): the
-  // cheap check can never notice a corrupt vault — a row whose ciphertext
-  // cannot be decrypted still has a row — which is exactly how this used to
-  // report `tokenConfigured: true, reachable: true` for a credential nobody
-  // could actually authenticate with. Never reads `stored.token` beyond this
-  // line: only presence, source and expiry ever reach the response below.
+  // `resolveBeeperToken()` (which decrypts the row), not a cheaper
+  // presence-only read: a row whose ciphertext cannot be decrypted still has
+  // a row, so a presence-only check can never notice a corrupt vault — which
+  // is exactly how this used to report `tokenConfigured: true, reachable:
+  // true` for a credential nobody could actually authenticate with. Never
+  // reads `stored.token` beyond this line: only presence, source and expiry
+  // ever reach the response below.
   const stored = await resolveBeeperToken();
   const credential = {
     tokenConfigured: Boolean(stored),
