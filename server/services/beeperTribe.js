@@ -11,14 +11,31 @@
  *     on a Tribe person from calendar/iMessage/Contacts. Resolution never
  *     creates a person — only matches an existing one — so the auto path can
  *     never produce a duplicate.
- *   - No durable handle at all (~13%) has nothing to resolve against;
- *     `beeper_participants.tribe_person_id` is then the sole, hand-set truth
- *     (`linkParticipant` / `createPersonAndLinkParticipant`).
+ *   - No durable handle at all (~13%) has nothing HANDLE-shaped to resolve
+ *     against, so every EXPLICIT link (`linkParticipant` /
+ *     `createPersonAndLinkParticipant`) also claims a `kind='beeper-user'`
+ *     identity keyed on the participant's own account and Beeper user id (see
+ *     `beeperUserScopeFor`), and `beeper_participants.tribe_person_id` drops
+ *     to being a pure cache for that case too.
+ *
+ * `kind='beeper-user'` OVERLOADS the existing `UNIQUE (kind, network, handle)`
+ * index rather than adding a column (#96): `network` carries the participant's
+ * `beeper_conversations.account_id` and `handle` carries its raw
+ * `source_user_id`. That pair is Beeper's own per-account `User.id`, stable
+ * across resweeps, where the mirror's `conversation_id` is a PortOS UUID
+ * re-minted by every purge — so the claim survives a purge + resweep by
+ * construction (`tribe_identities` has no FK onto anything Beeper-side).
+ * The ACCOUNT, not the network, is the scope: two bridge accounts on the same
+ * network mint their own independent user-id space. The overload is documented
+ * on the table itself in `server/lib/db/schema/tribe.js`; a `source_user_id`
+ * is an opaque id, so it is stored RAW and never routed through
+ * `classifyNetworkHandle` (which exists for phones/usernames only).
  *
  * `upsertParticipant` is the participant-row writer the ingestion sweep (#32)
  * calls on every sync pass — its ON CONFLICT clause deliberately never
  * touches `tribe_person_id`, so a manual link on the 13%-no-handle case
- * survives every re-sync (#34 acceptance).
+ * survives every re-sync (#34 acceptance); its post-insert auto-resolve is
+ * what re-fills the cache from the `beeper-user` claim after a purge (#96).
  *
  * Touchpoints: `logSenderTouchpoints` relates a GROUP conversation by message
  * SENDER only — Beeper's participant roster truncates (20/100, no cursor) so
@@ -63,6 +80,12 @@ function rowToParticipant(row) {
     // the wrong scope, or with none at all). Authoritative scope for a
     // kind='handle' tribe_identities claim.
     network: row.network || '',
+    // The Beeper ACCOUNT this participant's conversation belongs to, joined
+    // from beeper_conversations.account_id — likewise never client-supplied.
+    // Authoritative scope for the kind='beeper-user' claim (#96): a
+    // `source_user_id` is only unique within one bridge account, and the
+    // account survives a purge + resweep where the conversation id does not.
+    accountId: row.account_id || '',
     observedVia: row.observed_via,
     createdAt: row.created_at?.toISOString?.() ?? row.created_at,
     updatedAt: row.updated_at?.toISOString?.() ?? row.updated_at,
@@ -72,7 +95,7 @@ function rowToParticipant(row) {
 export async function getParticipant(conversationId, sourceUserId) {
   await ensureReady();
   const result = await query(
-    `SELECT p.*, c.network, tp.deleted AS tribe_person_deleted
+    `SELECT p.*, c.network, c.account_id, tp.deleted AS tribe_person_deleted
      FROM beeper_participants p
      JOIN beeper_conversations c ON c.id = p.conversation_id
      LEFT JOIN tribe_people tp ON tp.id = p.tribe_person_id
@@ -99,6 +122,32 @@ function identityScopeFor(participant) {
   return { kind: classified.kind, network, handle: classified.handle };
 }
 
+/** The `tribe_identities` kind that carries a Beeper `User.id` claim (#96). */
+export const BEEPER_USER_KIND = 'beeper-user';
+
+/**
+ * The `tribe_identities` scope a participant's BEEPER USER ID claims — the
+ * durable key every participant has, handle or not (#96). Overloads the
+ * existing `UNIQUE (kind, network, handle)` index: `network` is the
+ * participant's own `beeper_conversations.account_id` and `handle` is its raw
+ * `source_user_id` (an opaque id — never normalized, never classified).
+ *
+ * Keyed on the ACCOUNT rather than the network because a `source_user_id` is
+ * only unique within one bridge account, and joined server-side from the
+ * participant's own conversation, never caller-supplied — the same rule
+ * `identityScopeFor` follows for `network`. Returns `null` when either half is
+ * missing (an account-less conversation cannot exist through the FK, but an
+ * unscoped claim is the inert-row hazard `linkIdentity` refuses, so this
+ * never manufactures one). Shared by `resolveParticipantPerson` and
+ * `linkParticipant` so the read and the write agree on the key.
+ */
+function beeperUserScopeFor(participant) {
+  const network = participant?.accountId || '';
+  const handle = participant?.sourceUserId || '';
+  if (!network || !handle) return null;
+  return { kind: BEEPER_USER_KIND, network, handle };
+}
+
 /**
  * Resolve a participant to a Tribe person WITHOUT writing anything. Never
  * creates a person.
@@ -115,11 +164,18 @@ function identityScopeFor(participant) {
  *
  *   1. `tribe_identities` — the user's OWN explicit Beeper link, the truth for
  *      any handle that classifies into a resolvable scope.
- *   2. the cache column — the sole truth for the no-durable-handle case, and
- *      still the next-best answer for a durable handle nobody has claimed yet
+ *   2. the `kind='beeper-user'` claim on this participant's own
+ *      (account, `source_user_id`) — the same explicit link recorded durably
+ *      for a participant with NO classifiable handle (#96). Below the handle
+ *      claim because a handle can be re-pointed at a different person on its
+ *      own axis, and above the cache for the same reason the handle claim is:
+ *      the claim is the record of an explicit user action, the column is a
+ *      cache that a purge deletes and a resweep re-mints empty.
+ *   3. the cache column — still the next-best answer for a durable handle
+ *      nobody has claimed yet, and for a row auto-resolved but never claimed
  *      (it is a manual link, so it outranks the legacy array below). Null'd
  *      when it points at a soft-deleted person — see `rowToParticipant`.
- *   3. for a phone specifically, the existing Tribe phone matcher — a
+ *   4. for a phone specifically, the existing Tribe phone matcher — a
  *      WhatsApp/Signal counterpart's phone is plausibly already on a Tribe
  *      person from iMessage/Contacts with no Beeper claim recorded yet.
  *
@@ -138,6 +194,12 @@ export async function resolveParticipantPerson({ conversationId, sourceUserId },
   if (scope) {
     const via = await tribeIdentities.resolvePersonByIdentity(scope);
     if (via) return via;
+  }
+
+  const beeperUserScope = beeperUserScopeFor(participant);
+  if (beeperUserScope) {
+    const viaBeeperUser = await tribeIdentities.resolvePersonByIdentity(beeperUserScope);
+    if (viaBeeperUser) return viaBeeperUser;
   }
 
   if (participant.tribePersonId) return participant.tribePersonId;
@@ -209,9 +271,16 @@ export async function upsertParticipant({
   });
 
   const participant = await getParticipant(conversationId, sourceUserId);
-  // Gate on the row's OWN handle, not this call's argument — the COALESCE
-  // above means a handle-less re-observation leaves a durable handle in place.
-  if (!participant.tribePersonId && participant.handle) {
+  // Gated on the cache being empty ONLY (#96). It used to also require the
+  // row's own handle, on the reasoning that a handle-less participant had
+  // nothing to resolve against — true until the `kind='beeper-user'` claim
+  // existed, and the reason a hand-linked Messenger participant came back
+  // unlinked after a purge + resweep: the resweep re-minted the row with a
+  // NULL cache and the auto-resolve that would have re-filled it never ran.
+  // The extra cost for a genuinely unclaimed handle-less participant is one
+  // indexed `tribe_identities` lookup; the phone matcher (the expensive leg)
+  // still only runs for a phone-shaped handle.
+  if (!participant.tribePersonId) {
     const resolved = await resolveParticipantPerson({ conversationId, sourceUserId }, personIndex);
     if (resolved) {
       await query(
@@ -268,8 +337,34 @@ async function clearDisplacedParticipantCaches(displacedPersonId, scope) {
 }
 
 /**
+ * The `kind='beeper-user'` counterpart of `clearDisplacedParticipantCaches`
+ * (#96): after a re-link MOVES a (account, `source_user_id`) claim to another
+ * person, null the now-stale cache on every OTHER conversation's row for the
+ * SAME Beeper user under the SAME account that still points at the displaced
+ * person. Same rationale as the handle version — the read path stops
+ * resolving through those rows, but the column is what a participant listing
+ * renders and what `upsertParticipant`'s "still empty" gate reads.
+ *
+ * One statement rather than the handle version's filter-in-JS pass: the match
+ * here is an exact column comparison (a `source_user_id` is opaque and stored
+ * raw), so no normalizing comparator is needed.
+ */
+async function clearDisplacedBeeperUserCaches(displacedPersonId, scope) {
+  const result = await query(
+    `UPDATE beeper_participants p SET tribe_person_id = NULL, updated_at = NOW()
+     FROM beeper_conversations c
+     WHERE c.id = p.conversation_id
+       AND p.tribe_person_id = $1 AND c.account_id = $2 AND p.source_user_id = $3`,
+    [displacedPersonId, scope.network, scope.handle],
+  );
+  return result.rowCount ?? 0;
+}
+
+/**
  * Explicit link — the inline thread-participant action (#10 decision 4).
- * When the participant carries a durable handle, ALSO claims it in
+ * ALWAYS claims a `kind='beeper-user'` identity on the participant's own
+ * (account, `source_user_id`) so the link survives a purge + resweep (#96),
+ * and when the participant carries a durable handle ALSO claims that in
  * `tribe_identities` so the next participant (in this or another
  * conversation) presenting the same handle auto-resolves without another
  * manual click. `network` is never accepted as an argument — a `kind='handle'`
@@ -312,6 +407,22 @@ export async function linkParticipant({
     if (displacedPersonId) await clearDisplacedParticipantCaches(displacedPersonId, scope);
   }
 
+  // ALWAYS claim the beeper-user identity too (#96) — this is the half that
+  // makes a manual link durable for a participant with no classifiable
+  // handle, and it costs nothing for one that has both. Idempotent: re-linking
+  // the same participant to the same person re-writes the same row and
+  // displaces nobody. A handle-claim displacement is reported in preference to
+  // this one when the two disagree, because the handle axis is the one a
+  // second participant elsewhere can also present.
+  const beeperUserScope = beeperUserScopeFor(participant);
+  if (beeperUserScope) {
+    const identity = await tribeIdentities.linkIdentity({ personId, ...beeperUserScope, source });
+    if (identity.displacedPersonId) {
+      await clearDisplacedBeeperUserCaches(identity.displacedPersonId, beeperUserScope);
+      displacedPersonId = displacedPersonId || identity.displacedPersonId;
+    }
+  }
+
   const result = await query(
     `UPDATE beeper_participants SET tribe_person_id = $3, updated_at = NOW()
      WHERE conversation_id = $1 AND source_user_id = $2
@@ -330,6 +441,9 @@ export async function linkParticipant({
  * person"). Never invoked automatically; always an explicit user action. The
  * network named in `notes` (display only) is the participant's OWN
  * conversation's network, joined server-side — never caller-supplied.
+ *
+ * Delegates the whole write to `linkParticipant`, so the new person gets the
+ * same durable `kind='beeper-user'` claim any hand-link does (#96).
  */
 export async function createPersonAndLinkParticipant({
   conversationId, sourceUserId, name, ring = 'tribe', relationship = '', source = 'user',

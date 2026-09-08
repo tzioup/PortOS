@@ -66,7 +66,25 @@ export const tribeDdl = [
     // phone-shaped handle (E.164-normalized, `network` left '' since the same
     // phone means the same person regardless of which network reported it) or
     // 'handle' for a network-specific username (network-scoped, so `network`
-    // is required). This also leaves room for a later `kind='email'` /
+    // is required).
+    //
+    // `kind='beeper-user'` (#96) OVERLOADS the same three columns for the
+    // participants Beeper reports neither a phone nor a username for: it
+    // carries the participant's `beeper_conversations.account_id` in
+    // `network` and its raw `beeper_participants.source_user_id` in `handle`.
+    // That is Beeper's own per-account `User.id` — stable across resweeps,
+    // where the mirror's `conversation_id` is a PortOS UUID re-minted by every
+    // purge — so a hand-made link recorded here outlives a purge + resweep
+    // that deletes the `beeper_participants` cache row (`ON DELETE CASCADE`
+    // off `beeper_conversations`). The ACCOUNT is the scope, not the network:
+    // two bridge accounts on one network mint independent user-id spaces. The
+    // overload is deliberate — no new column, no widened UNIQUE, and the same
+    // `(kind, network, handle)` lookup serves it — and the writer/reader pair
+    // lives in `server/services/beeperTribe.js` (`beeperUserScopeFor`).
+    // A `source_user_id` is opaque, so it is stored RAW: unlike a phone or a
+    // username it is never normalized by `server/lib/tribeMatch.js`.
+    //
+    // This also leaves room for a later `kind='email'` /
     // consolidation of the legacy tribe_people.emails[]/phones[] arrays into
     // this table without a second schema decision (deferred, #10 decision 7 —
     // not done here). A handle is lowercased, trimmed, leading '@' stripped

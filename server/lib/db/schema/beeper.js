@@ -310,4 +310,38 @@ export const beeperDdl = [
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`,
   `CREATE INDEX IF NOT EXISTS idx_beeper_outbox_conversation_state ON beeper_outbox (conversation_id, state, created_at DESC)`,
+
+  // #96 backfill — one idempotent statement, LAST in this array because it
+  // reads both `beeper_participants` (created above) and `tribe_identities`
+  // (created in the phase-1 `tribeDdl` list, which `ensureSchemaImpl` runs in
+  // full before this one).
+  //
+  // Every link an existing install made by hand before `kind='beeper-user'`
+  // existed lives ONLY in the `beeper_participants.tribe_person_id` cache, so
+  // the next purge + resweep would still lose it. This promotes each of those
+  // to a durable claim. It is not in `server/scripts/init-db.sql`: that file
+  // provisions a FRESH database, where there is no participant row to
+  // promote, and the parity test (`server/lib/db.catalogDdlParity.test.js`)
+  // compares table/index/trigger shape, which this statement does not touch.
+  //
+  //   - `ON CONFLICT DO NOTHING` makes re-running it (every boot) a no-op and
+  //     never overwrites a claim the app has since written — the app's own
+  //     `linkParticipant` is the authority, this is only a catch-up.
+  //   - `DISTINCT ON` + `ORDER BY updated_at DESC` picks ONE row per
+  //     (account, source_user_id) deterministically when the same Beeper user
+  //     was hand-linked to different people in different conversations: the
+  //     most recently touched link wins, matching the table's own
+  //     "last explicit link wins" semantics.
+  //   - the `tribe_people` join drops soft-deleted persons (`tribe.deletePerson`
+  //     never fires the FK cascade), so a purge does not resurrect a link to
+  //     somebody the user deleted.
+  `INSERT INTO tribe_identities (person_id, kind, network, handle, source, linked_at)
+   SELECT DISTINCT ON (c.account_id, p.source_user_id)
+          p.tribe_person_id, 'beeper-user', c.account_id, p.source_user_id, 'backfill', NOW()
+   FROM beeper_participants p
+   JOIN beeper_conversations c ON c.id = p.conversation_id
+   JOIN tribe_people tp ON tp.id = p.tribe_person_id AND tp.deleted = FALSE
+   WHERE p.tribe_person_id IS NOT NULL AND c.account_id <> ''
+   ORDER BY c.account_id, p.source_user_id, p.updated_at DESC
+   ON CONFLICT (kind, network, handle) DO NOTHING`,
 ];
