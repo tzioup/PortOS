@@ -47,6 +47,26 @@ const isVideo = (mimeType) => String(mimeType || '').startsWith('video/');
 
 const sizeLabel = (bytes) => (bytes === null || bytes === undefined ? 'size unknown' : formatBytes(bytes));
 
+// The wrapper style that reserves an image attachment's box before it loads.
+//
+// Exported and pure because the width it computes is a `min()`, and the client
+// test environment (happy-dom since upstream v2.60.0) drops any declaration
+// whose value is a `min()` — the property never reaches the style attribute, so
+// a DOM assertion cannot see it in either direction. Asserting the function
+// keeps the cap under test rather than trading it for a value the test
+// environment happens to serialize: `min()` is what a real browser needs here.
+export const hasImageDimensions = (row) => Number.isFinite(row.width) && row.width > 0
+  && Number.isFinite(row.height) && row.height > 0;
+
+export const reservedBoxStyle = (row, imgLoaded) => {
+  if (!hasImageDimensions(row)) return !imgLoaded ? { width: '8rem', height: '8rem' } : undefined;
+  return {
+    aspectRatio: `${row.width} / ${row.height}`,
+    width: `min(${row.width}px, calc(16rem * ${(row.width / row.height).toFixed(4)}))`,
+    maxWidth: '100%',
+  };
+};
+
 function KeepButton({ attachment, busy, onToggle }) {
   const locked = attachment.keep === true;
   return (
@@ -223,15 +243,8 @@ export default function BeeperAttachment({ attachment, onUpdated }) {
     // `max-w-full` at the bubble edge. Without dimensions (older rows, or a
     // network that never reported size) the skeleton keeps the fixed neutral
     // box, so the layout still does not collapse to nothing.
-    const hasDims = Number.isFinite(row.width) && row.width > 0
-      && Number.isFinite(row.height) && row.height > 0;
-    const reservedBox = hasDims
-      ? {
-        aspectRatio: `${row.width} / ${row.height}`,
-        width: `min(${row.width}px, calc(16rem * ${(row.width / row.height).toFixed(4)}))`,
-        maxWidth: '100%',
-      }
-      : (!imgLoaded ? { width: '8rem', height: '8rem' } : undefined);
+    const hasDims = hasImageDimensions(row);
+    const reservedBox = reservedBoxStyle(row, imgLoaded);
     return (
       <div className="mt-1">
         <div

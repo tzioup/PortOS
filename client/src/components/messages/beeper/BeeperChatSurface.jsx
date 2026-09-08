@@ -864,7 +864,7 @@ export default function BeeperChatSurface({
             title="Unread only"
             aria-label="Unread only"
             aria-pressed={unreadOnly}
-            className={`ml-auto rounded p-1.5 ${unreadOnly ? 'bg-port-accent text-port-bg' : 'text-gray-500 hover:text-white'}`}
+            className={`ml-auto inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-1.5 ${unreadOnly ? 'bg-port-accent text-port-bg' : 'text-gray-500 hover:text-white'}`}
           >
             <Filter size={15} />
           </button>
@@ -874,7 +874,7 @@ export default function BeeperChatSurface({
             disabled={syncing}
             title="Sync now — runs a Beeper sweep immediately, then refreshes this list"
             aria-label="Sync now"
-            className="rounded p-1.5 text-gray-500 hover:text-white disabled:opacity-50"
+            className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-1.5 text-gray-500 hover:text-white disabled:opacity-50"
           >
             <RefreshCw size={15} className={syncing || listLoading ? 'animate-spin' : undefined} />
           </button>
