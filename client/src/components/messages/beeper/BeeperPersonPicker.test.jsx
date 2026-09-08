@@ -194,3 +194,63 @@ describe('BeeperPersonPicker — disabled state', () => {
     expect(screen.getByLabelText('Link Sam Example to a Tribe person')).toBeDisabled();
   });
 });
+
+/**
+ * #105: the results list used to render `absolute`, positioned inside the
+ * component's own `relative` wrapper — fine on its own, but wherever a caller
+ * nests the picker inside an `overflow: auto` ancestor (the Beeper
+ * participants roster, `BeeperThread.jsx`), an absolutely positioned child
+ * cannot escape that ancestor's clipping and instead extends its scrollable
+ * area. The list now portals to `document.body` and is fixed-positioned off
+ * the input's own rect (`usePopoverPosition`) so no ancestor can clip it.
+ * "Keyboard path still selects" and "Escape closes" are exercised above
+ * already (they never depended on the list's DOM location) and stayed green
+ * through this change — these add the portal-specific coverage.
+ */
+describe('BeeperPersonPicker — portaled results list (#105)', () => {
+  it('renders the results list outside the input wrapper, as a child of document.body', () => {
+    const { container } = renderPicker();
+    fireEvent.focus(screen.getByLabelText('Link Sam Example to a Tribe person'));
+
+    const listbox = screen.getByRole('listbox');
+    expect(container.contains(listbox)).toBe(false);
+    expect(document.body.contains(listbox)).toBe(true);
+  });
+
+  it('still selects on a click inside the portaled list', () => {
+    const onSelectPerson = vi.fn();
+    renderPicker({ onSelectPerson });
+    fireEvent.focus(screen.getByLabelText('Link Sam Example to a Tribe person'));
+
+    const option = screen.getByRole('option', { name: 'Blair Sample' });
+    // Confirms the click actually exercised the portal, not some fallback.
+    expect(document.body.contains(option)).toBe(true);
+    fireEvent.mouseDown(option);
+
+    expect(onSelectPerson).toHaveBeenCalledWith('p2');
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+
+  it('closes on an outside click: mousedown outside is not swallowed as "inside the picker"', () => {
+    renderPicker();
+    const input = screen.getByLabelText('Link Sam Example to a Tribe person');
+    fireEvent.focus(input);
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+
+    // This is a combobox, not a menu — the input keeps focus the whole time,
+    // so closing is driven by its own `onBlur`, not a global outside-click
+    // listener. A real outside click's mousedown moves the browser's focus
+    // away from the input, which is what fires that blur; happy-dom moves
+    // `document.activeElement` on `fireEvent.mousedown` (confirmed: it lands
+    // on `document.body`) without also dispatching the `blur` event a real
+    // browser would, so both are fired here to model that one user gesture.
+    // The regression this guards against: the portaled list's own
+    // `mousedown` handler (added for #105 so a click *inside* it doesn't
+    // blur the input away from under a selection) must not be broad enough
+    // to also swallow a `mousedown` that lands elsewhere, like this one.
+    fireEvent.mouseDown(document.body);
+    fireEvent.blur(input);
+
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+});
