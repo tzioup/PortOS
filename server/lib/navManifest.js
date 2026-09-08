@@ -177,8 +177,12 @@ const RAW_NAV_COMMANDS = [
   { id: 'nav.messages.imessage-settings', path: '/messages/imessage?settings=1', label: 'iMessage Settings', section: 'Comms', feature: 'imessage', aliases: ['settings-imessage', 'imessage-settings', 'imessage-sync'], keywords: ['imessage', 'sync', 'chat.db', 'sms', 'texts', 'tribe', 'timeline', 'full disk access'] },
   { id: 'nav.messages.sync', path: '/messages/sync', label: 'Sync', section: 'Comms', tabGroup: 'messages', tabId: 'sync', aliases: ['messages-sync', 'comms-sync'], keywords: ['comms'] },
   { id: 'nav.messages.config', path: '/messages/config', label: 'Config', section: 'Comms', tabGroup: 'messages', tabId: 'config', aliases: ['messages-config', 'comms-config'], keywords: ['comms'] },
-  { id: 'nav.stacker-news', path: '/stacker-news', label: 'Stacker News', section: 'Comms', aliases: ['stacker-news', 'stacker', 'sn'], keywords: ['comms', 'community', 'territory', 'moderation', 'stewardship'] },
-  { id: 'nav.x', path: '/x', label: 'X', section: 'Comms', aliases: ['x', 'x-com', 'twitter', 'comms-x'], keywords: ['comms', 'social', 'reach', 'engagement', 'shadowban', 'diagnostics'] },
+  // X and Stacker News join the Comms feature group alongside iMessage,
+  // Signal, and Beeper — default ON, so an existing install sees no change;
+  // only ⌘K/sidebar visibility gates on the flag, the `<Route>` itself keeps
+  // resolving with the feature off.
+  { id: 'nav.stacker-news', path: '/stacker-news', label: 'Stacker News', section: 'Comms', feature: 'stacker-news', aliases: ['stacker-news', 'stacker', 'sn'], keywords: ['comms', 'community', 'territory', 'moderation', 'stewardship'] },
+  { id: 'nav.x', path: '/x', label: 'X', section: 'Comms', feature: 'x', aliases: ['x', 'x-com', 'twitter', 'comms-x'], keywords: ['comms', 'social', 'reach', 'engagement', 'shadowban', 'diagnostics'] },
   { id: 'nav.timeline', path: '/timeline', label: 'Timeline', section: 'Brain', aliases: ['activity-timeline', 'activity', 'my-day', 'life-log', 'life-timeline'], keywords: ['human activity', 'life log', 'timeline', 'messages', 'calendar', 'history', 'what did i do', 'daily', 'import', 'backfill', 'whatsapp', 'spotify', 'discord', 'youtube'] },
   { id: 'nav.tribe', path: '/tribe', label: 'Tribe', section: 'Brain', aliases: ['tribe', 'relationships', 'relationship-manager', 'people'], keywords: ['dunbar', 'friends', 'family', 'network', 'social graph', 'care cadence'] },
 

@@ -57,17 +57,19 @@ describe('instance feature groups (#40)', () => {
     expect(INSTANCE_FEATURE_IDS).toContain('facetime');
     expect(INSTANCE_FEATURE_IDS).toContain('imessage');
     expect(INSTANCE_FEATURE_IDS).toContain('signal');
+    expect(INSTANCE_FEATURE_IDS).toContain('x');
+    expect(INSTANCE_FEATURE_IDS).toContain('stacker-news');
     expect(INSTANCE_FEATURE_IDS).toContain('beeper');
   });
 
-  it('buckets the comms group as FaceTime Audio, iMessage, Signal and Beeper (#30)', () => {
+  it('buckets the comms group as FaceTime Audio, iMessage, Signal, X, Stacker News and Beeper', () => {
     expect(INSTANCE_FEATURE_GROUP_IDS).toContain('comms');
     const members = INSTANCE_FEATURES.filter((feature) => feature.group === 'comms').map((feature) => feature.id);
-    expect(members.sort()).toEqual(['beeper', 'facetime', 'imessage', 'signal']);
+    expect(members.sort()).toEqual(['beeper', 'facetime', 'imessage', 'signal', 'stacker-news', 'x']);
   });
 
-  it('defaults iMessage and Signal to enabled with no detector, like the existing manual toggles', () => {
-    for (const id of ['imessage', 'signal']) {
+  it('defaults iMessage, Signal, X and Stacker News to enabled with no detector, like the existing manual toggles', () => {
+    for (const id of ['imessage', 'signal', 'x', 'stacker-news']) {
       expect(INSTANCE_FEATURES.find((feature) => feature.id === id)).toMatchObject({
         defaultEnabled: true,
         group: 'comms',

@@ -209,15 +209,17 @@ describe('nav contract — instance-feature gating', () => {
     expect(command).toMatchObject({ path: '/eidoverse', feature: 'eidoverse' });
   });
 
-  // Comms feature group (#40): iMessage and Signal join FaceTime Audio under
-  // the `comms` group. Nav gating stays per-entry (unlike Health's whole-section
-  // SECTION_FEATURE gate) because Comms holds ungated siblings — Inbox, Drafts,
-  // Contacts, X, Stacker News.
-  it('gates the iMessage, Signal and Beeper pages on their own instance features', () => {
+  // Comms feature group (#40): iMessage, Signal, X and Stacker News join
+  // FaceTime Audio and Beeper under the `comms` group. Nav gating stays
+  // per-entry (unlike Health's whole-section SECTION_FEATURE gate) because
+  // Comms holds ungated siblings — Inbox, Drafts, Contacts.
+  it('gates the iMessage, Signal, X, Stacker News and Beeper pages on their own instance features', () => {
     const byId = Object.fromEntries(NAV_COMMANDS.map((c) => [c.id, c.feature]));
     expect(byId['nav.messages.imessage']).toBe('imessage');
     expect(byId['nav.messages.imessage-settings']).toBe('imessage');
     expect(byId['nav.messages.signal']).toBe('signal');
+    expect(byId['nav.x']).toBe('x');
+    expect(byId['nav.stacker-news']).toBe('stacker-news');
     expect(byId['nav.messages.beeper']).toBe('beeper');
     expect(byId['nav.messages.beeper-settings']).toBe('beeper');
     // Contacts spans both networks (and every other message source) so it stays

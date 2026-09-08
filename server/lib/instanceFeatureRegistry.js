@@ -105,6 +105,20 @@ export const INSTANCE_FEATURES = Object.freeze([
     group: 'comms',
   }),
   Object.freeze({
+    id: 'x',
+    label: 'X',
+    description: 'X (Twitter) reach and health tracking, draft posts, and account safety controls.',
+    defaultEnabled: true,
+    group: 'comms',
+  }),
+  Object.freeze({
+    id: 'stacker-news',
+    label: 'Stacker News',
+    description: 'Stacker News community monitoring, triage queue, and draft composition.',
+    defaultEnabled: true,
+    group: 'comms',
+  }),
+  Object.freeze({
     id: 'beeper',
     label: 'Beeper',
     description: 'Local Beeper Desktop bridge — WhatsApp, Discord, Telegram, and other bridged networks, mirrored machine-local.',
@@ -119,10 +133,10 @@ export const INSTANCE_FEATURES = Object.freeze([
 export const INSTANCE_FEATURE_IDS = Object.freeze(INSTANCE_FEATURES.map((feature) => feature.id));
 
 // Buckets features under one group toggle with per-feature overrides (#40).
-// Membership: comms (FaceTime Audio, iMessage, Signal, Beeper — #30 joined
-// Beeper to the group #40 stood up). Widening membership is a one-line change
-// to a feature's `group` above; adding a new group is a one-line addition
-// here. A group's own
+// Membership: comms (FaceTime Audio, iMessage, Signal, X, Stacker News, Beeper
+// — #30 joined Beeper to the group #40 stood up, and X/Stacker News joined
+// after). Widening membership is a one-line change to a feature's `group`
+// above; adding a new group is a one-line addition here. A group's own
 // `enabled` flag defaults to true (see storedGroupEnabled in
 // services/instanceFeatures.js) so registering this never hides a feature an
 // existing install already saw with no settings write required.
