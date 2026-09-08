@@ -1207,14 +1207,12 @@ describe('the inline Tribe link action', () => {
 
     const peopleToggle = await screen.findByRole('button', { name: 'People' });
     act(() => { peopleToggle.click(); });
-    const select = await screen.findByLabelText('Link Sam Example to a Tribe person');
-    act(() => {
-      Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set.call(select, '55555555-5555-4555-8555-555555555555');
-      select.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-
-    const linkButton = within(select.closest('li')).getByRole('button', { name: 'Link' });
-    act(() => { linkButton.click(); });
+    // The search-first picker (#98 part B) replaced the `<select>` + Link
+    // button: opening the results and clicking a match IS the link action.
+    const picker = await screen.findByLabelText('Link Sam Example to a Tribe person');
+    act(() => { picker.focus(); });
+    const result = await screen.findByRole('option', { name: 'Alex Example' });
+    act(() => { fireEvent.mouseDown(result); });
 
     await waitFor(() => expect(api.linkBeeperParticipant).toHaveBeenCalledWith(
       { conversationId: CONV_A, sourceUserId: 'user-1', personId: '55555555-5555-4555-8555-555555555555' },

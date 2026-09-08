@@ -336,6 +336,41 @@ the displaced person's stale caches, the same "last explicit link wins" rule the
 follows. Installs that made such links before this shipped are promoted by an idempotent backfill
 that runs with the boot-time schema DDL (soft-deleted people are skipped).
 
+**The Tribe link surfaces beside the thread title** (fork issue #98), not only inside the
+participants drawer. `BeeperThread.jsx`'s header renders a small chip next to the title, branching
+on the mirrored `conversation.isGroup` (Beeper's own `chat.type === 'group'`), never on
+participant count:
+
+- **1:1** (`isGroup: false`) — the counterpart is simply the conversation's own participant list
+  (see `oneToOneCounterpart` in `BeeperThread.jsx`: Beeper's own roster for a `single` chat never
+  includes the local account's user, so the roster IS the counterpart; there is no per-participant
+  self/`isSender` marker anywhere in the mirrored schema to check instead, and no account user id
+  reaches the client). Linked shows **"<name> · Tribe"** and clicking it opens `/tribe?person=<id>`
+  directly; unlinked shows **"Link to Tribe"**, which opens the participants drawer (the same panel
+  the existing "People" button opens).
+- **Group** (`isGroup: true`) — a participant-count chip (e.g. "6 people", or "20+ people" once
+  `hasMoreParticipants` is set, matching the drawer's own truncation caveat), which also opens the
+  drawer. A group never shows a single link state — there is no one counterpart to link.
+
+**The participant-linking control is a search-first picker**, not a full-roster `<select>`.
+`BeeperPersonPicker.jsx` (beside `BeeperThread.jsx`, with its own test file) is a combobox: type to
+filter (client-side, debounced ≥200ms, over the roster the surface already loads once per mount —
+the server's `GET /tribe/people?search=` param stays available for a future caller with a roster
+too large to hold client-side), navigate results with ArrowUp/ArrowDown, and Enter/click selects.
+Selecting a result **is** the link action — there is no separate "Link" button afterwards. **"Create
+new…" is always the picker's last row**, below every match, and calls the exact same
+`onCreateAndLinkParticipant` callback the old standalone "New" button called (fork issue #97 changes
+what that callback *does* — a confirm-and-rename form instead of an immediate create — not this
+wiring).
+
+**`Tribe.jsx` accepts a `?person=<id>` deep link.** On load, and whenever the param changes, the
+page switches to the Circle tab, selects that person through the exact same path a click on their
+`ContactCard` takes (`selectContact`), and scrolls the card into view — the same shape the existing
+`?outreach=<conversationKey>` deep link (Care Queue) already uses. An id the roster does not
+recognize (a deleted person, or a stale bookmark) is silently ignored, with no error toast. Both the
+title chip's linked state and the participants drawer's "Linked · <name>" row (now a link, not plain
+text) point here.
+
 ### Unread badge
 
 `beeper_conversations.unread_count` is Beeper's own count, mirrored verbatim and overwritten

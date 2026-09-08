@@ -4,6 +4,7 @@ import {
 } from 'lucide-react';
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
 import BeeperAttachment from './BeeperAttachment';
+import BeeperPersonPicker from './BeeperPersonPicker';
 import InlineConfirmRow from '../../ui/InlineConfirmRow';
 import { decodeHtmlEntities, parseMessageBody } from '../../../lib/beeperMessageBody';
 import { formatBytes } from '../../../utils/formatters';
@@ -135,20 +136,38 @@ function Avatar({ name, size = 40 }) {
  * Two shapes in one control because they are the same decision: an existing
  * person, or a new one created from the participant's own display name.
  * `tribePersonId` present means the link is already resolved — the row then
- * states who it is rather than offering the action again.
+ * states who it is rather than offering the action again, and (#98 part C)
+ * that state is a link straight to the person's Tribe page rather than plain
+ * text, the same `?person=` deep link the title chip below uses.
+ *
+ * The unlinked branch (#98 part B) is a single search-first picker
+ * (`BeeperPersonPicker`) rather than the old `<select>` + "Link" + "New"
+ * button trio: choosing a result IS the link action, and "Create new…" is
+ * the picker's own last row, wired to the exact same `onLinkNew` callback
+ * the old "New" button called.
  */
-function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
-  const [personId, setPersonId] = useState('');
-  const selectId = `beeper-link-${participant.sourceUserId}`;
+function ParticipantRow({
+  participant, people, linking, onLink, onLinkNew, onOpenPerson,
+}) {
+  const pickerId = `beeper-link-${participant.sourceUserId}`;
+  const name = participant.displayName || participant.handle || participant.sourceUserId;
 
   if (participant.tribePersonId) {
     return (
       <li className="flex items-center gap-2 py-1 text-xs text-gray-300">
         <Avatar name={participant.displayName || participant.handle} size={22} />
-        <span className="min-w-0 flex-1 truncate">{participant.displayName || participant.handle || participant.sourceUserId}</span>
-        <span className="shrink-0 truncate text-[11px] text-port-success">
-          {participant.tribePersonName ? `Linked · ${participant.tribePersonName}` : 'Linked'}
-        </span>
+        <span className="min-w-0 flex-1 truncate">{name}</span>
+        {participant.tribePersonName ? (
+          <button
+            type="button"
+            onClick={() => onOpenPerson(participant.tribePersonId)}
+            className="shrink-0 truncate text-[11px] text-port-success underline-offset-2 hover:underline"
+          >
+            {`Linked · ${participant.tribePersonName}`}
+          </button>
+        ) : (
+          <span className="shrink-0 truncate text-[11px] text-port-success">Linked</span>
+        )}
       </li>
     );
   }
@@ -156,40 +175,16 @@ function ParticipantRow({ participant, people, linking, onLink, onLinkNew }) {
   return (
     <li className="flex flex-wrap items-center gap-2 py-1 text-xs text-gray-300">
       <Avatar name={participant.displayName || participant.handle} size={22} />
-      <span className="min-w-0 flex-1 truncate">{participant.displayName || participant.handle || participant.sourceUserId}</span>
-      <label htmlFor={selectId} className="sr-only">
-        Link {participant.displayName || participant.sourceUserId} to a Tribe person
-      </label>
-      <select
-        id={selectId}
-        value={personId}
-        onChange={(event) => setPersonId(event.target.value)}
-        className="max-w-[9rem] rounded border border-port-border bg-port-bg px-2 py-1 text-[11px] text-gray-200"
-      >
-        <option value="">Link to…</option>
-        {people.map((person) => (
-          <option key={person.id} value={person.id}>{person.name}</option>
-        ))}
-      </select>
-      <button
-        type="button"
-        disabled={!personId || linking}
-        onClick={() => onLink(participant, personId)}
-        className="inline-flex min-h-[28px] items-center gap-1 rounded border border-port-border px-2 py-1 text-[11px] text-gray-200 transition-colors hover:border-port-accent disabled:opacity-40"
-      >
-        {linking ? <Loader2 size={11} className="animate-spin" /> : <Users size={11} />}
-        Link
-      </button>
-      <button
-        type="button"
+      <span className="min-w-0 flex-1 truncate">{name}</span>
+      <BeeperPersonPicker
+        id={pickerId}
+        label={`Link ${participant.displayName || participant.sourceUserId} to a Tribe person`}
+        people={people}
         disabled={linking}
-        onClick={() => onLinkNew(participant)}
-        title="Create a new Tribe person from this participant and link them"
-        className="inline-flex min-h-[28px] items-center gap-1 rounded border border-port-border px-2 py-1 text-[11px] text-gray-200 transition-colors hover:border-port-accent disabled:opacity-40"
-      >
-        <UserPlus size={11} />
-        New
-      </button>
+        onSelectPerson={(personId) => onLink(participant, personId)}
+        onCreateNew={() => onLinkNew(participant)}
+      />
+      {linking && <Loader2 size={11} className="shrink-0 animate-spin text-gray-400" />}
     </li>
   );
 }
@@ -209,6 +204,83 @@ const SEND_INTERRUPTED_COPY = 'Delivery unconfirmed: PortOS restarted mid-send. 
 
 /** The outbox states that still have something to say above the composer. */
 const RENDERED_OUTBOX_STATES = new Set(['approved', 'sending', 'awaiting-confirmation', 'failed']);
+
+/**
+ * The counterpart participant in a 1:1 chat (never called for a group chat —
+ * see `TitleTribeChip` below, which branches on `conversation.isGroup` first).
+ *
+ * There is no per-participant self/is-sender marker anywhere in the mirrored
+ * schema to filter by: `shapeParticipant` (`server/services/beeperConversations.js`)
+ * carries `sourceUserId`/`displayName`/`handle`/`tribePersonId`/`tribePersonName`
+ * only, and `isSender` exists solely on MESSAGES, never on a participant row
+ * (see the `MessageBody`/`OutboxRow` docs above). No account user id is
+ * exposed to the client either. What IS true, straight from how the roster is
+ * built (`normalizeParticipants` in `server/services/beeperSync.js` maps
+ * `chat.participants.items` verbatim, and Beeper's own `items` for a `single`
+ * chat never includes the local account's own user — see the 1:1 fixtures in
+ * `beeperSync.test.js`, always exactly one item): a 1:1 conversation's roster
+ * IS the counterpart, in full. So the rule here is simply "the first — and by
+ * construction, only — participant"; if a 1:1 conversation's roster somehow
+ * carried more than one row (a shape Beeper's own contract for a `single`
+ * chat does not produce), the first is still used as the best-effort answer
+ * rather than declining to render a chip at all.
+ */
+const oneToOneCounterpart = (conversation) => (conversation?.participants || [])[0] || null;
+
+/**
+ * The Tribe link beside the thread title (#98 part A). Whether this reads as
+ * a 1:1 chat or a group chat comes from the mirrored `conversation.isGroup`
+ * (`beeperSync.js`'s `normalizeChat` sets it straight from Beeper's own
+ * `chat.type === 'group'`), never from participant count — the participant
+ * subset is truncated (`hasMoreParticipants`) and can legitimately read back
+ * as a single row for a group Beeper only handed one member over.
+ *
+ * A group chat's affordance is honest about being a subset, not a total:
+ * Beeper's `Chat` payload carries no total-member count independent of the
+ * (truncated) roster PortOS stores, so the count shown is `participants.length`
+ * with a trailing `+` when `hasMoreParticipants` is set — the same qualifier
+ * the People drawer's own heading already uses just below.
+ */
+function TitleTribeChip({ conversation, onOpenParticipants, onOpenPerson }) {
+  if (conversation.isGroup) {
+    const count = (conversation.participants || []).length;
+    const label = `${count}${conversation.hasMoreParticipants ? '+' : ''} ${count === 1 ? 'person' : 'people'}`;
+    return (
+      <button
+        type="button"
+        onClick={onOpenParticipants}
+        className="inline-flex shrink-0 items-center gap-1 rounded-full border border-port-border px-2 py-0.5 text-[10px] text-gray-300 transition-colors hover:border-port-accent hover:text-white"
+      >
+        <Users size={10} aria-hidden="true" />
+        {label}
+      </button>
+    );
+  }
+
+  const counterpart = oneToOneCounterpart(conversation);
+  if (counterpart?.tribePersonId) {
+    return (
+      <button
+        type="button"
+        onClick={() => onOpenPerson(counterpart.tribePersonId)}
+        className="inline-flex shrink-0 items-center gap-1 rounded-full border border-port-success/40 px-2 py-0.5 text-[10px] text-port-success transition-colors hover:border-port-success"
+      >
+        {`${counterpart.tribePersonName || 'Linked'} · Tribe`}
+      </button>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onOpenParticipants}
+      className="inline-flex shrink-0 items-center gap-1 rounded-full border border-dashed border-port-border px-2 py-0.5 text-[10px] text-gray-400 transition-colors hover:border-port-accent hover:text-gray-200"
+    >
+      <UserPlus size={10} aria-hidden="true" />
+      Link to Tribe
+    </button>
+  );
+}
 
 /**
  * One outbox row — a send that has not yet been confirmed by the mirror, or
@@ -340,6 +412,7 @@ export default function BeeperThread({
   linkingId,
   onLinkParticipant,
   onCreateAndLinkParticipant,
+  onOpenTribePerson,
   onBack,
   onRetry,
   onArchive,
@@ -525,9 +598,14 @@ export default function BeeperThread({
         </button>
         <Avatar name={conversation.title} size={28} />
         <div className="min-w-0">
-          <p className="flex items-center gap-1 truncate text-sm text-white">
-            {conversation.title || 'Untitled conversation'}
+          <p className="flex items-center gap-1 text-sm text-white">
+            <span className="truncate">{conversation.title || 'Untitled conversation'}</span>
             {conversation.isMuted && <BellOff size={11} className="shrink-0 text-gray-500" />}
+            <TitleTribeChip
+              conversation={conversation}
+              onOpenParticipants={() => setPeopleOpen((open) => !open)}
+              onOpenPerson={onOpenTribePerson}
+            />
           </p>
           <p className="truncate text-[11px] text-gray-500">{networkLabel(conversation.network)}</p>
         </div>
@@ -596,6 +674,7 @@ export default function BeeperThread({
                   linking={linkingId === participant.sourceUserId}
                   onLink={onLinkParticipant}
                   onLinkNew={onCreateAndLinkParticipant}
+                  onOpenPerson={onOpenTribePerson}
                 />
               ))}
             </ul>

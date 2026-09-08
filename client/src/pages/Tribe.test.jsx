@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
-import { MemoryRouter, useLocation } from 'react-router';
+import { MemoryRouter, useLocation, useSearchParams } from 'react-router';
 
 vi.mock('../services/api', () => ({
   getTribePeople: vi.fn(() => Promise.resolve({ people: [] })),
@@ -10,6 +10,12 @@ vi.mock('../services/api', () => ({
   // Non-blocking duplicate-identifier report (#5908); defaults to clean so
   // tests unrelated to it never see the banner.
   getTribeDuplicateIdentifiers: vi.fn(() => Promise.resolve({ emails: [], phones: [] })),
+  // Circle tab's aside mounts MemoryLinksPanel/TouchpointsPanel once a
+  // person is selected (`draft.id` set) — exercised for the first time by
+  // the `?person=` deep-link tests below, which do select a real person.
+  getTribeMemoryLinks: vi.fn(() => Promise.resolve({ links: [] })),
+  getMemories: vi.fn(() => Promise.resolve({ memories: [] })),
+  getTribeTouchpoints: vi.fn(() => Promise.resolve({ touchpoints: [] })),
 }));
 
 vi.mock('../services/socket', () => ({
@@ -165,6 +171,73 @@ describe('Tribe care filter', () => {
       { silent: true },
     ));
     expect(await screen.findByText('Last 2026-01-01')).toBeTruthy();
+  });
+});
+
+/**
+ * #98 part C: Beeper's Tribe chip and its participants-panel "Linked ·
+ * <name>" rows deep-link here via `?person=<id>`. On load (and whenever the
+ * param changes) the page takes the exact path a click on the person's own
+ * `ContactCard` takes (`selectContact`) — switch to Circle, populate the
+ * form — and scrolls that card into view. An id nothing recognizes (a
+ * deleted person, or someone else's stale bookmark) is silently ignored:
+ * PortOS never toasts an error for it.
+ */
+describe('Tribe person deep link (#98 part C)', () => {
+  beforeEach(() => {
+    api.getTribePeople.mockClear();
+    api.getTribePeople.mockResolvedValue({ people: PEOPLE });
+    window.localStorage.clear();
+  });
+
+  it('selects the named person, switches to Circle, and opens the form on their record', async () => {
+    renderAt('/tribe?person=p2');
+
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toContain('tab=circle'));
+    expect(screen.getByLabelText('Name')).toHaveValue('Sample Neighbor');
+    // Circle-only content — proves the tab actually switched, not just the draft.
+    expect(screen.getByPlaceholderText('Search relationships')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Relationship' })).toBeInTheDocument();
+  });
+
+  it('scrolls the matching card into view', async () => {
+    const scrollSpy = vi.spyOn(Element.prototype, 'scrollIntoView').mockImplementation(() => {});
+    renderAt('/tribe?person=p2');
+
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    scrollSpy.mockRestore();
+  });
+
+  it('re-applies when the person param changes to a different id, without remounting the page', async () => {
+    // `MemoryRouter`'s `initialEntries` is read once at construction, so
+    // exercising a real in-place param change needs an in-tree navigator
+    // rather than a fresh `render`/`rerender` with different entries.
+    function ChangePersonButton() {
+      const [, setPersonParams] = useSearchParams();
+      return (
+        <button type="button" onClick={() => setPersonParams({ person: 'p2' })}>
+          Switch to p2
+        </button>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/tribe?person=p1']}>
+        <Tribe />
+        <ChangePersonButton />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText('Name')).toHaveValue('Example Person'));
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to p2' }));
+    await waitFor(() => expect(screen.getByLabelText('Name')).toHaveValue('Sample Neighbor'));
+  });
+
+  it('ignores an id the roster does not recognize, with no error toast and no tab switch', async () => {
+    renderAt('/tribe?person=does-not-exist');
+
+    await screen.findByRole('group', { name: 'Care filter' }); // stayed on the default Care Queue tab
+    expect(screen.queryByPlaceholderText('Search relationships')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 });
 

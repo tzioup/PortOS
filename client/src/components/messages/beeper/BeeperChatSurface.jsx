@@ -646,6 +646,15 @@ export default function BeeperChatSurface({
     navigate(`/messages/beeper${querySuffix}`);
   }, [navigate, querySuffix]);
 
+  // The Tribe link (#98 parts A/C): the title chip for a linked 1:1 chat, and
+  // the "Linked · <name>" row in the participants panel, both jump to the
+  // Tribe page pre-selected on that person via `?person=<id>` (Tribe.jsx
+  // reads it, switches to the Circle tab, and scrolls the card into view).
+  const openTribePerson = useCallback((personId) => {
+    if (!personId) return;
+    navigate(`/tribe?person=${encodeURIComponent(personId)}`);
+  }, [navigate]);
+
   const setDraft = useCallback((value) => {
     if (!conversationId) return;
     setDrafts((prev) => {
@@ -1004,6 +1013,7 @@ export default function BeeperChatSurface({
             linkingId={linkingId}
             onLinkParticipant={linkParticipant}
             onCreateAndLinkParticipant={createAndLinkParticipant}
+            onOpenTribePerson={openTribePerson}
             onBack={clearSelection}
             onRetry={conversationId ? () => loadThread(conversationId) : null}
             writePending={writePending}
