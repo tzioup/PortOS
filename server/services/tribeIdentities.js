@@ -152,3 +152,21 @@ export async function linkIdentity({
   const displacedPersonId = previousPersonId && previousPersonId !== personId ? previousPersonId : null;
   return { ...rowToIdentity(result.rows[0]), displacedPersonId };
 }
+
+/**
+ * Delete one identity claim by id (#99 — the Tribe person form's per-identity
+ * "Unlink" action). Pure `tribe_identities` deletion only — clearing the
+ * `beeper_participants.tribe_person_id` cache that claim was backing is
+ * `beeperTribe.unlinkIdentity`'s job, not this module's: this file stays
+ * Beeper-agnostic (see file header), and `beeperTribe.js` already owns the
+ * cache-clearing helpers (`clearDisplacedParticipantCaches` /
+ * `clearDisplacedBeeperUserCaches`) a re-link uses for the same reason.
+ *
+ * Returns the deleted identity, or `null` when `id` does not exist (the
+ * route turns that into a 404).
+ */
+export async function unlinkIdentity(id) {
+  await ensureReady();
+  const result = await query(`DELETE FROM tribe_identities WHERE id = $1 RETURNING *`, [id]);
+  return result.rows[0] ? rowToIdentity(result.rows[0]) : null;
+}
