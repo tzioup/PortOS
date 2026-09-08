@@ -244,7 +244,15 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
       await query(statements[0]);
     };
 
+    // The statement's own guard is global — "any beeper-user claim exists"
+    // means this install is already past the one-shot promotion — so a fixture
+    // must start from a database where nothing has been promoted yet. Cheap
+    // and safe: this is portos_test, and every claim these suites write is
+    // torn down with its person.
+    const clearClaims = () => query(`DELETE FROM tribe_identities WHERE kind = 'beeper-user'`);
+
     it('promotes a cached link to a claim, skips soft-deleted people, and re-runs cleanly', async () => {
+      await clearClaims();
       await query(
         `INSERT INTO beeper_accounts (account_id, network, display_name, status, bridge_id)
          VALUES ($1, 'Example Network', 'Example Account', 'connected', 'example-bridge')`,
@@ -290,16 +298,29 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
       expect(await claims('backfill-user-removed')).toEqual([]);
       expect(await claims('backfill-user-unlinked')).toEqual([]);
 
-      // Idempotent: a second run (every boot re-runs the whole DDL) neither
-      // errors nor duplicates the claim.
+      // Idempotent: a second run (ensureSchema re-runs the whole DDL on every
+      // call, not just per boot) neither errors nor duplicates the claim.
       await expect(runBackfill()).resolves.not.toThrow();
       expect(await claims('backfill-user-live')).toEqual([{ person_id: live }]);
+
+      // …and it never re-points a claim the app owns: once any beeper-user
+      // claim exists this install is past the promotion, so a link the user
+      // has since moved by hand stays moved.
+      await query('UPDATE tribe_people SET deleted = FALSE WHERE id = $1', [removed]);
+      await query(
+        `UPDATE tribe_identities SET person_id = $1, source = 'user'
+         WHERE kind = 'beeper-user' AND network = $2 AND handle = 'backfill-user-live'`,
+        [removed, ACCOUNT_ID],
+      );
+      await runBackfill();
+      expect(await claims('backfill-user-live')).toEqual([{ person_id: removed }]);
 
       await query('DELETE FROM tribe_people WHERE id = ANY($1::uuid[])', [[live, removed]]);
       await query('DELETE FROM beeper_accounts WHERE account_id = $1', [ACCOUNT_ID]);
     });
 
-    it('leaves a claim the app already wrote alone, and never errors on a duplicated Beeper user', async () => {
+    it('picks the most recently updated link when one Beeper user was hand-linked to two people', async () => {
+      await clearClaims();
       await query(
         `INSERT INTO beeper_accounts (account_id, network, display_name, status, bridge_id)
          VALUES ($1, 'Example Network', 'Example Account', 'connected', 'example-bridge')`,
@@ -324,18 +345,14 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
       const other = peopleRows.find((r) => r.name.endsWith('Other Person')).id;
 
       // The SAME Beeper user hand-linked to two different people in two
-      // conversations — the ambiguity the DISTINCT ON resolves.
+      // conversations — the ambiguity the DISTINCT ON resolves, and the case
+      // that would otherwise make one statement insert the same
+      // (kind, network, handle) twice. The older row is the one that must lose.
       await query(
-        `INSERT INTO beeper_participants (conversation_id, source_user_id, display_name, handle, tribe_person_id, observed_via)
-         VALUES ($1, 'backfill-user-dupe', 'Example Claimed Person', '', $3, 'message-sender'),
-                ($2, 'backfill-user-dupe', 'Example Other Person', '', $4, 'message-sender')`,
-        [conversationIds[0], conversationIds[1], claimed, other],
-      );
-      // …and a claim the app already recorded, which the backfill must not move.
-      await query(
-        `INSERT INTO tribe_identities (person_id, kind, network, handle, source)
-         VALUES ($1, 'beeper-user', $2, 'backfill-user-dupe', 'user')`,
-        [claimed, ACCOUNT_ID],
+        `INSERT INTO beeper_participants (conversation_id, source_user_id, display_name, handle, tribe_person_id, observed_via, updated_at)
+         VALUES ($1, 'backfill-user-dupe', 'Example Other Person', '', $3, 'message-sender', NOW() - INTERVAL '1 day'),
+                ($2, 'backfill-user-dupe', 'Example Claimed Person', '', $4, 'message-sender', NOW())`,
+        [conversationIds[0], conversationIds[1], other, claimed],
       );
 
       await expect(runBackfill()).resolves.not.toThrow();
@@ -345,7 +362,7 @@ describe.skipIf(!runDb)('beeper conversation-mirror schema (#27)', () => {
          WHERE kind = 'beeper-user' AND network = $1 AND handle = 'backfill-user-dupe'`,
         [ACCOUNT_ID],
       );
-      expect(rows).toEqual([{ person_id: claimed, source: 'user' }]);
+      expect(rows).toEqual([{ person_id: claimed, source: 'backfill' }]);
 
       await query('DELETE FROM tribe_people WHERE id = ANY($1::uuid[])', [[claimed, other]]);
       await query('DELETE FROM beeper_accounts WHERE account_id = $1', [ACCOUNT_ID]);

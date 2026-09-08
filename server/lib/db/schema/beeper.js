@@ -324,8 +324,17 @@ export const beeperDdl = [
   // promote, and the parity test (`server/lib/db.catalogDdlParity.test.js`)
   // compares table/index/trigger shape, which this statement does not touch.
   //
-  //   - `ON CONFLICT DO NOTHING` makes re-running it (every boot) a no-op and
-  //     never overwrites a claim the app has since written — the app's own
+  //   - The `NOT EXISTS` guard makes it ONE-SHOT. `ensureSchema()` does not
+  //     memoize (it only collapses concurrent callers), and every beeperTribe
+  //     service call re-runs the whole list through `ensureReady()` — fine for
+  //     a list of no-op DDL parses, not for a join across the participant
+  //     mirror. The guard is an uncorrelated subquery, so the planner
+  //     evaluates it once as a one-time filter and skips the scan entirely
+  //     the moment ANY beeper-user claim exists. The app writes one on every
+  //     link from here on, so "a claim exists" is exactly "this install is
+  //     past the promotion", and the catch-up never needs to run again.
+  //   - `ON CONFLICT DO NOTHING` keeps it safe even if that guard is ever
+  //     loosened: it never overwrites a claim the app has since written —
   //     `linkParticipant` is the authority, this is only a catch-up.
   //   - `DISTINCT ON` + `ORDER BY updated_at DESC` picks ONE row per
   //     (account, source_user_id) deterministically when the same Beeper user
@@ -342,6 +351,7 @@ export const beeperDdl = [
    JOIN beeper_conversations c ON c.id = p.conversation_id
    JOIN tribe_people tp ON tp.id = p.tribe_person_id AND tp.deleted = FALSE
    WHERE p.tribe_person_id IS NOT NULL AND c.account_id <> ''
+     AND NOT EXISTS (SELECT 1 FROM tribe_identities WHERE kind = 'beeper-user')
    ORDER BY c.account_id, p.source_user_id, p.updated_at DESC
    ON CONFLICT (kind, network, handle) DO NOTHING`,
 ];
