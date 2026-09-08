@@ -310,4 +310,48 @@ export const beeperDdl = [
     updated_at TIMESTAMPTZ DEFAULT NOW()
   )`,
   `CREATE INDEX IF NOT EXISTS idx_beeper_outbox_conversation_state ON beeper_outbox (conversation_id, state, created_at DESC)`,
+
+  // #96 backfill — one idempotent statement, LAST in this array because it
+  // reads both `beeper_participants` (created above) and `tribe_identities`
+  // (created in the phase-1 `tribeDdl` list, which `ensureSchemaImpl` runs in
+  // full before this one).
+  //
+  // Every link an existing install made by hand before `kind='beeper-user'`
+  // existed lives ONLY in the `beeper_participants.tribe_person_id` cache, so
+  // the next purge + resweep would still lose it. This promotes each of those
+  // to a durable claim. It is not in `server/scripts/init-db.sql`: that file
+  // provisions a FRESH database, where there is no participant row to
+  // promote, and the parity test (`server/lib/db.catalogDdlParity.test.js`)
+  // compares table/index/trigger shape, which this statement does not touch.
+  //
+  //   - The `NOT EXISTS` guard makes it ONE-SHOT. `ensureSchema()` does not
+  //     memoize (it only collapses concurrent callers), and every beeperTribe
+  //     service call re-runs the whole list through `ensureReady()` — fine for
+  //     a list of no-op DDL parses, not for a join across the participant
+  //     mirror. The guard is an uncorrelated subquery, so the planner
+  //     evaluates it once as a one-time filter and skips the scan entirely
+  //     the moment ANY beeper-user claim exists. The app writes one on every
+  //     link from here on, so "a claim exists" is exactly "this install is
+  //     past the promotion", and the catch-up never needs to run again.
+  //   - `ON CONFLICT DO NOTHING` keeps it safe even if that guard is ever
+  //     loosened: it never overwrites a claim the app has since written —
+  //     `linkParticipant` is the authority, this is only a catch-up.
+  //   - `DISTINCT ON` + `ORDER BY updated_at DESC` picks ONE row per
+  //     (account, source_user_id) deterministically when the same Beeper user
+  //     was hand-linked to different people in different conversations: the
+  //     most recently touched link wins, matching the table's own
+  //     "last explicit link wins" semantics.
+  //   - the `tribe_people` join drops soft-deleted persons (`tribe.deletePerson`
+  //     never fires the FK cascade), so a purge does not resurrect a link to
+  //     somebody the user deleted.
+  `INSERT INTO tribe_identities (person_id, kind, network, handle, source, linked_at)
+   SELECT DISTINCT ON (c.account_id, p.source_user_id)
+          p.tribe_person_id, 'beeper-user', c.account_id, p.source_user_id, 'backfill', NOW()
+   FROM beeper_participants p
+   JOIN beeper_conversations c ON c.id = p.conversation_id
+   JOIN tribe_people tp ON tp.id = p.tribe_person_id AND tp.deleted = FALSE
+   WHERE p.tribe_person_id IS NOT NULL AND c.account_id <> ''
+     AND NOT EXISTS (SELECT 1 FROM tribe_identities WHERE kind = 'beeper-user')
+   ORDER BY c.account_id, p.source_user_id, p.updated_at DESC
+   ON CONFLICT (kind, network, handle) DO NOTHING`,
 ];

@@ -20,7 +20,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const db = {
   people: new Map(),        // id -> { deleted }
-  conversations: new Map(), // id -> network
+  conversations: new Map(), // id -> { network, accountId }
   participants: new Map(),  // `${conversationId}|${sourceUserId}` -> row
   identities: new Map(),    // `${kind}|${network}|${handle}` -> person_id
 };
@@ -28,11 +28,16 @@ const seenSql = [];
 
 const pKey = (c, s) => `${c}|${s}`;
 const iKey = (k, n, h) => `${k}|${n}|${h}`;
+// The conversation columns beeperTribe joins server-side: `network` scopes a
+// kind='handle' claim, `account_id` scopes the kind='beeper-user' one (#96).
+const convo = (id) => db.conversations.get(id) ?? { network: '', accountId: '' };
 
 function participantRow(row) {
+  const c = convo(row.conversation_id);
   return {
     ...row,
-    network: db.conversations.get(row.conversation_id) ?? '',
+    network: c.network,
+    account_id: c.accountId,
     tribe_person_deleted: row.tribe_person_id ? !!db.people.get(row.tribe_person_id)?.deleted : null,
   };
 }
@@ -43,7 +48,7 @@ vi.mock('../lib/db.js', () => ({
     seenSql.push(sql);
     const s = sql.replace(/\s+/g, ' ').trim();
 
-    if (/^SELECT p\.\*, c\.network, tp\.deleted/.test(s)) {
+    if (/^SELECT p\.\*, c\.network, c\.account_id, tp\.deleted/.test(s)) {
       const row = db.participants.get(pKey(params[0], params[1]));
       return { rows: row ? [participantRow(row)] : [] };
     }
@@ -67,7 +72,7 @@ vi.mock('../lib/db.js', () => ({
           conversation_id: r.conversation_id,
           source_user_id: r.source_user_id,
           handle: r.handle,
-          network: db.conversations.get(r.conversation_id) ?? '',
+          network: convo(r.conversation_id).network,
         }));
       return { rows };
     }
@@ -113,6 +118,20 @@ vi.mock('../lib/db.js', () => ({
       }
       return { rows: [] };
     }
+    // The kind='beeper-user' displaced-cache clear (#96) — matches on the
+    // conversation's ACCOUNT plus the raw source_user_id, in one statement.
+    if (/^UPDATE beeper_participants p SET tribe_person_id = NULL/.test(s)) {
+      const [displacedPersonId, accountId, sourceUserId] = params;
+      let rowCount = 0;
+      for (const row of db.participants.values()) {
+        if (row.tribe_person_id !== displacedPersonId) continue;
+        if (row.source_user_id !== sourceUserId) continue;
+        if (convo(row.conversation_id).accountId !== accountId) continue;
+        row.tribe_person_id = null;
+        rowCount++;
+      }
+      return { rows: [], rowCount };
+    }
     if (/^UPDATE beeper_participants SET tribe_person_id = NULL/.test(s)) {
       const row = db.participants.get(pKey(params[0], params[1]));
       if (row && row.tribe_person_id === params[2]) row.tribe_person_id = null;
@@ -146,17 +165,22 @@ const CLAIMING_PERSON = '22222222-2222-4222-8222-222222222222';
 const LEGACY_PHONE_PERSON = '33333333-3333-4333-8333-333333333333';
 const PHONE_RAW = '+1 (555) 010-0001';
 const PHONE_NORMALIZED = '+15550100001';
+const ACCOUNT_ID = 'example-account-1';
 
 function seedPerson(id) {
   db.people.set(id, { deleted: false });
   return id;
 }
 
+function seedConversation(conversationId, network = 'discord', accountId = ACCOUNT_ID) {
+  db.conversations.set(conversationId, { network, accountId });
+}
+
 function seedParticipant({
   conversationId = CONVERSATION, sourceUserId = 'user-1', handle = '', tribePersonId = null,
-  network = 'discord', displayName = 'Example Person', observedVia = 'message-sender',
+  network = 'discord', accountId = ACCOUNT_ID, displayName = 'Example Person', observedVia = 'message-sender',
 } = {}) {
-  db.conversations.set(conversationId, network);
+  seedConversation(conversationId, network, accountId);
   db.participants.set(pKey(conversationId, sourceUserId), {
     conversation_id: conversationId,
     source_user_id: sourceUserId,
@@ -236,6 +260,35 @@ describe('resolveParticipantPerson resolution order (#34 review)', () => {
     })).toBe(LEGACY_PHONE_PERSON);
   });
 
+  // #96 — the beeper-user claim sits between the handle claim and the cache.
+  it('lets a beeper-user claim beat a stale cached tribe_person_id when no handle classifies', async () => {
+    seedParticipant({ handle: '', tribePersonId: CACHED_PERSON, network: 'facebook' });
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CLAIMING_PERSON);
+
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId: CONVERSATION, sourceUserId: 'user-1',
+    })).toBe(CLAIMING_PERSON);
+  });
+
+  it('lets the HANDLE claim outrank the beeper-user claim when the two disagree', async () => {
+    seedParticipant({ handle: '@example_handle', network: 'discord' });
+    db.identities.set(iKey('handle', 'discord', 'example_handle'), CLAIMING_PERSON);
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CACHED_PERSON);
+
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId: CONVERSATION, sourceUserId: 'user-1',
+    })).toBe(CLAIMING_PERSON);
+  });
+
+  it('scopes the beeper-user claim to the ACCOUNT — the same source_user_id under another account never resolves', async () => {
+    seedParticipant({ handle: '', network: 'facebook', accountId: 'example-account-2' });
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CLAIMING_PERSON);
+
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId: CONVERSATION, sourceUserId: 'user-1',
+    })).toBeNull();
+  });
+
   it('returns null for an unknown participant', async () => {
     expect(await beeperTribe.resolveParticipantPerson({
       conversationId: CONVERSATION, sourceUserId: 'nobody',
@@ -289,8 +342,79 @@ describe('linkParticipant', () => {
     });
     expect(linked.tribePersonId).toBe(CLAIMING_PERSON);
     expect(linked.displacedPersonId).toBeNull();
-    // No inert, unscoped kind='handle' row was written.
-    expect(db.identities.size).toBe(0);
+    // No inert, unscoped kind='handle' row was written — the ONLY claim is the
+    // account-scoped beeper-user one (#96), which needs no conversation network.
+    expect([...db.identities.keys()]).toEqual([iKey('beeper-user', ACCOUNT_ID, 'user-1')]);
+  });
+
+  // #96 — the durable half for a participant with NO classifiable handle. The
+  // claim is keyed on the conversation's ACCOUNT and the raw source_user_id,
+  // both joined server-side, so it survives the purge that deletes the
+  // participant row (and its cache column) outright.
+  it('claims a beeper-user identity on the conversation account for a participant with no handle at all', async () => {
+    seedParticipant({ handle: '', network: 'facebook' });
+
+    const linked = await beeperTribe.linkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CLAIMING_PERSON,
+    });
+    expect(linked.tribePersonId).toBe(CLAIMING_PERSON);
+    expect(db.identities.get(iKey('beeper-user', ACCOUNT_ID, 'user-1'))).toBe(CLAIMING_PERSON);
+    // The account, not the network — two bridge accounts on one network mint
+    // independent source_user_id spaces.
+    expect(db.identities.has(iKey('beeper-user', 'facebook', 'user-1'))).toBe(false);
+  });
+
+  it('claims the beeper-user identity ALONGSIDE the handle claim when the participant has both', async () => {
+    seedParticipant({ handle: '@example_handle', network: 'discord' });
+
+    await beeperTribe.linkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CLAIMING_PERSON,
+    });
+    expect(db.identities.get(iKey('handle', 'discord', 'example_handle'))).toBe(CLAIMING_PERSON);
+    expect(db.identities.get(iKey('beeper-user', ACCOUNT_ID, 'user-1'))).toBe(CLAIMING_PERSON);
+  });
+
+  it('is a no-op when the same participant is re-linked to the same person', async () => {
+    seedParticipant({ handle: '', network: 'facebook' });
+
+    await beeperTribe.linkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CLAIMING_PERSON,
+    });
+    const again = await beeperTribe.linkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CLAIMING_PERSON,
+    });
+    expect(again.tribePersonId).toBe(CLAIMING_PERSON);
+    expect(again.displacedPersonId).toBeNull();
+    // One claim, not two — the UNIQUE (kind, network, handle) upsert path.
+    expect([...db.identities.keys()]).toEqual([iKey('beeper-user', ACCOUNT_ID, 'user-1')]);
+  });
+
+  it('moves the beeper-user claim and clears the displaced person\'s caches on a re-link to somebody else', async () => {
+    // The SAME Beeper user, under the same account, in two conversations.
+    seedParticipant({ handle: '', network: 'facebook' });
+    seedParticipant({ conversationId: OTHER_CONVERSATION, sourceUserId: 'user-1', handle: '', network: 'facebook' });
+
+    await beeperTribe.linkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CACHED_PERSON,
+    });
+    // The second conversation's row caches onto the same person on its next
+    // observation, through the claim alone (no handle to match on).
+    const second = await beeperTribe.upsertParticipant({
+      conversationId: OTHER_CONVERSATION, sourceUserId: 'user-1', handle: '', observedVia: 'message-sender',
+    });
+    expect(second.tribePersonId).toBe(CACHED_PERSON);
+
+    const moved = await beeperTribe.linkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CLAIMING_PERSON,
+    });
+    expect(moved.displacedPersonId).toBe(CACHED_PERSON);
+    expect(db.identities.get(iKey('beeper-user', ACCOUNT_ID, 'user-1'))).toBe(CLAIMING_PERSON);
+    // The other conversation's stale cache is cleared and re-resolves to the
+    // new owner rather than permanently attributing the thread to the old one.
+    expect(db.participants.get(pKey(OTHER_CONVERSATION, 'user-1')).tribe_person_id).toBeNull();
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId: OTHER_CONVERSATION, sourceUserId: 'user-1',
+    })).toBe(CLAIMING_PERSON);
   });
 
   it('still claims a phone identity on a network-less conversation (phones are network-less by design)', async () => {
@@ -305,7 +429,7 @@ describe('linkParticipant', () => {
 
 describe('upsertParticipant handle preservation', () => {
   it('guards the ON CONFLICT handle update with COALESCE/NULLIF', async () => {
-    db.conversations.set(CONVERSATION, 'discord');
+    seedConversation(CONVERSATION, 'discord');
     await beeperTribe.upsertParticipant({
       conversationId: CONVERSATION, sourceUserId: 'user-1', handle: '@example_handle', observedVia: 'message-sender',
     });
@@ -357,7 +481,7 @@ describe('upsertParticipant — roster hoisting: personIndex loaded once, not on
   ]);
 
   it('reuses one caller-supplied personIndex across N participants instead of reloading the roster per participant', async () => {
-    db.conversations.set(CONVERSATION, 'whatsapp');
+    seedConversation(CONVERSATION, 'whatsapp');
     listPeople.mockResolvedValue(rosterPeople());
 
     // The one load a whole sweep pass is meant to do, built up front —
@@ -390,7 +514,7 @@ describe('upsertParticipant — roster hoisting: personIndex loaded once, not on
   });
 
   it('falls back to one reload per call with no personIndex supplied — the old, unchanged default', async () => {
-    db.conversations.set(CONVERSATION, 'whatsapp');
+    seedConversation(CONVERSATION, 'whatsapp');
     listPeople.mockResolvedValue(rosterPeople());
 
     const first = await beeperTribe.upsertParticipant({

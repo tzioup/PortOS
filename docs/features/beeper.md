@@ -321,6 +321,21 @@ manual link survives every re-sync. Group touchpoints are derived from message *
 from the participant roster, because Beeper truncates that roster (20 in a list, 100 on a single
 GET, no cursor) and iterating it would invent contact with people who never messaged.
 
+**Every manual link is durable across a purge + resweep**, including for the roughly one in eight
+counterparties Beeper reports neither a phone nor a username for. Linking claims a
+`kind='beeper-user'` row in `tribe_identities` keyed on the participant's own Beeper **account id
+and user id** (`beeper_conversations.account_id` + `beeper_participants.source_user_id`, both
+joined server-side, never client-supplied) — a pair Beeper keeps stable across resweeps, where
+the mirror's own `conversation_id` is a PortOS UUID re-minted by every purge. `tribe_identities`
+has no foreign key onto anything Beeper-side, so purging a conversation cannot cascade the link
+away with the participant row; the first re-observation after the resweep re-fills
+`tribe_person_id` from the claim. Resolution order is: the handle claim, then the beeper-user
+claim, then the cached column, then the legacy Tribe phone matcher. Re-linking the same
+participant to the same person is a no-op; re-linking to somebody else moves the claim and clears
+the displaced person's stale caches, the same "last explicit link wins" rule the handle axis
+follows. Installs that made such links before this shipped are promoted by an idempotent backfill
+that runs with the boot-time schema DDL (soft-deleted people are skipped).
+
 ### Unread badge
 
 `beeper_conversations.unread_count` is Beeper's own count, mirrored verbatim and overwritten

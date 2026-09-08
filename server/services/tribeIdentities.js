@@ -19,6 +19,17 @@
 import { ensureSchema, query } from '../lib/db.js';
 import { ServerError } from '../lib/errorHandler.js';
 
+/**
+ * Kinds whose `handle` is only meaningful inside a scope, so a row with an
+ * empty `network` is inert (no lookup can ever match it) and a cross-scope
+ * collision on `UNIQUE (kind, network, handle)` would silently steal another
+ * person's claim. `'handle'` scopes a username to a Beeper NETWORK;
+ * `'beeper-user'` scopes a raw `source_user_id` to a Beeper ACCOUNT (#96 —
+ * see the overload note in server/lib/db/schema/tribe.js). `'phone'` is
+ * deliberately absent: the same number means the same person everywhere.
+ */
+const NETWORK_SCOPED_KINDS = new Set(['handle', 'beeper-user']);
+
 async function ensureReady() {
   await ensureSchema();
 }
@@ -41,8 +52,9 @@ export function rowToIdentity(row) {
  * identity, or `null`. `network` defaults to `''` (the network-less scope
  * `classifyNetworkHandle`'s `'phone'` kind uses — the same phone number means
  * the same person regardless of which network reported it). A `kind='handle'`
- * identity is always network-scoped — an empty network can never resolve one,
- * since `linkIdentity` refuses to write such a row (see below).
+ * or `kind='beeper-user'` identity is always scoped (`NETWORK_SCOPED_KINDS`) —
+ * an empty network can never resolve one, since `linkIdentity` refuses to
+ * write such a row (see below).
  *
  * Joined against `tribe_people` and filtered to `deleted = FALSE`:
  * `tribe.deletePerson` is a SOFT delete, so `ON DELETE CASCADE` on this
@@ -51,7 +63,7 @@ export function rowToIdentity(row) {
  */
 export async function resolvePersonByIdentity({ kind, network = '', handle }) {
   if (!kind || !handle) return null;
-  if (kind === 'handle' && !network) return null;
+  if (NETWORK_SCOPED_KINDS.has(kind) && !network) return null;
   await ensureReady();
   const result = await query(
     `SELECT ti.person_id
@@ -103,18 +115,19 @@ export async function listIdentitiesForPerson(personId) {
  * SAME person. Callers (`beeperTribe.linkParticipant`, the `/beeper/link*`
  * routes) surface it so an ownership move is never silent to the user.
  *
- * `network` is required for `kind='handle'` — a network-scoped username
- * claimed with no network is the inert-row / cross-network-collision hazard
- * this function exists to prevent (see server/routes/tribe.js's
- * `beeperLinkSchema` comment). `kind='phone'` stays network-less by design.
+ * `network` is required for every scoped kind (`NETWORK_SCOPED_KINDS`:
+ * `'handle'`, `'beeper-user'`) — a scoped identity claimed with no scope is
+ * the inert-row / cross-scope-collision hazard this function exists to
+ * prevent (see server/routes/tribe.js's `beeperLinkSchema` comment).
+ * `kind='phone'` stays network-less by design.
  */
 export async function linkIdentity({
   personId, kind, network = '', handle, source = '',
 }) {
   if (!personId) throw new ServerError('personId is required', { status: 400, code: 'BAD_REQUEST' });
   if (!kind || !handle) throw new ServerError('kind and handle are required', { status: 400, code: 'BAD_REQUEST' });
-  if (kind === 'handle' && !network) {
-    throw new ServerError('network is required to link a handle identity', { status: 400, code: 'BAD_REQUEST' });
+  if (NETWORK_SCOPED_KINDS.has(kind) && !network) {
+    throw new ServerError(`network is required to link a ${kind} identity`, { status: 400, code: 'BAD_REQUEST' });
   }
   await ensureReady();
   await assertPersonLinkable(personId);
