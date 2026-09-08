@@ -67,6 +67,8 @@ const NARROWED = [
     'needs inferTuiCommand, which providerVendors.js declares'],
   ['services/voice/tools/pipeline.js', 'services/pipeline/issues.js',
     'needs NAVIGABLE_STAGE_IDS, which issuesShared.js declares'],
+  ['services/cosTaskIntake.js', 'lib/validation.js',
+    'needs SWARM_COUNT_* and the reviewer normalizers, which cosValidation.js / reviewerConfig.js declare'],
 ];
 
 describe('narrowed imports stay narrow (#6009)', () => {
@@ -303,7 +305,14 @@ describe('deferred imports stay deferred (#6156)', () => {
 // nothing, and it is read inside a synchronous zod refine — there is no
 // subtree to narrow and no call site to defer to. So restore the ~1.5k
 // allowance over the measured total rather than pretend the delta is free.
-const MAX_STATIC_INSTANTIATIONS = 100500;
+//
+// Re-measured after rebuilding this branch as three layered commits on top
+// of a newer upstream/main (9 commits past the previous base, none of them
+// touching a heavy subtree): 99,168, essentially flat against the 99,024
+// measured above at the older v2.60.0 merge point (+144 — ordinary drift
+// from upstream's own intervening growth, not a new eager edge this branch
+// introduced). Restore the same ~1.5k allowance over that fresh total.
+const MAX_STATIC_INSTANTIATIONS = 100668;
 
 const SKIP_DIRS = new Set(['node_modules', 'coverage', 'dist', 'data']);
 const serverTestFiles = (dir = SERVER_DIR, out = []) => {
