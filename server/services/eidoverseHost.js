@@ -1,61 +1,37 @@
 import { request as httpRequest } from 'node:http';
-import { createConnection } from 'node:net';
 import { createTailscaleServers, watchCertReload } from '../../lib/tailscale-https.js';
 import { certPaths } from '../../lib/certPaths.js';
+import { isPortReachable } from '../lib/connectivity.js';
 import { PATHS } from '../lib/fileUtils.js';
 import { PORTS } from '../lib/ports.js';
 import { ServerError } from '../lib/errorHandler.js';
 import { EIDOVERSE_PORT } from './eidoverse.js';
+import {
+  handleEidoverseHttp,
+  proxyUpgradeToEidoverse,
+  createEidoverseExpressMiddleware,
+  mountEidoverseWebSocket,
+  EIDOVERSE_HOST_PATH_PREFIX,
+} from './eidoverseProxy.js';
 
-const BAD_GATEWAY_BODY = 'Eidoverse Worlds is not running.';
+export { EIDOVERSE_HOST_PATH_PREFIX };
 
 // Where a conflicting listener would sit. A local squatter almost always claims
 // loopback — Docker publishes to 127.0.0.1, dev servers bind localhost — and
 // loopback is also the address this bridge's own traffic arrives on when the
-// page is opened from the host itself.
+// page is opened from the host itself. The probe stays short because it runs on
+// the startup path, before this bridge will accept anything.
 const CONFLICT_PROBE_HOST = '127.0.0.1';
 const CONFLICT_PROBE_TIMEOUT_MS = 300;
-const FORWARDED_HEADER_NAMES = new Set(['host', 'x-forwarded-host', 'x-forwarded-proto']);
-
-const targetAuthority = (host, port) => `${host}:${port}`;
-
-const forwardedHeaders = (req, protocol, targetHost, targetPort) => ({
-  ...req.headers,
-  host: targetAuthority(targetHost, targetPort),
-  'x-forwarded-host': req.headers.host || '',
-  'x-forwarded-proto': protocol,
-});
-
-const writeBadGateway = (res) => {
-  if (res.headersSent) {
-    res.destroy();
-    return;
-  }
-  res.writeHead(502, {
-    'content-type': 'text/plain; charset=utf-8',
-    'content-length': Buffer.byteLength(BAD_GATEWAY_BODY),
-  });
-  res.end(BAD_GATEWAY_BODY);
-};
-
-const websocketRequestHead = (req, protocol, targetHost, targetPort) => {
-  const headers = [];
-  for (let index = 0; index < req.rawHeaders.length; index += 2) {
-    const name = req.rawHeaders[index];
-    if (!FORWARDED_HEADER_NAMES.has(name.toLowerCase())) {
-      headers.push(`${name}: ${req.rawHeaders[index + 1]}`);
-    }
-  }
-  headers.push(`Host: ${targetAuthority(targetHost, targetPort)}`);
-  headers.push(`X-Forwarded-Host: ${req.headers.host || ''}`);
-  headers.push(`X-Forwarded-Proto: ${protocol}`);
-  return `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n${headers.join('\r\n')}\r\n\r\n`;
-};
 
 /**
  * Create the lazy Eidoverse HTTPS bridge. The target is fixed at construction
  * time, so this is not a general-purpose proxy. No listener is opened until
  * `start()` is called by the user-facing Eidoverse page.
+ *
+ * Prefer the main-server `/eidoverse-host` mount (see `mountEidoverseOnServer`)
+ * for same-origin / single-port forwards; :5563 remains an optional ExternalLink
+ * fallback when a machine certificate is in play.
  */
 export function createEidoverseHost({
   targetHost = '127.0.0.1',
@@ -89,47 +65,27 @@ export function createEidoverseHost({
   };
 
   const handleHttp = (req, res) => {
-    const upstream = httpRequest({
-      hostname: targetHost,
-      port: targetPort,
-      method: req.method,
-      path: req.url,
-      headers: forwardedHeaders(req, protocol(), targetHost, targetPort),
-    }, (upstreamResponse) => {
-      res.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
-      upstreamResponse.once('error', () => res.destroy());
-      upstreamResponse.pipe(res);
+    // Bridge mode: parent origin is the PortOS page (API port), not :5563.
+    handleEidoverseHttp({
+      req,
+      res,
+      protocol: protocol(),
+      embedMode: 'bridge',
+      targetHost,
+      targetPort,
     });
-    upstream.once('error', () => writeBadGateway(res));
-    req.once('aborted', () => upstream.destroy());
-    req.pipe(upstream);
   };
 
   const handleUpgrade = (req, clientSocket, head) => {
-    trackSocket(clientSocket);
-    const upstreamSocket = trackSocket(createConnection({ host: targetHost, port: targetPort }));
-    let connected = false;
-
-    upstreamSocket.once('connect', () => {
-      connected = true;
-      upstreamSocket.write(websocketRequestHead(req, protocol(), targetHost, targetPort));
-      if (head.length > 0) upstreamSocket.write(head);
-      clientSocket.pipe(upstreamSocket).pipe(clientSocket);
+    proxyUpgradeToEidoverse({
+      req,
+      clientSocket,
+      head,
+      targetHost,
+      targetPort,
+      protocol: protocol(),
+      trackSocket,
     });
-
-    upstreamSocket.on('error', () => {
-      if (connected) {
-        clientSocket.destroy();
-        return;
-      }
-      if (!clientSocket.destroyed) {
-        clientSocket.end(
-          `HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${Buffer.byteLength(BAD_GATEWAY_BODY)}\r\nConnection: close\r\n\r\n${BAD_GATEWAY_BODY}`,
-        );
-      }
-    });
-    clientSocket.once('error', () => upstreamSocket.destroy());
-    clientSocket.once('close', () => upstreamSocket.destroy());
   };
 
   const targetIsReady = () => new Promise((resolve) => {
@@ -165,20 +121,13 @@ export function createEidoverseHost({
    * this bridge receives nothing and logs that it is listening. `listen` cannot
    * surface that, so probe before binding and fail loudly instead.
    */
-  const portIsClaimed = () => new Promise((resolve) => {
+  const portIsClaimed = async () => {
     // Port 0 asks the OS for a free ephemeral port, so there is nothing to
     // collide with — and it is not a connectable address to probe.
-    if (!listenPort) return resolve(false);
+    if (!listenPort) return false;
 
-    const probe = createConnection({ host: CONFLICT_PROBE_HOST, port: listenPort });
-    const settle = (claimed) => {
-      probe.destroy();
-      resolve(claimed);
-    };
-    probe.once('connect', () => settle(true));
-    probe.once('error', () => settle(false));
-    probe.setTimeout(CONFLICT_PROBE_TIMEOUT_MS, () => settle(false));
-  });
+    return isPortReachable({ host: CONFLICT_PROBE_HOST, port: listenPort, timeoutMs: CONFLICT_PROBE_TIMEOUT_MS });
+  };
 
   const openListener = async () => {
     if (await portIsClaimed()) {
@@ -247,8 +196,55 @@ export function createEidoverseHost({
 
 let eidoverseHost = null;
 
+/** True once the on-demand host bridge has been started for this process. */
+export function isEidoverseHostActive() {
+  return Boolean(eidoverseHost?.status()?.running);
+}
+
 export async function ensureEidoverseHost() {
   eidoverseHost ||= createEidoverseHost();
   await eidoverseHost.start();
   return eidoverseHost.waitUntilReady();
+}
+
+/**
+ * Wire the same-origin `/eidoverse-host` path proxy + root allowlist onto the
+ * main Express app and HTTP(S) servers. Call once at boot (like
+ * `remoteDesktopBroker.mountWebSocket`). Proxies only fire while the host is
+ * active after `ensureEidoverseHost()`.
+ */
+export function mountEidoverseOnServer(app, httpServers = []) {
+  if (app) {
+    app.use(createEidoverseExpressMiddleware({
+      isActive: isEidoverseHostActive,
+      targetHost: '127.0.0.1',
+      targetPort: EIDOVERSE_PORT,
+      getProtocol: (req) => {
+        if (req.secure) return 'https';
+        const forwarded = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+        if (forwarded === 'https' || forwarded === 'http') return forwarded;
+        // HTTPS main server with HTTP loopback mirror: mirror is plain HTTP.
+        return 'http';
+      },
+    }));
+  }
+  for (const httpServer of httpServers) {
+    if (!httpServer) continue;
+    mountEidoverseWebSocket(httpServer, {
+      isActive: isEidoverseHostActive,
+      targetHost: '127.0.0.1',
+      targetPort: EIDOVERSE_PORT,
+      getProtocol: (req) => {
+        // Socket upgrades on the TLS server are https; the loopback mirror is http.
+        // `req.socket.encrypted` is set for TLS sockets.
+        if (req.socket?.encrypted) return 'https';
+        return 'http';
+      },
+    });
+  }
+}
+
+/** Test helper: replace the process-wide host singleton. */
+export function __setEidoverseHostForTests(host) {
+  eidoverseHost = host;
 }

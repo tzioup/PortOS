@@ -41,7 +41,23 @@ vi.mock('../mediaJobQueue/index.js', () => ({
   mediaJobEvents: { on: vi.fn(), off: vi.fn() },
 }));
 
-const { handleCreativeDirectorCompletion, advanceAfterSceneSettled, __resetInflightState } = await import('./completionHook.js');
+const { handleCreativeDirectorCompletion, advanceAfterSceneSettled, startCreativeDirectorProject, __resetInflightState } = await import('./completionHook.js');
+
+import { hasCreativeDirectorProjectStarter, registerCreativeDirectorProjectStarter } from './projectStartSink.js';
+
+// #5920: `pipeline/episodeVideo.js` starts a CD project through the sink instead of
+// importing this module, so importing this module MUST arm the sink. Nothing else
+// registers a starter — if this side effect is ever dropped, every pipeline episode
+// silently stops advancing, and only this assertion notices.
+describe('registers the pipeline-facing project starter (#5920)', () => {
+  it('arms the project-start sink on import', () => {
+    expect(hasCreativeDirectorProjectStarter()).toBe(true);
+    // And it is THIS module's starter, not some other registrant: re-registering the
+    // same function is the sink's one idempotent case, so a no-throw here is an
+    // identity check on what is wired.
+    expect(() => registerCreativeDirectorProjectStarter(startCreativeDirectorProject)).not.toThrow();
+  });
+});
 
 const planTask = (runId = 'run-1') => ({
   id: 'task-1',
@@ -65,6 +81,20 @@ beforeEach(() => {
 });
 
 describe('handleCreativeDirectorCompletion — plan deliverable', () => {
+  it('settles the planner that wrote the current Video plan but rejects a later revision', async () => {
+    const task = planTask();
+    task.metadata.creativeDirector.productionRevision = 2;
+    const project = planProject({ workspace: 'video', videoWorkRevision: 3,
+      plan: { submittedProductionRevision: 2, replanRounds: 0, updatedAt: 'later', steps: [{ stepId: 'a', status: 'pending' }] } });
+    mockGetProject.mockResolvedValue(project);
+    await handleCreativeDirectorCompletion(task, 'agent-1', true);
+    expect(mockUpdateRun).toHaveBeenCalledWith('cd-1', 'run-1', expect.objectContaining({ status: 'completed' }));
+    mockUpdateRun.mockClear();
+    mockGetProject.mockResolvedValue({ ...project, videoWorkRevision: 4 });
+    await handleCreativeDirectorCompletion(task, 'agent-1', true);
+    expect(mockUpdateRun).not.toHaveBeenCalled();
+  });
+
   it('marks an exit-0 plan run FAILED when no plan was PATCHed', async () => {
     mockGetProject.mockResolvedValue(planProject());
     await handleCreativeDirectorCompletion(planTask(), 'agent-1', true);
@@ -202,4 +232,14 @@ describe('advanceAfterSceneSettled — bounded treatment gate', () => {
     await advanceAfterSceneSettled('cd-1');
     expect(mockEnqueueTreatmentTask).toHaveBeenCalledTimes(1);
   });
+});
+
+it('keeps Video drafts inert through both direct starts and background scene advancement', async () => {
+  mockGetProject.mockResolvedValue({ id: 'cd-video', workspace: 'video', status: 'planning', runs: [], directive: { goal: 'Example' } });
+  await startCreativeDirectorProject('cd-video');
+  await advanceAfterSceneSettled('cd-video');
+  expect(mockAdvancePlan).not.toHaveBeenCalled();
+  expect(mockEnqueueTreatmentTask).not.toHaveBeenCalled();
+  expect(mockRunSceneRender).not.toHaveBeenCalled();
+  expect(mockUpdateProject).not.toHaveBeenCalled();
 });

@@ -31,6 +31,8 @@ const {
   restoreLoom, sanitizeLoom, updateEpisode, updateLoom,
   mutateLoom, updateNode, updateNodeTransition,
 } = await import('./records.js');
+const { fableLoomEvolutionEvidenceRefs } = await import('./records.js');
+const { evolutionEvidenceStatus } = await import('../../lib/characterEvolution.js');
 const { _resetFableLoomBackend } = await import('./store.js');
 const conflictJournal = await import('../../lib/conflictJournal.js');
 const { registerSubscriptionAdapter, __resetSubscriptionAdapter } = await import('../sharing/recordEvents.js');
@@ -431,6 +433,32 @@ describe('loom CRUD', () => {
     });
   });
 
+  it('preserves v7 shot and character references from older peers while accepting current explicit clears', async () => {
+    let loom = await makeLoom({ name: 'A timed episode' });
+    loom = await addEpisode(loom.id, { title: 'Pilot' });
+    const episodeId = loom.episodes[0].id;
+    loom = await addNode(loom.id, episodeId, {
+      title: 'Arrival', shot: { dramaticSceneId: 'arrival', dramaticSceneTitle: 'Arrival', durationSeconds: 8, framing: 'Wide' },
+      visualCanon: { mode: 'draft', characterAppearances: [{ characterId: 'courier', referenceImage: 'courier.png' }] },
+    });
+    const remote = structuredClone(loom);
+    remote.updatedAt = '2099-01-01T00:00:00.000Z';
+    remote.name = 'Renamed on older peer';
+    delete remote.episodes[0].nodes[0].shot;
+    delete remote.episodes[0].nodes[0].visualCanon.characterAppearances[0].referenceImage;
+    remote.episodes[0].nodes[0].visualCanon.characterAppearances[0].expression = 'smiling';
+    await mergeLoomsFromSync([remote], { senderSchemaVersions: { fableLoom: 6 } });
+    const saved = await getLoom(loom.id);
+    expect(saved.name).toBe(remote.name);
+    expect(saved.episodes[0].nodes[0].shot).toEqual(loom.episodes[0].nodes[0].shot);
+    expect(saved.episodes[0].nodes[0].visualCanon.characterAppearances[0]).toMatchObject({ referenceImage: 'courier.png', expression: 'smiling' });
+    remote.updatedAt = '2099-01-02T00:00:00.000Z';
+    await mergeLoomsFromSync([remote], { senderSchemaVersions: { fableLoom: 7 } });
+    const cleared = (await getLoom(loom.id)).episodes[0].nodes[0];
+    expect(cleared.shot).toBeUndefined();
+    expect(cleared.visualCanon.characterAppearances[0].referenceImage).toBeUndefined();
+  });
+
   it('preserves playable challenge mappings when a v4 peer wins an unrelated edit', async () => {
     let loom = await makeLoom({ name: 'Local challenge plan' });
     loom = await addEpisode(loom.id, { title: 'Pilot' });
@@ -490,6 +518,84 @@ describe('loom CRUD', () => {
     expect(merged.episodes[0].storyOutline.scenes[0]).toMatchObject({
       plotPointId: 'plot-lock', challengePhase: 'setup',
     });
+  });
+
+  // Beat outlines and the series delivery plan both arrived with fableLoom
+  // wire schema v4, so a v3 sender omitting them means "cannot represent" while
+  // a v4 sender omitting them means the author cleared them.
+  const seedDeliveryAndOutlineLoom = async () => {
+    let loom = await makeLoom({ name: 'Local delivery plan' });
+    loom = await addEpisode(loom.id, { title: 'Pilot' });
+    const episodeId = loom.episodes[0].id;
+    loom = await addNode(loom.id, episodeId, { title: 'The keypad' });
+    const nodeId = loom.episodes[0].nodes[0].id;
+    loom = await updateLoom(loom.id, {
+      seriesPlan: {
+        storyArc: 'The courier crosses the first blockade.',
+        plotPoints: [],
+        sideQuests: [],
+        deliveryOptions: { overnightVoicemails: true, nextSeasonTeaser: true },
+        interEpisodeVoicemails: [{
+          id: 'voicemail-1',
+          fromEpisodeId: episodeId,
+          toEpisodeId: null,
+          title: 'Between blockades',
+          transcript: 'Call the courier when the lights go out.',
+        }],
+        nextSeasonTeaser: { title: 'Season two', transcript: 'The blockade moves north.' },
+      },
+    });
+    loom = await updateEpisode(loom.id, episodeId, {
+      storyOutline: {
+        startKey: nodeId,
+        scenes: [{
+          key: nodeId, title: 'The keypad', summary: 'The planted code becomes actionable.',
+          isEnding: true, transitions: [],
+        }],
+        validation: { status: 'draft', issues: [] },
+      },
+    });
+    return loom;
+  };
+
+  const stripDeliveryAndOutline = (loom, name) => ({
+    ...loom,
+    name,
+    updatedAt: '2099-01-01T00:00:00.000Z',
+    seriesPlan: { storyArc: loom.seriesPlan.storyArc, plotPoints: [], sideQuests: [] },
+    episodes: loom.episodes.map(({ storyOutline: _outline, ...episode }) => episode),
+  });
+
+  it('preserves the delivery plan and beat outline when a v3 peer wins an unrelated LWW edit', async () => {
+    const loom = await seedDeliveryAndOutlineLoom();
+    const remoteV3 = stripDeliveryAndOutline(loom, 'Renamed by v3 peer');
+
+    await mergeLoomsFromSync([remoteV3], { senderSchemaVersions: { fableLoom: 3 } });
+
+    const merged = await getLoom(loom.id);
+    expect(merged.name).toBe('Renamed by v3 peer');
+    expect(merged.seriesPlan).toMatchObject({
+      deliveryOptions: { overnightVoicemails: true, nextSeasonTeaser: true },
+      interEpisodeVoicemails: [{
+        id: 'voicemail-1', transcript: 'Call the courier when the lights go out.',
+      }],
+      nextSeasonTeaser: { title: 'Season two', transcript: 'The blockade moves north.' },
+    });
+    expect(merged.episodes[0].storyOutline).toEqual(loom.episodes[0].storyOutline);
+  });
+
+  it('lets a v4 peer clear the delivery plan and beat outline it fully understands', async () => {
+    const loom = await seedDeliveryAndOutlineLoom();
+    const remoteV4 = stripDeliveryAndOutline(loom, 'Renamed by v4 peer');
+
+    await mergeLoomsFromSync([remoteV4], { senderSchemaVersions: { fableLoom: 4 } });
+
+    const merged = await getLoom(loom.id);
+    expect(merged.name).toBe('Renamed by v4 peer');
+    expect(merged.seriesPlan.deliveryOptions).toBeUndefined();
+    expect(merged.seriesPlan.interEpisodeVoicemails).toBeUndefined();
+    expect(merged.seriesPlan.nextSeasonTeaser).toBeUndefined();
+    expect(merged.episodes[0].storyOutline).toBeUndefined();
   });
 
   it('journals divergent story edits and can restore the authored snapshot', async () => {
@@ -1158,5 +1264,116 @@ describe('attachNodePlaybackAsset and node playback fields', () => {
     expect(targetNode.interactionWindow.enabled).toBe(true);
     expect(targetNode.interactionWindow.ambientDuckDb).toBe(-6);
     expect(targetNode.playbackAssets.holdLoopVideoHistoryIds).toEqual(['vid-h1', 'vid-h2']);
+  });
+});
+
+describe('per-character evolution lens on the series plan (#6440)', () => {
+  const lens = (outcome, stages) => ({
+    characterId: 'chr-mara',
+    characterName: 'Mara',
+    evolution: { outcome, stages },
+  });
+
+  const seedLoomWithLens = async () => {
+    let loom = await makeLoom({ name: 'A lensed loom' });
+    loom = await addEpisode(loom.id, { title: 'Pilot' });
+    const episodeId = loom.episodes[0].id;
+    return updateLoom(loom.id, {
+      seriesPlan: {
+        ...loom.seriesPlan,
+        characterEvolutions: [lens('tragic-refusal', [
+          { stageId: 'control-strategy-failing', testedBelief: 'winning is safety' },
+          { stageId: 'final-proof', characterChoice: 'burns the ledger', evidence: { episodeId } },
+        ])],
+      },
+    });
+  };
+
+  it('leaves a plan that never opted in byte-identical', async () => {
+    const loom = await makeLoom({ name: 'A plain loom' });
+    expect(Object.prototype.hasOwnProperty.call(loom.seriesPlan, 'characterEvolutions')).toBe(false);
+    expect(JSON.stringify(sanitizeLoom(loom).seriesPlan)).toBe(JSON.stringify(loom.seriesPlan));
+  });
+
+  it('round-trips an authored lens through save, load and re-sanitize', async () => {
+    const saved = await seedLoomWithLens();
+    const reloaded = await getLoom(saved.id);
+    expect(reloaded.seriesPlan.characterEvolutions).toEqual(saved.seriesPlan.characterEvolutions);
+    expect(JSON.stringify(sanitizeLoom(reloaded).seriesPlan))
+      .toBe(JSON.stringify(reloaded.seriesPlan));
+    // The evidence anchor resolves against the loom's live episodes; a lens
+    // pointing at a deleted one must report stale rather than pass as proof.
+    const refs = fableLoomEvolutionEvidenceRefs(reloaded);
+    const proof = reloaded.seriesPlan.characterEvolutions[0].evolution.stages[1];
+    expect(evolutionEvidenceStatus(proof.evidence, refs)).toBe('anchored');
+    const afterDelete = await deleteEpisode(reloaded.id, reloaded.episodes[0].id);
+    expect(afterDelete.seriesPlan.characterEvolutions[0].evolution.stages[1].evidence.episodeId)
+      .toBe(proof.evidence.episodeId);
+    expect(evolutionEvidenceStatus(
+      afterDelete.seriesPlan.characterEvolutions[0].evolution.stages[1].evidence,
+      fableLoomEvolutionEvidenceRefs(afterDelete),
+    )).toBe('stale');
+  });
+
+  it('resolves an anchor at an expanded scene that has no outline beat', async () => {
+    // A graph-first episode has node ids and no outline; before #6444 the ref
+    // set was built from outline scene keys alone, so a live scene read as a
+    // deleted one and the stage could never be verified.
+    let loom = await makeLoom({ name: 'A graph-first loom' });
+    loom = await addEpisode(loom.id, { title: 'Pilot' });
+    const episodeId = loom.episodes[0].id;
+    loom = await addNode(loom.id, episodeId, { title: 'The Split' });
+    const { id: nodeId } = loom.episodes[0].nodes[0];
+    expect(loom.episodes[0].storyOutline).toBeFalsy();
+
+    const refs = fableLoomEvolutionEvidenceRefs(loom);
+    expect(evolutionEvidenceStatus({ episodeId, sceneKey: nodeId }, refs)).toBe('anchored');
+    expect(evolutionEvidenceStatus({ episodeId, sceneKey: 'node-deleted' }, refs)).toBe('stale');
+  });
+
+  it('preserves the lens when a v7 peer wins an unrelated LWW edit', async () => {
+    const loom = await seedLoomWithLens();
+    const { characterEvolutions: _dropped, ...planWithoutLens } = loom.seriesPlan;
+    const remoteV7 = {
+      ...loom,
+      name: 'Renamed by v7 peer',
+      updatedAt: '2099-01-01T00:00:00.000Z',
+      seriesPlan: planWithoutLens,
+    };
+
+    await mergeLoomsFromSync([remoteV7], { senderSchemaVersions: { fableLoom: 7 } });
+
+    const merged = await getLoom(loom.id);
+    expect(merged.name).toBe('Renamed by v7 peer');
+    // A v7 sanitizer cannot represent the lens, so its omission is "cannot
+    // represent", not "the author deleted it".
+    expect(merged.seriesPlan.characterEvolutions).toEqual(loom.seriesPlan.characterEvolutions);
+  });
+
+  it('lets a v8 peer clear the lens it fully understands, and round-trips one it sends', async () => {
+    const loom = await seedLoomWithLens();
+    const { characterEvolutions: _dropped, ...planWithoutLens } = loom.seriesPlan;
+
+    await mergeLoomsFromSync([{
+      ...loom,
+      name: 'Cleared by v8 peer',
+      updatedAt: '2099-01-01T00:00:00.000Z',
+      seriesPlan: planWithoutLens,
+    }], { senderSchemaVersions: { fableLoom: 8 } });
+    expect((await getLoom(loom.id)).seriesPlan.characterEvolutions).toBeUndefined();
+
+    await mergeLoomsFromSync([{
+      ...loom,
+      updatedAt: '2099-01-02T00:00:00.000Z',
+      seriesPlan: {
+        ...planWithoutLens,
+        characterEvolutions: [lens('flat-testing', [{ stageId: 'cost-tested', characterChoice: 'holds' }])],
+      },
+    }], { senderSchemaVersions: { fableLoom: 8 } });
+    const restored = await getLoom(loom.id);
+    expect(restored.seriesPlan.characterEvolutions[0].evolution).toMatchObject({
+      outcome: 'flat-testing',
+      stages: [{ stageId: 'cost-tested', characterChoice: 'holds' }],
+    });
   });
 });

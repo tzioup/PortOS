@@ -649,6 +649,60 @@ describe('Provider Status Service', () => {
     });
   });
 
+  describe('getFallbackProvider — caller execution-mode policy', () => {
+    // A CLI/API-only caller must not inherit a TUI route through ANY tier of
+    // the chain. The configured tier matters most: `fallbackProvider` is a saved
+    // value the user set once, and honoring it regardless of caller context is
+    // how a run with no PTY to drive ends up dispatched at a TUI route.
+    const providers = {
+      primary: { id: 'primary', type: 'cli', enabled: true, fallbackProvider: 'tui-route' },
+      'tui-route': { id: 'tui-route', type: 'tui', enabled: true },
+      'task-tui': { id: 'task-tui', type: 'tui', enabled: true },
+      'fallback-provider-1': { id: 'fallback-provider-1', type: 'tui', enabled: true },
+      'fallback-provider-2': { id: 'fallback-provider-2', type: 'cli', enabled: true },
+    };
+
+    it('skips a TUI candidate at the task, configured AND system tiers', () => {
+      const result = statusService.getFallbackProvider(
+        'primary', providers, 'task-tui', null, { allowedModes: ['cli', 'api'] },
+      );
+      expect(result.provider.id).toBe('fallback-provider-2');
+      expect(result.source).toBe('system');
+    });
+
+    it('returns null — never throws — when the policy excludes every candidate', () => {
+      const tuiOnly = {
+        primary: { id: 'primary', type: 'cli', enabled: true, fallbackProvider: 'tui-route' },
+        'tui-route': { id: 'tui-route', type: 'tui', enabled: true },
+        'fallback-provider-1': { id: 'fallback-provider-1', type: 'tui', enabled: true },
+      };
+      // A skipped mode is "not for this caller", not "this request is
+      // impossible" — callers already treat a null fallback as transient.
+      expect(statusService.getFallbackProvider(
+        'primary', tuiOnly, null, null, { allowedModes: ['cli'] },
+      )).toBeNull();
+    });
+
+    it('refuses a candidate whose record names no executable mode', () => {
+      const untyped = {
+        primary: { id: 'primary', type: 'cli', enabled: true, fallbackProvider: 'no-type' },
+        'no-type': { id: 'no-type', enabled: true },
+      };
+      expect(statusService.getFallbackProvider(
+        'primary', untyped, null, null, { allowedModes: ['cli', 'tui', 'api'] },
+      )).toBeNull();
+      // …but with NO declared policy it routes exactly as it always has.
+      expect(statusService.getFallbackProvider('primary', untyped).provider.id).toBe('no-type');
+    });
+
+    it('leaves an undeclared caller free to take a TUI route', () => {
+      expect(statusService.getFallbackProvider('primary', providers).provider.id).toBe('tui-route');
+      expect(statusService.getFallbackProvider(
+        'primary', providers, null, null, { hasImages: false, requiredContextTokens: 10 },
+      ).provider.id).toBe('tui-route');
+    });
+  });
+
   describe('getFallbackProvider — stale model pins', () => {
     // A `fallbackModel` is set on the PRIMARY but resolved against the
     // fallback, so a model bump on the fallback leaves the pin naming an id
@@ -860,14 +914,22 @@ describe('Provider Status Service', () => {
   });
 
   describe('init', () => {
+    // Fake time, not a real sleep: the recovery window under test is 1000ms and
+    // a real 1100ms sleep left only 100ms of slack on a loaded runner. Same
+    // pattern as the `stale recovery on read` describe below.
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
     it('should clean up expired statuses on init', async () => {
       // Mark provider unavailable with very short wait time
       await statusService.markUsageLimit('test-provider', {
         message: 'Test'
       });
 
-      // Wait for recovery time to pass
-      await new Promise(resolve => setTimeout(resolve, 1100));
+      // Advance past the 1000ms defaultUsageLimitWait recovery window. 1100 (not
+      // 1001) keeps the intent — "past the window" — legible; with fake time the
+      // extra 100ms is free.
+      await vi.advanceTimersByTimeAsync(1100);
 
       // Create new service and init (should clean up expired status)
       const newService = createProviderStatusService({
@@ -876,7 +938,16 @@ describe('Provider Status Service', () => {
         defaultUsageLimitWait: 1000
       });
 
-      await newService.init();
+      const loaded = await newService.init();
+
+      // init() itself must reset the expired entry in the cache it returns.
+      // Asserting only isAvailable() would pass even with the init cleanup
+      // deleted, because every reader re-applies the same recovery check on
+      // read (see server/lib/aiToolkit/AGENTS.md).
+      expect(loaded.providers['test-provider']).toMatchObject({
+        available: true,
+        reason: 'ok'
+      });
 
       // Provider should now be available
       expect(newService.isAvailable('test-provider')).toBe(true);

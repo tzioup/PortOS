@@ -26,3 +26,18 @@ database migrations, generated assets, and build. Use the dedicated
 package-manager behavior is never invoked merely because PortOS updated it.
 When more than one is present, the configured **Update Command** wins, then
 `portos:update`, then the conventional script.
+
+## PortOS is itself a managed app
+
+The PortOS record appears in App Management like any other app, so **Update**
+there runs the same `appUpdater` flow described above. It is the one app whose
+update routine deletes the process running that flow, so it takes a different
+launcher: the conventional-script branch delegates to `executeUpdate()` in
+`server/services/updateExecutor.js`, whose double-fork keeps `update.sh` alive
+through its own `pm2 delete` step, and the trailing PM2 restart is skipped
+because the script starts the ecosystem itself. See
+[Self-Update Flow](SELF_UPDATE.md#every-portos-update-goes-through-the-detached-launcher).
+
+A custom **Update Command** on the PortOS record keeps the ordinary attached
+path, since delegating would silently run `update.sh` instead of the configured
+command.

@@ -1,6 +1,10 @@
 import { request, API_BASE, throwApiError } from './apiCore.js';
 import { downloadBlob } from '../lib/downloadBlob.js';
 
+export const rectifyModelDuplicates = (payload, options = {}) => request('/system-resources/duplicates/rectify', {
+  method: 'POST', body: JSON.stringify(payload), ...options,
+});
+
 // Alerts
 export const getAlertsSummary = (options) => request('/alerts/summary', options);
 
@@ -28,6 +32,18 @@ export const getSystemCapabilities = (options) => request('/system/capabilities'
 export const updateHealthThresholds = (thresholds, options = {}) => request('/system/health/thresholds', {
   method: 'PUT',
   body: JSON.stringify(thresholds),
+  ...options
+});
+// Dismiss/undo a dashboard health warning as resolved. `message` must be the
+// warning's current `message` field — the server keys the dismissal on the
+// (type, message) pair so an unrelated recurrence isn't silently hidden.
+export const dismissHealthWarning = (type, message, options = {}) => request(`/system/health/warnings/${encodeURIComponent(type)}/dismiss`, {
+  method: 'POST',
+  body: JSON.stringify({ message }),
+  ...options
+});
+export const undismissHealthWarning = (type, options = {}) => request(`/system/health/warnings/${encodeURIComponent(type)}/dismiss`, {
+  method: 'DELETE',
   ...options
 });
 
@@ -329,6 +345,18 @@ export const getSelfInstance = (options) => request('/instances/self', options);
 export const getAssignableInstances = (options) => request('/instances/assignable', options);
 export const updateSelfInstance = (data) => request('/instances/self', { method: 'PUT', body: JSON.stringify(data) });
 export const addPeer = (data) => request('/instances/peers', { method: 'POST', body: JSON.stringify(data) });
+export const addTailcatPeer = (data) => request('/instances/peers/tailcat', { method: 'POST', body: JSON.stringify(data) });
+// Saved tailcat forwards. Rows never carry the tc address — only its redacted
+// form — so a failed forward can be retried without re-pasting the capability.
+export const getTailcatForwards = (options) => request('/instances/peers/tailcat/forwards', options);
+export const retryTailcatForward = (id, data = {}) => request(`/instances/peers/tailcat/forwards/${id}/retry`, { method: 'POST', body: JSON.stringify(data) });
+export const forgetTailcatForward = (id) => request(`/instances/peers/tailcat/forwards/${id}`, { method: 'DELETE' });
+// Managed tailcat serve on this node (PORTS.API). Status may include the full
+// tc address so the operator can Copy it — this is our own serve capability.
+export const getTailcatServe = (options) => request('/instances/peers/tailcat/serve', options);
+export const startTailcatServe = (data) => request('/instances/peers/tailcat/serve', { method: 'POST', body: JSON.stringify(data || {}) });
+export const retryTailcatServe = () => request('/instances/peers/tailcat/serve/retry', { method: 'POST' });
+export const stopTailcatServe = () => request('/instances/peers/tailcat/serve', { method: 'DELETE' });
 export const updatePeer = (id, data) => request(`/instances/peers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
 export const removePeer = (id) => request(`/instances/peers/${id}`, { method: 'DELETE' });
 export const connectPeer = (id) => request(`/instances/peers/${id}/connect`, { method: 'POST' });
@@ -464,3 +492,8 @@ export const updateGoalScorecardSettings = (partial) => request('/insights/goal-
   method: 'PUT',
   body: JSON.stringify(partial ?? {})
 });
+
+export const getEidoverseDestinations = (options) => request('/eidoverse/travel/destinations', options);
+export const departEidoverse = (peerId, options) => request('/eidoverse/travel/depart', { method: 'POST', body: JSON.stringify({ peerId }), ...options });
+
+export const saveCredential = (id, value, options) => request(`/settings/credentials/${encodeURIComponent(id)}`, { ...options, method: 'PUT', body: JSON.stringify({ value }) });

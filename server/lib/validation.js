@@ -1,3 +1,4 @@
+import { CREDENTIALS } from './credentialRegistry.js';
 import { z } from 'zod';
 import { ServerError } from './errorHandler.js';
 import { partialWithoutDefaults, emptyToUndefined, emptyToNull, optionalBooleanMap } from './zodCompat.js';
@@ -8,10 +9,12 @@ import { MAX_MONTHLY_COST } from './subscriptionSavings.js';
 import { QUEUEABLE_IMAGE_MODES, VIDEO_GEN_MODES } from './generationModes.js';
 import { RENDER_TARGETS, RENDER_TARGET_BACKEND_AUTO } from './renderTargets.js';
 import {
-  grokVideoDurationSchema, cloudModelIdString, recordRenderPinFields, isSafeSubdirFilter,
+  grokVideoDurationSchema, cloudModelIdString, recordRenderPinFields, isSafeSubdirFilter, csvIdsParam,
 } from './sharedSchemas.js';
 import { PR_COMPLETION_VALUES } from './prDisposition.js';
 import { EFFORT_LEVELS } from './providerModels.js';
+import { MODEL_ALIAS_LIMITS } from './providerModelAliases.js';
+import { PROVIDER_HARNESS_IDS, ROUTE_MODES } from './providerHarnesses.js';
 import { MAX_TIMEOUT as AI_RUN_TIMEOUT_MAX_MS, MIN_TIMEOUT as AI_RUN_TIMEOUT_MIN_MS } from './aiToolkit/constants.js';
 import {
   FEDERATED_MEDIA_ASSET_MAX_COUNT,
@@ -124,37 +127,6 @@ export const datadogSearchErrorsRequestSchema = z.object({
   fromTime: z.preprocess(emptyToUndefined, z.string().trim().refine(value => !Number.isNaN(Date.parse(value)), {
     message: 'fromTime must be a valid ISO 8601 date string',
   }).optional()),
-});
-
-// Reference-repo entry. Each app can list upstream repos it watches for
-// clean-room reimplementation;
-// the `reference-watch` scheduled task fetches each one, finds commits since
-// `lastReviewedSha`, and appends slug-tagged `[ref-watch-…]` checklist items
-// to the app's PLAN.md for `/claim` / `plan-task` to pick up. `notes` is the
-// free-text "what we use from this repo" field — fed into the review prompt
-// so the agent knows which features in our app are load-bearing for the watch.
-export const referenceRepoSchema = z.object({
-  id: z.string().min(1).max(64),
-  name: z.string().min(1).max(120),
-  // Either a clonable URL (https://github.com/owner/repo or scp-style
-  // user@host:owner/repo.git) or a local filesystem path. The service
-  // detects remote URLs by matching `scheme://` or scp-style
-  // `user@host:path` (see isLocalPath in services/referenceRepos.js);
-  // anything else is treated as a local path.
-  repoUrl: z.string().min(1).max(500),
-  branch: z.string().max(120).optional().default('main'),
-  // 40-char hex SHA (case-insensitive), or null (no review yet). Validating
-  // hex here rather than just length means a bogus PATCH like 'g'.repeat(40)
-  // fails fast at the API instead of producing confusing git failures later.
-  lastReviewedSha: z.string().regex(/^[0-9a-f]{40}$/i, 'must be a 40-char hex SHA').nullable().optional(),
-  lastCheckedAt: z.string().datetime().nullable().optional(),
-  notes: z.string().max(4000).optional().default(''),
-  // Last action's outcome — used by the UI to highlight refs needing
-  // attention. 'needs-clone' means the managed clone hasn't been
-  // initialized yet (first run will populate it).
-  status: z.enum(['ok', 'checking', 'error', 'needs-clone']).optional().default('needs-clone'),
-  lastError: z.string().max(2000).nullable().optional(),
-  createdAt: z.string().datetime().optional()
 });
 
 // App schema for registration/update
@@ -333,6 +305,20 @@ export const appSchema = z.object({
 // fails validation rather than slipping through and producing confusing
 // git failures downstream — matches the project convention used elsewhere
 // in this file.
+// Reference-repo entry. Each app can list upstream repos it watches for
+// clean-room reimplementation; the `reference-watch` scheduled task fetches
+// each one, finds commits since `lastReviewedSha`, and appends slug-tagged
+// `[ref-watch-…]` checklist items to the app's PLAN.md for `/claim` /
+// `plan-task` to pick up. `notes` is the free-text "what we use from this
+// repo" field — fed into the review prompt so the agent knows which features
+// in our app are load-bearing for the watch. `repoUrl` is either a clonable
+// URL (https://github.com/owner/repo or scp-style user@host:owner/repo.git)
+// or a local filesystem path; the service detects remote URLs by matching
+// `scheme://` or scp-style `user@host:path` (see isLocalPath in
+// services/referenceRepos.js) and treats anything else as a local path.
+// The persisted record's server-owned fields (id, status, lastError,
+// lastCheckedAt, lastKnownGoodSnapshot, createdAt) are stamped by
+// services/referenceRepos.js and never accepted from a request body.
 export const referenceRepoCreateSchema = z.object({
   name: z.string().trim().min(1).max(120),
   repoUrl: z.string().trim().min(1).max(500),
@@ -513,6 +499,10 @@ export const providerSchema = z.object({
   defaultModel: z.string().nullable().optional(),
   timeout: z.number().int().min(AI_RUN_TIMEOUT_MIN_MS).max(AI_RUN_TIMEOUT_MAX_MS).optional(),
   enabled: z.boolean().optional(),
+  // Marks a harness wrapper whose backend is the LM Studio server on this
+  // machine. Unlike the containers below, its context window and reasoning are
+  // chosen when the model instance is LOADED, so PortOS forwards neither.
+  lmstudioBacked: z.boolean().optional(),
   // Kept in schema parity with aiToolkit's provider schema. Marks OpenCode
   // wrappers for a separately started local MTPLX native-MTP server.
   mtplxBacked: z.boolean().optional(),
@@ -568,9 +558,180 @@ export const codexLoginStartSchema = z.object({
   deviceCode: z.boolean().optional().default(false),
 });
 
+// POST /api/providers/bindings/:id/link  (and /link/preview).
+//
+// Every revision the caller reviewed is named explicitly. Omitting one is
+// allowed for a PREVIEW (there is nothing to be stale against yet), but the
+// service refuses to APPLY a link whose named revisions have moved -- a link is
+// a decision about a specific difference, so a changed row invalidates it.
+export const providerBindingLinkSchema = z.object({
+  targetConnectionId: z.string().uuid(),
+  expectedRevisions: z.object({
+    binding: z.number().int().positive().optional(),
+    sourceConnection: z.number().int().positive().optional(),
+    targetConnection: z.number().int().positive().optional(),
+  }).strict().optional().default({}),
+}).strict();
+
+// POST /api/providers/bindings/:id/unlink. No target: unlink clones the
+// connection this binding already uses, so only the binding and its source
+// participate.
+export const providerBindingUnlinkSchema = z.object({
+  expectedRevisions: z.object({
+    binding: z.number().int().positive().optional(),
+    sourceConnection: z.number().int().positive().optional(),
+  }).strict().optional().default({}),
+}).strict();
+
+// POST /api/providers/connections (#6369) — a NEW backend.
+//
+// This schema bounds the SHAPE only. Which backend kinds and transport
+// protocols are real is checked by `connectionBlocker` in the service, which
+// already owns the harness/transport registries — importing them here would
+// pull that subtree into the one module nearly every route validates through
+// (`lib/importScoping.test.js`), for two enum lists and no extra safety.
+//
+// Exactly ONE transport, and this is the load-bearing rule: a provider record
+// names one endpoint, so the profile a minted route reports always declares one
+// transport. A connection declaring two would not be the connection its own
+// routes describe, and reconciliation would clone each binding onto a fresh
+// single-transport row on the next pass — silently undoing the create.
+//
+// Credentials take no `null` here, unlike the PATCH above: there is nothing yet
+// to clear, so a null would only be a typo with a destructive reading.
+export const providerConnectionCreateSchema = z.object({
+  kind: z.string().trim().min(1).max(64),
+  label: z.string().trim().min(1).max(200),
+  transports: z.record(
+    z.string().trim().min(1).max(64),
+    z.object({ baseUrl: z.string().trim().min(1).max(2048) }).strict(),
+  ).refine((value) => Object.keys(value).length === 1, {
+    message: 'Declare exactly one transport protocol for this backend',
+  }),
+  credentials: z.record(
+    z.string().trim().min(1).max(128),
+    z.string().min(1).max(4096),
+  ).optional().default({}),
+}).strict();
+
+// POST /api/providers/bindings (#6369) — a NEW harness configuration on an
+// existing backend, and the executable routes it owns.
+//
+// `harnessId` accepts every registry id, not only the creatable ones: a harness
+// with no command recipe gets the service's explanation of WHY it cannot be
+// pointed at a backend, which is more useful than a schema enum error. `null`
+// is the direct API binding and is spelled explicitly rather than by omission,
+// because "no harness" is a real choice here, not a missing field.
+export const providerBindingCreateSchema = z.object({
+  connectionId: z.string().uuid(),
+  harnessId: z.enum(PROVIDER_HARNESS_IDS).nullable(),
+  modes: z.array(z.enum(ROUTE_MODES)).min(1).max(ROUTE_MODES.length)
+    .refine((value) => new Set(value).size === value.length, { message: 'Name each mode once' }),
+  label: z.string().trim().min(1).max(200).optional(),
+}).strict();
+
+// PATCH /api/providers/connections/:id (#6369).
+//
+// `expectedRevision` is REQUIRED, unlike the link schemas where a preview may
+// omit it: this endpoint always writes, and a shared backend edit that lands on
+// a row the human never saw is exactly the silent overwrite the graph exists to
+// prevent.
+//
+// Credentials are three-valued on purpose — absent preserves, `null` clears, a
+// string sets — so a client that never received the secret (the DTO carries
+// only `hasCredentials`) can edit a label without wiping the key.
+export const providerConnectionUpdateSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  label: z.string().trim().max(200).optional(),
+  transports: z.record(
+    z.string().trim().min(1).max(64),
+    z.object({ baseUrl: z.string().trim().min(1).max(2048) }).strict(),
+  ).optional(),
+  credentials: z.record(z.string().trim().min(1).max(128), z.string().max(4096).nullable()).optional(),
+}).strict();
+
+// PATCH /api/providers/bindings/:id (#6369). Management state only: no
+// `enabled`, because route enablement is an executable-record field that
+// PATCH /api/providers/:id owns and a binding toggle must never grant it.
+export const providerBindingUpdateSchema = z.object({
+  expectedRevision: z.number().int().positive(),
+  label: z.string().trim().max(200).optional(),
+  selectedModels: z.array(z.string().trim().min(1).max(512)).max(1000).optional(),
+}).strict();
+
+// PATCH /api/providers/routes/:providerId (#6369) — ONE route's mode overrides.
+//
+// Deliberately not `providerSchema.partial()`: that would reopen the whole
+// executable record, including the connection-owned endpoint/key the graph
+// projects and the `enabled` flag that grants execution consent. The accepted
+// keys are exactly the route-owned table in `providerRouteSettings.js`;
+// `providerRouteSettings.test.js` fails if the two ever drift.
+//
+// `expectedRevision` is a FINGERPRINT of the values on disk, not a row counter
+// — these fields live in providers.json, which the route editor and a model
+// refresh also write. An empty patch is refused rather than written: it would
+// rewrite the provider file to say nothing.
+//
+// `timeout` takes no `null`. The executable record's own schema has no null
+// timeout, so storing one here would 400 the next save from the route editor;
+// clearing a custom timeout stays that editor's job.
+const nullableModelPin = z.preprocess(emptyToNull, z.string().trim().max(512).nullable());
+export const providerRouteSettingsUpdateSchema = z.object({
+  expectedRevision: z.string().trim().min(1).max(64),
+  settings: z.object({
+    args: z.array(z.string().trim().min(1).max(2048)).max(200).optional(),
+    timeout: z.number().int().min(AI_RUN_TIMEOUT_MIN_MS).max(AI_RUN_TIMEOUT_MAX_MS).optional(),
+    effort: z.preprocess(emptyToNull, z.enum(EFFORT_LEVELS).nullable()).optional(),
+    defaultModel: nullableModelPin.optional(),
+    lightModel: nullableModelPin.optional(),
+    mediumModel: nullableModelPin.optional(),
+    heavyModel: nullableModelPin.optional(),
+    ultraModel: nullableModelPin.optional(),
+  }).strict().refine((value) => Object.keys(value).length > 0, {
+    message: 'Name at least one setting to change',
+  }),
+}).strict();
+
+// PATCH /api/providers/routes/:providerId/model-aliases (#6369) — ONE route's
+// HAND-AUTHORED canonical→executable model aliases.
+//
+// Three-valued like the connection credentials above, and for the same reason:
+// a panel that read three aliases and changed one must be able to send one. An
+// absent key is preserved, a string sets, and `null` DELETES — the only way an
+// override is ever removed, because a refresh must never delete a correction.
+//
+// The keys are model names, so the record is not enumerable and each key is
+// length-checked. `expectedRevision` is a FINGERPRINT of the current override
+// map (`ai_route_bindings` has no revision column), and an empty patch is
+// refused rather than written: it would rewrite a row to say nothing.
+export const providerRouteModelAliasSchema = z.object({
+  expectedRevision: z.string().trim().min(1).max(64),
+  aliases: z.record(
+    z.string().trim().min(1).max(MODEL_ALIAS_LIMITS.maxLength),
+    z.string().trim().min(1).max(MODEL_ALIAS_LIMITS.maxLength).nullable(),
+  ).refine((value) => Object.keys(value).length > 0, { message: 'Name at least one alias to change' })
+    .refine((value) => Object.keys(value).length <= MODEL_ALIAS_LIMITS.maxEntries, {
+      message: `At most ${MODEL_ALIAS_LIMITS.maxEntries} aliases at a time`,
+    }),
+}).strict();
+
 // POST /api/providers/:id/vision-suite.
 export const providerVisionSuiteSchema = z.object({
   model: z.preprocess(emptyToUndefined, z.string().trim().min(1).max(256).optional()),
+});
+
+// POST /api/harnesses/action. Both values are TABLE KEYS, not free text: the
+// service rejects a `runtime` that names no row and an `action` outside this
+// enum before any child is spawned. This bounds the shape at the HTTP boundary
+// so a malformed query fails as a 400 rather than as a lookup miss mid-stream.
+export const harnessActionSchema = z.object({
+  runtime: z.string().trim().min(1).max(64),
+  action: z.enum(['install', 'update', 'uninstall']).optional().default('install'),
+});
+
+// POST /api/harnesses/models/refresh.
+export const harnessRefreshSchema = z.object({
+  runtime: z.string().trim().min(1).max(64),
 });
 
 // POST /api/uploads and POST /api/attachments. The shared upload helper
@@ -1324,6 +1485,13 @@ export const databaseExportSchema = z.object({
   backend: z.enum(DB_BACKENDS).optional()
 });
 
+// System health dashboard warnings — see server/routes/systemHealth.js. The
+// `type` enum mirrors every `rawWarnings.push({ type: ... })` call site there;
+// keep the two lists in sync.
+export const SYSTEM_HEALTH_WARNING_TYPES = ['memory', 'cpu', 'disk', 'process', 'restarts', 'apps', 'database', 'forge'];
+export const systemHealthWarningParamsSchema = z.object({ type: z.enum(SYSTEM_HEALTH_WARNING_TYPES) });
+export const systemHealthWarningDismissSchema = z.object({ message: z.string().trim().min(1).max(500) });
+
 /**
  * Validate data against a Zod schema, throwing on failure.
  * Returns parsed data on success, throws ServerError on failure.
@@ -1387,6 +1555,72 @@ export const userActionsListQuerySchema = z.object({
   limit: z.coerce.number().int().optional(),
   offset: z.coerce.number().int().optional(),
 });
+
+// =============================================================================
+// AGENT ACTIVITY LOG (server/routes/agentActivity.js)
+// =============================================================================
+
+// The activity log is a per-agent, per-day tree of JSON files under
+// `data/agents/activity/<agentId>/<YYYY-MM-DD>.json`. Two things follow:
+// `agentId` is interpolated into a filesystem path, so it is held to a bare
+// filename segment (`isSafeRecordId` on top of the charset, so `..` can't turn
+// a read into a traversal); and the read limits are CLAMPED here rather than in
+// the service, because every handler slices an already-loaded array — an
+// unbounded `limit` is a memory/response-size problem, not a query cost.
+const AGENT_ACTIVITY_MAX_LIMIT = 500;
+const agentActivityLimit = (defaultLimit) =>
+  z.coerce.number().int().min(1).max(AGENT_ACTIVITY_MAX_LIMIT).default(defaultLimit);
+// A blank query value (`?action=` from an unset form field) reads as absent
+// rather than as a 400 — it was `action || null` before this schema existed.
+const agentActivityAction = z.preprocess(emptyToUndefined, z.string().trim().min(1).max(64).optional());
+const agentActivityIds = csvIdsParam({ max: 50, maxIdLength: 128 });
+
+// GET /api/agents/activity
+export const agentActivityQuerySchema = z.object({
+  limit: agentActivityLimit(50),
+  agentIds: agentActivityIds,
+  action: agentActivityAction,
+}).strict();
+
+// GET /api/agents/activity/timeline — `before` is an infinite-scroll cursor the
+// client echoes back from a row's `timestamp`, so it is a full ISO instant.
+export const agentActivityTimelineQuerySchema = z.object({
+  limit: agentActivityLimit(50),
+  agentIds: agentActivityIds,
+  before: z.preprocess(emptyToUndefined, z.string().datetime().optional()),
+}).strict();
+
+export const agentActivityAgentParamsSchema = z.object({
+  agentId: z.string().trim().min(1).max(128)
+    .regex(/^[A-Za-z0-9._-]+$/, 'agentId must be alphanumeric with . _ -')
+    .refine(isSafeRecordId, 'agentId must be a bare filename segment'),
+}).strict();
+
+// GET /api/agents/activity/agent/:agentId — `date` stays a `YYYY-MM-DD` STRING
+// all the way to `getActivityFilePath`, which takes that form directly. Parsing
+// it to a Date first would re-derive the day in local time from a UTC midnight
+// and read the neighbouring file for anyone west of UTC.
+export const agentActivityAgentQuerySchema = z.object({
+  date: z.preprocess(emptyToUndefined, z.string().date().optional()),
+  limit: agentActivityLimit(100),
+  offset: z.coerce.number().int().min(0).default(0),
+  action: agentActivityAction,
+}).strict();
+
+// GET /api/agents/activity/agent/:agentId/stats — one file read per day, so the
+// window is capped at a year rather than left open.
+export const agentActivityStatsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(365).default(7),
+}).strict();
+
+// POST /api/agents/activity/cleanup — unlinks every activity file older than the
+// window. The floor is 1 day, NOT 0: `daysToKeep: 0` puts the cutoff at now and
+// deletes the whole archive, and a negative value reaches into future-dated
+// files. "Delete everything" is not a retention window; if it is ever wanted it
+// gets its own explicitly-named endpoint rather than riding this number.
+export const agentActivityCleanupSchema = z.object({
+  daysToKeep: z.coerce.number().int().min(1).max(3650).default(30),
+}).strict();
 
 // =============================================================================
 // CLIENT ERROR REPORT
@@ -1528,6 +1762,13 @@ export const locationSettingsSchema = z.object({
   { message: 'Provide both lat and lon, or neither.' },
 );
 
+// Durable "don't show this again" for the dashboard first-run card (#5640).
+// Top-level general-settings boolean — same record as timezone/location, never
+// localStorage. Absent means show; only an explicit true suppresses.
+export const networkSetupPreferenceSchema = z.enum(['tailscale', 'tailcat', 'none']);
+
+export const hideFirstRunCardSchema = z.boolean();
+
 // Grok Imagegen settings slice (`imageGen.grok`) — the Grok Build CLI backend
 // (#2859). No model/effort knobs: grok's image tools run on xAI's fixed image
 // backend, so only the enable gate, binary path, default aspect ratio, and
@@ -1560,8 +1801,8 @@ const agyImageModelSchema = z.preprocess(
 // route makes for catalogUserTypes. The route persists the raw body, so a
 // newer build's pins survive the round-trip intact rather than being dropped.
 // Known fields keep full enum/charset enforcement (that's what stops a bad
-// model id reaching a CLI argv); the client mirror's parity test guards the
-// known-key alphabet.
+// model id reaching a CLI argv); the known-key alphabet is RENDER_TARGETS from
+// lib/renderTargets.js, which the client re-exports rather than mirrors.
 const renderTargetModelSchema = z.preprocess(
   (v) => (v === '' ? null : v),
   cloudModelIdString('model must be a valid model id').nullable().optional(),
@@ -1589,14 +1830,27 @@ export const renderDefaultsSettingsSchema = z.object(
 export const videoGenSettingsSchema = z.object({
   mode: videoModePinSchema,
   defaultModelId: z.preprocess(emptyToNull, z.string().trim().max(64).nullable().optional()),
-  // Default-on macOS GPU-watchdog mitigation for sustained MLX video renders.
-  // Set false for a headless display workflow that manages display power itself.
+  // Opt-in macOS GPU-watchdog mitigation for local MLX video renders (mlx
+  // #3267) — OFF by default, since a render is a short, attended action and
+  // sleeping the screen unasked reads as a crash. Set true to have PortOS
+  // sleep the display for the duration of a render; also settable per-render
+  // (see the `displaySleep` field on POST /api/video-gen).
   displaySleep: z.boolean().optional(),
   // Install-wide acknowledgement of restricted-model license gates, stored as
   // the exact reviewed-license ids (`termsGate.id`). Written through
   // POST /api/video-gen/model-terms; typed here so a Settings save can't put
   // junk where the render gate reads authorization from.
   acceptedModelTerms: z.array(z.string().trim().min(1).max(128)).max(50).optional(),
+  // fal.ai queue REST provider (#6213) — settings-stored key wins over the
+  // FAL_KEY env var (same precedence as loras.js's Civitai key).
+  fal: z.object({
+    apiKey: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().max(200).optional()),
+  }).optional(),
+  // reactor.inc fast-h3 provider (#6214) — same settings-wins-over-env
+  // precedence as `fal` above.
+  reactor: z.object({
+    apiKey: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().max(200).optional()),
+  }).optional(),
 });
 
 // POST /api/video-gen/model-terms — record (or withdraw) the acknowledgement of
@@ -1634,9 +1888,15 @@ export const localLlmSettingsSchema = z.object({
   // release the model, which is what every install did before this setting
   // existed and stays the default. Capped at a day: a longer window is
   // indistinguishable from "never" and is far likelier a units mix-up.
-  llama: z.object({ idleMinutes: z.number().int().min(0).max(1440).optional() }).strict().optional(),
+  llama: z.object({
+    idleMinutes: z.number().int().min(0).max(1440).optional(),
+    keepLoaded: z.boolean().optional(),
+    pinned: z.boolean().optional(),
+  }).strict().optional(),
   mtplx: z.object({
     idleMinutes: z.number().int().min(0).max(1440).optional(),
+    keepLoaded: z.boolean().optional(),
+    pinned: z.boolean().optional(),
     // The launch line a lazy start replays. MTPLX has no Start button any more —
     // the first request that needs it brings it up — so the checkpoint and port
     // the user chose have to outlive the process, or an on-demand start would
@@ -1649,6 +1909,8 @@ export const localLlmSettingsSchema = z.object({
   }).strict().optional(),
   slotstream: z.object({
     idleMinutes: z.number().int().min(0).max(1440).optional(),
+    keepLoaded: z.boolean().optional(),
+    pinned: z.boolean().optional(),
     launch: z.object({
       model: z.string().trim().max(300).nullable().optional(),
       port: z.number().int().min(1).max(65535).optional(),
@@ -1796,3 +2058,49 @@ export * from './quotaBurnValidation.js';
 export * from './spriteValidation.js';
 export * from './agentContextValidation.js';
 export * from './eidoverseValidation.js';
+
+// Public benchmark observations. A source is attached to each metric because
+// price, quality and runtime measurements often come from different workloads.
+const comparisonSourceSchema = z.object({
+  url: z.string().url().max(2000).refine(value => /^https:\/\//i.test(value), 'Source must use HTTPS'),
+  retrievedAt: z.string().datetime().refine(value => Date.parse(value) <= Date.now(), 'Source date cannot be in the future'),
+  methodology: z.string().min(1).max(1000),
+}).strict();
+const comparisonMetricSchema = z.object({ value: z.number().finite().nonnegative(), source: comparisonSourceSchema }).strict();
+export const modelComparisonObservationSchema = z.object({
+  id: z.string().min(1).max(200),
+  provider: z.string().min(1).max(160),
+  model: z.string().min(1).max(200),
+  effort: z.string().min(1).max(80),
+  configuration: z.string().min(1).max(500),
+  billing: z.enum(['api', 'subscription', 'local', 'unknown']),
+  benchmark: z.string().min(1).max(160),
+  quality: comparisonMetricSchema.nullable(),
+  costPerTask: comparisonMetricSchema.nullable(),
+  inputPerMillion: comparisonMetricSchema.nullable(),
+  outputPerMillion: comparisonMetricSchema.nullable(),
+  reasoningPerMillion: comparisonMetricSchema.nullable(),
+  responseSeconds: comparisonMetricSchema.nullable(),
+  tokensPerSecond: comparisonMetricSchema.nullable(),
+  quota: z.object({ unitsPerTask: z.number().finite().nonnegative(), unit: z.string().min(1).max(80), source: comparisonSourceSchema }).strict().nullable(),
+  notes: z.string().max(2000),
+}).strict();
+export const modelComparisonImportSchema = z.object({
+  schemaVersion: z.literal(1),
+  observations: z.array(modelComparisonObservationSchema).min(1).max(2000),
+}).strict().superRefine((value, ctx) => {
+  const ids = new Set();
+  value.observations.forEach((row, index) => {
+    if (ids.has(row.id)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['observations', index, 'id'], message: 'Duplicate observation id' });
+    ids.add(row.id);
+    if (!row.quality && !row.costPerTask && !row.inputPerMillion && !row.outputPerMillion && !row.reasoningPerMillion && !row.responseSeconds && !row.tokensPerSecond && !row.quota) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['observations', index], message: 'At least one sourced metric is required' });
+    }
+  });
+});
+
+export const modelComparisonDiscoverySchema = z.object({ providerId: z.string().min(1).max(200) }).strict();
+export const privateCredentialParamsSchema = z.object({ id: z.enum(CREDENTIALS.filter(entry => entry.privateStore).map(entry => entry.id)) });
+export const privateCredentialInputSchema = z.object({ value: z.string().trim().max(2000) }).strict();
+
+export const modelComparisonSyncSchema = z.object({ apiKey: z.string().min(1).max(200).optional() }).strict();

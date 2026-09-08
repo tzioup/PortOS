@@ -1,4 +1,5 @@
 import ProviderModelSelector from '../../../ProviderModelSelector';
+import { providerModeSelectionPolicy } from '../../../../utils/providers.js';
 
 // Compact provider/model/effort pins rendered directly on a schedule card, so
 // the common "point this task at a different model and run it" loop doesn't
@@ -7,10 +8,10 @@ import ProviderModelSelector from '../../../ProviderModelSelector';
 //
 // `highlightToolUse` is on because a scheduled task IS an agent run: a task
 // pinned to a local model that can't call tools narrates instead of working.
-export default function TaskModelQuickControls({ pins, providers, disabled = false }) {
+export default function TaskModelQuickControls({ pins, providers, loading = false, disabled = false }) {
   const {
     providerId, model, effort, effectiveProviderId, defaultProviderLabel,
-    availableModels, saving, changeProvider, changeModel, changeEffort,
+    availableModels, saving, changeProvider, changeModel, changeEffort, toolFree,
   } = pins;
 
   return (
@@ -29,7 +30,9 @@ export default function TaskModelQuickControls({ pins, providers, disabled = fal
         emptyModelOption="Default model"
         alwaysShowModel
         compact
-        highlightToolUse
+        highlightToolUse={!toolFree}
+        selectionPolicy={toolFree ? providerModeSelectionPolicy('direct-api') : undefined}
+        loading={loading}
         disabled={disabled || saving}
       />
     </div>

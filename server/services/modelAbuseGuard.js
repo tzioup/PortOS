@@ -2,12 +2,15 @@
  * Local model-abuse screening service.
  *
  * This service is intentionally separate from the local chat completion path.
- * It runs deterministic checks and then a pinned Prompt Guard classifier in a
- * dedicated offline Python environment. The classifier receives no tools,
- * agent prompt, repository checkout, credentials, or network access.
+ * It runs deterministic hidden-content and model-abuse checks first, then —
+ * only when the operator installed it on Models → LLMs → Abuse Guard — the
+ * pinned Prompt Guard classifier in a dedicated offline Python environment. The
+ * classifier receives no tools, agent prompt, repository checkout,
+ * credentials, or network requests. Offline library flags are not an OS sandbox.
  */
 
-import { chmod, existsSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { chmod } from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { execFile, spawn } from '../lib/childProcess.js';
@@ -28,19 +31,26 @@ import {
   MODEL_ABUSE_GUARD_MAX_OUTPUT_CHARS,
   MODEL_ABUSE_GUARD_MIN_BENIGN_SCORE,
   MODEL_ABUSE_GUARD_PYTHON_IMPORTS,
+  MODEL_ABUSE_GUARD_PYTHON_PACKAGES,
   MODEL_ABUSE_GUARD_REQUIRED_FILES,
   MODEL_ABUSE_GUARD_TIMEOUT_MS,
   detectDeterministicModelAbuseSignals,
   hasToolFreeTextCapability,
+  isSha256Hex,
   modelAbuseGuardStageReadiness,
+  normalizeEligibilityFacts,
+  normalizeLinkedIssues,
   normalizeModelAbuseGuardResult,
 } from '../lib/modelAbuseGuard.js';
-import { findCachedRepoFiles } from '../lib/hfCache.js';
+import { findCachedRepoFiles, getHfCacheRoot } from '../lib/hfCache.js';
 import { localRuntimeForProvider } from '../lib/localProviderRuntime.js';
 import { publicReviewProviderBlock, PUBLIC_REVIEW_NO_TOOL_POSTURE } from '../lib/providerVendors.js';
 import { withSpawnCwdEnv } from '../lib/spawnCwd.js';
 import { detectVenvBasePythonSync, createVenv, installPackages } from '../lib/pythonSetup.js';
 import { safeChildProcessOptions } from '../lib/processEnv.js';
+// Declared in lib/ so `classifyWorktreeDirt` can subtract this scratch without
+// importing this module's provider/runtime graph — see agentScratchPaths.js.
+import { PUBLIC_REVIEW_INPUT_FILENAME, PUBLIC_REVIEW_PATCH_DIRNAME } from '../lib/agentScratchPaths.js';
 import { downloadHfRepo } from './hfDownload.js';
 import { getHfToken } from './hfToken.js';
 import { listModels } from './localLlm.js';
@@ -61,46 +71,24 @@ const MAX_SCAN_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INSTALL_EVENT_CHARS = 300;
 const MAX_PUBLIC_REVIEW_SNAPSHOT_CHARS = MODEL_ABUSE_GUARD_MAX_INPUT_CHARS * 3;
 const PUBLIC_REVIEW_INPUT_DIR = join(PATHS.cos, 'public-review-inputs');
-export const PUBLIC_REVIEW_INPUT_FILENAME = 'PORTOS_PUBLIC_REVIEW_INPUT.json';
-export const PUBLIC_REVIEW_PATCH_DIRNAME = '.portos-public-review';
 export const PUBLIC_REVIEW_PATCH_MANIFEST_FILENAME = 'PORTOS_PUBLIC_REVIEW_PATCHES.json';
 
 let cachedRuntime = null;
+let selfTestFailed = false;
 let installInFlight = null;
 let installKill = null;
 
 const failure = (code, extra = {}) => ({ ok: false, passed: false, safe: false, code, ...extra });
+// What a report names as its guard model when only the deterministic layer ran.
+export const DETERMINISTIC_ONLY_GUARD_MODEL = 'Deterministic hidden-content checks (classifier not installed)';
 const publicReviewModelFailure = (code) => ({ ok: false, code });
 
 const isSha = (value) => typeof value === 'string' && /^[a-f0-9]{40}$/i.test(value);
-const isScanKey = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
-const publicReviewInputPath = (scanKey) => isScanKey(scanKey)
+const publicReviewInputPath = (scanKey) => isSha256Hex(scanKey)
   ? join(PUBLIC_REVIEW_INPUT_DIR, `${scanKey}.json`)
   : null;
 
-const normalizeIssueNumbers = (value) => Array.isArray(value)
-  ? [...new Set(value.filter((number) => Number.isInteger(number) && number > 0 && number <= 1_000_000))]
-    .sort((a, b) => a - b)
-    .slice(0, 50)
-  : [];
-
-const emptyEligibilityFacts = () => ({
-  linkedIssueNumbers: [],
-  openLinkedIssueNumbers: [],
-  openerAssignedIssueNumbers: [],
-  // Unknown is deliberately false. A missing facts object is not approval.
-  issueLookupComplete: false,
-});
-
-export function normalizeEligibilityFacts(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return emptyEligibilityFacts();
-  return {
-    linkedIssueNumbers: normalizeIssueNumbers(value.linkedIssueNumbers),
-    openLinkedIssueNumbers: normalizeIssueNumbers(value.openLinkedIssueNumbers),
-    openerAssignedIssueNumbers: normalizeIssueNumbers(value.openerAssignedIssueNumbers),
-    issueLookupComplete: value.issueLookupComplete === true,
-  };
-}
+export { normalizeEligibilityFacts, normalizeLinkedIssues };
 
 export function normalizePublicReviewInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
@@ -120,6 +108,10 @@ export function normalizePublicReviewInput(input) {
     additions: Number.isInteger(input.additions) ? input.additions : 0,
     deletions: Number.isInteger(input.deletions) ? input.deletions : 0,
     eligibilityFacts: normalizeEligibilityFacts(input.eligibilityFacts),
+    // The filed issue's own words. Carried through the same validation
+    // boundary as the diff so a reviewer can check the change against the
+    // requirement instead of inferring intent from the PR's own description.
+    linkedIssues: normalizeLinkedIssues(input.linkedIssues),
     diff: input.diff,
   };
 }
@@ -130,6 +122,7 @@ function normalizePublicReviewInputs(pullRequests) {
   if (normalized.some((item) => !item)) return null;
   const contentChars = normalized.reduce((total, item) => (
     total + item.title.length + item.body.length + item.diff.length
+    + item.linkedIssues.reduce((chars, issue) => chars + issue.title.length + issue.body.length, 0)
   ), 0);
   return contentChars <= MAX_PUBLIC_REVIEW_SNAPSHOT_CHARS ? normalized : null;
 }
@@ -270,7 +263,11 @@ export async function materializePublicReviewPatches({ scanKey, workspacePath, a
     const filename = `PR-${pullRequest.number}.patch`;
     const relativePath = `${PUBLIC_REVIEW_PATCH_DIRNAME}/${filename}`;
     const destination = join(patchDir, filename);
-    await atomicWrite(destination, pullRequest.diff);
+    // The gh wrapper trims stdout, which drops the diff's final newline; git
+    // apply then rejects the file as "corrupt patch at line N". Restore it so
+    // the reviewer can apply the patch verbatim (the fingerprint is computed
+    // on the trimmed text upstream and is unaffected).
+    await atomicWrite(destination, pullRequest.diff.endsWith('\n') ? pullRequest.diff : `${pullRequest.diff}\n`);
     const restricted = await chmod(destination, 0o444).then(() => true).catch(() => false);
     if (!restricted) return false;
     patches.push({
@@ -331,13 +328,29 @@ function probeScript() {
   const imports = MODEL_ABUSE_GUARD_PYTHON_IMPORTS
     .map((name) => `import ${name}`)
     .join('; ');
-  return `${imports}; print('{"ready":true}')`;
+  const expected = Object.fromEntries(MODEL_ABUSE_GUARD_PYTHON_PACKAGES.map(spec => spec.split('==')));
+  return `${imports}; import importlib.metadata as metadata; expected = ${JSON.stringify(expected)}; ready = all(metadata.version(name).split('+')[0] == version for name, version in expected.items()); print('{"ready":true}' if ready else '{"ready":false}')`;
 }
+
+async function isBasePythonSupported(pythonPath) {
+  if (!pythonPath) return false;
+  return execFileAsync(pythonPath, ['-c', 'import sys; print("supported" if sys.version_info >= (3, 10) else "unsupported")'],
+    safeChildProcessOptions({ env: buildModelAbuseGuardEnv(), timeout: 5_000, maxBuffer: 1000 }))
+    .then(({ stdout }) => stdout.trim() === 'supported').catch(() => false);
+}
+
+// A benign sentence the helper must classify end to end before the installer
+// reports success. Importing packages proves prerequisites, not classification:
+// a helper that loads the model and then dies on the first window (the
+// unbatched-tensor bug that failed every Stage 1 scan on transformers 4.57)
+// passed the import probe and only surfaced as a bare
+// `security-guard-process-failed` at scan time.
+const RUNTIME_CANARY_TEXT = 'The quick brown fox jumps over the lazy dog.';
 
 async function isRuntimeReady(pythonPath) {
   if (!pythonPath) return false;
-  if (cachedRuntime?.pythonPath === pythonPath && cachedRuntime.ready === true) return true;
-  const ready = await execFileAsync(
+  if (cachedRuntime?.pythonPath === pythonPath && Date.now() - cachedRuntime.checkedAt < 60_000) return true;
+  const importsReady = await execFileAsync(
     pythonPath,
     ['-c', probeScript()],
     safeChildProcessOptions({
@@ -347,8 +360,16 @@ async function isRuntimeReady(pythonPath) {
     }),
   ).then(({ stdout }) => stdout.trim().split(/\r?\n/).pop() === '{"ready":true}')
     .catch(() => false);
-  if (ready) cachedRuntime = { pythonPath, ready: true };
-  return ready;
+  if (importsReady) cachedRuntime = { pythonPath, checkedAt: Date.now() };
+  return importsReady;
+}
+
+async function canaryPasses(pythonPath, modelDir) {
+  const result = await runClassifier({ pythonPath, modelDir, content: RUNTIME_CANARY_TEXT, timeoutMs: RUNTIME_PROBE_TIMEOUT_MS })
+    .catch(() => ({ ok: false }));
+  if (!result.ok) return false;
+  const verdict = normalizeModelAbuseGuardResult(result.parsed, { minBenignScore: MODEL_ABUSE_GUARD_MIN_BENIGN_SCORE });
+  return verdict.ok === true && verdict.safe === true;
 }
 
 /**
@@ -365,15 +386,21 @@ export async function getModelAbuseGuardStatus() {
   ]);
   const modelCached = Array.isArray(files);
   const venvReady = Boolean(pythonPath);
-  const pythonAvailable = Boolean(detectVenvBasePythonSync());
+  const pythonAvailable = await isBasePythonSupported(detectVenvBasePythonSync());
+  // Status is observational: importing packages is permitted, inference and
+  // downloads run only from an explicit install or a requested content scan.
   const runtimeReady = await isRuntimeReady(pythonPath);
-  const { stages, ready } = modelAbuseGuardStageReadiness({
+  const { stages, ready: prerequisitesReady } = modelAbuseGuardStageReadiness({
     huggingfaceTokenPresent,
     pythonAvailable,
     venvReady,
     runtimeReady,
     modelCached,
   });
+  const ready = prerequisitesReady && !selfTestFailed;
+  const installationPresent = modelCached || venvReady || existsSync(GUARD_VENV_DIR)
+    || existsSync(dirname(dirname(FALLBACK_GUARD_PYTHON)))
+    || existsSync(join(getHfCacheRoot(), `models--${MODEL_ABUSE_GUARD.repository.replaceAll('/', '--')}`));
   return {
     ...MODEL_ABUSE_GUARD,
     modelCached,
@@ -382,6 +409,11 @@ export async function getModelAbuseGuardStatus() {
     venvReady,
     stages,
     ready,
+    selfTestFailed,
+    setupState: ready ? 'ready' : installationPresent ? 'incomplete' : 'not-installed',
+    classifierMode: 'required',
+    minBenignScore: MODEL_ABUSE_GUARD_MIN_BENIGN_SCORE,
+    maxInputChars: MODEL_ABUSE_GUARD_MAX_INPUT_CHARS,
   };
 }
 
@@ -399,14 +431,16 @@ export function installModelAbuseGuard({ onEvent } = {}) {
     // only after setup has changed the install.
     if (!(await getHfToken())) return failure('security-guard-huggingface-token-required');
     const basePython = detectVenvBasePythonSync();
-    if (!basePython) return failure('security-guard-python-unavailable');
+    if (!await isBasePythonSupported(basePython)) return failure('security-guard-python-unavailable');
     await ensureDir(dirname(GUARD_VENV_DIR));
     emitInstall(onEvent, 'stage', 'Preparing the dedicated Prompt Guard runtime…', 'venv');
-    const pythonPath = await createVenv(basePython, GUARD_VENV_DIR);
+    const clear = existsSync(GUARD_PYTHON) && !await isBasePythonSupported(GUARD_PYTHON);
+    const pythonPath = await createVenv(basePython, GUARD_VENV_DIR, { clear });
     cachedRuntime = null;
+    selfTestFailed = false;
 
     emitInstall(onEvent, 'stage', 'Installing the fixed classifier runtime packages…', 'packages');
-    const packageRun = installPackages(pythonPath, [...MODEL_ABUSE_GUARD_PYTHON_IMPORTS], ({ type, message }) => {
+    const packageRun = installPackages(pythonPath, [...MODEL_ABUSE_GUARD_PYTHON_PACKAGES], ({ type, message }) => {
       if (type === 'complete') emitInstall(onEvent, 'stage', 'Classifier runtime packages are ready.', 'packages');
       else if (type === 'error') emitInstall(onEvent, 'error', 'Classifier runtime package installation failed.', 'packages');
       else if (message && /install|uninstall/i.test(message)) emitInstall(onEvent, 'stage', 'Installing classifier runtime packages…', 'packages');
@@ -437,6 +471,12 @@ export function installModelAbuseGuard({ onEvent } = {}) {
 
     const status = await getModelAbuseGuardStatus();
     if (!status.ready) return failure('security-guard-install-incomplete');
+    const files = await findCachedRepoFiles(MODEL_ABUSE_GUARD.repository, MODEL_ABUSE_GUARD_REQUIRED_FILES, { revision: MODEL_ABUSE_GUARD.revision });
+    if (!files?.[0] || !await canaryPasses(pythonPath, dirname(files[0]))) {
+      cachedRuntime = null;
+      selfTestFailed = true;
+      return failure('security-guard-self-test-failed');
+    }
     emitInstall(onEvent, 'complete', 'Prompt Guard is ready for model-abuse screening.');
     return { ok: true, ...status };
   })()
@@ -462,8 +502,8 @@ function runClassifier({ pythonPath, modelDir, content, timeoutMs }) {
       pythonPath,
       [HELPER_SCRIPT, '--model-dir', modelDir],
       safeChildProcessOptions({
-        cwd: PATHS.root,
-        env: withSpawnCwdEnv(buildModelAbuseGuardEnv(), PATHS.root),
+        cwd: dirname(pythonPath),
+        env: withSpawnCwdEnv(buildModelAbuseGuardEnv(), dirname(pythonPath)),
         stdio: ['pipe', 'pipe', 'pipe'],
       }),
     );
@@ -483,6 +523,8 @@ function runClassifier({ pythonPath, modelDir, content, timeoutMs }) {
     proc.stdout.on('data', appendStdout);
     proc.stderr.on('data', (chunk) => {
       stderrSize += chunk.length;
+      // Dependency exceptions may contain source text or private local paths.
+      // Count their output for bounds, but never retain or log it.
       if (stderrSize > MODEL_ABUSE_GUARD_MAX_OUTPUT_CHARS) {
         proc.kill('SIGTERM');
         finish({ ok: false, code: 'security-guard-output-too-large' });
@@ -493,6 +535,7 @@ function runClassifier({ pythonPath, modelDir, content, timeoutMs }) {
     proc.on('close', (code) => {
       if (settled) return;
       if (code !== 0) {
+        console.error(`❌ Prompt Guard helper exited with code ${code}`);
         finish({ ok: false, code: 'security-guard-process-failed' });
         return;
       }
@@ -509,37 +552,55 @@ function runClassifier({ pythonPath, modelDir, content, timeoutMs }) {
 }
 
 /**
+ * A validated verdict from the deterministic layer alone — either it blocked
+ * (so the classifier was never asked) or the classifier is not installed.
+ */
+const deterministicVerdict = (findings, classifier) => ({
+  ok: true,
+  passed: findings.length === 0,
+  safe: findings.length === 0,
+  code: findings.length ? 'security-guard-deterministic-findings' : 'security-guard-passed',
+  guardId: MODEL_ABUSE_GUARD_ID,
+  model: DETERMINISTIC_ONLY_GUARD_MODEL,
+  revision: null,
+  findings,
+  chunkCount: null,
+  minBenignScore: null,
+  layers: { deterministic: findings.length ? 'blocked' : 'passed', classifier, verdict: 'validated' },
+});
+
+/**
  * Screen one untrusted external-content item. The return value is safe to
  * persist in a report or pass as metadata: it contains no source text and no
  * raw subprocess/model response.
  */
-export async function runModelAbuseScan({ content, timeoutMs = MODEL_ABUSE_GUARD_TIMEOUT_MS } = {}) {
+export async function runModelAbuseScan({
+  content,
+  timeoutMs = MODEL_ABUSE_GUARD_TIMEOUT_MS,
+  classifierMode = 'required',
+  minBenignScore = MODEL_ABUSE_GUARD_MIN_BENIGN_SCORE,
+} = {}) {
+  if (!['required', 'optional'].includes(classifierMode)
+    || !Number.isFinite(minBenignScore) || minBenignScore < MODEL_ABUSE_GUARD_MIN_BENIGN_SCORE || minBenignScore > 1) {
+    return failure('security-guard-policy-invalid');
+  }
   if (typeof content !== 'string' || !content.trim()) return failure('security-guard-empty-input');
   if (content.length > MODEL_ABUSE_GUARD_MAX_INPUT_CHARS) return failure('security-guard-input-too-large');
 
   const deterministicFindings = detectDeterministicModelAbuseSignals(content);
   if (deterministicFindings.length > 0) {
-    return {
-      ok: true,
-      passed: false,
-      safe: false,
-      code: 'security-guard-deterministic-findings',
-      guardId: MODEL_ABUSE_GUARD_ID,
-      model: MODEL_ABUSE_GUARD.name,
-      revision: MODEL_ABUSE_GUARD.revision,
-      findings: deterministicFindings,
-      chunkCount: null,
-      minBenignScore: null,
-      layers: { deterministic: 'blocked', classifier: 'not-run', verdict: 'validated' },
-    };
+    return deterministicVerdict(deterministicFindings, 'not-run');
   }
 
+  // Only an explicit policy can omit a never-installed classifier. A broken
+  // or partial installation is never silently downgraded to fewer layers.
   const status = await getModelAbuseGuardStatus();
-  if (!status.ready) return failure('security-guard-not-ready', {
-    guardId: MODEL_ABUSE_GUARD_ID,
-    model: MODEL_ABUSE_GUARD.name,
-    revision: MODEL_ABUSE_GUARD.revision,
-  });
+  if (!status.ready) {
+    if (classifierMode === 'optional' && status.setupState === 'not-installed') return deterministicVerdict([], 'not-installed');
+    return failure('security-guard-not-ready', {
+      layers: { deterministic: 'passed', classifier: status.setupState, verdict: 'blocked' },
+    });
+  }
   const modelFiles = await findCachedRepoFiles(
     MODEL_ABUSE_GUARD.repository,
     MODEL_ABUSE_GUARD_REQUIRED_FILES,
@@ -560,7 +621,7 @@ export async function runModelAbuseScan({ content, timeoutMs = MODEL_ABUSE_GUARD
     revision: MODEL_ABUSE_GUARD.revision,
   });
   const verdict = normalizeModelAbuseGuardResult(processResult.parsed, {
-    minBenignScore: MODEL_ABUSE_GUARD_MIN_BENIGN_SCORE,
+    minBenignScore,
   });
   if (!verdict.ok) return failure(verdict.code, {
     guardId: MODEL_ABUSE_GUARD_ID,

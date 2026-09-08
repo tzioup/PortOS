@@ -1,7 +1,25 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import express from 'express';
 import { pinPlatform, request } from '../lib/testHelper.js';
 import { errorMiddleware } from '../lib/errorHandler.js';
+import { cleanupTempDataRoots, lazyTempDataRoot, makePathsProxy } from '../lib/mockPathsDataRoot.js';
+
+// The annotated-regen path stages its init-image snapshot under PATHS.imageRefs
+// (imageGen.js's `ensureDir(PATHS.imageRefs)` + init-<uuid>.png write). Without
+// this redirect the suite wrote that snapshot into the developer's live data/
+// tree on every run of the "stages the flattened annotation" case (#6176).
+vi.mock('../lib/fileUtils.js', async (importOriginal) =>
+  makePathsProxy(await importOriginal(), { dataRoot: () => lazyTempDataRoot('portos-imagegen-') }));
+// `fileUtils.js` re-exports pathSafety.js's resolvers (resolveGalleryImage,
+// resolveImageInputPath, …), but those read PATHS from `paths.js` directly —
+// the fileUtils.js mock above never touches that binding. Mirror the same
+// temp root here too, so the runner's own re-validation of the staged init
+// path (`fileUtils.resolveImageInputPath`) agrees with where the write above
+// actually landed.
+vi.mock('../lib/paths.js', async (importOriginal) =>
+  makePathsProxy(await importOriginal(), { dataRoot: () => lazyTempDataRoot('portos-imagegen-') }));
+afterAll(cleanupTempDataRoots);
+
 import imageGenRoutes from './imageGen.js';
 import * as fileUtils from '../lib/fileUtils.js';
 import * as regen from '../services/imageGen/regen.js';
@@ -102,6 +120,9 @@ vi.mock('../services/mediaJobQueue/index.js', () => ({
   cancelJob: vi.fn(async () => ({ ok: true, status: 'canceling' })),
   listJobs: vi.fn(() => []),
 }));
+
+const recordUserAction = vi.hoisted(() => vi.fn(async () => ({ id: 'evt' })));
+vi.mock('../services/userActions.js', () => ({ recordUserAction }));
 
 // The /generate route resolves an optional universeRun collection target via
 // findOrCreateUniverseCollection. Mock it so the universeRun test asserts the
@@ -419,6 +440,13 @@ describe('Image Gen Routes', () => {
       // Synchronous generateImage MUST NOT be called in local mode — the
       // queue takes ownership of the job lifecycle.
       expect(imageGen.generateImage).not.toHaveBeenCalled();
+      expect(recordUserAction).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'media.image.enqueue',
+        target: 'queued-job-001',
+        summary: 'enqueued image job',
+        payload: { jobId: 'queued-job-001' },
+      }));
+      expect(JSON.stringify(recordUserAction.mock.calls[0][0])).not.toContain('a fox in a forest');
     });
 
     it('local mode maps cfgScale to guidance before enqueueing', async () => {

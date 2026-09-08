@@ -31,6 +31,26 @@ vi.mock('./imageGenQuota.js', () => ({
   } : null))
 }));
 
+// The federation layer `getProviderQuotas` folds in reads AND WRITES this
+// machine's real `data/` store: `getFleetQuotaEntries` returns whatever peers
+// have published, and `recordLocalQuotaCards` persists the cards it was handed
+// to `data/provider-quotas.json` (then invalidates the `usage` sync checksum, so
+// peers pull it). Unmocked, that made this suite non-hermetic in both
+// directions — it read a developer's live peer readings into assertions that
+// expect `limits: []`, and it wrote these fixtures' fake agy/grok cards over
+// their genuine ones. Green in CI only because CI has no peer data.
+// The merge and the store have their own coverage (lib/fleetQuotas.test.js,
+// services/peerUsage.test.js); this file's boundary is local card assembly.
+vi.mock('./peerUsage.js', () => ({
+  getFleetQuotaEntries: vi.fn().mockResolvedValue([])
+}));
+vi.mock('./providerQuotaShare.js', () => ({
+  recordLocalQuotaCards: vi.fn().mockResolvedValue(null)
+}));
+vi.mock('./usageFleetBilling.js', () => ({
+  getApiBilledInstanceIds: vi.fn().mockResolvedValue([])
+}));
+
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -172,6 +192,27 @@ describe('mapCodexQuota', () => {
     expect(quota.limits[0].resetsAt).toBe(new Date(1767225600 * 1000).toISOString());
     expect(quota.note).toContain('2026-01-02T00:00:00Z');
     expect(quota.error).toBeUndefined();
+  });
+
+  // The meters describe the signed-in ChatGPT account. When the install's own
+  // ~/.codex/config.toml re-points model routing, PortOS's runs may not be
+  // going there — the card must say so rather than present the numbers as if
+  // they covered its own work (#6304).
+  it('caveats the note when the user config overrides Codex routing, and names no base URL', () => {
+    const quota = mapCodexQuota(SAMPLE_RATE_LIMITS, '2026-01-02T00:00:00Z', {
+      now: SAMPLE_NOW,
+      routingOverridden: true,
+    });
+    expect(quota.note).toContain('2026-01-02T00:00:00Z');
+    expect(quota.note).toContain('~/.codex/config.toml overrides Codex model routing');
+    expect(quota.note).not.toMatch(/https?:\/\//);
+    expect(quota.limits).toHaveLength(2);
+
+    const clean = mapCodexQuota(SAMPLE_RATE_LIMITS, '2026-01-02T00:00:00Z', {
+      now: SAMPLE_NOW,
+      routingOverridden: false,
+    });
+    expect(clean.note).not.toContain('config.toml');
   });
 
   it('renders a fully-spent window as a 100%-used meter, not an empty card', () => {

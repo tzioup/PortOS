@@ -24,6 +24,18 @@ const PARK_REASON_LABELS = {
   'no-detector': 'no work detector for this task'
 };
 
+// pr-reviewer's on-demand skip reasons (server: runPrReviewerSecurityPreflight in
+// cosTaskGenerator.js). An unlisted code falls back to the raw string rather than
+// the generic "nothing to do" — the reason IS the actionable detail here, since a
+// per-PR "Review this PR" trigger names a specific PR the maintainer wants reviewed.
+const PR_REVIEWER_REASON_LABELS = {
+  'parked': 'paused after repeated failures — it will retry on its normal cadence',
+  'no-external-open-prs': 'no open external pull requests to review',
+  'target-pull-request-not-reviewable': "that pull request isn't eligible right now (not open against the default branch, or authored by a trusted collaborator)",
+  'security-scan-report-pending': 'a security scan for this pull request is already in progress',
+  'security-guard-not-ready': "the local model-abuse classifier (Settings → Models → LLMs → Abuse Guard) isn't ready — finish or repair its setup, then try again",
+};
+
 /**
  * Global subscriber that toasts when a user-initiated on-demand task run
  * produced no work. The server emits `cos:schedule:on-demand-empty` ONLY for
@@ -69,6 +81,13 @@ export function useOnDemandTaskToast() {
           });
           return;
         }
+        if (data?.taskType === 'pr-reviewer' && data?.reason) {
+          toast(`${task}${scope}: ${PR_REVIEWER_REASON_LABELS[data.reason] || data.reason}.`, {
+            duration: 8000,
+            icon: '⚠️'
+          });
+          return;
+        }
         toast(`${task}${scope}: re-checked now — nothing to do right now.`, {
           duration: 6000,
           icon: '💤'
@@ -109,9 +128,26 @@ export function useOnDemandTaskToast() {
       });
     };
 
+    // A PROGRAMMATIC scheduled handler (universe bible descriptions/images)
+    // finishes its work inside the server — no agent task appears in the CoS
+    // queue for the user to watch — so its outcome is the only feedback the Run
+    // Now button can produce. `dispatched: false` is a decline, not a failure
+    // (nothing to do, or a setting that needs picking), so it stays calm and
+    // always names the handler's own reason rather than a generic gloss.
+    const handleHandled = (data) => {
+      const task = data?.taskType || 'task';
+      if (data?.dispatched) {
+        toast(data.summary || `${task}: done.`, { duration: 7000, icon: '✅' });
+        return;
+      }
+      toast(`${task}: ${data?.reason || 'nothing to do right now'}.`, { duration: 7000, icon: '💤' });
+    };
+
     socket.on('cos:schedule:on-demand-empty', handleEmpty);
+    socket.on('cos:schedule:on-demand-handled', handleHandled);
     return () => {
       socket.off('cos:schedule:on-demand-empty', handleEmpty);
+      socket.off('cos:schedule:on-demand-handled', handleHandled);
       // Don't unsubscribe from cos — other components share the room.
     };
   }, []);

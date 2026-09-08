@@ -6,8 +6,10 @@ import {
   forceFullReasonFor,
   FULL_SUITE_SHARDS,
   isRouteOnlyAppDiff,
-  pythonReferencePattern,
+  needsSlashdoSubmodule,
   shardIndexes,
+  SLASHDO_GITLINK_PATH,
+  sourceReferencePattern,
   splitByRunner,
   WINDOWS_CONTRACT_TESTS,
 } from './ci-test-plan.js';
@@ -31,6 +33,10 @@ const TRACKED = [
   'server/services/sprites/atlasLayout.js',
   'server/services/sprites/atlasLayout.test.js',
   'server/services/taskPromptDefaults.test.js',
+  'server/lib/slashdoLoader.js',
+  'server/lib/slashdoLoader.test.js',
+  'server/lib/slashdoInvocation.js',
+  'server/lib/slashdoInvocation.test.js',
   'server/lib/bufferedSpawn.test.js',
   'server/lib/platform.test.js',
   'server/lib/shellCd.test.js',
@@ -394,7 +400,7 @@ describe('CI test impact planner', () => {
       'server/services/videoGen/runtimes.test.js',
       'client/src/lib/videoRenderPhase.test.js',
     ];
-    const pythonContractTests = {
+    const pathContractTests = {
       'scripts/_runner_common.py': [
         'scripts/generate_ltx2.test.js',
         'server/services/videoGen/runtimes.test.js',
@@ -403,7 +409,7 @@ describe('CI test impact planner', () => {
       ],
     };
 
-    const plan = buildCiTestPlan(['scripts/_runner_common.py'], { trackedFiles: tracked, pythonContractTests });
+    const plan = buildCiTestPlan(['scripts/_runner_common.py'], { trackedFiles: tracked, pathContractTests });
 
     expect(plan).toMatchObject({
       full: false,
@@ -426,7 +432,7 @@ describe('CI test impact planner', () => {
     // python contracts ride along as explicit files.
     const mixed = buildCiTestPlan(['scripts/_runner_common.py', 'server/services/auth.js'], {
       trackedFiles: tracked,
-      pythonContractTests,
+      pathContractTests,
     });
     expect(mixed.reason).toBe('Vitest related-test fallback');
     expect(mixed.server).toMatchObject({ mode: 'related', sources: ['server/services/auth.js'] });
@@ -434,32 +440,74 @@ describe('CI test impact planner', () => {
     expect(mixed.smoke).toBe(true);
   });
 
-  it('runs the generated-manifest drift tests whenever a server source changes', () => {
+  it('selects a text-reading contract test by the changed file\'s basename (#6363)', () => {
     const tracked = [
       ...TRACKED,
-      'server/routes/settings.js',
-      'scripts/generate-api-route-catalog.test.js',
+      'client/src/pages/Calendar.jsx',
+      'server/lib/navManifest.js',
+      'server/lib/navManifest.test.js',
+    ];
+    // navManifest.test.js reads client/src/pages/Calendar.jsx with readFileSync
+    // rather than importing it, so no `vitest related` edge reaches it — only
+    // the basename lookup computed by main() and threaded through as
+    // pathContractTests can.
+    const pathContractTests = {
+      'client/src/pages/Calendar.jsx': ['server/lib/navManifest.test.js'],
+    };
+
+    const plan = buildCiTestPlan(['client/src/pages/Calendar.jsx'], { trackedFiles: tracked, pathContractTests });
+
+    expect(plan.full).toBe(false);
+    expect(plan.server.files).toContain('server/lib/navManifest.test.js');
+  });
+
+  it('reaches a mirror-parity test from either side of the mirror by basename (#6363)', () => {
+    const tracked = [
+      ...TRACKED,
+      'server/lib/eidoverseWorldReset.js',
+      'server/lib/eidoverseWorldReset.parity.test.js',
+      'client/src/lib/eidoverseWorldReset.js',
+    ];
+    // Both copies share one basename, and the mirror test names the OTHER copy
+    // only by that basename — a mirror test living in server/lib is what a
+    // change to either side must select.
+    const pathContractTests = {
+      'server/lib/eidoverseWorldReset.js': ['server/lib/eidoverseWorldReset.parity.test.js'],
+      'client/src/lib/eidoverseWorldReset.js': ['server/lib/eidoverseWorldReset.parity.test.js'],
+    };
+
+    const serverSide = buildCiTestPlan(['server/lib/eidoverseWorldReset.js'], { trackedFiles: tracked, pathContractTests });
+    expect(serverSide.server.files).toContain('server/lib/eidoverseWorldReset.parity.test.js');
+
+    const clientSide = buildCiTestPlan(['client/src/lib/eidoverseWorldReset.js'], { trackedFiles: tracked, pathContractTests });
+    expect(clientSide.server.files).toContain('server/lib/eidoverseWorldReset.parity.test.js');
+  });
+
+  it('runs the tree-scanning route and prompt-stage guards whenever a server source changes', () => {
+    const treeGuards = [
+      'server/lib/apiRouteGraph.test.js',
+      'server/lib/apiRouteParity.test.js',
       'scripts/generate-prompt-stage-call-sites.test.js',
     ];
-    const drift = ['scripts/generate-api-route-catalog.test.js', 'scripts/generate-prompt-stage-call-sites.test.js'];
+    const tracked = [...TRACKED, 'server/routes/settings.js', ...treeGuards];
 
-    // A new route on a scoped plan is exactly the case that shipped a stale catalog.
+    // An unmounted route file or a renamed mount on a scoped plan.
     const route = buildCiTestPlan(['server/routes/settings.js'], { trackedFiles: tracked });
     expect(route.full).toBe(false);
-    expect(route.server.files).toEqual(expect.arrayContaining(drift));
+    expect(route.server.files).toEqual(expect.arrayContaining(treeGuards));
     // Any server module can add a literal stage-key call site.
     const service = buildCiTestPlan(['server/services/auth.js'], { trackedFiles: tracked });
-    expect(service.server.files).toEqual(expect.arrayContaining(drift));
-    // A client-only change has nothing to regenerate.
+    expect(service.server.files).toEqual(expect.arrayContaining(treeGuards));
+    // A client-only change has nothing to scan.
     const client = buildCiTestPlan(['client/src/lib/catalogLinks.js'], { trackedFiles: tracked });
-    expect(client.server.files).not.toEqual(expect.arrayContaining(drift));
+    expect(client.server.files).not.toEqual(expect.arrayContaining(treeGuards));
   });
 
   it('fails closed to the full suite for a python script nothing pins', () => {
     // Per script: a pinned sibling in the same diff does not vouch for the orphan.
     const plan = buildCiTestPlan(['scripts/generate_ltx2.py', 'scripts/orphan.py'], {
       trackedFiles: [...TRACKED, 'scripts/generate_ltx2.py', 'scripts/orphan.py', 'scripts/generate_ltx2.test.js'],
-      pythonContractTests: { 'scripts/generate_ltx2.py': ['scripts/generate_ltx2.test.js'] },
+      pathContractTests: { 'scripts/generate_ltx2.py': ['scripts/generate_ltx2.test.js'] },
     });
     expect(plan.full).toBe(true);
     expect(plan.reason).toMatch(/python script with no parsing contract: scripts\/orphan\.py/);
@@ -469,7 +517,7 @@ describe('CI test impact planner', () => {
   });
 
   it('matches the way tests name one python script, not every one', () => {
-    const re = new RegExp(pythonReferencePattern('scripts/generate_ltx2.py'));
+    const re = new RegExp(sourceReferencePattern('scripts/generate_ltx2.py'));
     expect(re.test("join(SCRIPTS, 'generate_ltx2.py')")).toBe(true);
     expect(re.test('readFileSync("scripts/generate_ltx2.py", "utf8")')).toBe(true);
     expect(re.test('"generate_ltx2.py"')).toBe(true);
@@ -637,5 +685,80 @@ describe('CI test impact planner', () => {
     expect(plan.windows).toBe(true);
     expect(plan.windowsMode).toBe('files');
     expect(plan.windowsSources).toEqual([]);
+  });
+
+  describe('slashdo submodule initialization (#6263)', () => {
+    it('requests the submodule for a gitlink-only change, forced full by the unclassified path', () => {
+      const plan = buildCiTestPlan([SLASHDO_GITLINK_PATH], { trackedFiles: TRACKED });
+
+      expect(plan.full).toBe(true);
+      expect(plan.slashdo).toBe(true);
+    });
+
+    it('requests the submodule when the loader source changes, without forcing full CI', () => {
+      const plan = buildCiTestPlan(['server/lib/slashdoLoader.js'], { trackedFiles: TRACKED });
+
+      expect(plan.full).toBe(false);
+      expect(plan.server.mode).toBe('related');
+      expect(plan.server.sources).toContain('server/lib/slashdoLoader.js');
+      expect(plan.slashdo).toBe(true);
+    });
+
+    it('requests the submodule when only the adapter test file changes', () => {
+      const plan = buildCiTestPlan(['server/lib/slashdoInvocation.test.js'], { trackedFiles: TRACKED });
+
+      expect(plan.full).toBe(false);
+      expect(plan.server.files).toContain('server/lib/slashdoInvocation.test.js');
+      expect(plan.slashdo).toBe(true);
+    });
+
+    it('requests the submodule on an explicit full-CI request (nightly / release gate)', () => {
+      const plan = buildCiTestPlan(['docs/README.md'], { trackedFiles: TRACKED, forceFull: true });
+
+      expect(plan.slashdo).toBe(true);
+    });
+
+    it('does not request the submodule for an unrelated scoped change', () => {
+      const plan = buildCiTestPlan(['server/services/sprites/atlas.js'], { trackedFiles: TRACKED });
+
+      expect(plan.full).toBe(false);
+      expect(plan.slashdo).toBe(false);
+    });
+
+    it('never requests the submodule for a documentation-only change', () => {
+      const plan = buildCiTestPlan(['docs/GITHUB_ACTIONS.md'], { trackedFiles: TRACKED });
+
+      expect(plan.slashdo).toBe(false);
+    });
+  });
+});
+
+describe('needsSlashdoSubmodule', () => {
+  const basePlan = { full: false, changedFiles: [], server: { files: [], sources: [] } };
+
+  it('is false for a plan that touches neither the gitlink nor the adapter', () => {
+    expect(needsSlashdoSubmodule(basePlan)).toBe(false);
+  });
+
+  it('is true for a full plan even without an explicit slashdo change', () => {
+    expect(needsSlashdoSubmodule({ ...basePlan, full: true })).toBe(true);
+  });
+
+  it('is true when the gitlink path itself changed', () => {
+    expect(needsSlashdoSubmodule({ ...basePlan, changedFiles: [SLASHDO_GITLINK_PATH] })).toBe(true);
+  });
+
+  it('is true when a contract test file is selected', () => {
+    expect(needsSlashdoSubmodule({
+      ...basePlan,
+      server: { files: ['server/lib/slashdoLoader.test.js'], sources: [] },
+    })).toBe(true);
+  });
+
+  it('is true when a contract source file is selected', () => {
+    expect(needsSlashdoSubmodule({
+      ...basePlan,
+      server: { files: [], sources: ['server/lib/slashdoInvocation.js'] },
+    })).toBe(true);
   });
 });

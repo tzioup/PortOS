@@ -30,12 +30,12 @@
  */
 
 import { spawn } from '../../lib/childProcess.js';
-import { copyFile, readFile, readdir, stat, writeFile } from 'fs/promises';
+import { readFile, readdir, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
-import { atomicWrite, ensureDir, PATHS } from '../../lib/fileUtils.js';
+import { atomicWrite, copyFileGuarded, ensureDir, PATHS } from '../../lib/fileUtils.js';
 import { ServerError } from '../../lib/errorHandler.js';
 import { autoCleanGeneratedImage } from '../../lib/imageClean.js';
 import { imageGenEvents } from '../imageGenEvents.js';
@@ -197,9 +197,13 @@ export async function generateImage({
   // `resolveCliEffort` (rather than a bare `CODEX_EFFORT_LEVELS.includes`) so a
   // legacy `ultra` value resolves to Codex's strongest supported level instead
   // of collapsing to the cheap default and silently rendering at a fraction of
-  // the requested effort.
+  // the requested effort. `effectiveModel` is threaded through because Codex's
+  // ladder is MODEL-gated in both directions: it decides whether `ultra` is a
+  // real level here, and whether `minimal` is — a gpt-6 model rejects `minimal`
+  // outright (HTTP 400), so an unclamped legacy value would fail the render.
   const requestedEffort = (typeof effort === 'string' && effort.trim()) ? effort.trim() : CODEX_IMAGEGEN_DEFAULT_EFFORT;
-  const effectiveEffort = resolveCliEffort(requestedEffort, { command: 'codex' }) || CODEX_IMAGEGEN_DEFAULT_EFFORT;
+  const effectiveEffort = resolveCliEffort(requestedEffort, { command: 'codex' }, effectiveModel)
+    || CODEX_IMAGEGEN_DEFAULT_EFFORT;
 
   // Re-anchors every path to the approved image roots and caps the list at what
   // codex's image_gen accepts — see inputImages.js.
@@ -252,7 +256,7 @@ export async function generateImage({
     // Reasoning-effort override (`-c model_reasoning_effort=<level>`), defaulting
     // to `low` — also before the variadic `-i`. A user who baked an effort pin
     // into their config is respected via hasEffortFlag inside buildEffortArgs.
-    ...buildEffortArgs(effectiveEffort, { command: 'codex' }),
+    ...buildEffortArgs(effectiveEffort, { command: 'codex' }, [], effectiveModel),
     // `-i` is variadic, so every input image rides one flag.
     ...(inputImages.paths.length ? ['-i', ...inputImages.paths] : []),
     '-m', effectiveModel,
@@ -413,9 +417,9 @@ async function runCodex(job, jobId, bin, args, outputPath, filename, meta, { cle
         return finalizeError(job, jobId, proc, noImageReason(stdoutTail));
       }
       if (harvested.path) {
-        await copyFile(harvested.path, outputPath);
+        await copyFileGuarded(harvested.path, outputPath);
       } else {
-        await writeFile(outputPath, harvested.buffer);
+        await atomicWrite(outputPath, harvested.buffer);
       }
       // Degenerate-frame gate (#4173) — before the sidecar, so a decodable but
       // contentless canvas never becomes a gallery record.

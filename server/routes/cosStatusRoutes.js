@@ -11,10 +11,16 @@ import { asyncHandler } from '../lib/errorHandler.js';
 import { validateRequest } from '../lib/validation.js';
 import { z } from 'zod';
 import { DOMAIN_IDS, DOMAIN_MODES } from '../lib/domainAutonomy.js';
+import { AVATAR_VARIANT_PATTERN, RIGGED_VARIANT_PREFIX } from '../lib/avatarVariants.js';
+// Single source of truth for the avatar-style vocabulary (#6253); the client
+// picker re-exports the same leaf.
+import { AVATAR_STYLE_IDS } from '../lib/avatarStyles.js';
 import { BUDGET_LIMIT_FIELDS } from '../lib/domainBudgets.js';
 import { persistentMindCapabilitiesSchema } from '../lib/persistentMindCapabilities.js';
 import { persistentMindProfileSchema } from '../lib/persistentMindProfile.js';
+import { persistentMindThinkingPresetsSchema } from '../lib/persistentMindThinkingPresets.js';
 import { persistentMindPromptSchema } from '../lib/persistentMindPrompt.js';
+import { persistentMindPlaybookSchema } from '../lib/persistentMindPlaybook.js';
 
 const router = Router();
 
@@ -40,7 +46,16 @@ export const cosConfigSchema = z.object({
   selfImprovementEnabled: z.boolean().optional(),
   appImprovementEnabled: z.boolean().optional(),
   improvementEnabled: z.boolean().optional(),
-  avatarStyle: z.enum(['svg', 'ascii', 'cyber', 'sigil', 'esoteric', 'nexus', 'muse', 'miniMaleC', 'miniFemaleD']).optional(),
+  // Built-in styles plus selectable rigged records (`rigged-<modelId>`, #5894).
+  // The record half reuses the avatar variant charset (no slashes, no dots —
+  // the same traversal guard `server/routes/avatar.js` enforces), so unknown
+  // spellings still 400 here instead of persisting a style nothing can render.
+  avatarStyle: z.union([
+    z.enum(AVATAR_STYLE_IDS),
+    z.string().startsWith(RIGGED_VARIANT_PREFIX).refine(
+      (value) => AVATAR_VARIANT_PATTERN.test(value.slice(RIGGED_VARIANT_PREFIX.length)),
+    ),
+  ]).optional(),
   dynamicAvatar: z.boolean().optional(),
   alwaysOn: z.boolean().optional(),
   appReviewCooldownMs: z.number().int().min(0).optional(),
@@ -57,7 +72,11 @@ export const cosConfigSchema = z.object({
   // A durable reasoning route for the persistent mind. It is separate from
   // `alwaysOn`: saving or enabling this profile never starts background work.
   persistentMindProfile: persistentMindProfileSchema.optional(),
+  // Saved alternates one message may borrow for a single turn. Storing them
+  // changes nothing about the route the mind wakes on by default.
+  persistentMindThinkingPresets: persistentMindThinkingPresetsSchema.optional(),
   persistentMindPrompt: persistentMindPromptSchema.optional(),
+  persistentMindPlaybook: persistentMindPlaybookSchema.optional(),
   // Separate opt-in action grant: an enabled reasoning profile does not imply
   // authority to create and execute agent tasks.
   persistentMindCapabilities: persistentMindCapabilitiesSchema.optional(),

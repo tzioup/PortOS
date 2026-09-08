@@ -6,21 +6,31 @@
  */
 import { getCodeReviewDefaults, runLocalClaimCommentReview, runLocalCodeReview } from '../services/codeReview.js';
 
+import { Console } from 'node:console';
+import { reviewerModelsFromDefaults } from '../lib/reviewerConfig.js';
+
+// Provider/runtime diagnostics belong on stderr; stdout is exactly one JSON
+// response for the claim procedure's jq gate.
+globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
 
 try {
   const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
   const defaults = await getCodeReviewDefaults().catch(() => null);
-  const model = request.model || defaults?.[`${request.backend}Model`] || null;
+  const model = request.model || reviewerModelsFromDefaults(defaults)[request.backend] || null;
   const effort = request.effort || defaults?.[`${request.backend}Effort`] || null;
   const review = request.kind === 'claim-comments'
     ? runLocalClaimCommentReview
     : runLocalCodeReview;
   const result = await review({ ...request, model, effort });
   process.stdout.write(`${JSON.stringify(result)}\n`);
-  if (!result.ok) process.exitCode = 1;
+  if (!result.ok) {
+    process.stderr.write(`${result.error}\n`);
+    process.exitCode = 1;
+  }
 } catch (err) {
   process.stdout.write(`${JSON.stringify({ ok: false, error: err.message })}\n`);
+  process.stderr.write(`${err.message}\n`);
   process.exitCode = 1;
 }

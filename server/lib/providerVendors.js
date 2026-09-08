@@ -51,7 +51,10 @@
  * cursor.js / codex.js): imports only the vendor files above, providerModels.js,
  * and node builtins, so it stays importable from the standalone autofixer
  * process (which pulls in cliProviderArgs.js and must NOT drag in the AI
- * toolkit / data layer).
+ * toolkit / data layer). That is load-bearing, not cosmetic: reaching into
+ * opencodeConfig.js for the OpenCode public-review agent name pulled ports.js
+ * in behind it and broke a suite that partially mocks it — which is why that
+ * constant lives in providerModels.js beside its siblings.
  */
 
 import {
@@ -68,6 +71,10 @@ import {
   buildEffortArgs,
   isOpencodeCommand,
   prefixOpencodeModel,
+  localRuntimeNamespace,
+  opencodeProviderIsLocalOnly,
+  OPENCODE_PUBLIC_REVIEW_AGENT,
+  OPENCODE_BUILD_AGENT,
   applyLeanClaudeArgs,
 } from './providerModels.js';
 import {
@@ -75,6 +82,7 @@ import {
   ensureCodexTuiArgs,
   CODEX_COMMAND,
   CODEX_CLI_ID,
+  buildCodexOssArgs,
 } from './codex.js';
 import {
   ANTIGRAVITY_COMMAND,
@@ -98,8 +106,9 @@ import {
   ensureCursorTuiArgs,
   ensureCursorHeadlessArgs,
 } from './cursor.js';
+import { PI_COMMAND, isPiCommand, ensurePiTuiArgs, ensurePiHeadlessArgs, preparePiPrompt } from './pi.js';
+import { PROVIDER_TYPES } from './aiToolkit/constants.js';
 import {
-  isPublicReviewNoToolProfile,
   publicReviewPostureForProfile,
   PUBLIC_REVIEW_EXECUTION_PROFILE,
   PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
@@ -136,7 +145,32 @@ function defaultSpawnArgs(cliArgsFn, fallbackCommand) {
   });
 }
 
+/**
+ * A provider record that names a local binary PortOS can spawn. A TUI record of
+ * a vendor (`codex-tui`, `grok-tui`, …) is spawned through that vendor's
+ * headless public-review recipe exactly like its CLI sibling, so the user's
+ * enabled TUI providers are legal stage choices. The one exception is a recipe
+ * supplying `tuiSpawnArgs` (see `supportsTuiPublicReviewPosture`), which the
+ * sandboxed-actions stage may run as an attachable session so an operator can
+ * watch and steer it. API/custom providers have no binary and no recipe.
+ */
+const isDirectBinaryProvider = (provider) => provider?.type === PROVIDER_TYPES.CLI || provider?.type === PROVIDER_TYPES.TUI;
+
 // ─── codex ──────────────────────────────────────────────────────────────────
+
+// The opt-in that pins a Codex run to the account PortOS believes it is using.
+// A third-party bridge re-points Codex by writing top-level routing keys into
+// `~/.codex/config.toml`, and codex honors that file on every invocation — so
+// without this flag PortOS's runs, reviewer rounds and autofixer repairs route
+// wherever that file says while the provider card reports a ChatGPT account.
+// Default OFF (an absent flag is today's behavior); the AI Providers page badges
+// the override and offers the toggle. Same flag the public-review recipes
+// already pass, so no new Codex surface is introduced here.
+const codexIgnoreUserConfigArgs = (provider, existingArgs = []) => (
+  provider?.ignoreUserConfig === true && !existingArgs.includes('--ignore-user-config')
+    ? ['--ignore-user-config']
+    : []
+);
 
 function codexCliArgs(baseArgs, { model, effort, provider }) {
   // Detect an existing leading `exec` in user/legacy args so we don't end up
@@ -144,7 +178,12 @@ function codexCliArgs(baseArgs, { model, effort, provider }) {
   // configs that already pinned an `exec` subcommand.
   const hasExec = baseArgs.includes('exec');
   const args = hasExec ? [...baseArgs] : [...baseArgs, 'exec'];
+  args.push(...codexIgnoreUserConfigArgs(provider, args));
   args.push(...buildCodexStartupArgs(baseArgs));
+  // The local-model backing, when the record carries a runtime marker codex can
+  // serve. Emitted from the marker rather than from provider args so a wrapper
+  // stays declarative — see buildCodexOssArgs in codex.js.
+  args.push(...buildCodexOssArgs(provider, baseArgs));
   if (model) {
     args.push('--model', model);
   }
@@ -160,7 +199,9 @@ function codexSpawnArgs(provider, { effectiveModel, effort, maxConcurrentThreads
   const args = [
     'exec',
     '--dangerously-bypass-approvals-and-sandbox',
+    ...codexIgnoreUserConfigArgs(provider),
     ...buildCodexStartupArgs(),
+    ...buildCodexOssArgs(provider),
     ...buildCodexAgentThreadArgs(maxConcurrentThreads),
   ];
   if (effectiveModel) {
@@ -175,10 +216,6 @@ function codexSpawnArgs(provider, { effectiveModel, effort, maxConcurrentThreads
 // `provider.args`: a saved `--dangerously-bypass-approvals-and-sandbox` in a
 // user's provider config would otherwise turn a screened review into an
 // unrestricted session.
-function codexPublicReviewSpawnArgs(provider, { effectiveModel, effort, maxConcurrentThreads }) {
-  return codexPublicReviewArgs(provider, { effectiveModel, effort, maxConcurrentThreads }, ['--sandbox', 'read-only']);
-}
-
 function codexPublicReviewActionsSpawnArgs(provider, { effectiveModel, effort, maxConcurrentThreads }) {
   // `workspace-write` is intentionally the narrowest Codex sandbox that can
   // apply a supplied patch and run local tests; `--approve-for-me` only
@@ -197,6 +234,11 @@ function codexPublicReviewArgs(provider, { effectiveModel, effort, maxConcurrent
     '--ephemeral',
     '--ignore-user-config',
     ...buildCodexStartupArgs(),
+    // The backing is orthogonal to the posture: a local-backed record reviews
+    // untrusted public code under the SAME sandbox ladder, with the tokens
+    // generated on-box. `--ignore-user-config` does not strip it — the pair is
+    // argv, not config.
+    ...buildCodexOssArgs(provider),
     ...buildCodexAgentThreadArgs(maxConcurrentThreads),
   ];
   if (effectiveModel) {
@@ -213,10 +255,6 @@ function codexPublicReviewArgs(provider, { effectiveModel, effort, maxConcurrent
 // unrestricted session. `--print` carries the prompt as its VALUE (see
 // antigravity.js) — `prepareAntigravityPrompt` relocates it to the end of the
 // argv at spawn time, which is why it is safe to append flags after it here.
-function antigravityPublicReviewSpawnArgs(provider, ctx) {
-  return antigravityPublicReviewArgs(provider, ctx, 'plan');
-}
-
 function antigravityPublicReviewActionsSpawnArgs(provider, ctx) {
   return antigravityPublicReviewArgs(provider, ctx, 'accept-edits');
 }
@@ -265,20 +303,21 @@ const CODEX = {
   idFragment: 'codex',
   inferredCommand: CODEX_COMMAND,
   matchCommand: isCodexCommand,
-  matchCliProvider: (provider) => provider?.id === CODEX_CLI_ID,
+  // Id OR command: the shipped `codex` record is not the only one that must
+  // build codex argv any more — a local-backed wrapper (`codex-ollama`) carries
+  // its own id, and an id-only match would drop it through to `claude`'s
+  // fallback row and spawn `claude --print` against the codex binary.
+  matchCliProvider: (provider) => provider?.id === CODEX_CLI_ID || isCodexCommand(provider?.command),
   tuiArgs: ensureCodexTuiArgs,
   cliArgs: codexCliArgs,
   spawnArgs: codexSpawnArgs,
   publicReview: {
     // The CLI id and the TUI id share one binary, so both reach the same
     // enforced recipe when a stage selects them.
-    [PUBLIC_REVIEW_NO_TOOL_POSTURE]: {
-      spawnArgs: codexPublicReviewSpawnArgs,
-      matchProvider: (provider) => isCodexCommand(provider?.command) || provider?.id === CODEX_CLI_ID || provider?.id === 'codex-tui',
-    },
+    // Read-only filesystem access still exposes tools; it is not no-tool.
     [PUBLIC_REVIEW_ACTIONS_POSTURE]: {
       spawnArgs: codexPublicReviewActionsSpawnArgs,
-      matchProvider: (provider) => provider?.type === 'cli' && isCodexCommand(provider?.command),
+      matchProvider: (provider) => isDirectBinaryProvider(provider) && isCodexCommand(provider?.command),
     },
   },
 };
@@ -302,26 +341,99 @@ const ANTIGRAVITY = {
   preparePrompt: prepareAntigravityPrompt,
   spawnArgs: defaultSpawnArgs(antigravityCliArgs, ANTIGRAVITY_COMMAND),
   publicReview: {
-    [PUBLIC_REVIEW_NO_TOOL_POSTURE]: {
-      spawnArgs: antigravityPublicReviewSpawnArgs,
-      matchProvider: (provider) => provider?.type === 'cli' && isAntigravityCommand(provider?.command),
-    },
+    // Plan mode is not an explicit empty-tool contract.
     [PUBLIC_REVIEW_ACTIONS_POSTURE]: {
       spawnArgs: antigravityPublicReviewActionsSpawnArgs,
-      matchProvider: (provider) => provider?.type === 'cli' && isAntigravityCommand(provider?.command),
+      matchProvider: (provider) => isDirectBinaryProvider(provider) && isAntigravityCommand(provider?.command),
     },
   },
 };
 
 // ─── opencode ───────────────────────────────────────────────────────────────
 
+/** Append the namespaced `-m` unless the argv already pins a model. */
+function appendOpencodeModel(args, provider, model) {
+  const resolvedModel = prefixOpencodeModel(provider, model);
+  if (resolvedModel && !hasModelFlag(args)) args.push('-m', resolvedModel);
+  return args;
+}
+
+const opencodeSpawnConfig = (provider, args) => ({ command: provider?.command || 'opencode', args, stdinMode: 'prompt' });
+
 function opencodeCliArgs(baseArgs, { model, provider }) {
   const args = baseArgs.includes('run') ? [...baseArgs] : ['run', ...baseArgs];
-  const resolvedModel = prefixOpencodeModel(provider, model);
-  if (resolvedModel && !hasModelFlag(baseArgs)) {
-    args.push('-m', resolvedModel);
-  }
-  return args;
+  return appendOpencodeModel(args, provider, model);
+}
+
+/**
+ * An OpenCode wrapper this install can actually run the tool-free gate on.
+ * Three conditions, each closing a different way the stage would otherwise be
+ * offered and then fail — or, worse, appear to succeed:
+ *
+ *   - **an Ollama or LM Studio namespace.** Private assessments verify installed
+ *     weights on either runtime. Public-review model validation independently
+ *     keeps its stricter Ollama-only capability probe. Other local runtimes
+ *     have no maintained assessment recipe.
+ *   - **only local endpoints.** The enforcement rides in
+ *     `OPENCODE_CONFIG_CONTENT`, which `cliChildEnv.js` keeps through the
+ *     public-review env allowlist under the SAME `opencodeConfigIsLocalOnly`
+ *     rule. A provider carrying `ollamaBacked` but a relocated off-box
+ *     `baseURL` would pass a marker-only check here, then have its hardened
+ *     config stripped there — and OpenCode falls back to the user's own
+ *     `~/.config/opencode`, tools and MCP servers intact, while the gate still
+ *     reports as enforced. Sharing one predicate is what makes that
+ *     unrepresentable.
+ *   - **a spawnable binary**, as for every other vendor.
+ */
+const matchOpencodeBinary = (provider) => isDirectBinaryProvider(provider) && isOpencodeCommand(provider?.command);
+
+const isLocalOpencodeProvider = (provider) => matchOpencodeBinary(provider)
+  && ['ollama', 'lmstudio'].includes(localRuntimeNamespace(provider))
+  && opencodeProviderIsLocalOnly(provider);
+
+/**
+ * OpenCode is the natural harness for a local Ollama model — but unlike every
+ * other vendor here it has NO read-only argv flag: its tool posture, permission
+ * block and per-model `tool_call` advertisement all live in the config. So this
+ * recipe is only half the enforcement; the other half is
+ * `hardenOpencodeConfigForNoTool` in `opencodeConfig.js`, which the same
+ * `safetyProfile` applies to `OPENCODE_CONFIG_CONTENT`.
+ *
+ * The argv is the ordinary headless one seeded with the read-only agent (the
+ * shape grok's recipe uses), so `run`/`-m` namespacing cannot drift from the
+ * normal path. Provider args are deliberately not forwarded: a saved
+ * `--agent build` would select the tool-enabled agent. There is no effort flag
+ * to add — `opencode run` has none; the level rides
+ * `agent.<name>.reasoningEffort` in the config, which the harden step copies
+ * onto this agent (see `hardenOpencodeConfigForNoTool`).
+ */
+function opencodePublicReviewSpawnArgs(provider, { effectiveModel } = {}) {
+  return opencodeSpawnConfig(provider, opencodeCliArgs(['--agent', OPENCODE_PUBLIC_REVIEW_AGENT], { model: effectiveModel, provider }));
+}
+
+/**
+ * The ATTACHABLE `sandboxed-actions` invocation (#6238). OpenCode's headless
+ * argv is a one-shot `opencode run …`, which cannot become an interactive
+ * session by dropping flags the way Claude's recipe does — in a PTY it neither
+ * accepts a pasted prompt nor renders. Its real interactive entry point is the
+ * BARE binary, which takes the same `--agent`/`-m` flags and reads the prompt
+ * the spawner pastes into every TUI (`agentTuiSpawning.js`). The tool-enabled
+ * agent is pinned on the argv and provider args are not forwarded (same rule as
+ * `buildTuiSpawnConfig`): a saved `--agent plan` would hand the session to a
+ * human nobody has to be. Permissions are the config's, on both paths — every
+ * tool allowed, the interactive gates denied (`buildOpencodeEnvVars`) — for as
+ * long as `OPENCODE_CONFIG_CONTENT` survives the actions env allowlist, i.e. a
+ * local-only endpoint (`cliChildEnv.js`); a gateway-backed wrapper runs on the
+ * operator's own `~/.config/opencode` instead, exactly as its headless run
+ * already did.
+ *
+ * The row supplies ONLY this builder: a headless actions run keeps falling
+ * through to the ordinary `run` argv, and with no headless `spawnArgs` the row
+ * is not an enforcement (OpenCode ships no sandbox; the disposable worktree is
+ * the isolation), so the schedule UI keeps reporting it as worktree-only.
+ */
+function opencodePublicReviewActionsTuiSpawnArgs(provider, { effectiveModel } = {}) {
+  return opencodeSpawnConfig(provider, appendOpencodeModel(['--agent', OPENCODE_BUILD_AGENT], provider, effectiveModel));
 }
 
 const OPENCODE = {
@@ -334,6 +446,20 @@ const OPENCODE = {
   // matchCliProvider is absent).
   cliArgs: opencodeCliArgs,
   spawnArgs: defaultSpawnArgs(opencodeCliArgs, 'opencode'),
+  publicReview: {
+    [PUBLIC_REVIEW_NO_TOOL_POSTURE]: {
+      spawnArgs: opencodePublicReviewSpawnArgs,
+      matchProvider: isLocalOpencodeProvider,
+    },
+    [PUBLIC_REVIEW_ACTIONS_POSTURE]: {
+      // No `spawnArgs` here — see the builder's docstring above: OpenCode
+      // ships no sandbox, so this row is never an enforcement and the
+      // attachable builder below is unreachable through the posture gate
+      // (`enforcesPublicReviewPosture` requires `spawnArgs`).
+      tuiSpawnArgs: opencodePublicReviewActionsTuiSpawnArgs,
+      matchProvider: matchOpencodeBinary,
+    },
+  },
 };
 
 // ─── grok ───────────────────────────────────────────────────────────────────
@@ -354,11 +480,11 @@ const GROK = {
   publicReview: {
     [PUBLIC_REVIEW_NO_TOOL_POSTURE]: {
       spawnArgs: grokPublicReviewSpawnArgs,
-      matchProvider: (provider) => provider?.type === 'cli' && isGrokCommand(provider?.command),
+      matchProvider: (provider) => isDirectBinaryProvider(provider) && isGrokCommand(provider?.command),
     },
     [PUBLIC_REVIEW_ACTIONS_POSTURE]: {
       spawnArgs: grokPublicReviewActionsSpawnArgs,
-      matchProvider: (provider) => provider?.type === 'cli' && isGrokCommand(provider?.command),
+      matchProvider: (provider) => isDirectBinaryProvider(provider) && isGrokCommand(provider?.command),
     },
   },
 };
@@ -422,6 +548,34 @@ const GEMINI_LEGACY = {
   // is deliberately incomplete.
 };
 
+// Pi public review discards configured args and disables every tool/resource
+// discovery surface. --no-builtin-tools alone leaves extension tools enabled.
+const piCliArgs = (args, { model, effort }) => ensurePiHeadlessArgs(args, model, effort);
+const PI = {
+  id: 'pi',
+  idFragment: 'pi-',
+  matchId: (id) => /^pi(?:-|$)/.test(id),
+  inferredCommand: PI_COMMAND,
+  matchCommand: isPiCommand,
+  tuiArgs: ensurePiTuiArgs,
+  cliArgs: piCliArgs,
+  preparePrompt: preparePiPrompt,
+  spawnArgs: defaultSpawnArgs(piCliArgs, PI_COMMAND),
+  publicReview: {
+    [PUBLIC_REVIEW_NO_TOOL_POSTURE]: {
+      matchProvider: (provider) => isDirectBinaryProvider(provider) && isPiCommand(provider?.command),
+      spawnArgs: (provider, { effectiveModel, effort } = {}) => ({
+        command: provider.command,
+        args: ensurePiHeadlessArgs([
+          '--no-approve', '--no-tools', '--no-builtin-tools', '--no-extensions',
+          '--no-skills', '--no-prompt-templates', '--no-themes', '--no-context-files', '--no-session',
+        ], effectiveModel, effort),
+        stdinMode: 'prompt',
+      }),
+    },
+  },
+};
+
 // ─── claude (default fallback — MUST stay last) ────────────────────────────
 
 function claudeCliArgs(baseArgs, { model, effort, provider }) {
@@ -462,7 +616,19 @@ function claudeSpawnArgs(provider, { effectiveModel, effort, systemPromptFile, s
   return { command, args, stdinMode: 'prompt', streamFormat: 'stream-json' };
 }
 
-const CLAUDE_PUBLIC_REVIEW_ARGS = [
+// Shared by both Claude postures: no MCP servers, no browser bridge, no
+// persisted session, no slash commands. `--bare` is NOT here: it also disables
+// OAuth/keychain auth, so it would break a subscription-authenticated cloud
+// Claude — `applyLeanClaudeArgs` adds it for the local Ollama wrapper only.
+const CLAUDE_PUBLIC_REVIEW_COMMON_ARGS = [
+  '--strict-mcp-config',
+  '--mcp-config', '{"mcpServers":{}}',
+  '--no-chrome',
+  '--no-session-persistence',
+  '--disable-slash-commands',
+];
+
+const CLAUDE_PUBLIC_REVIEW_NO_TOOL_ARGS = [
   '--permission-mode', 'plan',
   // The code-review model gets the cleared PR material in its prompt. Keep
   // both controls: `--restricted` removes the command/network-capable built-in
@@ -470,24 +636,80 @@ const CLAUDE_PUBLIC_REVIEW_ARGS = [
   // any tool schema to a local model that does not support tool calls.
   '--restricted',
   '--tools', '',
-  '--strict-mcp-config',
-  '--mcp-config', '{"mcpServers":{}}',
-  '--no-chrome',
-  '--no-session-persistence',
-  '--disable-slash-commands',
-  '--bare',
+  ...CLAUDE_PUBLIC_REVIEW_COMMON_ARGS,
 ];
 
-function claudePublicReviewArgs(provider, {
+// Claude Code's OS-level sandbox (seatbelt on macOS, bubblewrap on Linux) is a
+// settings switch rather than a flag; `--settings` accepts inline JSON. Inside
+// it, Bash runs without prompting but filesystem writes stay inside the working
+// tree and the empty domain allowlist denies every network request — in
+// `--print` mode a denied request is simply not executed, there is nobody to
+// approve it. The web tools are denied outright for the same reason.
+//
+// `sandbox.filesystem.allowWrite` (a real, current setting) does NOT reach a
+// PR that edits `.claude/skills`, `.claude/agents`, `.claude/commands`,
+// `.claude/hooks`, `.claude/workflows`, or `.mcp.json` — Claude Code's docs
+// state plainly that these are "protected paths" and "there is no way to
+// exempt one of them: an allowWrite entry ... doesn't lift the protection."
+// (docs.claude.com/en/docs/claude-code/sandboxing, "Protected paths"). The
+// only way to lift it is `sandbox.filesystem.disabled`, which turns off
+// filesystem isolation for every path — defeating the point of sandboxing an
+// untrusted PR's patch. So the Stage 3 review prompt (`pr-reviewer-review` in
+// taskPromptDefaults/prompts.js) is taught the `git apply --cached` +
+// index-verification fallback instead (#5963).
+const CLAUDE_SANDBOX_SETTINGS = JSON.stringify({
+  sandbox: { enabled: true, autoAllowBashIfSandboxed: true, network: { allowedDomains: [] } },
+});
+const CLAUDE_PUBLIC_REVIEW_ACTIONS_ARGS = [
+  '--permission-mode', 'acceptEdits',
+  '--settings', CLAUDE_SANDBOX_SETTINGS,
+  '--disallowedTools', 'WebFetch,WebSearch',
+  ...CLAUDE_PUBLIC_REVIEW_COMMON_ARGS,
+];
+
+// Flags Claude Code accepts ONLY alongside `--print`, mapped to whether they
+// consume the following argv entry as their value. The posture arrays above are
+// written for the headless launch, so the attachable `tuiSpawnArgs` recipe has to
+// drop them — the CLI refuses to start at all otherwise:
+//
+//   Error: --no-session-persistence can only be used with --print mode.
+//
+// That is a 3-second exit(1) before the prompt is ever pasted, and it burned all
+// three retries of a Stage 3 pr-reviewer run. Worse, the only thing in the PTY
+// transcript by then was the shell's echo of the argv, so the failure analyzer
+// classified the run off `--mcp-config '{"mcpServers":{}}'` and filed "MCP server
+// error" for what was a flag-compatibility bug (agent-a12b1837).
+//
+// Filtered rather than conditionally spread so a print-only flag added to ANY
+// posture set is dropped for the attachable recipe automatically.
+const CLAUDE_PRINT_ONLY_ARGS = new Map([
+  ['--no-session-persistence', false],
+  ['--output-format', true],
+]);
+
+function dropPrintOnlyArgs(args) {
+  const kept = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (!CLAUDE_PRINT_ONLY_ARGS.has(args[i])) {
+      kept.push(args[i]);
+      continue;
+    }
+    if (CLAUDE_PRINT_ONLY_ARGS.get(args[i])) i += 1; // also skip its value
+  }
+  return kept;
+}
+
+const claudePublicReviewSpawnArgsFor = (postureArgs) => (provider, ctx) => claudePublicReviewArgs(postureArgs, provider, ctx);
+
+function claudePublicReviewArgs(postureArgs, provider, {
   effectiveModel,
   effort,
   systemPromptFile,
-  settingsEnv,
   tui = false,
 } = {}) {
   const providerId = provider?.id || 'claude-code';
   const args = [
-    ...CLAUDE_PUBLIC_REVIEW_ARGS,
+    ...(tui ? dropPrintOnlyArgs(postureArgs) : postureArgs),
     ...(tui ? [] : ['--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']),
   ];
   if (systemPromptFile) args.push('--append-system-prompt-file', systemPromptFile);
@@ -508,6 +730,8 @@ function claudePublicReviewArgs(provider, {
   };
 }
 
+const matchClaudeBinary = (provider) => isDirectBinaryProvider(provider) && isClaudeCommand(provider?.command);
+
 const CLAUDE = {
   id: 'claude',
   idFragment: null, // never matched by id.includes() — it's the outside-the-loop default
@@ -521,12 +745,27 @@ const CLAUDE = {
   publicReview: {
     // Claude is the historical always-true fallback row, so its posture
     // matcher must positively identify the binary — an unknown command must
-    // never inherit claude's flag set. There is deliberately no
-    // sandboxed-actions recipe: Claude Code has no OS-level sandbox flag, only
-    // permission modes, so it fails closed for the actions stage.
+    // never inherit claude's flag set.
     [PUBLIC_REVIEW_NO_TOOL_POSTURE]: {
-      spawnArgs: claudePublicReviewArgs,
-      matchProvider: (provider) => provider?.type === 'cli' && isClaudeCommand(provider?.command),
+      spawnArgs: claudePublicReviewSpawnArgsFor(CLAUDE_PUBLIC_REVIEW_NO_TOOL_ARGS),
+      matchProvider: matchClaudeBinary,
+    },
+    [PUBLIC_REVIEW_ACTIONS_POSTURE]: {
+      spawnArgs: claudePublicReviewSpawnArgsFor(CLAUDE_PUBLIC_REVIEW_ACTIONS_ARGS),
+      matchProvider: matchClaudeBinary,
+      // One of two posture/vendor pairings that may run as an ATTACHABLE session
+      // (OpenCode is the other — see its row).
+      // `claudePublicReviewArgs` drops only the flags that REQUIRE `--print`
+      // (the headless output set plus CLAUDE_PRINT_ONLY_ARGS) for
+      // `tui: true`; every enforcement flag above (`--permission-mode
+      // acceptEdits`, the `--settings` sandbox JSON, `--disallowedTools`, and
+      // the shared no-MCP/no-chrome/no-slash-command set) is still emitted, so
+      // an operator who drops into the PTY inherits the same boundary the
+      // headless run had. Nothing inside the session can widen it: the only
+      // lever that lifts Claude Code's filesystem protection is
+      // `sandbox.filesystem.disabled`, which this recipe never emits, and
+      // `--disable-slash-commands` removes the in-session settings surface.
+      tuiSpawnArgs: claudePublicReviewSpawnArgsFor(CLAUDE_PUBLIC_REVIEW_ACTIONS_ARGS),
     },
   },
 };
@@ -543,7 +782,7 @@ const CLAUDE = {
  * exclusive by construction (distinct binary basenames, or a provider-id
  * check that doesn't overlap with a command-basename check).
  */
-export const PROVIDER_VENDORS = [CODEX, ANTIGRAVITY, CURSOR, GEMINI_LEGACY, KIMI, GROK, OPENCODE, CLAUDE];
+export const PROVIDER_VENDORS = [CODEX, ANTIGRAVITY, CURSOR, GEMINI_LEGACY, KIMI, GROK, OPENCODE, PI, CLAUDE];
 
 /**
  * A row's `matchCliProvider` may be absent when it's identical to
@@ -570,7 +809,7 @@ export function publicReviewRecipe(provider, posture) {
   if (!PUBLIC_REVIEW_POSTURES.includes(posture)) return null;
   for (const vendor of PROVIDER_VENDORS) {
     const recipe = vendor.publicReview?.[posture];
-    if (recipe?.spawnArgs && recipe.matchProvider(provider)) return recipe;
+    if ((recipe?.spawnArgs || recipe?.tuiSpawnArgs) && recipe.matchProvider(provider)) return recipe;
   }
   return null;
 }
@@ -587,28 +826,32 @@ export function publicReviewRecipe(provider, posture) {
 export function inferTuiCommand(id) {
   if (!id) return CLAUDE.inferredCommand;
   for (const vendor of PROVIDER_VENDORS) {
-    if (vendor.idFragment && id.includes(vendor.idFragment)) return vendor.inferredCommand;
+    if (vendor.matchId ? vendor.matchId(id) : vendor.idFragment && id.includes(vendor.idFragment)) return vendor.inferredCommand;
   }
   return CLAUDE.inferredCommand;
 }
 
-/** `applyCommandDefaults` (tuiHandshake.js): TUI posture-flag dispatch. */
-export function applyCommandDefaults(command, args, { safetyProfile = null } = {}) {
-  if (publicReviewPostureForProfile(safetyProfile) === PUBLIC_REVIEW_ACTIONS_POSTURE) {
-    throw new Error('The public-review-actions profile requires a supported direct CLI sandbox');
-  }
-  const vendor = PROVIDER_VENDORS.find((v) => (
-    (isPublicReviewNoToolProfile(safetyProfile) ? v.publicReviewTuiArgs : v.tuiArgs)
-      && v.matchCommand(command)
-  ));
-  if (isPublicReviewNoToolProfile(safetyProfile)) {
-    if (!vendor || typeof vendor.publicReviewTuiArgs !== 'function') {
-      throw new Error(`Provider command '${command}' has no enforced public-review posture`);
-    }
-    return vendor.publicReviewTuiArgs(args, { safetyProfile });
-  }
+/**
+ * `applyCommandDefaults` (tuiHandshake.js): interactive-session flag dispatch.
+ * Public-review stages never reach this — headless OR attachable, their argv
+ * comes from `buildVendorSpawnConfig`, which is where a posture is enforced.
+ * (That is load-bearing for the attachable case: `ensureAntigravityTuiArgs` and
+ * friends append `--dangerously-skip-permissions`-class defaults, which would
+ * undo the recipe.)
+ *
+ * `provider` carries the record-level facts a command name cannot — the codex
+ * `ignoreUserConfig` pin and its local-runtime backing. Passing it here keeps
+ * BOTH TUI spawn paths on one injection point, which is the whole reason this
+ * dispatcher exists (see the `injectTuiModelAndEffort` note below for what
+ * happened the last time an argv rule lived in only one of them).
+ */
+export function applyCommandDefaults(command, args, provider = null) {
+  const vendor = PROVIDER_VENDORS.find((v) => v.tuiArgs && v.matchCommand(command));
   if (!vendor) return args;
-  return vendor.tuiArgs(args);
+  // `provider` is optional and only some vendors read it (codex, for the
+  // `ignoreUserConfig` pin and the local-runtime backing) — a vendor that
+  // ignores the second argument keeps behaving exactly as before.
+  return vendor.tuiArgs(args, provider);
 }
 
 /**
@@ -645,8 +888,20 @@ export function buildVendorSpawnConfig(provider, ctx) {
   const posture = publicReviewPostureForProfile(ctx?.safetyProfile);
   if (posture) {
     const recipe = publicReviewRecipe(provider, posture);
-    if (!recipe) {
+    if (!supportsPublicReviewPosture(provider, posture)) {
       throw new Error(`Provider '${providerLabel(provider)}' has no enforced ${posture} public-review posture`);
+    }
+    // An interactive spawn has no headless fallback tier: the ordinary
+    // `spawnArgs` of a vendor without a TUI-capable recipe emits that vendor's
+    // HEADLESS argv (`--print`, `exec`, `run`), which in a PTY neither accepts
+    // a pasted prompt nor enforces anything. Fail closed rather than open a
+    // session whose posture is decorative. Callers decide TUI-vs-headless from
+    // `supportsTuiPublicReviewPosture`, so reaching this is a routing bug.
+    if (ctx?.tui) {
+      if (!recipe?.tuiSpawnArgs) {
+        throw new Error(`Provider '${providerLabel(provider)}' has no attachable ${posture} public-review recipe`);
+      }
+      return recipe.tuiSpawnArgs(provider, ctx);
     }
     return recipe.spawnArgs(provider, ctx);
   }
@@ -660,13 +915,32 @@ export function buildVendorSpawnConfig(provider, ctx) {
  * offer a stage's eligible providers, so it must stay derived from the vendor
  * rows rather than from a hardcoded list of vendor names.
  *
- * Interactive (TUI) sessions and API/custom providers have no maintained
- * recipe: a generic read-only prompt is not enforcement, so they fail closed.
+ * API/custom providers have no maintained recipe: a generic read-only prompt
+ * is not enforcement, so they fail closed. A TUI record IS eligible — the
+ * stage spawns its binary through the vendor's enforced recipe, headless unless
+ * that recipe also supplies `tuiSpawnArgs` (see `isDirectBinaryProvider` and
+ * `supportsTuiPublicReviewPosture`).
  */
-export function publicReviewPosturesForProvider(provider, { tui = false } = {}) {
-  if (tui || provider?.type !== 'cli') return [];
-  return PUBLIC_REVIEW_POSTURES.filter((posture) => Boolean(publicReviewRecipe(provider, posture)));
+export function publicReviewPosturesForProvider(provider) {
+  return PUBLIC_REVIEW_POSTURES.filter((posture) => supportsPublicReviewPosture(provider, posture));
 }
+
+/**
+ * The subset of `publicReviewPosturesForProvider` backed by a vendor-enforced
+ * recipe; the schedule UI uses the difference to say which actions-stage
+ * choices are OS-sandboxed and which rely on the worktree alone.
+ */
+export function enforcedPublicReviewPosturesForProvider(provider) {
+  return PUBLIC_REVIEW_POSTURES.filter((posture) => enforcesPublicReviewPosture(provider, posture));
+}
+
+// A row that supplies the HEADLESS argv is an enforcement; one that supplies
+// only an attachable invocation (OpenCode's actions row) is not — the stage
+// still falls through to the vendor's ordinary argv and the schedule UI keeps
+// reporting that choice as worktree-only rather than OS-sandboxed.
+const enforcesPublicReviewPosture = (provider, posture) => (
+  isDirectBinaryProvider(provider) && Boolean(publicReviewRecipe(provider, posture)?.spawnArgs)
+);
 
 /**
  * Vendor ids that declare a maintained recipe for `posture`, for naming what a
@@ -677,10 +951,16 @@ export function publicReviewCapableVendorIds(posture) {
   return PROVIDER_VENDORS.filter((vendor) => vendor.publicReview?.[posture]?.spawnArgs).map((vendor) => vendor.id);
 }
 
-/** Whether `provider` has a maintained, enforced recipe for one posture. */
-export function supportsPublicReviewPosture(provider, posture, { tui = false } = {}) {
-  if (tui || provider?.type !== 'cli') return false;
-  return Boolean(publicReviewRecipe(provider, posture));
+/**
+ * Whether `provider` may run a stage with this posture.
+ *
+ * The no-tool gate requires a maintained recipe: only an enforced argv can
+ * hold a model tool-free. Actions require a maintained enforcement recipe too:
+ * a disposable worktree cannot stop malware reading host files or networking.
+ * API providers have no binary to spawn and fail closed for these CLI profiles.
+ */
+export function supportsPublicReviewPosture(provider, posture) {
+  return enforcesPublicReviewPosture(provider, posture);
 }
 
 /**
@@ -696,9 +976,9 @@ export function supportsPublicReviewPosture(provider, posture, { tui = false } =
  *
  * @returns {{ reason: string, category: string }|null}
  */
-export function publicReviewProviderBlock(provider, posture, { tui = false } = {}) {
+export function publicReviewProviderBlock(provider, posture) {
   if (!posture) return null;
-  if (supportsPublicReviewPosture(provider, posture, { tui })) return null;
+  if (supportsPublicReviewPosture(provider, posture)) return null;
   return {
     reason: `Provider '${providerLabel(provider)}' has no enforced ${posture} public-content review mode`,
     category: posture === PUBLIC_REVIEW_ACTIONS_POSTURE
@@ -708,13 +988,38 @@ export function publicReviewProviderBlock(provider, posture, { tui = false } = {
 }
 
 /** Whether a provider can run a tool-free public-content stage. */
-export function supportsPublicReviewProvider(provider, options) {
-  return supportsPublicReviewPosture(provider, PUBLIC_REVIEW_NO_TOOL_POSTURE, options);
+export function supportsPublicReviewProvider(provider) {
+  return supportsPublicReviewPosture(provider, PUBLIC_REVIEW_NO_TOOL_POSTURE);
 }
 
 /** Whether a provider can run the sandboxed final public-review stage. */
-export function supportsPublicReviewActionsProvider(provider, options) {
-  return supportsPublicReviewPosture(provider, PUBLIC_REVIEW_ACTIONS_POSTURE, options);
+export function supportsPublicReviewActionsProvider(provider) {
+  return supportsPublicReviewPosture(provider, PUBLIC_REVIEW_ACTIONS_POSTURE);
+}
+
+/**
+ * Whether `provider` may run a `posture` stage as an ATTACHABLE PTY session
+ * rather than headless.
+ *
+ * Deliberately much narrower than `supportsPublicReviewPosture`: that one lets
+ * the actions stage fall through to a vendor's ordinary headless recipe when it
+ * declares none, which is fine for a `--print` child and useless in a PTY. An
+ * interactive session requires a recipe that has been reviewed for it and
+ * supplies `tuiSpawnArgs` — the argv a PTY can drive (for Claude the headless
+ * argv minus the flags that only work under `--print`; for OpenCode a
+ * different entry point entirely).
+ *
+ * `no-tool` is structurally excluded: an interactive session for a reasoner
+ * with no tools buys nothing and widens the boundary for free, so no row
+ * declares it and this returns false for that posture by construction.
+ */
+export function supportsTuiPublicReviewPosture(provider, posture) {
+  return enforcesPublicReviewPosture(provider, posture) && Boolean(publicReviewRecipe(provider, posture)?.tuiSpawnArgs);
+}
+
+/** Whether the sandboxed final public-review stage can attach a PTY here. */
+export function supportsTuiPublicReviewActionsProvider(provider) {
+  return supportsTuiPublicReviewPosture(provider, PUBLIC_REVIEW_ACTIONS_POSTURE);
 }
 
 /**

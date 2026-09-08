@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createHash } from 'crypto';
-import { mockNoPeerSync, mockNoPeers } from '../../lib/mockPathsDataRoot.js';
+import { makePathsProxy, mockNoPeerSync, mockNoPeers } from '../../lib/mockPathsDataRoot.js';
 
 function sha256Hex(buf) {
   return createHash('sha256').update(buf).digest('hex');
@@ -25,20 +25,14 @@ function sha256Hex(buf) {
 const tempData = mkdtempSync(join(tmpdir(), 'portos-sharing-roundtrip-data-'));
 let tempBucket;
 
-vi.mock('../../lib/fileUtils.js', async () => {
-  const actual = await vi.importActual('../../lib/fileUtils.js');
-  return new Proxy(actual, {
-    get(target, prop) {
-      if (prop === 'PATHS') return {
-        ...actual.PATHS,
-        data: tempData,
-        images: join(tempData, 'images'),
-        videos: join(tempData, 'videos'),
-      };
-      return target[prop];
-    },
-  });
-});
+// makePathsProxy, not a hand-rolled one: this suite listed `data`/`images`/
+// `videos` by hand, so `PATHS.imageRefs` — added later — still resolved to the
+// install's live `data/image-refs`, and the importer's copyAssetsLocally
+// created it and copied bundled reference sheets there on every run (#6176).
+// The shared helper re-roots EVERY member that lives under `data/`, so a member
+// added tomorrow is covered without touching this file.
+vi.mock('../../lib/fileUtils.js', async () =>
+  makePathsProxy(await vi.importActual('../../lib/fileUtils.js'), { dataRoot: tempData }));
 
 // Stub instances.getInstanceId so the exporter doesn't try to read the
 // real identity.json. Returns a fixed id for assertions.
@@ -101,6 +95,23 @@ describe('sharing round-trip', () => {
   });
   afterEach(() => {
     if (tempBucket) rmSync(tempBucket, { recursive: true, force: true });
+  });
+
+  it('preserves local video holds while importing bundled media-job records', async () => {
+    const bucket = await buckets.createBucket({ name: 'Example Bucket', path: tempBucket, mode: 'inbox' });
+    const local = { id: 'retained-local', kind: 'video', status: 'queued', params: { modelId: 'example-video' } };
+    const videoHolds = [{ id: '00000000-0000-4000-8000-000000000001', modelId: 'example-video', runtime: 'mlx_video',
+      classification: 'runtimeerror', cause: 'shader failed', heldAt: '2026-09-05T00:00:00.000Z' }];
+    const file = join(tempData, 'media-jobs.json');
+    writeFileSync(file, JSON.stringify({ jobs: [local], videoHolds, futureEnvelopeField: 'preserved' }));
+    const incoming = { id: '00000000-0000-4000-8000-000000000002', kind: 'video', status: 'completed', params: {} };
+    mkdirSync(join(tempBucket, 'records', 'media'), { recursive: true });
+    writeFileSync(join(tempBucket, 'records', 'media', `${incoming.id}.json`), JSON.stringify(incoming));
+    writeFileSync(join(tempBucket, 'manifests', 'example-media.json'), JSON.stringify({
+      id: 'example-manifest', senderInstanceId: 'example-peer', kind: 'media', recordIds: [incoming.id], assetRefs: [],
+    }));
+    expect((await importer.processManifest(bucket.id, 'example-media.json')).processed).toBe(true);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ jobs: [local, incoming], videoHolds, futureEnvelopeField: 'preserved' });
   });
 
   it('exports a series, processes the manifest as inbox, then promotes — id + origin preserved', async () => {
@@ -2312,7 +2323,7 @@ describe('sharing round-trip', () => {
       const exp = await exporter.exportSeries(s.id, bucket.id);
       const manifest = JSON.parse(readFileSync(join(tempBucket, 'manifests', exp.filename), 'utf-8'));
       expect(manifest.portosSchemaVersions).toBeDefined();
-      expect(manifest.portosSchemaVersions.universes).toBe(10);
+      expect(manifest.portosSchemaVersions.universes).toBe(11);
     });
 
     it('preserves character production packages when an older peer wins universe LWW', async () => {
@@ -2369,7 +2380,14 @@ describe('sharing round-trip', () => {
       const result = await importer.processManifest(bucket.id, exp.filename);
       expect(result.skipped).toBe(true);
       expect(result.reason).toBe('portos-schema-ahead');
-      expect(result.ahead).toEqual([{ category: 'pipelineSeries', senderV: 99, receiverV: 12 }]);
+      // Receiver version read from the live registry — this test is about the
+      // per-category GATE, not about which number pipelineSeries is on today
+      // (the registry's own test pins that). Imported lazily because the
+      // static-import graph is hoisted above this file's `vi.mock` setup.
+      const { PORTOS_SCHEMA_VERSIONS } = await import('../../lib/schemaVersions.js');
+      expect(result.ahead).toEqual([
+        { category: 'pipelineSeries', senderV: 99, receiverV: PORTOS_SCHEMA_VERSIONS.pipelineSeries },
+      ]);
       expect(result.producedByVersion).toBe('99.0.0');
       // Series stayed tombstoned (or absent) — apply was refused.
       await expect(series.getSeries(s.id)).rejects.toThrow();

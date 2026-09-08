@@ -6,28 +6,27 @@
  * recovery tasks when a merge or PR creation fails. Extracted from
  * agentLifecycle.js as a self-contained leaf so the completion-cleanup
  * orchestrator (agentCompletionCleanup.js) can import it without a circular
- * dependency back into agentLifecycle.js.
- *
- * agentLifecycle.js re-exports these three functions for backward
- * compatibility (agentManagement.js and subAgentSpawner.js import
- * `cleanupAgentWorktree` / `spawnMergeRecoveryTask` / `spawnReviewLoopFollowUp`
- * from there).
+ * dependency back into agentLifecycle.js. Consumers import these functions from
+ * here directly — the agentLifecycle.js pass-through re-exports were retired
+ * with the subAgentSpawner barrel (#3450).
  */
 
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { emitLog } from './cosEvents.js';
-import { addTask, updateTask } from './cos.js';
+import { addTask, forceSpawnTask, updateTask } from './cos.js';
 import * as git from './git.js';
 import { removeWorktree, classifyWorktreeDirt } from './worktreeManager.js';
 import { isTruthyMeta } from './agentState.js';
 import { PATHS } from '../lib/fileUtils.js';
+import { execGit } from '../lib/execGit.js';
 import { isRetryHoldOwner, clearedRetryHoldMetadata } from '../lib/taskRetryHold.js';
 import { resolveTaskTargetBranch, shouldStripTaskTargetBranch } from '../lib/taskTargetBranch.js';
 import { RECOVERY_TASK_PREFIX } from './recoveryTasks.js';
 import { detectForgeCli } from '../lib/gitForge.js';
+import { normalizeForkHead } from '../lib/forkHead.js';
 import { PR_COMPLETIONS, PR_COMPLETION_VALUES, PR_CREATION, leavesPrForHuman, prClaimWasVerified } from '../lib/prDisposition.js';
-import { DEFAULT_REVIEWER, DEFAULT_REVIEWERS, DEFAULT_REVIEW_STOP_MODE, MODEL_SELECTABLE_REVIEWERS, EFFORT_SELECTABLE_REVIEWERS, normalizeReviewers, normalizeReviewUsernames, normalizeOptionalReviewers, normalizeReviewerMaxRounds, prioritizeToolFreeReviewers } from '../lib/validation.js';
+import { DEFAULT_REVIEWER, DEFAULT_REVIEWERS, DEFAULT_REVIEW_STOP_MODE, MODEL_SELECTABLE_REVIEWERS, EFFORT_SELECTABLE_REVIEWERS, normalizeReviewers, normalizeReviewUsernames, normalizeOptionalReviewers, normalizeReviewerMaxRounds, prioritizeToolFreeReviewers } from '../lib/reviewerConfig.js';
 
 // In-flight cleanup per agentId, so two completion paths racing to clean the
 // SAME agent coalesce onto one run instead of tripping over each other.
@@ -131,7 +130,7 @@ async function auditRepoState(agentId, success, originalTask, warnings) {
   });
 }
 
-async function runCleanupAgentWorktree(agentId, success, { prCreation = PR_CREATION.NEVER, prCompletion = null, requestCopilotReview: legacyRequestCopilotReview = false, reviewers = DEFAULT_REVIEWERS, usernames = [], optionalReviewers = [], reviewerMaxRounds = {}, reviewStopMode = DEFAULT_REVIEW_STOP_MODE, reviewerApplies = false, reviewerModels = null, reviewerEfforts = null, skipMerge = false, description = null, agentOutput = null, originalTask = null } = {}) {
+async function runCleanupAgentWorktree(agentId, success, { prCreation = PR_CREATION.NEVER, prCompletion = null, requestCopilotReview: legacyRequestCopilotReview = false, reviewers, usernames = [], optionalReviewers = [], reviewerMaxRounds = {}, reviewStopMode = DEFAULT_REVIEW_STOP_MODE, reviewerApplies = false, reviewerModels = null, reviewerEfforts = null, skipMerge = false, description = null, agentOutput = null, originalTask = null } = {}) {
   const { getAgent: getAgentState } = await import('./cos.js');
   const agentState = await getAgentState(agentId).catch(() => null);
   if (!agentState?.metadata?.isWorktree) return [];
@@ -288,7 +287,13 @@ async function runCleanupAgentWorktree(agentId, success, { prCreation = PR_CREAT
         ? prCompletion
         : (legacyRequestCopilotReview ? PR_COMPLETIONS.REVIEW_THEN_MERGE : PR_COMPLETIONS.MERGE_ON_GREEN);
       const runsReviewLoop = resolvedPrCompletion === PR_COMPLETIONS.REVIEW_THEN_MERGE;
-      const reviewerList = normalizeReviewers({ reviewers });
+      // Keep the pre-reviewer-chain API contract for direct callers: the legacy
+      // flag explicitly requested Copilot, whereas an explicitly supplied empty
+      // list means the caller opted into no reviewers. Production callers pass
+      // the resolved list, so a fresh install remains reviewer-free by default.
+      const reviewerList = reviewers === undefined
+        ? (legacyRequestCopilotReview ? [DEFAULT_REVIEWER] : [...DEFAULT_REVIEWERS])
+        : normalizeReviewers({ reviewers });
       const copilotIsFirst = reviewerList[0] === DEFAULT_REVIEWER;
       const nonCopilotReviewers = reviewerList.filter(r => r !== DEFAULT_REVIEWER);
       // Pre-request the native Copilot review ONLY when copilot LEADS the order — it
@@ -463,6 +468,14 @@ async function runCleanupAgentWorktree(agentId, success, { prCreation = PR_CREAT
   });
   warnings.push(...(result?.warnings || []));
 
+  // The branch just landed by local merge. If the agent pushed it anyway — an
+  // older prompt said `/do:push` under this posture, and the repo's own
+  // "commit and push" convention still reaches every agent — origin holds a
+  // copy nothing will ever read, which the post-completion audit reports as a
+  // leaked remote branch and hands to a recovery agent. Finish the job here,
+  // deterministically, instead of paying a model to run one `git push --delete`.
+  if (result?.merged) await deleteMergedRemoteCopy(agentId, sourceWorkspace, worktreeBranch);
+
   // The branch is released now, so the follow-up can check it out.
   if (strandedPrUrl) {
     await spawnReviewLoopFollowUp({
@@ -481,6 +494,46 @@ async function runCleanupAgentWorktree(agentId, success, { prCreation = PR_CREAT
     });
   }
   return warnings;
+}
+
+/**
+ * Delete origin's copy of a worktree branch that cleanup just merged locally.
+ *
+ * Cheap on the common path, narrow on the rare one:
+ *   - A push from the worktree updates the shared clone's remote-tracking ref,
+ *     so `refs/remotes/origin/<branch>` answers "did this agent push?" with one
+ *     local rev-parse and no network. Absent ⇒ nothing to do. (A push from some
+ *     other clone is invisible here; the repo-state audit still reports it.)
+ *   - Merged-ness is `git.isBranchMergedInto` — the definition the branch-
+ *     reconcile reaper and `removeWorktree` already use — so a copy the agent
+ *     amended or rebased after pushing (patch-equivalent, not an ancestor) still
+ *     counts as landed, and an unresolvable object fails closed.
+ *   - The delete is lease-protected against the SHA this clone last pushed: one
+ *     round trip that asserts and deletes atomically, refused as "stale info" if
+ *     origin has since moved. Nothing is deleted on stale knowledge.
+ * Never adds a warning: a warning is what spawns cleanup's own merge-recovery
+ * task, and a copy that could not be deleted is exactly what the audit exists
+ * to catch on its own.
+ */
+async function deleteMergedRemoteCopy(agentId, sourceWorkspace, branchName) {
+  const remoteRef = `refs/heads/${branchName}`;
+  const tracked = await execGit(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branchName}`], sourceWorkspace, { ignoreExitCode: true })
+    .catch(() => null);
+  const pushedSha = tracked?.exitCode === 0 ? tracked.stdout.trim() : '';
+  if (!pushedSha) return;
+  const landed = await git.isBranchMergedInto(sourceWorkspace, pushedSha, 'HEAD').catch(() => false);
+  if (!landed) {
+    emitLog('warn', `🌳 origin/${branchName} (${pushedSha.slice(0, 7)}) is not merged into the checkout that received the branch — left in place for the repo-state audit`, { agentId, branchName });
+    return;
+  }
+  const pushed = await execGit(['push', `--force-with-lease=${remoteRef}:${pushedSha}`, 'origin', `:${remoteRef}`], sourceWorkspace, { ignoreExitCode: true })
+    .catch(err => ({ exitCode: 1, stderr: err.message }));
+  if (pushed.exitCode === 0) {
+    emitLog('info', `🌳 ${agentId} pushed ${branchName} but cleanup merged it locally — deleted the remote copy`, { agentId, branchName });
+    return;
+  }
+  const why = String(pushed.stderr || '').trim().split('\n').pop() || `exit ${pushed.exitCode}`;
+  emitLog('warn', `🌳 Could not delete origin/${branchName} after merging it locally (${why}) — left for the repo-state audit`, { agentId, branchName });
 }
 
 /**
@@ -701,8 +754,9 @@ export async function recordTaskResumePointer({ task, agentId, agentMetadata }) 
  * agent that began the shipped work over.
  *
  * Call this AFTER `cleanupAgentWorktree` so it reflects what actually survived, and
- * from all three spawn sites — `spawnDirectly` (agentCliSpawning.js), the TUI
- * `finish()` (agentTuiSpawning.js), and `handleAgentCompletion`
+ * from all three completion paths — the two in-process spawners (`spawnDirectly` in
+ * agentCliSpawning.js and the TUI `finish()` in agentTuiSpawning.js, both through
+ * `runSpawnerCompletionCleanup`) and `handleAgentCompletion`
  * (agentCompletionCleanup.js, runner mode). Only the runner path used to do it, so a
  * failed direct-CLI/TUI run left a branch full of commits nothing would ever point a
  * retry at.
@@ -811,9 +865,35 @@ export async function releaseRetryHold({ agentId, task, success, agentMetadata }
  *
  * The follow-up task uses an isolated worktree attached to the existing PR branch
  * through its canonical `reviewLoopPRBranch`, so it can fix-and-push without
- * trampling concurrent agents.
+ * trampling concurrent agents. `forkHead` is where that branch lives when the PR
+ * came from a FORK — such a head has no `origin/<branch>` for the attach to
+ * resolve, so without it the follow-up is queued and then blocked at workspace
+ * prep for exactly the PRs external contributors open (#6064). Persisted beside
+ * the branch name and threaded back out by `agentWorkspacePrep`; a same-repo PR
+ * passes null and nothing changes.
+ *
+ * `dispatch` decides WHO starts the task:
+ *   `'queue'`     (default) — the autonomous lane. The task is persisted and the
+ *                 ordinary `tasks:changed` dequeue picks it up, which is correct
+ *                 for a follow-up spawned by cleanup/prWatcher: the run that
+ *                 produced the PR was itself autonomous, so its continuation
+ *                 belongs under the CoS auto-run gate and daily action budget.
+ *   `'immediate'` — an explicit human action (the app PR page's "Resolve &
+ *                 merge"). The dequeue's Priority-2 tier only spawns
+ *                 auto-approved system tasks while CoS auto-run is in `execute`
+ *                 and under budget, so a queued follow-up would sit `pending`
+ *                 until the user pressed Run now on the task page — the whole
+ *                 point of the button was not having to. This suppresses the
+ *                 automatic dequeue and force-spawns the task instead (same path
+ *                 as that Run now button), reporting the outcome as `dispatch`.
+ *
+ * Returns the follow-up task, or — when an equivalent follow-up was already
+ * queued — that existing task with `duplicate: true`. `dispatch: 'immediate'`
+ * additionally stamps `dispatch: { started, reason }` so the caller can say
+ * whether an agent actually started or the task is still waiting (no slots,
+ * daemon stopped, …) rather than guessing.
  */
-export async function spawnReviewLoopFollowUp({ originalAgentId, originalTask, prUrl, prBranch, sourceWorkspace, prCompletion = PR_COMPLETIONS.REVIEW_THEN_MERGE, reviewers = DEFAULT_REVIEWERS, usernames = [], optionalReviewers = [], reviewerMaxRounds = {}, reviewStopMode = DEFAULT_REVIEW_STOP_MODE, reviewerApplies = false, reviewerModels = null, reviewerEfforts = null, leaveOpen = false }) {
+export async function spawnReviewLoopFollowUp({ originalAgentId, originalTask, prUrl, prBranch, forkHead = null, sourceWorkspace, prCompletion = PR_COMPLETIONS.REVIEW_THEN_MERGE, reviewers = DEFAULT_REVIEWERS, usernames = [], optionalReviewers = [], reviewerMaxRounds = {}, reviewStopMode = DEFAULT_REVIEW_STOP_MODE, reviewerApplies = false, reviewerModels = null, reviewerEfforts = null, leaveOpen = false, dispatch = 'queue' }) {
   if (!prUrl || !prBranch) return null;
   if (prCompletion === PR_COMPLETIONS.LEAVE_OPEN) return null;
 
@@ -938,6 +1018,10 @@ export async function spawnReviewLoopFollowUp({ originalAgentId, originalTask, p
       reviewLoopLeaveOpen: leaveOpen,
       reviewLoopPRUrl: prUrl,
       reviewLoopPRBranch: prBranch,
+      // Fork coordinates for that branch, or null for a same-repo head. The
+      // shared reader is `resolveTaskForkHead`, so this key is the generic
+      // `forkHead` rather than a review-loop-specific one.
+      forkHead: normalizeForkHead(forkHead),
       reviewLoopPRNumber: parsedPr?.number ?? null,
       reviewLoopPRHost: parsedPr?.host ?? null,
       reviewLoopPROwner: parsedPr?.owner ?? null,
@@ -973,11 +1057,44 @@ export async function spawnReviewLoopFollowUp({ originalAgentId, originalTask, p
     section: 'pending'
   };
 
-  await addTask(followUpTask, 'internal', { raw: true });
+  // An immediate dispatch owns the spawn, so the automatic dequeue is suppressed:
+  // otherwise it races this force-spawn for the same task and whichever loses
+  // reports a bogus failure for a run that did start (see the `suppressDequeue`
+  // contract on cos.js's `tasks:changed` listener).
+  const immediate = dispatch === 'immediate';
+  const persisted = await addTask(followUpTask, 'internal', { raw: true, suppressDequeue: immediate });
+
+  // A duplicate rejection persisted NOTHING under `followUpTaskId` — an equivalent
+  // follow-up is already queued under a different id. Return THAT record so a
+  // caller reports (and force-spawns) the task that actually exists instead of the
+  // id we just minted, which `forceSpawnTask` would answer with "Task not found".
+  if (persisted?.duplicate) {
+    emitLog('info', `🔁 ${kind.label} follow-up for PR ${prUrl} matched already-queued task ${persisted.id}`, {
+      taskId: persisted.id, prUrl, prBranch, sourceAgentId: originalAgentId, sourceTaskId: originalTask?.id
+    });
+    return persisted;
+  }
+
   emitLog('info', `🔁 Spawned ${kind.label} follow-up task ${followUpTaskId} (${kind.reviewers}) for PR ${prUrl}`, {
     taskId: followUpTaskId, prUrl, prBranch, sourceAgentId: originalAgentId, sourceTaskId: originalTask?.id
   });
-  return followUpTask;
+  if (!immediate) return followUpTask;
+
+  // A throw here would 500 an explicit user request whose task IS already
+  // persisted — report it the same way a refusal is reported instead.
+  const spawn = await forceSpawnTask(followUpTaskId).catch(err => ({ error: err.message }));
+  if (spawn?.error) {
+    // The task stays `pending` and keeps its place in the queue — say why it has
+    // not started rather than letting the caller claim an agent is running.
+    emitLog('warn', `⏳ ${kind.label} follow-up ${followUpTaskId} queued but not started — ${spawn.error}`, {
+      taskId: followUpTaskId, prUrl
+    });
+    return { ...followUpTask, dispatch: { started: false, reason: spawn.error } };
+  }
+  emitLog('info', `⚡ Started ${kind.label} follow-up ${followUpTaskId} immediately for PR ${prUrl}`, {
+    taskId: followUpTaskId, prUrl
+  });
+  return { ...followUpTask, dispatch: { started: true, reason: null } };
 }
 
 /**

@@ -1,3 +1,4 @@
+import { PRIVATE_CREDENTIALS, putCredential } from '../services/privateKeyStore.js';
 import { Router } from 'express';
 import { z } from 'zod';
 import { getSettings, updateSettingsWith } from '../services/settings.js';
@@ -18,9 +19,10 @@ import { ensureEidoverseHost } from '../services/eidoverseHost.js';
 import { isGitHubRepoUrl } from '../lib/repoUrl.js';
 import { asyncHandler } from '../lib/errorHandler.js';
 import { isPlainObject } from '../lib/objects.js';
+import { DEFAULT_UNTRUSTED_CONTENT_POLICY, untrustedContentSettingsSchema } from '../lib/untrustedContent.js';
 import { agentContextSettingsSchema } from '../lib/agentContextValidation.js';
 import { EFFORT_LEVELS } from '../lib/providerModels.js';
-import { backupConfigSchema, sharingSettingsPatchSchema, featureProviderConfigSchema, autofixerSettingsSchema, codeReviewSettingsSchema, locationSettingsSchema, settingsEmbeddingsSchema, localLlmSettingsSchema, imessageConfigSchema, signalConfigSchema, beeperSettingsSchema, spotifyConfigSchema, youtubeConfigSchema, apiAccessSettingsSchema, instanceFeatureSettingsSchema, instanceFeatureIdSchema, instanceFeatureUpdateSchema, instanceFeatureGroupSettingsSchema, instanceFeatureGroupIdSchema, instanceFeatureGroupUpdateSchema, loraTrainingConfigSchema, pipelineEditorialChecksSettingsSchema, creativeDirectorSettingsSchema, musicSettingsSchema, federationSettingsSchema, privacySettingsSchema, seriesAutopilotSettingsSchema, layeredIntelligenceSettingsSchema, imageGenGrokSettingsSchema, imageGenAgySettingsSchema, renderDefaultsSettingsSchema, videoGenSettingsSchema, subscriptionCostsMapSchema, usageApiBilledInstanceIdsSchema, validateRequest } from '../lib/validation.js';
+import { privateCredentialParamsSchema, privateCredentialInputSchema, backupConfigSchema, sharingSettingsPatchSchema, featureProviderConfigSchema, autofixerSettingsSchema, codeReviewSettingsSchema, locationSettingsSchema, hideFirstRunCardSchema, networkSetupPreferenceSchema, settingsEmbeddingsSchema, localLlmSettingsSchema, imessageConfigSchema, signalConfigSchema, beeperSettingsSchema, spotifyConfigSchema, youtubeConfigSchema, apiAccessSettingsSchema, instanceFeatureSettingsSchema, instanceFeatureIdSchema, instanceFeatureUpdateSchema, instanceFeatureGroupSettingsSchema, instanceFeatureGroupIdSchema, instanceFeatureGroupUpdateSchema, loraTrainingConfigSchema, pipelineEditorialChecksSettingsSchema, creativeDirectorSettingsSchema, musicSettingsSchema, federationSettingsSchema, privacySettingsSchema, seriesAutopilotSettingsSchema, layeredIntelligenceSettingsSchema, imageGenGrokSettingsSchema, imageGenAgySettingsSchema, renderDefaultsSettingsSchema, videoGenSettingsSchema, subscriptionCostsMapSchema, usageApiBilledInstanceIdsSchema, namedOrchestrationProfileSchema, orchestrationProfilesSettingsSchema, validateRequest } from '../lib/validation.js';
 
 const router = Router();
 
@@ -40,6 +42,7 @@ const eidoverseRepoSchema = z.object({
 // the bounds describe lives.
 const decorateBounds = (settings) => ({
   ...settings,
+  untrustedContent: { defaults: { ...DEFAULT_UNTRUSTED_CONTENT_POLICY, ...settings.untrustedContent?.defaults }, sources: settings.untrustedContent?.sources || {} },
   imageGen: {
     ...(settings.imageGen || {}),
     codex: {
@@ -190,10 +193,22 @@ router.get('/features', asyncHandler(async (_req, res) => {
 }));
 
 // GET /api/settings/credentials
-// Presence + source only. Never a value or masked prefix — the page links out
-// to the existing per-integration tab to enter a secret.
+// Presence + source only. Supported integrations have a separate write-only setter.
 router.get('/credentials', asyncHandler(async (_req, res) => {
   res.json(await getCredentialInventory());
+}));
+
+// Write-only, allowlisted integration credentials; no generic secrets access.
+router.put('/credentials/:id', asyncHandler(async (req, res) => {
+  const { id } = validateRequest(privateCredentialParamsSchema, req.params);
+  const { value } = validateRequest(privateCredentialInputSchema, req.body);
+  const entry = PRIVATE_CREDENTIALS.find(item => item.id === id);
+  await updateSettingsWith(current => {
+    putCredential(current, entry, value);
+    return current;
+  });
+  const inventory = await getCredentialInventory();
+  res.json(inventory.credentials.find(item => item.id === id));
 }));
 
 // POST /api/settings/features/eidoverse/install
@@ -288,12 +303,47 @@ router.put('/ai-assignments/:id', asyncHandler(async (req, res) => {
   res.json(await updateAiAssignment(req.params.id, payload));
 }));
 
+// GET /api/settings/orchestration-profiles
+router.get('/orchestration-profiles', asyncHandler(async (_req, res) => {
+  const { getOrchestrationProfiles } = await import('../services/orchestrationProfiles.js');
+  res.json(await getOrchestrationProfiles());
+}));
+
+// POST /api/settings/orchestration-profiles
+router.post('/orchestration-profiles', asyncHandler(async (req, res) => {
+  const { saveOrchestrationProfile } = await import('../services/orchestrationProfiles.js');
+  const payload = validateRequest(namedOrchestrationProfileSchema, req.body || {});
+  const saved = await saveOrchestrationProfile(payload);
+  res.status(201).json(saved);
+}));
+
+// PUT /api/settings/orchestration-profiles/:id
+router.put('/orchestration-profiles/:id', asyncHandler(async (req, res) => {
+  const { updateOrchestrationProfile } = await import('../services/orchestrationProfiles.js');
+  const payload = validateRequest(namedOrchestrationProfileSchema.partial(), req.body || {});
+  const updated = await updateOrchestrationProfile(req.params.id, payload);
+  res.json(updated);
+}));
+
+// DELETE /api/settings/orchestration-profiles/:id
+router.delete('/orchestration-profiles/:id', asyncHandler(async (req, res) => {
+  const { deleteOrchestrationProfile } = await import('../services/orchestrationProfiles.js');
+  const result = await deleteOrchestrationProfile(req.params.id);
+  res.json(result);
+}));
+
 // PUT /api/settings
 router.put('/', asyncHandler(async (req, res) => {
+  if (req.body?.orchestrationProfiles !== undefined) {
+    validateRequest(orchestrationProfilesSettingsSchema, req.body.orchestrationProfiles);
+  }
   // Settings is a polymorphic store but the backup sub-object has a known
   // schema. Validate that slice when it's present so a malformed Backup-tab
   // save doesn't reach disk (the runtime guards downstream are belt-and-
   // suspenders, but per project convention all inputs are validated).
+  if (req.body?.untrustedContent !== undefined) {
+    validateRequest(untrustedContentSettingsSchema, req.body.untrustedContent);
+  }
   if (req.body?.backup !== undefined) {
     validateRequest(backupConfigSchema.partial(), req.body.backup);
   }
@@ -340,6 +390,12 @@ router.put('/', asyncHandler(async (req, res) => {
   // whole slice rather than .partial()ing away that pairing rule.
   if (req.body?.location !== undefined) {
     validateRequest(locationSettingsSchema, req.body.location);
+  }
+  if (req.body?.networkSetupPreference !== undefined) {
+    validateRequest(networkSetupPreferenceSchema, req.body.networkSetupPreference);
+  }
+  if (req.body?.hideFirstRunCard !== undefined) {
+    validateRequest(hideFirstRunCardSchema, req.body.hideFirstRunCard);
   }
   if (req.body?.embeddings !== undefined) {
     validateRequest(settingsEmbeddingsSchema.partial(), req.body.embeddings);

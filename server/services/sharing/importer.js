@@ -22,10 +22,10 @@
  */
 
 import { join, basename } from 'path';
-import { copyFile, readdir } from 'fs/promises';
+import { readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { EventEmitter } from 'events';
-import { PATHS, ensureDir, atomicWrite, readJSONFile } from '../../lib/fileUtils.js';
+import { PATHS, copyFileGuarded, ensureDir, atomicWrite, readJSONFile } from '../../lib/fileUtils.js';
 import { isSafeRecordId } from '../../lib/validation.js';
 import { getBucket, bucketBlobPath, bucketBlobSidecarPath, bucketRecordsDir, bucketRecordPath, imageSidecarName, isHexHash } from './buckets.js';
 import { readManifest, markProcessed, readCursor, hasBeenProcessed, forgetProcessed } from './manifest.js';
@@ -41,7 +41,7 @@ import { findOrCreateUniverseCollection, findOrCreateSeriesCollection, addItem a
 import { adoptImportedSubscription, withReexportSuppressed } from './subscriptions.js';
 import { getInstanceId, UNKNOWN_INSTANCE_ID } from '../instances.js';
 import { mergePeerAnnotations } from '../mediaAnnotations.js';
-import { isStr, preserveLegacyCharacterProductionPackages } from '../../lib/storyBible.js';
+import { isStr, preserveLegacyCharacterFields } from '../../lib/storyBible.js';
 import { isPlainObject } from '../../lib/objects.js';
 import { maybeJournalBeforeOverwrite, flushBaseHashes, setSyncBaseHash, contentHashForRecord } from '../../lib/conflictJournal.js';
 
@@ -298,12 +298,12 @@ async function copyAssetsLocally(bucketPath, assetRefs) {
     }
     available.push({ kind, ref: filename });
     if (!existsSync(targetPath)) {
-      await copyFile(blobPath, targetPath);
+      await copyFileGuarded(blobPath, targetPath);
       copied.push({ kind, ref: filename });
     }
     if (sidecarPath && existsSync(sidecarPath)) {
       const sidecarTarget = join(targetDir, imageSidecarName(filename));
-      if (!existsSync(sidecarTarget)) await copyFile(sidecarPath, sidecarTarget);
+      if (!existsSync(sidecarTarget)) await copyFileGuarded(sidecarPath, sidecarTarget);
     }
   }));
   return { copied, available, missing };
@@ -352,7 +352,7 @@ async function mergeMediaJobRecords(bucketPath, recordIds) {
     changed = true;
   }
   if (changed) {
-    await atomicWrite(persistedPath, { jobs: Array.from(byId.values()) });
+    await atomicWrite(persistedPath, { ...persisted, jobs: Array.from(byId.values()) });
   }
 }
 
@@ -566,7 +566,7 @@ async function applyAutoMerge(bucket, manifest, records, { availableAssetKeys = 
       if (kind === 'universe') {
         record = {
           ...record,
-          characters: preserveLegacyCharacterProductionPackages(
+          characters: preserveLegacyCharacterFields(
             record.characters,
             existing.characters,
             senderUniversesVersion,

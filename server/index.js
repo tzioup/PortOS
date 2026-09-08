@@ -89,6 +89,7 @@ import autobiographyRoutes from './routes/autobiography.js';
 import backupRoutes from './routes/backup.js';
 import legacyExportRoutes from './routes/legacyExport.js';
 import eidoverseWorldRoutes from './routes/eidoverseWorldRoutes.js';
+import eidoverseTravelRoutes from './routes/eidoverseTravelRoutes.js';
 import databaseRoutes from './routes/database.js';
 import localLlmRoutes from './routes/localLlm.js';
 import codeReviewRoutes from './routes/codeReview.js';
@@ -118,11 +119,18 @@ import characterRoutes from './routes/character.js';
 import toolsRoutes from './routes/tools.js';
 import imageGenRoutes from './routes/imageGen.js';
 import videoGenRoutes from './routes/videoGen.js';
+import continuousVideoEpisodeRoutes from './routes/continuousVideoEpisode.js';
 import videoDownloadRoutes from './routes/videoDownload.js';
 import videoTimelineRoutes from './routes/videoTimeline.js';
 import mediaJobsRoutes from './routes/mediaJobs.js';
 import federatedMediaRoutes from './routes/federatedMedia.js';
 import creativeDirectorRoutes from './routes/creativeDirector.js';
+// Side-effect import (#5920): evaluating the completion hook is what registers the
+// Creative Director project starter on `creativeDirector/projectStartSink.js`, the
+// seam `pipeline/episodeVideo.js` starts a CD project through. The route module
+// above already pulls it in, but the pipeline must not depend on THAT staying true —
+// an unregistered sink throws, so arm it explicitly at boot.
+import './services/creativeDirector/completionHook.js';
 import creativeCommissionRoutes from './routes/creativeCommissions.js';
 import gamesRoutes from './routes/games.js';
 import fableLoomRoutes from './routes/fableLoom.js';
@@ -131,6 +139,7 @@ import spriteRoutes from './routes/sprites.js';
 import moodBoardRoutes from './routes/moodBoard.js';
 import threejsModelsRoutes from './routes/threejsModels.js';
 import imageTo3dRoutes from './routes/imageTo3d.js';
+import riggingRoutes from './routes/rigging.js';
 import privacyRoutes from './routes/privacy.js';
 import writersRoomRoutes from './routes/writersRoom.js';
 import universeBuilderRoutes from './routes/universeBuilder/index.js';
@@ -152,17 +161,21 @@ import openclawRoutes from './routes/openclaw.js';
 import sharingRoutes from './routes/sharing.js';
 import roundsRoutes from './routes/rounds.js';
 import midiRuntimeRoutes from './routes/midiRuntime.js';
+import harnessRoutes from './routes/harnesses.js';
 import peerSyncRoutes from './routes/peerSync.js';
 import askRoutes from './routes/ask.js';
 import remoteDesktopRoutes from './routes/remoteDesktop.js';
 import remoteDesktopViewerRoutes from './routes/remoteDesktopViewer.js';
 import { initSocket } from './services/socket.js';
 import { remoteDesktopBroker } from './services/remoteDesktop.js';
+import { mountEidoverseOnServer } from './services/eidoverseHost.js';
 import { bootstrapServices, runBootSequence, registerShutdownHandlers } from './services/bootstrap.js';
 import { errorMiddleware } from './lib/errorHandler.js';
 import { setHttpsEnabledAtBoot } from './lib/httpsState.js';
 import { JSON_BODY_LIMIT } from './lib/uploadLimits.js';
 import { createPortOSProviderRoutes } from './routes/providers.js';
+import { configureTailcatIngress } from './services/tailcatIngress.js';
+import { createModelComparisonRoutes } from './routes/modelComparison.js';
 import { createPortOSRunsRoutes } from './routes/runs.js';
 import { createPortOSPromptsRoutes } from './routes/prompts.js';
 
@@ -194,11 +207,15 @@ const io = new Server(httpServer, {
 // request input. Mount the HTTPS server and its optional loopback HTTP mirror.
 remoteDesktopBroker.mountWebSocket(httpServer);
 remoteDesktopBroker.mountWebSocket(localHttpServer);
+// Eidoverse same-origin path + root allowlist (active only after the on-demand
+// host starts). Upgrade for `/ws` and `/eidoverse-host/**` on both listeners.
+mountEidoverseOnServer(null, [httpServer, localHttpServer]);
 
 // Auth gate for Socket.IO — when settings.secrets.auth.enabled is true the
 // handshake must carry a valid token cookie or Authorization: Bearer header
 // (set by POST /api/auth/login). No-op when auth is off.
 io.use(socketAuthGate);
+configureTailcatIngress({ app, io, certDir: CERT_DIR, httpsEnabled });
 
 // Initialize socket handlers
 initSocket(io);
@@ -273,6 +290,7 @@ app.use('/api/detect', detectRoutes);
 app.use('/api/scaffold', scaffoldRoutes);
 
 // AI Toolkit routes with PortOS extensions
+app.use('/api/providers/comparison', createModelComparisonRoutes(aiToolkit.services.providers));
 app.use('/api/providers', createPortOSProviderRoutes(aiToolkit));
 app.use('/api/runs', createPortOSRunsRoutes(aiToolkit));
 app.use('/api/prompts', createPortOSPromptsRoutes(aiToolkit));
@@ -299,6 +317,7 @@ app.use('/api/autofix', autoFixMetricsRoutes);
 app.use('/api/backup', backupRoutes);
 app.use('/api/legacy-export', legacyExportRoutes);
 app.use('/api/eidoverse/world', eidoverseWorldRoutes);
+app.use('/api/eidoverse/travel', eidoverseTravelRoutes);
 app.use('/api/database', databaseRoutes);
 app.use('/api/uploads', uploadsRoutes);
 app.use('/api/image-clean', imageCleanRoutes);
@@ -374,6 +393,7 @@ app.use('/api/character', characterRoutes);
 app.use('/api/tools', toolsRoutes);
 app.use('/api/image-gen', imageGenRoutes);
 app.use('/api/video-gen', videoGenRoutes);
+app.use('/api/continuous-video', continuousVideoEpisodeRoutes);
 app.use('/api/devtools/video-download', videoDownloadRoutes);
 app.use('/api/video-timeline', videoTimelineRoutes);
 app.use('/api/media-jobs', mediaJobsRoutes);
@@ -387,6 +407,7 @@ app.use('/api/sprites', spriteRoutes);
 app.use('/api/mood-boards', moodBoardRoutes);
 app.use('/api/threejs-models', threejsModelsRoutes);
 app.use('/api/image-to-3d', imageTo3dRoutes);
+app.use('/api/rigging', riggingRoutes);
 app.use('/api/privacy', privacyRoutes);
 app.use('/api/writers-room', writersRoomRoutes);
 app.use('/api/universe-builder', universeBuilderRoutes);
@@ -410,8 +431,15 @@ app.use('/api/openclaw', openclawRoutes);
 app.use('/api/sharing', sharingRoutes);
 app.use('/api/rounds', roundsRoutes);
 app.use('/api/midi-runtime', midiRuntimeRoutes);
+app.use('/api/harnesses', harnessRoutes);
 app.use('/api/peer-sync', peerSyncRoutes);
 app.use('/api/ask', askRoutes);
+
+// Eidoverse same-origin reverse-proxy (`/eidoverse-host` + root allowlist while
+// the host is active). Must sit above mountAssetRoutes so the `/eidoverse-host`
+// SERVER_OWNED terminator cannot 404 proxied paths, and above the SPA fallback
+// so `/version` / `/ws` are not answered with PortOS index.html.
+mountEidoverseOnServer(app);
 
 // Asset static mounts, then a terminating 404 for every server-owned prefix so
 // an extensionless `/data/…` or a mistyped `/api/…` can no longer fall through
@@ -481,4 +509,7 @@ getBuildIdentity().catch((err) => console.error(`❌ Build identity probe failed
 // process itself. See services/bootstrap.js.
 runBootSequence({ io, httpServer, localHttpServer, httpsEnabled, port: PORT, host: HOST, spawnerReady });
 
+// Opt-in listener only: restores host configuration without generating tokens.
+import('./services/fleetLlmHost.js').then(({ startFleetLlmHost }) => startFleetLlmHost())
+  .catch(() => console.error('❌ Dedicated model host listener could not start; open AI Providers → Model host setup.'));
 registerShutdownHandlers({ io, httpServer, localHttpServer });

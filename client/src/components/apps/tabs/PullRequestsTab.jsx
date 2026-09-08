@@ -1,14 +1,17 @@
 import { useState, useEffect, useCallback, useMemo, useRef, useId } from 'react';
 import { Link } from 'react-router';
 import {
-  AlertTriangle, CheckCircle2, ExternalLink, GitBranch, GitMerge,
+  AlertTriangle, Bot, CheckCircle2, ExternalLink, GitBranch, GitMerge,
   GitPullRequest, Loader2, RefreshCw, Rocket, ScanSearch, Search, ShieldAlert, User
 } from 'lucide-react';
 import BrailleSpinner from '../../BrailleSpinner';
 import Banner from '../../ui/Banner';
 import Pill from '../../ui/Pill';
 import toast from '../../ui/Toast';
+import ProviderModelSelector from '../../ProviderModelSelector';
 import { useCosTaskUpdates } from '../../../hooks/useCosTaskUpdates';
+import useProviderModels from '../../../hooks/useProviderModels';
+import { enabledProcessProviderFilter } from '../../../utils/providers';
 import * as api from '../../../services/api';
 import { timeAgo } from '../../../utils/formatters';
 
@@ -45,7 +48,7 @@ const ACTION_KINDS = {
     field: 'agentAction',
     queued: result => result.task && { taskId: result.task.id, status: result.task.status },
     title: (forgeLabel, number, appName) =>
-      `Queue a CoS agent to resolve and merge ${forgeLabel} request #${number} for ${appName}`,
+      `Start a CoS agent now to resolve and merge ${forgeLabel} request #${number} for ${appName}`,
     matches: (task, appId, number) => task.metadata?.app === appId
       && Number(task.metadata?.reviewLoopPRNumber) === number,
   },
@@ -133,6 +136,16 @@ export default function PullRequestsTab({ appId, appName }) {
   const [actions, setActions] = useState(emptyActions);
   const actionsRef = useRef(emptyActions());
   const requestRef = useRef(0);
+
+  // Page-level provider/model/effort pin for every Resolve & merge / PR review
+  // click on this tab — left untouched (blank), a run resolves the install's
+  // active provider, same as the bare button always did. Mirrors the Issues
+  // tab's "Run with" picker: a session convenience, never persisted.
+  const {
+    providers, selectedProviderId, selectedModel, availableModels,
+    setSelectedProviderId, setSelectedModel
+  } = useProviderModels({ filter: enabledProcessProviderFilter, allowDefault: true, silent: true, withEffort: true });
+  const [effort, setEffort] = useState('');
 
   // One writer for the whole `{ kind: { number: action } }` bag so the ref the
   // socket handler reads and the state React renders can never disagree.
@@ -272,17 +285,39 @@ export default function PullRequestsTab({ appId, appName }) {
         },
       };
     });
-    toast.success(result.duplicate ? already : queued);
+    // The `queued` toast text may be a function of the response, for an action
+    // that reports whether an agent actually STARTED (resolve dispatches
+    // immediately) rather than only that a task was persisted.
+    const duplicate = result.duplicate === true;
+    const message = duplicate ? already
+      : (typeof queued === 'function' ? queued(result) : queued);
+    // Queued-but-not-started is not a failure — it just isn't running yet (no
+    // agent slots, daemon stopped) — but it is not a success claim either, so it
+    // gets the neutral toast. A duplicate stays a success: something is already
+    // on it.
+    if (!duplicate && result.started === false) toast(message);
+    else toast.success(message);
+  };
+
+  // The "Run with" picker above the list — left untouched, every field is
+  // `undefined` and the server resolves its own default exactly as before.
+  const providerSettings = {
+    provider: selectedProviderId || undefined,
+    model: selectedModel || undefined,
+    effort: effort || undefined,
   };
 
   const handleResolve = pullRequest => queueAction('resolve', pullRequest, {
-    call: () => api.resolveAppPullRequest(appId, pullRequest.number),
-    queued: `Queued an agent to resolve and merge ${forgeLabel} #${pullRequest.number}`,
+    call: () => api.resolveAppPullRequest(appId, pullRequest.number, providerSettings),
+    queued: result => (result.started
+      ? `Started an agent to resolve and merge ${forgeLabel} #${pullRequest.number}`
+      : `Queued an agent to resolve and merge ${forgeLabel} #${pullRequest.number}`
+        + (result.queueReason ? ` — ${result.queueReason}` : '')),
     already: `An agent is already resolving ${forgeLabel} #${pullRequest.number}`,
   });
 
   const handleReview = pullRequest => queueAction('review', pullRequest, {
-    call: () => api.reviewAppPullRequest(appId, pullRequest.number),
+    call: () => api.reviewAppPullRequest(appId, pullRequest.number, providerSettings),
     queued: `Queued the pr-reviewer task for ${forgeLabel} #${pullRequest.number}`,
     already: `pr-reviewer is already queued for ${forgeLabel} #${pullRequest.number}`,
   });
@@ -334,13 +369,35 @@ export default function PullRequestsTab({ appId, appName }) {
 
       <div className="px-3 py-2 text-xs text-gray-500 bg-port-card border border-port-border rounded-lg space-y-1">
         <p>
-          Resolve and merge queues a PortOS agent to inspect feedback, fix the branch, wait for checks, and merge when the forge allows it. It uses the configured Code Review Defaults.
+          Resolve and merge starts a PortOS agent right away to inspect feedback, fix the branch, wait for checks, and merge when the forge allows it. It uses the configured Code Review Defaults.
         </p>
         {(data?.pullRequests || []).some(pullRequest => pullRequest.reviewEligible) && (
           <p>
             PR review points the <span className="font-mono">pr-reviewer</span> scheduled task at this one request instead of letting it sweep every open contributor PR. It appears only on requests it can review — opened by someone else against the default branch — and its security scan still holds the review behind approval.
           </p>
         )}
+      </div>
+
+      <div className="flex flex-col sm:flex-row sm:items-center gap-2 px-3 py-2 bg-port-card border border-port-border rounded-lg">
+        <span className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide shrink-0">
+          <Bot size={14} /> Run with
+        </span>
+        <div className="flex-1">
+          <ProviderModelSelector
+            providers={providers}
+            selectedProviderId={selectedProviderId}
+            selectedModel={selectedModel}
+            availableModels={availableModels}
+            onProviderChange={(id) => { setSelectedProviderId(id); setEffort(''); }}
+            onModelChange={setSelectedModel}
+            effort={effort}
+            onEffortChange={setEffort}
+            emptyProviderOption="Auto (default)"
+            emptyModelOption="Default model"
+            compact
+            highlightToolUse
+          />
+        </div>
       </div>
 
       {error && (

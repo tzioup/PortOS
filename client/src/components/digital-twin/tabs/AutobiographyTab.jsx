@@ -19,6 +19,7 @@ import BrailleSpinner from '../../BrailleSpinner';
 import InlineConfirmRow from '../../ui/InlineConfirmRow';
 import * as api from '../../../services/api';
 import { copyToClipboard } from '../../../lib/clipboard';
+import { countWords } from '../../../lib/textUtils';
 import toast from '../../ui/Toast';
 import { useConfirmDelete } from '../../../hooks/useConfirmDelete';
 import { formatDateTime, formatDateNumeric } from '../../../utils/formatters';
@@ -220,7 +221,7 @@ export default function AutobiographyTab({ onRefresh }) {
     }
   };
 
-  const wordCount = storyContent.split(/\s+/).filter(Boolean).length;
+  const wordCount = countWords(storyContent);
 
   if (loading) {
     return (
@@ -559,7 +560,7 @@ export default function AutobiographyTab({ onRefresh }) {
                             </button>
                             <button
                               onClick={() => setNarrative(null)}
-                              className="p-0.5 text-gray-500 hover:text-white"
+                              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-0.5 text-gray-500 hover:text-white"
                               aria-label="Dismiss narrative"
                             >
                               <X size={12} />

@@ -4,11 +4,23 @@ import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 import { md5, buildPromptDriftTables } from './migrations/_lib.js';
+import { MIGRATION_OWNED_PATHS } from './lib/migrationOwnedPaths.js';
+import { rewriteAppsPortosRoot } from './lib/rewriteAppsPortosRoot.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const rootDir = join(__dirname, '..');
 const dataDir = join(rootDir, 'data');
 const referenceDir = join(rootDir, 'data.reference');
+
+// Absolute data.reference paths this script must never copy: a migration builds
+// each of them from the install's own records, and setup-data runs BEFORE
+// run-migrations — so seeding one makes the migration see its output as already
+// present, no-op, and leave shipped defaults where the user's settings were.
+// See scripts/migrations/340-cos-config-seed-repair.js for the case that
+// prompted it.
+const migrationOwnedSeeds = new Set(
+  [...MIGRATION_OWNED_PATHS].map((relPath) => join(referenceDir, ...relPath.split('/'))),
+);
 
 console.log('📁 Setting up data directory...');
 
@@ -30,21 +42,24 @@ if (existsSync(legacyMigrationsDir) && readdirSync(legacyMigrationsDir).length =
   console.log('🧹 Removed orphan data/migrations/ directory');
 }
 
+/**
+ * Expand `__PORTOS_ROOT__` in data/apps.json to this checkout's absolute path.
+ * Idempotent: no-op when the file is missing or already expanded. Runs for both
+ * fresh seeds and existing data/ trees (partial copies / restored volumes can
+ * leave the literal token in place — that breaks Apps → Git checkout detection).
+ */
+const rewritePortosRootPlaceholder = () => {
+  const { rewritten, token, rootDir: expandedRoot } = rewriteAppsPortosRoot(dataDir, rootDir);
+  if (rewritten) {
+    console.log(`📍 Expanded ${token} in apps.json → ${expandedRoot}`);
+  }
+};
+
 if (!existsSync(dataDir)) {
   console.log('📁 Creating data directory from data.reference...');
   mkdirSync(dataDir, { recursive: true });
-  cpSync(referenceDir, dataDir, { recursive: true });
-
-  // Replace __PORTOS_ROOT__ placeholder with actual install path in apps.json
-  const appsFile = join(dataDir, 'apps.json');
-  if (existsSync(appsFile)) {
-    const content = readFileSync(appsFile, 'utf8');
-    if (content.includes('__PORTOS_ROOT__')) {
-      writeFileSync(appsFile, content.replace(/__PORTOS_ROOT__/g, rootDir));
-      console.log(`📍 Set PortOS repoPath to ${rootDir}`);
-    }
-  }
-
+  cpSync(referenceDir, dataDir, { recursive: true, filter: (src) => !migrationOwnedSeeds.has(src) });
+  rewritePortosRootPlaceholder();
   console.log('✅ Data directory created');
 } else {
   // Ensure all subdirectories and files exist without overwriting existing files
@@ -52,6 +67,7 @@ if (!existsSync(dataDir)) {
     const items = readdirSync(srcDir);
     for (const item of items) {
       const srcPath = join(srcDir, item);
+      if (migrationOwnedSeeds.has(srcPath)) continue;
       const destPath = join(destDir, item);
       const stat = statSync(srcPath);
 
@@ -69,6 +85,7 @@ if (!existsSync(dataDir)) {
   };
 
   ensureSampleContent(referenceDir, dataDir);
+  rewritePortosRootPlaceholder();
 
   console.log('✅ Data directory already exists, ensured subdirectories and files');
 }

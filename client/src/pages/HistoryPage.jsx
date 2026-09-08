@@ -213,7 +213,7 @@ export function HistoryPage() {
                       <span className="text-sm text-gray-500 shrink-0">{formatTime(entry.timestamp)}</span>
                       <button
                         onClick={(e) => handleDelete(entry.id, e)}
-                        className="p-1 text-gray-500 hover:text-port-error transition-colors sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100 focus:outline-hidden focus:ring-2 focus:ring-port-accent rounded"
+                        className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1 text-gray-500 hover:text-port-error transition-colors sm:opacity-0 sm:group-hover:opacity-100 focus:opacity-100 focus:outline-hidden focus:ring-2 focus:ring-port-accent rounded"
                         title="Delete entry"
                         aria-label={`Delete ${entry.action} entry from ${formatTime(entry.timestamp)}`}
                       >
@@ -284,7 +284,7 @@ export function HistoryPage() {
                         <div>
                           <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Error</div>
                           <Banner tone="error" size="md">
-                            <pre className="text-sm font-mono whitespace-pre-wrap">
+                            <pre className="text-sm font-mono whitespace-pre-wrap break-all">
                               {entry.error}
                             </pre>
                           </Banner>
@@ -296,7 +296,7 @@ export function HistoryPage() {
                         <div>
                           <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Additional Details</div>
                           <div className="bg-port-card border border-port-border rounded-lg p-3">
-                            <pre className="text-xs text-gray-400 font-mono whitespace-pre-wrap">
+                            <pre className="text-xs text-gray-400 font-mono whitespace-pre-wrap break-all">
                               {JSON.stringify(
                                 Object.fromEntries(
                                   Object.entries(entry.details).filter(([k]) => !['command', 'output', 'runtime', 'exitCode'].includes(k))

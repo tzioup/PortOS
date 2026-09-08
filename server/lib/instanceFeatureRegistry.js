@@ -58,15 +58,13 @@ export const INSTANCE_FEATURES = Object.freeze([
     id: 'gsd',
     label: 'GSD',
     description: 'Get Stuff Done project planning and progress tracking for managed apps.',
-    defaultEnabled: true,
+    defaultEnabled: false,
   }),
   Object.freeze({
     id: 'openclaw',
     label: 'OpenClaw',
     description: 'Operator chat with a configured OpenClaw runtime.',
-    // Preserve the existing behavior for installs that already configured
-    // OpenClaw; an explicit Settings > Features toggle remains authoritative.
-    defaultEnabled: true,
+    defaultEnabled: false,
   }),
   Object.freeze({
     id: 'health',
@@ -75,6 +73,15 @@ export const INSTANCE_FEATURES = Object.freeze([
     // Health and MortalLoom were previously always visible. Keep existing
     // installs on that behavior until the user explicitly changes the flag.
     defaultEnabled: true,
+  }),
+  Object.freeze({
+    id: 'rigging',
+    label: 'Character rigging',
+    description: 'Blender-backed rigging for generated 3D characters. Needs a provisioned Blender Python runtime on this machine.',
+    // Off until a runtime is actually present: the detector in
+    // services/instanceFeatures.js turns it on only when the probe says the Blender
+    // module imports, so a fresh install never advertises a capability it cannot run.
+    defaultEnabled: false,
   }),
   Object.freeze({
     id: 'facetime',

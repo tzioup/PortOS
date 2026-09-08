@@ -519,7 +519,7 @@ export default function BeeperThread({
           type="button"
           onClick={onBack}
           aria-label="Back to conversations"
-          className="rounded p-1.5 text-gray-400 hover:text-white md:hidden"
+          className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-1.5 text-gray-400 hover:text-white md:hidden"
         >
           <ArrowLeft size={16} />
         </button>

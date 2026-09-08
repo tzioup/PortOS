@@ -6,6 +6,7 @@ import { join } from 'path';
 
 vi.mock('./shell.js', () => ({
   createShellSession: vi.fn(),
+  spawnCommandSession: vi.fn(),
   writeToSession: vi.fn(),
   pasteToSession: vi.fn(),
   killSession: vi.fn(),
@@ -110,13 +111,27 @@ vi.mock('./git.js', () => ({
   getDiff: vi.fn().mockResolvedValue('diff content here'),
   // No owner-matched gh account by default → empty overlay (ambient auth kept).
   resolveForgeTokenEnv: vi.fn().mockResolvedValue({}),
+  // Read by the merge-gate contract check (#5876) to name the branch it
+  // probes the forge for.
+  getBranch: vi.fn().mockResolvedValue('claim/issue-5876'),
 }));
 
-// Lazily imported by finish()'s cleanup block to record a failed run's resume
-// pointer (#3368). Mocked so the test doesn't pull the real cleanup graph
-// (cos.js, worktreeManager, recoveryTasks) in behind it.
-vi.mock('./agentWorktreeCleanup.js', () => ({
-  releaseRetryHold: vi.fn().mockResolvedValue({}),
+// The forge lookup itself (`resolveForgeForRepo` + gitlab.js/github.js) is
+// exercised on its own in prProbe.test.js — this suite only needs to drive
+// the merge-gate contract check's branching on the tri-state result.
+vi.mock('./prProbe.js', () => ({
+  probePrForBranch: vi.fn().mockResolvedValue({ prState: null, prUrl: null, prNumber: null, cli: null, readable: true }),
+}));
+
+// finish() hands the run to the shared completion dispatch (pipeline
+// progression → worktree cleanup with the PR disposition → retry-hold release).
+// Doubled at that boundary: what this suite owns is that the TUI path dispatches
+// with the right verdict and PR ownership, and only when it should — the
+// dispatch's own sequence is pinned in agentCompletionCleanup.test.js. Mocking
+// it also keeps the real cleanup graph (cos.js, worktreeManager, recoveryTasks)
+// out of this suite.
+vi.mock('./agentCompletionCleanup.js', () => ({
+  runSpawnerCompletionCleanup: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock('fs', () => ({
@@ -216,10 +231,14 @@ vi.mock('../lib/childProcess.js', async (importOriginal) => {
 });
 
 import { existsSync } from 'fs';
-import { readFile } from 'fs/promises';
+import { readFile, rm } from 'fs/promises';
 import { execFile } from '../lib/childProcess.js';
 import { buildTuiSpawnConfig, spawnTuiAgent } from './agentTuiSpawning.js';
-import { releaseRetryHold } from './agentWorktreeCleanup.js';
+import {
+  PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+  PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
+} from '../lib/agentExecutionProfiles.js';
+import { runSpawnerCompletionCleanup } from './agentCompletionCleanup.js';
 import { spawnTuiSessionViaRunner, RUNNER_SPAWN_REFUSED, RUNNER_SPAWN_AMBIGUOUS } from './cosRunnerClient.js';
 import * as shellService from './shell.js';
 import * as agentLifecycle from './agentFinalization.js';
@@ -227,6 +246,7 @@ import { ensureOllamaAgentContext } from './ollamaAgentContext.js';
 import * as agentErrorAnalysis from './agentErrorAnalysis.js';
 import * as cosAgentLifecycle from './cosAgentLifecycle.js';
 import * as gitService from './git.js';
+import { probePrForBranch } from './prProbe.js';
 import { activeAgents, userTerminatedAgents } from './agentState.js';
 import {
   SELF_CLEARING_RESUBMIT_INTERVAL_MS,
@@ -235,6 +255,8 @@ import {
   OOM_NUDGE_COOLDOWN_MS,
   OOM_NUDGE_MAX_ATTEMPTS,
   OOM_NUDGE_TEXT,
+  RETRY_STALL_MS,
+  TOOL_PERMISSION_NUDGE_TEXT,
 } from '../lib/tuiHandshake.js';
 // Real module, not a mock: the flag is a plain process-local boolean, so driving
 // it directly exercises the same code path production does.
@@ -259,6 +281,60 @@ describe('agent TUI spawning', () => {
   // on a Bedrock box launched with a rewritten, unroutable model id. Both copies
   // now delegate to `resolveInjectedTuiModel`; re-inlining the mapper here would
   // break this test.
+  // #6062 — Stage 3 (`sandboxed-actions`) may run attachable. When it does, its
+  // argv MUST come from the vendor's maintained recipe, never the generic
+  // assembly below: that path forwards `provider.args` and runs
+  // `applyCommandDefaults`, either of which can hand a contributor-controlled
+  // review a `--dangerously-skip-permissions` session.
+  it('builds an actions-posture TUI session from the vendor recipe, not the generic argv', () => {
+    const config = buildTuiSpawnConfig({
+      id: 'claude-tui',
+      type: 'tui',
+      command: 'claude',
+      args: ['--dangerously-skip-permissions'],
+    }, 'sonnet', { safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE, effort: 'high' });
+
+    expect(config.command).toBe('claude');
+    expect(config.args).toEqual(expect.arrayContaining([
+      '--permission-mode', 'acceptEdits', '--settings', '--disallowedTools',
+      '--strict-mcp-config', '--disable-slash-commands', '--model', 'sonnet',
+    ]));
+    // The saved arg is dropped, and the headless output flags are gone so the
+    // PTY actually gets an interactive session to attach to.
+    expect(config.args).not.toContain('--dangerously-skip-permissions');
+    expect(config.args).not.toContain('--print');
+    expect(config.args).not.toContain('--output-format');
+    // The command LINE is still rendered by the shared renderer, so it names the
+    // binary and carries the recipe. Asserted by CONTENT, not by prefix: the
+    // rendering is shell-dialect specific (cmd.exe/PowerShell quote the command
+    // token itself), so a `startsWith('claude ')` here passes on POSIX and fails
+    // on a Windows runner.
+    expect(config.commandLine).toContain('claude');
+    expect(config.commandLine).toContain('--permission-mode');
+    expect(config.commandLine).toContain('acceptEdits');
+  });
+
+  it('fails closed rather than opening an actions-posture PTY with no maintained recipe', () => {
+    // Reaching this is a routing bug (`agentLifecycle` asks
+    // `supportsTuiPublicReviewActionsProvider` first) — but the fallback tier
+    // would emit codex's headless `exec` argv, which in a PTY neither accepts a
+    // pasted prompt nor enforces anything.
+    expect(() => buildTuiSpawnConfig({ id: 'codex-tui', type: 'tui', command: 'codex' }, 'gpt-5.6', {
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+    })).toThrow(/cannot run an attachable sandboxed-actions session/);
+    expect(() => buildTuiSpawnConfig({ id: 'claude-tui', type: 'tui', command: 'claude' }, 'sonnet', {
+      safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
+    })).toThrow(/cannot run an attachable no-tool session/);
+  });
+
+  it('leaves the ordinary TUI argv untouched when no posture is requested', () => {
+    const config = buildTuiSpawnConfig({
+      id: 'claude-tui', type: 'tui', command: 'claude', args: ['--dangerously-skip-permissions'],
+    }, 'sonnet');
+    expect(config.args).toContain('--dangerously-skip-permissions');
+    expect(config.args).not.toContain('--settings');
+  });
+
   it('does not Bedrock-map a cursor TUI model id that merely contains "claude"', () => {
     process.env.CLAUDE_CODE_USE_BEDROCK = '1';
     const config = buildTuiSpawnConfig({
@@ -538,7 +614,7 @@ describe('agent TUI spawning', () => {
 // ─── spawnTuiAgent runtime tests ─────────────────────────────────────────────
 
 // Flush the microtask queue (pending Promise continuations). vi.runAllMicrotasksAsync
-// is not available in vitest 4.x — use Promise.resolve() ticks instead.
+// is available in neither vitest 4 nor 5 — use Promise.resolve() ticks instead.
 const flushMicrotasks = () => Promise.resolve().then(() => Promise.resolve()).then(() => Promise.resolve());
 
 describe('spawnTuiAgent runtime', () => {
@@ -568,10 +644,7 @@ describe('spawnTuiAgent runtime', () => {
     const agentDir = overrides.agentDir ?? '/tmp/agentdir';
     const executionId = overrides.executionId ?? null;
     const laneName = overrides.laneName ?? null;
-    const helpers = overrides.helpers ?? {
-      cleanupWorktreeFn: vi.fn().mockResolvedValue(undefined),
-      isTruthyMetaFn: (v) => !!v
-    };
+    const helpers = overrides.helpers ?? { isTruthyMetaFn: (v) => !!v };
     return spawnTuiAgent({
       agentId,
       task,
@@ -584,8 +657,10 @@ describe('spawnTuiAgent runtime', () => {
       agentDir,
       executionId,
       laneName,
+      ownsPrWorkflow: overrides.ownsPrWorkflow ?? !overrides.leanMode,
       leanMode: overrides.leanMode ?? false,
       useDurableRunner: overrides.useDurableRunner ?? false,
+      safetyProfile: overrides.safetyProfile ?? null,
       ...helpers,
     });
   }
@@ -622,8 +697,23 @@ describe('spawnTuiAgent runtime', () => {
       return SESSION_ID;
     });
 
+    // The direct-PTY path a public-content stage takes (#6159). Real shell.js
+    // has no readiness probe there — the CLI *is* the PTY — so
+    // createAgentTuiSession opens the paste gate itself before the spawn; the
+    // mock therefore does NOT invoke onInitialCommandSent.
+    vi.mocked(shellService.spawnCommandSession).mockImplementation((_command, _args, opts) => {
+      capturedOnData = opts.onData;
+      capturedOnExit = opts.onExit;
+      return SESSION_ID;
+    });
+
     vi.mocked(shellService.getSessionProcess).mockReturnValue(null);
     vi.mocked(shellService.getSession).mockReturnValue({ id: SESSION_ID });
+    // Restore the liveness probe's "assume alive" default. `clearAllMocks` clears
+    // call history but KEEPS implementations, so a test that makes the probe
+    // report "no live child" would otherwise leak that verdict into whichever
+    // test runs next and strand it at the paste gate.
+    vi.mocked(execFile).mockImplementation((_file, _args, _opts, cb) => cb(new Error('not mocked')));
     vi.mocked(spawnTuiSessionViaRunner).mockImplementation(async (options) => {
       capturedOnData = options.onData;
       capturedOnExit = options.onExit;
@@ -706,6 +796,121 @@ describe('spawnTuiAgent runtime', () => {
     await completeDone;
   });
 
+  // #6062 — the attachable Stage 3. The PTY child must get the SAME allowlisted
+  // environment its headless sibling would; a TUI Stage 3 running with the
+  // server's own inherited environment would be a real regression, not a
+  // cosmetic one — the whole posture assumes no forge credential is reachable.
+  //
+  // #6159 closed the residual that allowlist could not: the stage no longer runs
+  // inside a login shell at all, so the operator's rc file never executes between
+  // the allowlist and the provider.
+  it('spawns an actions-posture stage as its own PTY with the allowlisted env, never inside a login shell', async () => {
+    let resolveComplete;
+    const completeDone = new Promise((r) => { resolveComplete = r; });
+    vi.mocked(agentLifecycle.finalizeAgent).mockImplementation(async () => { resolveComplete(); });
+    process.env.PORTOS_TEST_6062_SECRET = 'must-not-reach-the-review';
+
+    runSpawn({
+      provider: { id: 'claude-tui', name: 'Local Claude TUI', type: 'tui', command: 'claude', envVars: {} },
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+      tuiConfig: { command: 'claude', args: ['--permission-mode', 'plan'], commandLine: 'claude --permission-mode plan', promptDelayMs: 100 },
+    });
+    await flushMicrotasks();
+
+    // No login shell is created at all — that is what makes an rc-file export
+    // unreachable, and no env assertion on its own can prove it.
+    expect(shellService.createShellSession).not.toHaveBeenCalled();
+    const [command, args, opts] = vi.mocked(shellService.spawnCommandSession).mock.calls[0];
+    // The PTY's process is the provider binary from the vendor recipe.
+    expect(command).toBe('claude');
+    expect(args).toEqual(['--permission-mode', 'plan']);
+    expect(opts.env.PORTOS_TEST_6062_SECRET).toBeUndefined();
+    expect(opts.env.GH_TOKEN).toBeUndefined();
+    // …while the variables the stage legitimately needs survive.
+    expect(opts.env.PATH).toBeTruthy();
+    expect(opts.env.HOME).toBeTruthy();
+    // The forge credential is never even read out of the keychain for this stage.
+    expect(gitService.resolveForgeTokenEnv).not.toHaveBeenCalled();
+
+    delete process.env.PORTOS_TEST_6062_SECRET;
+    await capturedOnExit({ exitCode: 0, killed: false });
+    await completeDone;
+  });
+
+  it('keeps the ordinary TUI session on the shell service\u2019s own base env', async () => {
+    let resolveComplete;
+    const completeDone = new Promise((r) => { resolveComplete = r; });
+    vi.mocked(agentLifecycle.finalizeAgent).mockImplementation(async () => { resolveComplete(); });
+
+    runSpawn();
+    await flushMicrotasks();
+
+    // The operator's rc file is a FEATURE for an ordinary coding agent — it is
+    // where their toolchain (nvm, pyenv, PATH edits) comes from. #6159 removes
+    // the hosting shell only for the restricted posture, and `env` stays a
+    // DELTA that createShellSession unions onto its own base: the regression
+    // this guards is flipping every agent session onto the public-review
+    // allowlist, which would strip the toolchain vars a coding agent needs.
+    expect(shellService.spawnCommandSession).not.toHaveBeenCalled();
+    const opts = vi.mocked(shellService.createShellSession).mock.calls[0][1];
+    expect(opts.initialCommand).toBe('codex');
+    expect(opts.waitForPromptReady).toBe(true);
+
+    await capturedOnExit({ exitCode: 0, killed: false });
+    await completeDone;
+  });
+
+  // #6159 — the direct PTY loses both affordances the login shell supplied:
+  // shell.js's readiness probe (which fired onInitialCommandSent, opening the
+  // paste gate) and the shell's bracketed-paste OFF that the input-ready tracker
+  // waited for. It also invalidates the "does this pid have a live child?" guard,
+  // because the pid IS the CLI. If any of those were left wired for the shell
+  // shape, the prompt would never be delivered — silently, on a live stage.
+  it('still delivers the prompt for a direct actions-posture PTY, with no shell probe or paste-mode OFF', async () => {
+    // Truthy pid AND a probe that reports no child of it — exactly the state
+    // that trips `tui-exited-early` on the login-shell path.
+    vi.mocked(shellService.getSessionProcess).mockReturnValue({ pid: 4242 });
+    vi.mocked(execFile).mockImplementation((_file, _args, _opts, cb) => cb(null, '1\n1\n999\n'));
+
+    runSpawn({
+      provider: { id: 'claude-tui', name: 'Local Claude TUI', type: 'tui', command: 'claude', envVars: {} },
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+      tuiConfig: { command: 'claude', args: [], commandLine: 'claude', promptDelayMs: 100 },
+    });
+    await flushMicrotasks();
+
+    // The TUI owns the PTY from byte zero: its composer turns bracketed-paste ON
+    // with no preceding shell OFF.
+    await capturedOnData(Buffer.from('\x1b[?2004hClaude Code v2.1.186\n'));
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(2000);
+    await flushMicrotasks();
+
+    const pasteWrites = vi.mocked(shellService.writeToSession).mock.calls
+      .filter(([, data]) => typeof data === 'string' && data.includes('\x1b[200~'));
+    expect(pasteWrites).toHaveLength(1);
+
+    await capturedOnExit({ exitCode: 0, killed: false });
+  });
+
+  it('refuses to route a public-content stage through the shared CoS runner', async () => {
+    // The runner builds its own child env from ITS ambient environment
+    // (`/spawn-tui` → `buildCliChildEnv` with no profile), so a restricted stage
+    // routed through it would silently lose the allowlist. `agentLifecycle`
+    // forces every such stage direct-only; this keeps that true by construction.
+    const spawned = runSpawn({
+      provider: { id: 'claude-tui', name: 'Local Claude TUI', type: 'tui', command: 'claude', envVars: {} },
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+      useDurableRunner: true,
+    });
+    await flushMicrotasks();
+
+    expect(spawnTuiSessionViaRunner).not.toHaveBeenCalled();
+    expect(shellService.createShellSession).not.toHaveBeenCalled();
+    expect(shellService.spawnCommandSession).not.toHaveBeenCalled();
+    await expect(spawned).resolves.toBeNull();
+  });
+
   it('makes the login shell exit with the TUI command instead of lingering after it exits', async () => {
     runSpawn();
     await flushMicrotasks();
@@ -738,34 +943,38 @@ describe('spawnTuiAgent runtime', () => {
     await completeDone;
   });
 
-  it('backstops a slashdo-free TUI PR instead of creating one outright (#3733)', async () => {
-    const cleanupWorktreeFn = vi.fn().mockResolvedValue(undefined);
+  it('hands a slashdo-free TUI to the dispatch as owning its PR with nothing verified (#3733)', async () => {
+    const task = {
+      id: 'task-1',
+      description: 'do the thing',
+      metadata: { openPR: true, prCompletion: 'review-then-merge', reviewers: ['codex'] },
+    };
     const spawnPromise = runSpawn({
       provider: { id: 'codex-tui', name: 'Codex TUI', type: 'tui', command: 'codex', envVars: {} },
-      task: {
-        id: 'task-1',
-        description: 'do the thing',
-        metadata: { openPR: true, prCompletion: 'review-then-merge', reviewers: ['codex'] },
-      },
-      helpers: { cleanupWorktreeFn, isTruthyMetaFn: (value) => value === true || value === 'true' },
+      task,
+      helpers: { isTruthyMetaFn: (value) => value === true || value === 'true' },
     });
     await flushMicrotasks();
 
     await capturedOnExit({ exitCode: 0, killed: false });
     await spawnPromise;
 
-    // The codex TUI drives its own push → PR → review → merge, so PortOS only
-    // steps in when the forge says no PR exists — hence prCreation: if-missing.
-    expect(cleanupWorktreeFn).toHaveBeenCalledWith('agent-1', true, expect.objectContaining({
-      prCreation: 'if-missing',
-      prCompletion: 'review-then-merge',
-      reviewers: ['codex'],
-      skipMerge: true,
+    // The codex TUI drives its own push → PR → review → merge but cannot type
+    // `/do:pr`, so finalize verified no claim — the dispatch maps that to a
+    // forge-checked `if-missing` backstop (pinned in agentCompletionCleanup.test.js).
+    expect(runSpawnerCompletionCleanup).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: 'agent-1',
+      task,
+      success: true,
+      prOwnership: { taskOpenPR: true, agentOwnsPR: true, prClaimExpected: false },
+      prClaimVerified: false,
     }));
+    // …and finalize was told not to verify a claim this session cannot make —
+    // failing it there would pre-empt the backstop cleanup is about to run.
+    expect(agentLifecycle.finalizeAgent).toHaveBeenCalledWith(expect.objectContaining({ prExpected: false }));
   });
 
   it('a lean --bare TUI still hands its PR to PortOS outright', async () => {
-    const cleanupWorktreeFn = vi.fn().mockResolvedValue(undefined);
     const spawnPromise = runSpawn({
       provider: { id: 'claude-ollama-tui', name: 'Lean Claude TUI', type: 'tui', command: 'claude', ollamaBacked: true, envVars: {} },
       leanMode: true,
@@ -774,16 +983,17 @@ describe('spawnTuiAgent runtime', () => {
         description: 'do the thing',
         metadata: { openPR: true, prCompletion: 'review-then-merge' },
       },
-      helpers: { cleanupWorktreeFn, isTruthyMetaFn: (value) => value === true || value === 'true' },
+      helpers: { isTruthyMetaFn: (value) => value === true || value === 'true' },
     });
     await flushMicrotasks();
 
     await capturedOnExit({ exitCode: 0, killed: false });
     await spawnPromise;
 
-    expect(cleanupWorktreeFn).toHaveBeenCalledWith('agent-1', true, expect.objectContaining({
-      prCreation: 'always',
-      skipMerge: false,
+    // Neither predicate holds for a `--bare` session, so the dispatch opens the
+    // PR itself (`always`) and may auto-merge the branch.
+    expect(runSpawnerCompletionCleanup).toHaveBeenCalledWith(expect.objectContaining({
+      prOwnership: { taskOpenPR: true, agentOwnsPR: false, prClaimExpected: false },
     }));
   });
 
@@ -805,7 +1015,6 @@ describe('spawnTuiAgent runtime', () => {
   });
 
   it('does not double-fire a PR owned by a slashdo-capable Claude TUI', async () => {
-    const cleanupWorktreeFn = vi.fn().mockResolvedValue(undefined);
     // finalize asked the forge and got an answer for a real branch — the only
     // shape that lets cleanup skip its own query (see `prClaimWasVerified`).
     vi.mocked(agentLifecycle.finalizeAgent).mockResolvedValueOnce({
@@ -818,52 +1027,40 @@ describe('spawnTuiAgent runtime', () => {
         description: 'do the thing',
         metadata: { openPR: true, prCompletion: 'review-then-merge' },
       },
-      helpers: { cleanupWorktreeFn, isTruthyMetaFn: (value) => value === true || value === 'true' },
+      helpers: { isTruthyMetaFn: (value) => value === true || value === 'true' },
     });
     await flushMicrotasks();
 
     await capturedOnExit({ exitCode: 0, killed: false });
     await spawnPromise;
 
-    // `never`, not `if-missing`: finalize already ran `verifyPrClaim` for a
-    // slashdo-capable session, so a second forge query would be pure duplication.
-    expect(cleanupWorktreeFn).toHaveBeenCalledWith('agent-1', true, expect.objectContaining({
-      prCreation: 'never',
-      prCompletion: 'review-then-merge',
-      skipMerge: true,
+    // finalize ran `verifyPrClaim` for a slashdo-capable session and the verdict
+    // reaches the dispatch as verified, so it never queries the forge again.
+    expect(runSpawnerCompletionCleanup).toHaveBeenCalledWith(expect.objectContaining({
+      prOwnership: { taskOpenPR: true, agentOwnsPR: true, prClaimExpected: true },
+      prClaimVerified: true,
     }));
+    expect(agentLifecycle.finalizeAgent).toHaveBeenCalledWith(expect.objectContaining({ prExpected: true }));
   });
 
-  // A failed TUI run's branch is preserved by cleanup when it holds commits; without
-  // this call nothing ever points the retry at it and the work is redone from
-  // scratch (#3368). Runs after cleanup so it reflects what actually survived.
-  it('records a resume pointer after cleanup when the run failed', async () => {
-    vi.mocked(releaseRetryHold).mockClear();
-    const cleanupWorktreeFn = vi.fn().mockResolvedValue(undefined);
+  // The dispatch releases the retry hold with this verdict (#3368 — its ordering
+  // after worktree cleanup is pinned in agentCompletionCleanup.test.js). What
+  // this pins is that finish() hands it the REAL verdict: a hardcoded value
+  // would stamp resume pointers on every completed run, or on none.
+  it('hands the dispatch the run verdict — failure on a non-zero exit, success on a clean one', async () => {
     const task = { id: 'task-1', description: 'do the thing', metadata: {} };
-    const spawnPromise = runSpawn({ task, helpers: { cleanupWorktreeFn, isTruthyMetaFn: (v) => !!v } });
+    const failed = runSpawn({ task });
     await flushMicrotasks();
-
     await capturedOnExit({ exitCode: 1, killed: false });
-    await spawnPromise;
+    await failed;
+    expect(runSpawnerCompletionCleanup).toHaveBeenCalledWith(expect.objectContaining({ agentId: 'agent-1', task, success: false }));
 
-    expect(releaseRetryHold).toHaveBeenCalledWith({ agentId: 'agent-1', task, success: false });
-    expect(cleanupWorktreeFn.mock.invocationCallOrder[0])
-      .toBeLessThan(vi.mocked(releaseRetryHold).mock.invocationCallOrder[0]);
-  });
-
-  // The helper no-ops on success (unit-tested in cleanupAgentWorktree.test.js) —
-  // what this pins is that finish() hands it the real verdict, not a hardcoded
-  // false that would stamp pointers on every completed run.
-  it('passes the success verdict through on a clean run', async () => {
-    vi.mocked(releaseRetryHold).mockClear();
-    const spawnPromise = runSpawn({ helpers: { cleanupWorktreeFn: vi.fn().mockResolvedValue(undefined), isTruthyMetaFn: (v) => !!v } });
+    vi.mocked(runSpawnerCompletionCleanup).mockClear();
+    const clean = runSpawn();
     await flushMicrotasks();
-
     await capturedOnExit({ exitCode: 0, killed: false });
-    await spawnPromise;
-
-    expect(releaseRetryHold).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    await clean;
+    expect(runSpawnerCompletionCleanup).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
   });
 
   // ── CoS agents stay alive while provider output is silent ────────────────────
@@ -1090,6 +1287,22 @@ describe('spawnTuiAgent runtime', () => {
     await capturedOnData(Buffer.from(PASTE_ON));
     await flushMicrotasks();
     await vi.advanceTimersByTimeAsync(400);
+    await flushMicrotasks();
+    expect(pasteCount()).toBe(1);
+  });
+
+  it('Cursor workspace trust: selects the keyed choice before delivering the task', async () => {
+    runSpawn({ tuiConfig: { command: 'cursor-agent', args: ['--force'], commandLine: 'cursor-agent --force', promptDelayMs: 100 } });
+    await flushMicrotasks();
+    await capturedOnData(Buffer.from(`${PASTE_OFF}Do you trust the contents of this directory?\n/workspace/example\n▶ [a] Trust this workspace\n[q] Quit\n`));
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(700);
+    await flushMicrotasks();
+    expect(vi.mocked(shellService.writeToSession).mock.calls.map(([, data]) => data)).toContain('a\r');
+    expect(pasteCount()).toBe(0);
+    await capturedOnData(Buffer.from(PASTE_ON));
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(2000);
     await flushMicrotasks();
     expect(pasteCount()).toBe(1);
   });
@@ -1576,6 +1789,85 @@ describe('spawnTuiAgent runtime', () => {
         error: expect.stringContaining('GPU memory'),
       })
     );
+  });
+
+  // ── Retry stall: the provider keeps failing the same request ───────────────
+  // agent-e057cca7 (2026-09-04): a Stage 3 prefill the harness cancelled every
+  // ~6 minutes and re-sent verbatim. The screen repaints on every attempt, so
+  // every reaper saw a busy session and the run held its lane until the
+  // max-runtime ceiling.
+  it('fails over a session whose retry banner keeps advancing past the stall window', async () => {
+    let resolveComplete;
+    const completeDone = new Promise((r) => { resolveComplete = r; });
+    vi.mocked(agentLifecycle.finalizeAgent).mockImplementation(async () => { resolveComplete(); });
+
+    await driveAgyToSubmittedPrompt();
+
+    const retryCycleMs = RETRY_STALL_MS / 2 + 60_000;
+    for (const attempt of [1, 2]) {
+      await capturedOnData(Buffer.from(`API error · Retrying in 0s · attempt ${attempt}/10\n`));
+      await flushMicrotasks();
+      // The retried request is in flight: the title bar flickers, nothing else
+      // paints. Two attempts alone are not a verdict, however long they span.
+      await vi.advanceTimersByTimeAsync(retryCycleMs);
+      await flushMicrotasks();
+      expect(agentLifecycle.finalizeAgent).not.toHaveBeenCalled();
+    }
+
+    await capturedOnData(Buffer.from('API error · Retrying in 0s · attempt 3/10\n'));
+    await flushMicrotasks();
+    // Acted on by the 5s provider-signal poll, like the other gates.
+    await vi.advanceTimersByTimeAsync(5000);
+    vi.useRealTimers();
+    await completeDone;
+
+    expect(agentLifecycle.finalizeAgent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: false,
+        completionReason: 'fallback-signal',
+        error: expect.stringContaining('retried it 3 times'),
+      })
+    );
+  });
+
+  // ── Tool-permission dialog: decline, then nudge ───────────────────────────
+  // agent-e057cca7 (2026-09-04): under the sandboxed acceptEdits recipe a local
+  // model asked to Read an absolute path outside the worktree, and the dialog
+  // sat unanswered for the rest of the run.
+  it('declines a tool-permission dialog and nudges the session once it goes quiet', async () => {
+    // A claude session: the dialog is Claude Code chrome, and the spawner only
+    // watches claude sessions for it.
+    runSpawn({ tuiConfig: claudeTuiConfig });
+    await flushMicrotasks();
+    await capturedOnData(Buffer.from(`${PASTE_OFF}Claude Code v2.1.260\n`));
+    await flushMicrotasks();
+    await capturedOnData(Buffer.from(PASTE_ON));
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(400);
+    await flushMicrotasks();
+    expect(pasteCount()).toBe(1);
+    await capturedOnData(Buffer.from('do the thing\n'));
+    await flushMicrotasks();
+    await vi.advanceTimersByTimeAsync(4000);
+    await flushMicrotasks();
+    vi.mocked(shellService.writeToSession).mockClear();
+    vi.mocked(shellService.pasteToSession).mockClear();
+
+    await capturedOnData(Buffer.from(' Read(/data.reference/providers.json) Doyouwanttoproceed? ❯1. Yes 2. Yes,allowreadingfrom/data.referenceduringthissession 3. No Esc to cancel · Tab to amend '));
+    await flushMicrotasks();
+    // Option 1 is highlighted; "No" is option 3: down, down, Enter.
+    expect(shellService.writeToSession).toHaveBeenCalledWith(SESSION_ID, '\x1b[B\x1b[B\r');
+
+    // The decline ends the turn; once the session is quiet the nudge goes out.
+    await vi.advanceTimersByTimeAsync(OOM_NUDGE_SETTLE_MS + 10000);
+    await flushMicrotasks();
+    expect(shellService.pasteToSession).toHaveBeenCalledWith(
+      SESSION_ID,
+      TOOL_PERMISSION_NUDGE_TEXT,
+      expect.objectContaining({ label: expect.stringContaining('permission') }),
+    );
+    expect(shellService.pasteToSession).toHaveBeenCalledTimes(1);
+    expect(agentLifecycle.finalizeAgent).not.toHaveBeenCalled();
   });
 
   // ── 1b. Submit-Enter retries ─────────────────────────────────────────────────
@@ -2210,14 +2502,13 @@ describe('spawnTuiAgent runtime', () => {
   // Reported in #3202: `pm2 restart portos-server` TreeKills the agent's PTY.
   // node-pty reports that as exit code 0, so `success: code === 0 && !killed`
   // recorded a run that had produced nothing as SUCCESSFUL — and worse, finalize
-  // handed the worktree to cleanupWorktreeFn, destroying the state a resume
-  // needs. Both halves are asserted here.
+  // handed the worktree to cleanup, destroying the state a resume needs. Both
+  // halves are asserted here.
   describe('host restart (#3202)', () => {
     afterEach(() => resetHostShutdownFlagForTests());
 
     it('abandons instead of finalizing when the PTY dies during shutdown', async () => {
-      const cleanupWorktreeFn = vi.fn().mockResolvedValue(undefined);
-      const spawnPromise = runSpawn({ helpers: { cleanupWorktreeFn, isTruthyMetaFn: (v) => !!v } });
+      const spawnPromise = runSpawn();
       await flushMicrotasks();
 
       markHostShuttingDown();
@@ -2228,7 +2519,7 @@ describe('spawnTuiAgent runtime', () => {
 
       // No outcome recorded, and — critically — the worktree is left alone.
       expect(agentLifecycle.finalizeAgent).not.toHaveBeenCalled();
-      expect(cleanupWorktreeFn).not.toHaveBeenCalled();
+      expect(runSpawnerCompletionCleanup).not.toHaveBeenCalled();
       // The record stays `running`; only the phase label is refined, so boot
       // recovery still sees it as an agent to reconcile from the marker.
       expect(vi.mocked(cosAgentLifecycle.updateAgent).mock.calls.some(
@@ -2424,5 +2715,247 @@ describe('spawnTuiAgent runtime', () => {
       );
     });
 
+  });
+
+  // ── Merge Gate contract check (#5876) ────────────────────────────────────
+  // A run that owns its own PR lifecycle (`openPR: true`, a TUI/CLI provider,
+  // not leaned/handed-to-a-human) is told to merge its own PR before exiting.
+  // These tests drive `finish()` via the shell-exit path (same as the
+  // completion-sentinel suite above) with a `.agent-done` sentinel already on
+  // disk, and assert on the re-prompt delivery (`shellService.pasteToSession`)
+  // and on whether `finalizeAgent` — the point of no return — was reached.
+  describe('merge-gate contract check (#5876)', () => {
+    const openPrTask = { id: 'task-1', description: 'ship the fix', metadata: { openPR: true } };
+
+    // Stateful (not a blanket `true`): `watchForFile`'s `detect()` also runs
+    // SYNCHRONOUSLY at watcher-creation time, so if the sentinel already
+    // "existed" when spawnTuiAgent creates its initial watcher, that watcher
+    // self-fires before the test ever drives an explicit trigger — and a
+    // re-prompt's `rm(doneSentinelPath)` needs to actually clear presence for
+    // the re-armed watcher's OWN creation-time check to stay quiet too.
+    // `withSentinel` therefore only wires the mocks; every test flips
+    // `sentinelExists = true` itself, only once its trigger is ready to fire.
+    let sentinelExists = false;
+    const withSentinel = (summary) => {
+      vi.mocked(existsSync).mockImplementation(() => sentinelExists);
+      vi.mocked(readFile).mockImplementation(async (p) =>
+        (typeof p === 'string' && p.endsWith('.agent-done-agent-1') && sentinelExists) ? summary : ''
+      );
+      vi.mocked(rm).mockImplementation(async () => { sentinelExists = false; });
+    };
+
+    // The merge-gate check adds real await hops (ingestDoneSentinel's readFile,
+    // git.getBranch, probePrForBranch) before finish() reaches finalizeAgent —
+    // more than the module-level `flushMicrotasks`'s fixed 3 hops reliably
+    // drains. Loop it rather than deepen the shared helper for every caller.
+    const settle = async () => {
+      for (let i = 0; i < 8; i += 1) await flushMicrotasks();
+    };
+
+    beforeEach(() => { sentinelExists = false; });
+
+    it('leaves a read-only run with an open PR to PortOS without a merge re-prompt', async () => {
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: 'OPEN', prUrl: 'https://example.com/pr/1', prNumber: 1, cli: 'gh', readable: true,
+      });
+      withSentinel('## Summary\nFinished the analysis.');
+      const spawnPromise = runSpawn({
+        task: { ...openPrTask, metadata: { openPR: true, readOnly: true } },
+        ownsPrWorkflow: false,
+      });
+      await flushMicrotasks();
+      sentinelExists = true;
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+      expect(probePrForBranch).not.toHaveBeenCalled();
+      expect(shellService.pasteToSession).not.toHaveBeenCalled();
+      expect(runSpawnerCompletionCleanup).toHaveBeenCalledWith(expect.objectContaining({
+        prOwnership: expect.objectContaining({ taskOpenPR: true, agentOwnsPR: false }),
+      }));
+    });
+
+    it('re-prompts exactly once when the PR is open and the summary names no blocker, then finalizes on the RE-ARMED watcher even if still open', async () => {
+      vi.mocked(shellService.pasteToSession).mockReturnValue(999);
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: 'OPEN', prUrl: 'https://example.com/pr/1', prNumber: 1, cli: 'gh', readable: true,
+      });
+      withSentinel('## Summary\nShipped the fix and opened the PR.');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+
+      // Round 1: nudged, not finalized. The reprompt path deletes the
+      // sentinel (`rm` flips `sentinelExists` false, see withSentinel) and
+      // arms a brand-new watcher — the original is one-shot and already
+      // closed itself on this same detection.
+      expect(shellService.pasteToSession).toHaveBeenCalledTimes(1);
+      expect(shellService.pasteToSession.mock.calls[0][1]).toContain('still OPEN');
+      expect(agentLifecycle.finalizeAgent).not.toHaveBeenCalled();
+
+      // Round 2: the agent writes a fresh sentinel (still OPEN, still no
+      // blocker) and the RE-ARMED watcher's fallback poll picks it up —
+      // proving the re-arm itself works, not just a second exit event.
+      sentinelExists = true;
+      // Past the 5000ms poll AND the 50ms settle delay `watchForFile` applies
+      // after a `detect()` — a bare 5000ms advance lands exactly on the poll
+      // tick but not the settle timer it then schedules.
+      await vi.advanceTimersByTimeAsync(5100);
+      await settle();
+      await spawnPromise;
+
+      // One nudge per run: round 2 finalizes instead of nudging again.
+      expect(shellService.pasteToSession).toHaveBeenCalledTimes(1);
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
+
+    it('never nudges a clean exit that carries no real .agent-done summary, even for a run that owed a merge', async () => {
+      // success:true with nothing on disk — an ordinary quit, not the agent
+      // signaling its Merge Gate is done. Must fall straight through to a
+      // normal finalize, never probe the forge or paste into the session.
+      vi.mocked(existsSync).mockReturnValue(false);
+      vi.mocked(readFile).mockResolvedValue('');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+
+      expect(probePrForBranch).not.toHaveBeenCalled();
+      expect(shellService.pasteToSession).not.toHaveBeenCalled();
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls through to a normal finalize when the session is already gone (resubmit fails)', async () => {
+      // pasteToSession returns nothing → resubmit() reports it couldn't nudge.
+      // `clearAllMocks()` doesn't reset a return value set by an earlier test
+      // (only call history), so this is explicit rather than relying on the
+      // vi.fn() factory default.
+      vi.mocked(shellService.pasteToSession).mockReturnValue(undefined);
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: 'OPEN', prUrl: 'https://example.com/pr/1', prNumber: 1, cli: 'gh', readable: true,
+      });
+      withSentinel('## Summary\nShipped the fix and opened the PR.');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+
+      expect(shellService.pasteToSession).toHaveBeenCalledTimes(1);
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
+
+    it('replays a finish() trigger dropped while the merge-gate check was deciding, instead of losing it', async () => {
+      vi.mocked(shellService.pasteToSession).mockReturnValue(999);
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: 'OPEN', prUrl: 'https://example.com/pr/1', prNumber: 1, cli: 'gh', readable: true,
+      });
+      withSentinel('## Summary\nShipped the fix and opened the PR.');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      // Two triggers fire back-to-back with no await between them: the first
+      // (a clean exit) starts the merge-gate decision; the second (a kill
+      // signal racing in right after) is dropped by the `finishing` guard
+      // while the first is still deciding. It must be replayed — not lost —
+      // once the first settles on "not finalizing after all", or the run
+      // would sit forever waiting for a nudge into a session that already died.
+      const p1 = capturedOnExit({ exitCode: 0, killed: false });
+      const p2 = capturedOnExit({ exitCode: 1, killed: true });
+      await settle();
+      await Promise.all([p1, p2]);
+      await spawnPromise;
+
+      expect(shellService.pasteToSession).toHaveBeenCalledTimes(1);
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ success: false })
+      );
+    });
+
+    it('finalizes on the first sentinel with no re-prompt when the PR is already merged', async () => {
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: 'MERGED', prUrl: 'https://example.com/pr/1', prNumber: 1, cli: 'gh', readable: true,
+      });
+      withSentinel('## Summary\nMerged the PR.');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+
+      expect(shellService.pasteToSession).not.toHaveBeenCalled();
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
+
+    it('finalizes on the first sentinel with no re-prompt when the summary states it is deliberately leaving the PR open', async () => {
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: 'OPEN', prUrl: 'https://example.com/pr/1', prNumber: 1, cli: 'gh', readable: true,
+      });
+      withSentinel('## Summary\nA required check is still red after two fix attempts — leaving the PR open for a human.');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+
+      expect(shellService.pasteToSession).not.toHaveBeenCalled();
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
+
+    it('finalizes on the first sentinel with no re-prompt when the forge lookup is unreadable', async () => {
+      vi.mocked(probePrForBranch).mockResolvedValue({
+        prState: null, prUrl: null, prNumber: null, cli: null, readable: false,
+      });
+      withSentinel('## Summary\nShipped the fix and opened the PR.');
+
+      const spawnPromise = runSpawn({ task: openPrTask, workspacePath: '/tmp/ws' });
+      await flushMicrotasks(); // initial watcher arms while quiet — must not self-fire
+
+      sentinelExists = true; // the agent writes .agent-done
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+
+      expect(shellService.pasteToSession).not.toHaveBeenCalled();
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
+
+    it('never probes the forge or re-prompts for a run that never asked for a PR', async () => {
+      withSentinel('## Summary\nDid the audit, no PR needed.');
+
+      const spawnPromise = runSpawn({
+        task: { id: 'task-1', description: 'audit only', metadata: {} },
+        workspacePath: '/tmp/ws',
+      });
+      await flushMicrotasks();
+
+      await capturedOnExit({ exitCode: 0, killed: false });
+      await settle();
+      await spawnPromise;
+
+      expect(probePrForBranch).not.toHaveBeenCalled();
+      expect(shellService.pasteToSession).not.toHaveBeenCalled();
+      expect(agentLifecycle.finalizeAgent).toHaveBeenCalledTimes(1);
+    });
   });
 });

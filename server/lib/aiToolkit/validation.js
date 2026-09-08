@@ -10,7 +10,7 @@ const ALLOWED_SCREENSHOT_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', 
 // Reasoning-effort values accepted by the effort-capable CLI providers. Keep
 // this local because the vendored toolkit must remain self-contained; the
 // runtime mirror lives in server/lib/providerModels.js and the UI mirror lives
-// in client/src/utils/providers.js.
+// in client/src/utils/providerModels.js.
 const PROVIDER_EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
 const providerEffort = z.preprocess(
@@ -96,6 +96,7 @@ export const providerSchema = z.object({
   lightModel: z.string().nullable().optional(),
   mediumModel: z.string().nullable().optional(),
   heavyModel: z.string().nullable().optional(),
+  ultraModel: z.string().nullable().optional(),
   fallbackProvider: z.string().nullable().optional(),
   // Model to run on the fallback provider. The UI sends '' when no model is
   // pinned (fall back to the fallback provider's own default), so allow empty.
@@ -147,6 +148,13 @@ export const providerSchema = z.object({
   // local Ollama daemon — the "Claude Ollama" pattern. Drives model refresh to
   // pull tool-use-capable Ollama models instead of the static Anthropic list.
   ollamaBacked: z.boolean().optional(),
+  // Marks a harness wrapper (OpenCode, and Codex via its native `--oss
+  // --local-provider lmstudio`) whose backend is the LM Studio server on this
+  // machine. Distinct from `ollamaBacked`: a different daemon, a different port,
+  // and — unlike Ollama — a context window that is fixed when the model is
+  // LOADED rather than settable per request, so PortOS prepares nothing before a
+  // spawn (see `localRuntimeNamespace` in ../providerModels.js).
+  lmstudioBacked: z.boolean().optional(),
   // Marks an OpenCode CLI/TUI wrapper for a separately started MTPLX native-MTP
   // server. This is intentionally distinct from `ollamaBacked`: model weights
   // and runtime protocol configuration are not interchangeable.
@@ -178,6 +186,13 @@ export const providerSchema = z.object({
   // exfiltration to a hostile or mistyped host — see
   // endpointGuard.js. Metadata endpoints stay blocked even when true.
   allowCustomEndpoint: z.boolean().optional(),
+  // Pin a Codex CLI/TUI provider to PortOS's own account by appending
+  // `--ignore-user-config` at spawn, so a bridge that re-pointed model routing
+  // in the user's `~/.codex/config.toml` no longer decides where PortOS's runs
+  // go. Default OFF: today's behavior (Codex reads the user's config) is the
+  // one an existing install already relies on, and an override that silently
+  // turned itself on would be its own surprise.
+  ignoreUserConfig: z.boolean().optional(),
   envVars: z.record(z.string()).optional(),
   secretEnvVars: z.array(z.string()).optional(),
   headlessArgs: z.array(z.string()).optional(),

@@ -23,7 +23,8 @@ vi.mock('../../ReviewerPicker', () => ({
 import GlobalConfigControls from './GlobalConfigControls';
 
 const BASE_CONFIG = {
-  type: 'daily',
+  type: 'cron',
+  cronExpression: '0 7 * * *',
   enabled: true,
   providerId: null,
   model: null,
@@ -32,15 +33,17 @@ const BASE_CONFIG = {
   status: {},
 };
 
-function renderControls({ taskMetadata, onUpdate = vi.fn(), taskType = 'feature-ideas', config: extraConfig = {}, setUpdating = () => {} } = {}) {
+// The real `onUpdate` (ScheduleTab's handleUpdateTask) is async, and several
+// handlers here attach a rejection handler to what it returns — so the default
+// mock must resolve a promise, not `undefined`.
+function renderControls({ taskMetadata, onUpdate = vi.fn(async () => {}), taskType = 'feature-ideas', config: extraConfig = {}, setUpdating = () => {}, providers = [] } = {}) {
   render(
     <GlobalConfigControls
       taskType={taskType}
       config={{ ...BASE_CONFIG, taskMetadata, ...extraConfig }}
       onUpdate={onUpdate}
       onTrigger={() => {}}
-      onReset={() => {}}
-      providers={[]}
+      providers={providers}
       apps={[]}
       updating={false}
       setUpdating={setUpdating}
@@ -105,6 +108,17 @@ describe('GlobalConfigControls — After opening PR', () => {
 
   it('keeps the reviewer picker for a legacy reviewLoop task that opens no PR', () => {
     renderControls({ taskMetadata: { useWorktree: true, openPR: false, reviewLoop: true } });
+    expect(screen.getByTestId('reviewer-picker')).toBeInTheDocument();
+  });
+
+  it('keeps the reviewer picker for a claim flow, whose shipped metadata sets neither flag', () => {
+    // A claim PROMPT opens and merges its own PR and runs the reviewers itself,
+    // so the resolved list is operative even though `openPR` and `reviewLoop` are
+    // both false — which is exactly the shipped `claim-work` metadata. Hiding the
+    // picker here leaves a reviewer override that every claim obeys with no
+    // control anywhere that can clear it, while the claim surfaces tell the user
+    // to come here and do precisely that.
+    renderControls({ taskType: 'claim-work', taskMetadata: { useWorktree: false, openPR: false, claimFlow: true } });
     expect(screen.getByTestId('reviewer-picker')).toBeInTheDocument();
   });
 
@@ -263,5 +277,53 @@ describe('GlobalConfigControls — file issues only', () => {
     expect(onUpdate).toHaveBeenCalledWith('module-hygiene', {
       taskMetadata: { useWorktree: true, openPR: false, simplify: false, fileIssues: false },
     });
+  });
+});
+
+describe('GlobalConfigControls — cadence + perpetual', () => {
+  const cadenceSelect = () => screen.getByLabelText('Interval Type');
+
+  it('offers exactly the two cadence variants', () => {
+    renderControls();
+    expect([...cadenceSelect().options].map((o) => o.value)).toEqual(['on-demand', 'cron']);
+  });
+
+  it('toggling Perpetual writes only the flag, leaving the cron cadence intact', async () => {
+    const onUpdate = renderControls({ config: { perpetual: false } });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText('Enable perpetual drain'));
+    });
+    expect(onUpdate).toHaveBeenCalledWith('feature-ideas', { perpetual: true });
+  });
+
+  it('shows a recheck-cadence control only for an ON-DEMAND perpetual task', () => {
+    renderControls({ config: { type: 'on-demand', cronExpression: null, perpetual: true } });
+    expect(screen.getByText('Recheck Cadence')).toBeInTheDocument();
+
+    cleanup();
+    // A cron+perpetual task rechecks on its OWN expression, so it needs none.
+    renderControls({ config: { type: 'cron', cronExpression: '0 7 * * *', perpetual: true } });
+    expect(screen.queryByText('Recheck Cadence')).not.toBeInTheDocument();
+  });
+});
+
+
+describe('GlobalConfigControls — external issue isolation', () => {
+  it('offers text API providers and explains the source policy while retaining an invalid saved pin', async () => {
+    const onUpdate = renderControls({
+      taskType: 'issue-watcher',
+      config: { providerId: 'coding-cli', promptMode: 'runtime-generated' },
+      providers: [
+        { id: 'coding-cli', name: 'Coding CLI', type: 'cli', enabled: true },
+        { id: 'local-api', name: 'Local API', type: 'api', enabled: true },
+        { id: 'another-cli', name: 'Another CLI', type: 'cli', enabled: true },
+      ],
+    });
+    expect(screen.getByRole('option', { name: 'Coding CLI (API provider required)' })).toBeDisabled();
+    expect(screen.getByRole('option', { name: 'Local API' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'Another CLI' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Abuse Guard source settings' })).toHaveAttribute('href', '/models/llms/abuse');
+    await act(async () => { fireEvent.change(screen.getByLabelText('Provider (optional)'), { target: { value: '' } }); });
+    expect(onUpdate).toHaveBeenCalledWith('issue-watcher', { providerId: null, model: null, effort: null });
   });
 });

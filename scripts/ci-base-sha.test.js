@@ -215,3 +215,39 @@ describe('ci.yml server node_modules cache', () => {
     }
   });
 });
+
+describe('ci.yml autofixer workspace install', () => {
+  const jobs = workflowJobs(WORKFLOW);
+
+  /** Every job that resolves the autofixer lockfile. */
+  const installers = Object.entries(jobs)
+    .filter(([, body]) => body.includes('npm ci --prefix autofixer'));
+
+  it('resolves the autofixer lockfile on the job that runs the server suite', () => {
+    // autofixer/ carries its own package.json, its own tracked lockfile, and
+    // its own .npmrc, and `npm run setup` / scripts/ensure-deps.js install it
+    // on every user's machine. When no CI job ran `npm ci` against it, a
+    // lockfile that stopped resolving shipped green and failed at setup time
+    // instead — the static parity checks in dependency-overrides.test.js only
+    // parse the JSON. The server job is the one that already globs
+    // autofixer/*.test.js, so it is where the tree belongs.
+    // Named, so the loop below is never vacuously green on a deleted step.
+    expect(jobs.server).toMatch(/- name: Install autofixer dependencies\n {8}run: npm ci --prefix autofixer/);
+  });
+
+  it('never lets a cache hit skip the resolution it exists to prove', () => {
+    // The server tree is cached and its `npm ci` is skipped on a hit, which is
+    // fine because that job's job is to run tests. This step's whole purpose is
+    // the install, so caching it (or gating it on a cache outcome) would put
+    // the hole straight back. The job-level `server_mode != 'skip'` is what
+    // keeps a docs-only plan from paying for it.
+    for (const [id, body] of installers) {
+      const step = body.match(
+        /- name: Install autofixer dependencies\n(?<between>(?: {8}.*\n)*?) {8}run: npm ci --prefix autofixer/,
+      );
+      expect(step, id).not.toBeNull();
+      expect(step.groups.between, id).not.toMatch(/^ {8}if:/m);
+      expect(body, id).not.toMatch(/path: autofixer\/node_modules/);
+    }
+  });
+});

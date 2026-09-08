@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmod, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { delimiter, join } from 'path';
 import { createProviderService, isOllamaBackedProvider } from './providers.js';
 
 // Temp dir, NOT a cwd-rooted one — see providerStatus.test.js (#3823).
@@ -21,6 +21,50 @@ describe('Provider Service', () => {
 
   afterEach(async () => {
     if (TEST_DATA_DIR) await rm(TEST_DATA_DIR, { recursive: true, force: true });
+  });
+
+  it('shares mode enablement and models while preserving mode-specific arguments, defaults and IDs', async () => {
+    await writeFile(join(TEST_DATA_DIR, 'providers.json'), JSON.stringify({ activeProvider: 'example-tui', providers: {
+      example: { id: 'example', name: 'Example CLI', type: 'cli', command: 'example', enabled: false, models: ['a'], args: ['--print'], defaultModel: 'a' },
+      'example-tui': { id: 'example-tui', name: 'Example TUI', type: 'tui', command: 'example', enabled: true, models: ['b'], args: [], defaultModel: 'b' },
+      remote: { id: 'remote', type: 'api', enabled: false, models: ['remote'] },
+    } }));
+    expect((await providerService.getProviderById('example')).enabled).toBe(true);
+    expect((await providerService.getActiveProvider()).id).toBe('example-tui');
+    await providerService.updateProvider('example-tui', { enabled: false, models: ['c'], args: ['--interactive'], defaultModel: 'c' });
+    expect(await providerService.getProviderById('example')).toMatchObject({ enabled: false, models: ['c'], args: ['--print'], defaultModel: 'c' });
+    expect(await providerService.getProviderById('remote')).toMatchObject({ enabled: false, models: ['remote'] });
+    const catalog = vi.spyOn(providerService, 'fetchProviderModelCatalog').mockResolvedValue({ models: ['fresh'], contextWindows: { fresh: 8192 } });
+    await providerService.refreshProviderModelsBatch(['example-tui']);
+    expect((await providerService.getProviderById('example')).models).toEqual(['fresh']);
+    expect((await providerService.getProviderById('example-tui')).models).toEqual(['fresh']);
+    catalog.mockRestore();
+    await providerService.setActiveProvider('example');
+    expect((await providerService.getActiveProvider()).type).toBe('cli');
+    await providerService.deleteProvider('example-tui');
+    expect(await providerService.getProviderById('example')).toBeNull();
+    expect((await providerService.getActiveProvider()).id).toBe('remote');
+  });
+
+  it.skipIf(process.platform === 'win32')('refreshes Pi models and distinguishes authentication from probe failure', async () => {
+    const command = join(TEST_DATA_DIR, 'pi');
+    const emit = async (text, code = 0) => {
+      await writeFile(command, `#!/usr/bin/env node\nif (process.argv[2] !== '--list-models') process.exit(9);\nconsole.log(${JSON.stringify(text)}); process.exit(${code});\n`);
+      await chmod(command, 0o755);
+    };
+    await emit('provider model context max-out thinking images\nexample model-a 200K 32K yes yes');
+    const provider = await providerService.createProvider({ name: 'Pi test', type: 'cli', command, models: [] });
+    const refreshed = await providerService.refreshProviderModels(provider.id);
+    expect(refreshed.models).toEqual(['example/model-a']);
+    await emit('Temporary transport failure', 1);
+    await expect(providerService.refreshProviderModels(provider.id)).rejects.toThrow('failed');
+    expect((await providerService.getProviderById(provider.id)).models).toEqual(['example/model-a']);
+    await emit('No models available. Use /login to authenticate.');
+    await expect(providerService.refreshProviderModels(provider.id)).rejects.toThrow('no authenticated models');
+    expect((await providerService.getProviderById(provider.id)).models).toEqual(['example/model-a']);
+    expect(await providerService._fetchPiModels({ command })).toEqual([]);
+    await emit('No models available. Use /login to authenticate.', 1);
+    expect(await providerService._fetchPiModels({ command })).toEqual([]);
   });
 
   it('should create a provider', async () => {
@@ -43,6 +87,18 @@ describe('Provider Service', () => {
       temperature: 0.6, thinking: false,
     });
     expect(provider).toMatchObject({ temperature: 0.6, thinking: false });
+  });
+
+  it('preserves the lmstudioBacked marker through creation', async () => {
+    // `createProvider` has an EXPLICIT field list (unlike `updateProvider`'s
+    // spread), so a backend marker it does not name is silently dropped — the
+    // record then resolves no namespace, OpenCode falls through to its own
+    // built-in provider, and model refresh probes the harness instead of the
+    // LM Studio server.
+    const provider = await providerService.createProvider({
+      name: 'Local LM Studio', type: 'cli', command: 'opencode', lmstudioBacked: true,
+    });
+    expect(provider.lmstudioBacked).toBe(true);
   });
 
   it('should get all providers', async () => {
@@ -143,6 +199,7 @@ describe('Provider Service', () => {
       lightModel: 'model-b',
       mediumModel: 'model-a',
       heavyModel: 'model-c',
+      ultraModel: 'model-c',
       fallbackProvider: 'fallback-provider-id',
       fallbackModel: 'fallback-model-id',
       numCtx: 32768,
@@ -322,9 +379,13 @@ describe('Provider Service', () => {
 
       const codex = await providerService.getProviderById('codex');
       expect(codex.models).toEqual([
-        'gpt-5.6-luna',
-        'gpt-5.6-terra',
+        'gpt-6-astra',
         'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+        'gpt-5.5',
+        'gpt-5.4',
+        'gpt-5.4-mini',
         'gpt-5.3-codex-spark',
       ]);
       expect(codex.defaultModel).toBe('gpt-5.6-terra');
@@ -353,9 +414,13 @@ describe('Provider Service', () => {
 
       const codexTui = await providerService.getProviderById('codex-tui');
       expect(codexTui.models).toEqual([
-        'gpt-5.6-luna',
-        'gpt-5.6-terra',
+        'gpt-6-astra',
         'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+        'gpt-5.5',
+        'gpt-5.4',
+        'gpt-5.4-mini',
         'gpt-5.3-codex-spark',
       ]);
       expect(codexTui.defaultModel).toBe('gpt-5.6-terra');
@@ -384,11 +449,52 @@ describe('Provider Service', () => {
       });
 
       const codex = await providerService.getProviderById('codex');
-      expect(codex.models).toEqual([...priorModels, 'gpt-5.3-codex-spark']);
+      expect(codex.models).toEqual([
+        'gpt-6-astra',
+        'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+        'gpt-5.5',
+        'gpt-5.4',
+        'gpt-5.4-mini',
+        'gpt-5.3-codex-spark',
+      ]);
       expect(codex.defaultModel).toBe('gpt-5.6-luna');
       expect(codex.lightModel).toBe('gpt-5.6-sol');
       expect(codex.mediumModel).toBe('gpt-5.6-luna');
       expect(codex.heavyModel).toBe('gpt-5.6-terra');
+    });
+
+    it('widens the 2026-08 seeded Codex catalog to include GPT-6 and GPT-5.4/5.5 models', async () => {
+      const priorModels = ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.3-codex-spark'];
+      await writeProvidersFile({
+        activeProvider: 'codex',
+        providers: {
+          codex: {
+            id: 'codex',
+            name: 'Codex CLI',
+            type: 'cli',
+            command: 'codex',
+            models: [...priorModels],
+            defaultModel: 'gpt-5.6-terra',
+            lightModel: 'gpt-5.6-luna',
+            mediumModel: 'gpt-5.6-terra',
+            heavyModel: 'gpt-5.6-sol',
+          },
+        },
+      });
+
+      const codex = await providerService.getProviderById('codex');
+      expect(codex.models).toEqual([
+        'gpt-6-astra',
+        'gpt-5.6-sol',
+        'gpt-5.6-terra',
+        'gpt-5.6-luna',
+        'gpt-5.5',
+        'gpt-5.4',
+        'gpt-5.4-mini',
+        'gpt-5.3-codex-spark',
+      ]);
     });
 
     it('does not touch non-codex providers', async () => {
@@ -678,6 +784,48 @@ describe('Provider Service', () => {
       expect(antigravity.models).toContain('gemini-3.7-flash-medium');
       expect(antigravity.models).toContain('gemini-3.7-flash-low');
       expect(antigravity.models).toContain('gemini-3.6-flash-high');
+      expect(antigravity.defaultModel).toBe('antigravity-configured-default');
+    });
+
+    it('upgrades a prior-seeded Antigravity model list to include Gemini 3.8 models', async () => {
+      const priorModels = [
+        'antigravity-configured-default',
+        'gemini-3.7-flash-high',
+        'gemini-3.7-flash-medium',
+        'gemini-3.7-flash-low',
+        'gemini-3.6-flash-high',
+        'gemini-3.6-flash-medium',
+        'gemini-3.6-flash-low',
+        'gemini-3.5-flash-high',
+        'gemini-3.5-flash-medium',
+        'gemini-3.5-flash-low',
+        'gemini-3.1-pro-high',
+        'gemini-3.1-pro-low',
+        'claude-sonnet-4-6',
+        'claude-opus-4-6-thinking',
+        'gpt-oss-120b-medium',
+      ];
+      await writeProvidersFile({
+        activeProvider: 'antigravity-cli',
+        providers: {
+          'antigravity-cli': {
+            id: 'antigravity-cli',
+            name: 'Antigravity CLI',
+            type: 'cli',
+            command: 'agy',
+            contextWindow: 1048576,
+            models: [...priorModels],
+            defaultModel: 'antigravity-configured-default',
+            lightModel: 'antigravity-configured-default'
+          }
+        }
+      });
+
+      const antigravity = await providerService.getProviderById('antigravity-cli');
+      expect(antigravity.models).toContain('gemini-3.8-flash-high');
+      expect(antigravity.models).toContain('gemini-3.8-flash-medium');
+      expect(antigravity.models).toContain('gemini-3.8-flash-low');
+      expect(antigravity.models).toContain('gemini-3.7-flash-high');
       expect(antigravity.defaultModel).toBe('antigravity-configured-default');
     });
 
@@ -1264,6 +1412,134 @@ describe('Provider Service', () => {
     });
   });
 
+  describe('Codex model refresh (`codex app-server`)', () => {
+    const writeFakeCodex = async (modelsResponse) => {
+      const path = join(TEST_DATA_DIR, 'fake-codex.js');
+      const script = `#!/usr/bin/env node
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  try {
+    const msg = JSON.parse(line);
+    if (msg.id === 1) {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }) + '\\n');
+    } else if (msg.id === 2) {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 2, result: ${JSON.stringify(modelsResponse)} }) + '\\n');
+    }
+  } catch {}
+});
+`;
+      await writeFile(path, script);
+      await chmod(path, 0o755);
+      return path;
+    };
+
+    it.skipIf(process.platform === 'win32')('persists the live catalog for a Codex CLI provider', async () => {
+      const fakeCodex = await writeFakeCodex({
+        data: [
+          { id: 'gpt-6-astra' },
+          { id: 'gpt-5.6-sol' },
+          { id: 'hidden-model', hidden: true },
+        ],
+      });
+      const p = await providerService.createProvider({
+        name: 'Codex CLI',
+        type: 'cli',
+        command: fakeCodex,
+        models: ['gpt-5.3-codex-spark'],
+        defaultModel: 'gpt-5.3-codex-spark',
+      });
+
+      const updated = await providerService.refreshProviderModels(p.id);
+      expect(updated).not.toBeNull();
+      expect(updated.models).toEqual(['gpt-6-astra', 'gpt-5.6-sol']);
+    });
+
+    it.skipIf(process.platform === 'win32')('refreshes a Codex TUI provider too', async () => {
+      const fakeCodex = await writeFakeCodex({
+        models: [
+          { id: 'gpt-6-astra' },
+          { id: 'gpt-5.6-terra' },
+        ],
+      });
+      const p = await providerService.createProvider({
+        name: 'Codex TUI',
+        type: 'tui',
+        command: fakeCodex,
+        models: ['gpt-5.3-codex-spark'],
+        defaultModel: 'gpt-5.3-codex-spark',
+      });
+
+      const updated = await providerService.refreshProviderModels(p.id);
+      expect(updated).not.toBeNull();
+      expect(updated.models).toEqual(['gpt-6-astra', 'gpt-5.6-terra']);
+    });
+
+    it.skipIf(process.platform === 'win32')('refreshes a shipped codex-tui repointed at a wrapper command', async () => {
+      const fakeCodex = await writeFakeCodex({
+        data: [{ id: 'gpt-6-astra' }, { id: 'gpt-5.6-sol' }],
+      });
+      const wrapper = join(TEST_DATA_DIR, 'codex-wrap');
+      await writeFile(wrapper, `#!/bin/sh\nexec "${fakeCodex}" "$@"\n`);
+      await chmod(wrapper, 0o755);
+
+      await writeFile(join(TEST_DATA_DIR, 'providers.json'), JSON.stringify({
+        activeProvider: 'codex-tui',
+        providers: {
+          'codex-tui': {
+            id: 'codex-tui', name: 'Codex TUI', type: 'tui',
+            command: wrapper, models: ['gpt-5.3-codex-spark'], defaultModel: 'gpt-5.3-codex-spark',
+          },
+        },
+      }, null, 2));
+
+      const updated = await providerService.refreshProviderModels('codex-tui');
+      expect(updated, 'the id clause on the TUI arm matches').not.toBeNull();
+      expect(updated.models).toEqual(['gpt-6-astra', 'gpt-5.6-sol']);
+    });
+
+    it.skipIf(process.platform !== 'win32')('resolves the Windows codex.cmd shim before refreshing', async () => {
+      const fakeCodex = await writeFakeCodex({ data: [{ id: 'gpt-6-astra' }] });
+      const shimDir = await mkdtemp(join(tmpdir(), 'portos-codex-shim-'));
+      const previousPath = process.env.PATH;
+      try {
+        const shim = join(shimDir, 'codex.cmd');
+        await writeFile(shim, `@echo off\r\nnode "${fakeCodex}" %*\r\n`);
+        process.env.PATH = `${shimDir}${delimiter}${previousPath || ''}`;
+
+        const p = await providerService.createProvider({
+          name: 'Codex TUI', type: 'tui', command: 'codex',
+          models: ['gpt-5.3-codex-spark'], defaultModel: 'gpt-5.3-codex-spark',
+        });
+        const updated = await providerService.refreshProviderModels(p.id);
+        expect(updated.models).toEqual(['gpt-6-astra']);
+      } finally {
+        process.env.PATH = previousPath;
+        await rm(shimDir, { recursive: true, force: true });
+      }
+    });
+
+    it('reports a failed codex app-server probe as a refresh failure, leaving the stored list intact', async () => {
+      const stored = ['gpt-6-astra', 'gpt-5.6-sol'];
+      const p = await providerService.createProvider({
+        name: 'Codex CLI',
+        type: 'cli',
+        command: '/nonexistent/path/to/codex',
+        models: [...stored],
+        defaultModel: 'gpt-6-astra',
+      });
+
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const err = await providerService.refreshProviderModels(p.id).catch(e => e);
+      errSpy.mockRestore();
+
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toMatch(/codex app-server' failed/);
+      const after = await providerService.getProviderById(p.id);
+      expect(after.models).toEqual(stored);
+    });
+  });
+
   describe('MTPLX model refresh', () => {
     afterEach(() => {
       vi.unstubAllGlobals();
@@ -1293,6 +1569,132 @@ describe('Provider Service', () => {
       for (const [url] of fetchSpy.mock.calls) {
         expect(url).toBe('http://127.0.0.1:8000/v1/models');
       }
+    });
+
+    /**
+     * The cached-checkpoint half of that refresh.
+     *
+     * MTPLX loads ONE checkpoint per process and reports only that one, under
+     * the slug its launch line minted — so clicking "Refresh Models" after
+     * pulling a second checkpoint kept answering with the same lone id, and the
+     * new weights were unreachable from the provider's model list. The host
+     * injects the on-disk listing (`services/mtplxServerManager.js`); this
+     * directory stays self-contained.
+     *
+     * Driven through `refreshProviderModels` — the boundary the route calls —
+     * so the PERSISTED record is what proves the behavior.
+     */
+    describe('cached checkpoints the daemon is not serving', () => {
+      const SERVED = 'mtplx-qwen38-27b-optimized-speed';
+      const CACHED = 'wang-yang/Ornith-1.0-35B-MTPLX';
+      const MTPLX_ENDPOINT = 'http://127.0.0.1:8000/v1';
+
+      let cachedModelIds;
+      let hostedService;
+
+      /** The listing a running MTPLX answers with. */
+      const servesModels = (ids) => vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: ids.map((id) => ({ id, context_length: 262144 })) }),
+      }));
+
+      const seedProvider = (shape = {}) => hostedService.createProvider({
+        name: 'MTPLX provider',
+        type: 'cli',
+        command: 'opencode',
+        mtplxBacked: true,
+        endpoint: MTPLX_ENDPOINT,
+        models: [SERVED],
+        ...shape,
+      });
+
+      beforeEach(() => {
+        // Keyed on the endpoint, the way the real host predicate is: every
+        // provider that is not MTPLX's gets `null` and an untouched probe.
+        cachedModelIds = vi.fn(async (provider) => (
+          provider.endpoint === MTPLX_ENDPOINT ? [SERVED, CACHED] : null
+        ));
+        hostedService = createProviderService({
+          dataDir: TEST_DATA_DIR,
+          providersFile: 'providers.json',
+          cachedModelIds,
+        });
+      });
+
+      // Two rows, because there are two dispatch arms: the `mtplxBacked` fetcher
+      // (which the test above already pins BOTH OpenCode modes reach) and the
+      // generic `api` branch, which the marker never reaches.
+      it.each([
+        ['an OpenCode wrapper', { type: 'cli', command: 'opencode', mtplxBacked: true }],
+        ['the unmarked API record', { type: 'api' }],
+      ])('adds them to what %s is serving', async (_label, shape) => {
+        servesModels([SERVED]);
+        const provider = await seedProvider(shape);
+        const updated = await hostedService.refreshProviderModels(provider.id);
+        // Served first — it is the one id live right now, so it stays the
+        // natural default — then what the daemon has on disk but has not loaded.
+        expect(updated.models).toEqual([SERVED, CACHED]);
+        // Only the served entry declares a window; guessing one for an unloaded
+        // checkpoint would be worse than the caller's own fallback.
+        expect(updated.modelContextWindows).toEqual({ [SERVED]: 262144 });
+      });
+
+      // The served id and the cached ids are DIFFERENT namespaces — MTPLX
+      // answers as a slug its launch line minted, its cache yields HF repo ids —
+      // and the slug is the shipped record's `defaultModel`. A stopped daemon
+      // must not cost the provider its pin, so a FAILED probe keeps what the
+      // record already listed. (A successful one stays authoritative: the
+      // delisting cases above still prune.)
+      it('reports the cache when the daemon is stopped, keeping the pin it can no longer probe', async () => {
+        const provider = await seedProvider({ defaultModel: SERVED });
+        vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')));
+        const updated = await hostedService.refreshProviderModels(provider.id);
+        expect(updated.models).toEqual([SERVED, CACHED]);
+        expect(updated.models).toContain(updated.defaultModel);
+      });
+
+      // The mirror of the case above: when the endpoint DOES answer, its list is
+      // the truth, so an id it dropped leaves the record.
+      it('drops a delisted model when the daemon answers', async () => {
+        const provider = await seedProvider({ models: [SERVED, 'retired-checkpoint'] });
+        servesModels([SERVED]);
+        const updated = await hostedService.refreshProviderModels(provider.id);
+        expect(updated.models).toEqual([SERVED, CACHED]);
+      });
+
+      it('rethrows the probe failure when nothing is cached', async () => {
+        // The throw-don't-degrade posture `_refreshAPIProviderModels` documents:
+        // with no cache to fall back on, an unreachable endpoint must not
+        // persist a plausible-looking list over the one already stored.
+        const provider = await seedProvider({});
+        cachedModelIds.mockResolvedValue([]);
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 503 }));
+        await expect(hostedService.refreshProviderModels(provider.id)).rejects.toThrow(/503/);
+        expect((await hostedService.getProviderById(provider.id)).models).toEqual([SERVED]);
+      });
+
+      // A rejection carrying a falsy value is still a failure. Keyed on the
+      // outcome rather than the error's truthiness, or this probe reads as a
+      // success whose catalog is `undefined` — swallowed instead of rethrown,
+      // and treated as authoritative so the record's own ids get pruned.
+
+      it('leaves a provider the host does not claim exactly as the endpoint answered', async () => {
+        servesModels(['gpt-example']);
+        const provider = await hostedService.createProvider({
+          name: 'Other API', type: 'api', endpoint: 'https://api.example.com/v1', models: [],
+        });
+        expect((await hostedService.refreshProviderModels(provider.id)).models).toEqual(['gpt-example']);
+      });
+
+      it('survives a throwing probe rather than failing the refresh', async () => {
+        // `mtplx models` runs a subprocess, so it can time out — a refresh that
+        // still has the endpoint's answer should report it.
+        servesModels([SERVED]);
+        const provider = await seedProvider({});
+        cachedModelIds.mockRejectedValue(new Error('`mtplx models` timed out'));
+        expect((await hostedService.refreshProviderModels(provider.id)).models).toEqual([SERVED]);
+      });
     });
   });
 

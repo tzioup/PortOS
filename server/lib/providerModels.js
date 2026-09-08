@@ -1,9 +1,19 @@
 /**
  * Shared sentinel and helpers for provider model resolution.
- * Mirrors the constants in client/src/utils/providers.js — keep in sync.
+ *
+ * Pure leaf (no Node built-ins, nothing outside server/lib), so the browser
+ * imports it: client/src/utils/providerModels.js re-exports the sentinels,
+ * effort ladders and the Antigravity split, and delegates its own ladder
+ * resolution to `effortLevelsForProvider` / `clampEffortToLadder`. The
+ * `isXProvider` predicates are still copied in client/src/utils/providerTypes.js
+ * — keep those in sync. One caveat the purity guard cannot see: the Bedrock /
+ * Claude-argv resolvers below default to `process.env`, so they are server-only
+ * — never call them from the browser (they tree-shake out unless something does).
  */
 
 import { gatewayIdForProvider, isGatewayNamespace } from './providerGateways.js';
+import { isLocalInstanceEndpoint } from './localEndpoint.js';
+import { isPlainObject } from './objects.js';
 
 export const CODEX_CONFIGURED_DEFAULT = 'codex-configured-default';
 export const ANTIGRAVITY_CONFIGURED_DEFAULT = 'antigravity-configured-default';
@@ -76,12 +86,16 @@ export const resolveCliModel = (model) => isConfiguredDefaultModel(model) ? null
 // verified against claude CLI v2.1.x (`--help`), current Codex CLI config
 // values (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, plus
 // model-gated `ultra`) and agy
-// (`--help`: "Reasoning effort for the current CLI session (low|medium|high)"). Mirrored in
-// client/src/utils/providers.js — keep in sync
-// (`providerModels.mirror.test.js` fails when the two copies drift).
+// (`--help`: "Reasoning effort for the current CLI session (low|medium|high)").
+// Re-exported by client/src/utils/providerModels.js, whose own
+// `effortLevelsForProvider` layers the server-published `effortLevels` /
+// `effortLevelsByModel` fields on top of these ladders.
 //
 // Codex Ultra adds automatic task delegation on the models that advertise it.
 // Keep it model-gated: older Codex models and Luna top out at `max`.
+//
+// `minimal` is model-gated the other way — it is a gpt-5-era rung that the
+// gpt-6 family dropped. See CODEX_NO_MINIMAL_MODEL_RE below.
 //
 // `none` is a real codex variant but is deliberately NOT offered: it means "do
 // not reason at all", which no PortOS effort control should be able to select.
@@ -119,11 +133,32 @@ export const EFFORT_LEVELS = Object.freeze([...new Set([
   ...CURSOR_EFFORT_LEVELS,
 ])]);
 
-const CODEX_ULTRA_MODELS = new Set(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra']);
+const CODEX_ULTRA_MODELS = new Set(['gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-6-astra']);
 
-const codexEffortLevelsForModel = (model) => CODEX_ULTRA_MODELS.has(String(model || '').trim().toLowerCase())
-  ? CODEX_ULTRA_EFFORT_LEVELS
-  : CODEX_EFFORT_LEVELS;
+// Models that REJECT `minimal`. The gpt-6 family dropped the rung: codex
+// against `gpt-6-astra` answers HTTP 400 `unsupported_value` — "'minimal' is
+// not supported with the 'gpt-6-astra' model. Supported values are: 'low',
+// 'medium', 'high', 'xhigh', and 'max'." — so a picker that offers it hands the
+// user a level whose only outcome is a failed run.
+//
+// Matched as a FAMILY prefix rather than an id list, deliberately: the two
+// failure directions are not symmetric. Missing a new gpt-6/7 model ships that
+// 400 again, while over-matching a model that does still accept `minimal` costs
+// it only its weakest rung (a stored `minimal` clamps up to `low`).
+const CODEX_NO_MINIMAL_MODEL_RE = /^gpt-[6-9]([.-]|$)/;
+
+const withoutMinimal = (levels) => Object.freeze(levels.filter((l) => l !== 'minimal'));
+const CODEX_EFFORT_LEVELS_NO_MINIMAL = withoutMinimal(CODEX_EFFORT_LEVELS);
+const CODEX_ULTRA_EFFORT_LEVELS_NO_MINIMAL = withoutMinimal(CODEX_ULTRA_EFFORT_LEVELS);
+
+const codexEffortLevelsForModel = (model) => {
+  const id = String(model || '').trim().toLowerCase();
+  const ultra = CODEX_ULTRA_MODELS.has(id);
+  if (CODEX_NO_MINIMAL_MODEL_RE.test(id)) {
+    return ultra ? CODEX_ULTRA_EFFORT_LEVELS_NO_MINIMAL : CODEX_EFFORT_LEVELS_NO_MINIMAL;
+  }
+  return ultra ? CODEX_ULTRA_EFFORT_LEVELS : CODEX_EFFORT_LEVELS;
+};
 
 // ---------------------------------------------------------------------------
 // Antigravity base-model ↔ effort-suffix split.
@@ -139,7 +174,7 @@ const codexEffortLevelsForModel = (model) => CODEX_ULTRA_MODELS.has(String(model
 // errors with `gemini-3.1-pro has no "medium" effort (available: low, high)`.
 // So the tiers a base model offers are derived from the provider's own model
 // catalog rather than assumed to be the full low/medium/high ladder.
-// Mirrored in client/src/utils/providers.js — keep in lockstep.
+// Re-exported by client/src/utils/providerModels.js.
 // ---------------------------------------------------------------------------
 
 const ANTIGRAVITY_EFFORT_SUFFIX_RE = new RegExp(`-(${ANTIGRAVITY_EFFORT_LEVELS.join('|')})$`);
@@ -274,7 +309,7 @@ export function isOpencodeProvider(provider) {
  * True when a provider is Kimi-Code-flavored — the shipped `kimi-cli`/`kimi-tui`
  * ids or any provider whose launch command basename is `kimi` (path/exe tolerant).
  * The single home for the kimi signature, same posture as `isCodexProvider`.
- * Mirrored in client/src/utils/providers.js — keep in lockstep.
+ * Mirrored in client/src/utils/providerTypes.js — keep in lockstep.
  * @param {{id?:string, command?:string}|null|undefined} provider
  * @returns {boolean}
  */
@@ -290,7 +325,7 @@ export function isKimiProvider(provider) {
  * companion to `isAntigravityCommand` in antigravity.js; lives here (rather
  * than there) so `effortLevelsForProvider` can key on it without this
  * dependency-light module importing a sibling. Mirrored in
- * client/src/utils/providers.js — keep in lockstep.
+ * client/src/utils/providerTypes.js — keep in lockstep.
  * @param {{id?:string, command?:string}|null|undefined} provider
  * @returns {boolean}
  */
@@ -313,7 +348,7 @@ export function isAntigravityProvider(provider) {
  *
  * Deliberately never matches a bare `cursor` command: that is Cursor's GUI
  * editor launcher, not the agent binary (see cursor.js).
- * Mirrored in client/src/utils/providers.js — keep in lockstep.
+ * Mirrored in client/src/utils/providerTypes.js — keep in lockstep.
  * @param {{id?:string, command?:string}|null|undefined} provider
  * @returns {boolean}
  */
@@ -384,6 +419,7 @@ export function effortLevelsForProvider(provider, model = null) {
     if (perModel === null) return ANTIGRAVITY_EFFORT_LEVELS;
     return perModel.length ? perModel : null;
   }
+  if (commandBasename(provider.command) === 'pi') return ['low', 'medium', 'high', 'xhigh', 'max'];
   if (isCursorProvider(provider)) return CURSOR_EFFORT_LEVELS;
   if (isGrokProvider(provider)) return GROK_EFFORT_LEVELS;
   if (isClaudeProvider(provider)) return CLAUDE_EFFORT_LEVELS;
@@ -411,9 +447,22 @@ const EFFORT_RANK = Object.freeze(['minimal', 'low', 'medium', 'high', 'xhigh', 
  * @returns {string|null}
  */
 export function resolveCliEffort(effort, provider, model = null) {
-  if (!effort) return null;
-  const levels = effortLevelsForProvider(provider, model);
-  if (!levels) return null;
+  return clampEffortToLadder(effort, effortLevelsForProvider(provider, model));
+}
+
+/**
+ * The clamp behind `resolveCliEffort`, over an explicit ladder: the effort
+ * itself when `levels` has it, else the nearest supported level below it, else
+ * the ladder's weakest — or null when there is no effort, no ladder, or the
+ * value is not an effort at all. The client's `resolveCliEffort` clamps its own
+ * ladder (which can come from the server-published fields) through this, so
+ * the two ends can't rank the rungs differently.
+ * @param {string|null|undefined} effort
+ * @param {readonly string[]|null|undefined} levels
+ * @returns {string|null}
+ */
+export function clampEffortToLadder(effort, levels) {
+  if (!effort || !levels) return null;
   if (levels.includes(effort)) return effort;
   const requested = EFFORT_RANK.indexOf(effort);
   if (requested === -1) return null; // not an effort value at all
@@ -436,7 +485,9 @@ export const CODEX_EFFORT_KEY = 'model_reasoning_effort';
 // provider args gets a SECOND, injected `--effort <level>` appended. Grok's
 // parser accepts the duplicate and takes the last one, so their explicit pin
 // would be silently overridden — the exact opposite of the contract below.
-const EFFORT_FLAG_NAMES = Object.freeze(['--effort', '--reasoning-effort']);
+// Pi's --thinking is also a value-taking effort pin; shared stripping keeps
+// per-run overrides consistent when switching providers.
+const EFFORT_FLAG_NAMES = Object.freeze(['--effort', '--reasoning-effort', '--thinking']);
 
 /**
  * True when the user has already baked an effort override into the provider's
@@ -483,6 +534,7 @@ export function hasEffortFlag(args) {
 export function buildEffortArgs(effort, provider, existingArgs = [], model = null) {
   const effectiveEffort = resolveCliEffort(effort, provider, model);
   if (!effectiveEffort || hasEffortFlag(existingArgs)) return [];
+  if (commandBasename(provider?.command) === 'pi') return ['--thinking', effectiveEffort];
   if (isCursorProvider(provider)) return []; // rides `--model`, not a flag — see above
   return isCodexProvider(provider)
     ? ['-c', `${CODEX_EFFORT_KEY}=${effectiveEffort}`]
@@ -601,6 +653,27 @@ export function isOpencodeCommand(command) {
   return commandBasename(command) === 'opencode';
 }
 
+/**
+ * The OpenCode agent a `no-tool` public-review stage runs as (`opencode run
+ * --agent …`). `plan` is OpenCode's OWN built-in read-only agent, chosen over a
+ * PortOS-declared one so the stage never depends on a custom agent definition
+ * being accepted by whatever OpenCode version is installed.
+ *
+ * It is a belt, not the braces: `hardenOpencodeConfigForNoTool`
+ * (`opencodeConfig.js`) still empties this agent's tool map, so a future
+ * OpenCode that widens `plan` cannot widen the stage. Lives HERE rather than
+ * beside that function because `providerVendors.js` — which passes the flag —
+ * must not import `opencodeConfig.js`; doing so pulls `ports.js` in behind it
+ * and breaks a suite that partially mocks it.
+ */
+export const OPENCODE_PUBLIC_REVIEW_AGENT = 'plan';
+
+/**
+ * OpenCode's built-in tool-enabled agent — the one an attachable Stage 3
+ * session runs as (`providerVendors.js`) and the one `hardenOpencodeConfigForNoTool`
+ * must still empty. Homed here for the same import-graph reason as above.
+ */
+export const OPENCODE_BUILD_AGENT = 'build';
 
 /**
  * OpenCode addresses models as `provider/model` (e.g. `ollama/qwen2.5:7b`). The
@@ -617,7 +690,7 @@ export function isOpencodeCommand(command) {
  * already-qualified id (`openai/gpt-4o`, `anthropic/claude-sonnet`), and blindly
  * prefixing `ollama/` would route it to the wrong backend. No-op for
  * non-local / non-OpenCode providers and empty models.
- * @param {{command?:string, ollamaBacked?:boolean, mtplxBacked?:boolean, llamaBacked?:boolean, vllmBacked?:boolean, sglangBacked?:boolean, orcarouterBacked?:boolean}} provider
+ * @param {{command?:string, ollamaBacked?:boolean, lmstudioBacked?:boolean, mtplxBacked?:boolean, llamaBacked?:boolean, vllmBacked?:boolean, sglangBacked?:boolean, orcarouterBacked?:boolean}} provider
  * @param {string|null|undefined} model
  * @returns {string|null|undefined}
  */
@@ -644,11 +717,12 @@ export function prefixOpencodeModel(provider, model) {
  * opted into one. Structural markers avoid deriving a backend from an editable
  * display name or endpoint and preserve the legacy Ollama outcome if a malformed
  * record carries both markers.
- * @param {{ollamaBacked?:boolean, mtplxBacked?:boolean, llamaBacked?:boolean, vllmBacked?:boolean, sglangBacked?:boolean, gatewayBacked?:string, orcarouterBacked?:boolean}|null|undefined} provider
- * @returns {'ollama'|'mtplx'|'llama'|'vllm'|'sglang'|string|null}
+ * @param {{ollamaBacked?:boolean, lmstudioBacked?:boolean, mtplxBacked?:boolean, llamaBacked?:boolean, vllmBacked?:boolean, sglangBacked?:boolean, gatewayBacked?:string, orcarouterBacked?:boolean}|null|undefined} provider
+ * @returns {'ollama'|'lmstudio'|'mtplx'|'llama'|'vllm'|'sglang'|string|null}
  */
 export function getOpencodeLocalProviderNamespace(provider) {
   if (provider?.ollamaBacked === true) return 'ollama';
+  if (provider?.lmstudioBacked === true) return 'lmstudio';
   if (provider?.mtplxBacked === true) return 'mtplx';
   if (provider?.llamaBacked === true) return 'llama';
   if (provider?.vllmBacked === true) return 'vllm';
@@ -657,6 +731,162 @@ export function getOpencodeLocalProviderNamespace(provider) {
   // carrying both a local marker and a gateway marker keeps its legacy local
   // outcome, exactly as the old if-chain did with `orcarouterBacked`.
   return gatewayIdForProvider(provider);
+}
+
+/**
+ * The namespace above, but only when it names a LOCAL daemon — a hosted gateway
+ * (`providerGateways.js`) is an OpenCode namespace and a remote API, so every
+ * consumer asking "is there a daemon on this machine behind this provider?"
+ * has to exclude it.
+ *
+ * That exclusion was hand-written at three sites (`isLocalBackedClaude` in
+ * `cliChildEnv.js`, `localRuntimeKind` in `localProviderRuntime.js`, and the
+ * OpenCode public-review recipe in `providerVendors.js`), which is one more
+ * than the `orcarouterBacked` → `providerGateways.js` sweep was meant to leave
+ * behind — so the composed predicate lives here, beside the namespace resolver
+ * it wraps.
+ *
+ * @param {object|null|undefined} provider
+ * @returns {'ollama'|'lmstudio'|'mtplx'|'llama'|'vllm'|'sglang'|null}
+ */
+export function localRuntimeNamespace(provider) {
+  const namespace = getOpencodeLocalProviderNamespace(provider);
+  return namespace && !isGatewayNamespace(namespace) ? namespace : null;
+}
+
+/**
+ * The Codex CLI's own `--local-provider` values, mapped from PortOS's
+ * local-runtime marker axis (`localRuntimeNamespace` in providerModels.js).
+ *
+ * Codex 0.153.0+ ships `--oss` / `--local-provider <lmstudio|ollama>`, so
+ * running the Codex harness on a local model is a pair of flags rather than a
+ * rewrite of the user's `~/.codex/config.toml` — the flags are per-invocation
+ * and leave every other `codex` run on the machine untouched.
+ *
+ * Deliberately a TABLE, not a passthrough: PortOS's marker axis carries five
+ * local runtimes (ollama / mtplx / llama / vllm / sglang) and Codex serves two
+ * of them by name. Forwarding an unmapped namespace would hand codex a value it
+ * rejects, and forwarding nothing would silently run the record against the
+ * OpenAI cloud — which is why `codexUnsupportedLocalRuntime` below exists.
+ *
+ * Both of Codex's values are mapped: `lmstudio` joined the axis with the
+ * `lmstudioBacked` marker (#6309). The remaining three (mtplx / vllm / sglang)
+ * have no Codex spelling at all, which is what `codexUnsupportedLocalRuntime`
+ * below is for.
+ */
+export const CODEX_OSS_LOCAL_PROVIDERS = Object.freeze({ ollama: 'ollama', lmstudio: 'lmstudio' });
+
+/**
+ * The first Codex CLI release that ships `--oss` / `--local-provider`. Used
+ * only to NAME the requirement in a prerequisite finding — the gate itself is a
+ * `codex exec --help` flag probe (`services/codexOssSupport.js`), because a
+ * version string is a proxy for the contract and the help text IS the contract.
+ */
+export const CODEX_OSS_MIN_VERSION = '0.153.0';
+
+/**
+ * The `--local-provider` value for `provider`, or `null` when this record is not
+ * backed by a local runtime Codex can serve.
+ * @param {object|null|undefined} provider
+ * @returns {string|null}
+ */
+export function codexOssLocalProvider(provider) {
+  const namespace = localRuntimeNamespace(provider);
+  return (namespace && CODEX_OSS_LOCAL_PROVIDERS[namespace]) || null;
+}
+
+/**
+ * The local runtime this codex record is marked with but Codex cannot serve
+ * (`vllm`, `sglang`, …), or `null`. A definite negative: the marker is on the
+ * record, and no credential or config makes `--local-provider vllm` exist. The
+ * prerequisite layer turns it into a finding rather than letting the row spawn
+ * against the OpenAI cloud while the card claims it is local.
+ * @param {object|null|undefined} provider
+ * @returns {string|null}
+ */
+export function codexUnsupportedLocalRuntime(provider) {
+  const namespace = localRuntimeNamespace(provider);
+  return namespace && !CODEX_OSS_LOCAL_PROVIDERS[namespace] ? namespace : null;
+}
+
+/**
+ * Parse a stored `OPENCODE_CONFIG_CONTENT` value, or null when it is absent or
+ * no longer valid JSON (a hand-edited config tells us nothing, so every caller
+ * falls back to its own default rather than guessing).
+ *
+ * Shared because four call sites read the same variable and must agree on what
+ * counts as unusable: `opencodeConfig.js`'s merge base, `localProviderRuntime.js`'s
+ * endpoint lookup, `cliChildEnv.js`'s public-review allowlist, and the locality
+ * predicate below.
+ *
+ * @param {unknown} value
+ * @returns {object|null}
+ */
+export function parseOpencodeConfigContent(value) {
+  if (typeof value !== 'string' || value === '') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every provider endpoint an OpenCode config object declares is on this machine.
+ *
+ * This is the ONE rule two public-review sites must not disagree about, which is
+ * why it lives here rather than being spelled out at each of them:
+ *
+ *   - `providerVendors.js` decides whether an OpenCode wrapper may run the
+ *     tool-free gate at all;
+ *   - `cliChildEnv.js` decides whether `OPENCODE_CONFIG_CONTENT` survives the
+ *     public-review env allowlist.
+ *
+ * If the first says yes and the second says no, the stage still spawns — but
+ * with the hardened config stripped, so OpenCode falls back to reading the
+ * user's own `~/.config/opencode`, tools and MCP servers and all, while every
+ * signal still reports an enforced tool-free gate. A remote `baseURL` inside an
+ * otherwise `ollamaBacked` provider is exactly that shape, and the marker alone
+ * cannot see it.
+ *
+ * `requireDeclaration` is the one place the two callers legitimately differ, and
+ * it is about PROVENANCE, not locality:
+ *
+ *   - A provider RECORD storing a config with no `provider` entry has relocated
+ *     nothing — the builder still adds the canonical per-namespace entry, all of
+ *     which are loopback — so that is vacuously local (the default).
+ *   - The env allowlist sees a bare string that may be ambient rather than the
+ *     config PortOS just built for this spawn. A value declaring no endpoint is
+ *     not one we produced for an eligible provider, so it passes
+ *     `requireDeclaration: true` and is dropped with every other inherited var.
+ *
+ * The locality rule itself — every declared endpoint is on this machine — is
+ * identical for both, which is what keeps eligibility and the allowlist in step.
+ * Absent config (`null`) is never local: there is nothing to keep.
+ *
+ * @param {object|null|undefined} config - a parsed OpenCode config
+ * @param {{requireDeclaration?: boolean}} [options]
+ * @returns {boolean}
+ */
+export function opencodeConfigIsLocalOnly(config, { requireDeclaration = false } = {}) {
+  if (!isPlainObject(config)) return false;
+  const declared = isPlainObject(config.provider) ? Object.values(config.provider) : [];
+  if (declared.length === 0) return !requireDeclaration;
+  return declared.every((entry) => isLocalInstanceEndpoint(entry?.options?.baseURL));
+}
+
+/**
+ * The same question asked of a PROVIDER RECORD, before its config has been
+ * built. A record storing no config — or an unparseable one, which the builder
+ * discards too — runs against those same canonical defaults.
+ *
+ * @param {object|null|undefined} provider
+ * @returns {boolean}
+ */
+export function opencodeProviderIsLocalOnly(provider) {
+  const stored = parseOpencodeConfigContent(provider?.envVars?.OPENCODE_CONFIG_CONTENT);
+  return stored === null || opencodeConfigIsLocalOnly(stored);
 }
 
 /**

@@ -1,3 +1,6 @@
+import { INTERVAL_OPTIONS } from '../../../server/lib/autonomousJobIntervals.js';
+export { ON_DEMAND_INTERVAL } from '../../../server/lib/autonomousJobIntervals.js';
+
 export const CRON_PRESETS = [
   { value: '*/15 * * * *', label: 'Every 15 min' },
   { value: '0 * * * *', label: 'Every hour' },
@@ -21,6 +24,38 @@ const DOW_MAP = { '0': 'Sun', '1': 'Mon', '2': 'Tue', '3': 'Wed', '4': 'Thu', '5
 // the time picker's fallback and every call site's seed cron stay in lockstep.
 export const DEFAULT_TIME = '07:00';
 export const DEFAULT_CRON = '0 7 * * *';
+
+// Weekly default for a Monday-morning cadence (mirrors the server's
+// DEFAULT_WEEKLY_CRON), so a task converted from a weekly cadence never lands
+// on a weekend.
+export const DEFAULT_WEEKLY_CRON = '0 7 * * 1';
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+const WEEK_MS = 7 * DAY_MS;
+
+/**
+ * Approximate a numeric interval as a 5-field cron expression. Mirrors the
+ * server's `cronFromIntervalMs` (server/services/taskScheduleConstants.js) so a
+ * numeric cadence picker and the server-side migration derive the SAME
+ * expression — keep the two in lockstep.
+ */
+export function cronFromIntervalMs(intervalMs) {
+  const ms = Number(intervalMs);
+  if (!Number.isFinite(ms) || ms <= 0) return DEFAULT_CRON;
+  if (ms === WEEK_MS) return DEFAULT_WEEKLY_CRON;
+  if (ms >= DAY_MS) return DEFAULT_CRON;
+  if (ms >= HOUR_MS) {
+    const hours = Math.round(ms / HOUR_MS);
+    if (hours <= 1) return '0 * * * *';
+    // Only an even divisor of 24 lays out evenly across a day.
+    const step = [2, 3, 4, 6, 8, 12].find((h) => h >= hours) || 12;
+    return `0 */${step} * * *`;
+  }
+  const minutes = Math.min(59, Math.max(1, Math.round(ms / MINUTE_MS)));
+  return `*/${minutes} * * * *`;
+}
 
 // Sunday-first, matching cron's day-of-week numbering (0 = Sunday).
 export const WEEKDAYS = [
@@ -246,19 +281,6 @@ export function describeCron(expr) {
   return segments.join(' ');
 }
 
-// Interval-mode cadences for autonomous jobs — the client mirror of
-// `INTERVAL_OPTIONS` in `server/services/autonomousJobs/constants.js`. Values
-// must stay in lockstep with `resolveIntervalMs` there, since the server
-// recomputes `intervalMs` from whichever value a picker submits. Lives here
-// rather than in a component so a second job-scheduling surface doesn't fork
-// its own copy of the list.
-export const JOB_INTERVAL_OPTIONS = [
-  { value: 'hourly', label: 'Every Hour' },
-  { value: 'every-2-hours', label: 'Every 2 Hours' },
-  { value: 'every-4-hours', label: 'Every 4 Hours' },
-  { value: 'every-8-hours', label: 'Every 8 Hours' },
-  { value: 'daily', label: 'Daily' },
-  { value: 'weekly', label: 'Weekly' },
-  { value: 'biweekly', label: 'Every 2 Weeks' },
-  { value: 'monthly', label: 'Monthly' }
-];
+// Both autonomous-job pickers use the same vocabulary as server validation and
+// duration resolution. Keep the client projection's existing value/label shape.
+export const JOB_INTERVAL_OPTIONS = INTERVAL_OPTIONS.map(({ value, label }) => ({ value, label }));

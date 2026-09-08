@@ -3,8 +3,8 @@
     "accessibility": "372916803f32b82da38a5b2130a54baf",
     "api-contract": "cf02b10a5993baf473e0d320771f26b6",
     "branch-cleanup": "8fdeb4acc2749816a47ca318b6602721",
-    "branch-reconcile": "16479f4b64395103fd222dc9608830b1",
-    "claim-issue": "78325cbcfb0e5698018fcd16b3aa8b49",
+    "branch-reconcile": "44281269863b3133696fdebe9b558256",
+    "claim-issue": "5600fde65e31874bd96c3ad83ce72a92",
     "claim-issue-gitlab": "bb83608738b6517f3f05df116994a6fd",
     "claim-issue-jira": "b14a5dde5519fda59c2ba1ae7a3d8989",
     "code-quality": "c34792a374dd9868e6381557da582dc1",
@@ -18,20 +18,22 @@
     "documentation": "246be4932c277fa0ec0ab365beb3baad",
     "error-handling": "9afba2e99b90a8d5771c75e7f0615d96",
     "feature-ideas": "804f62f1dadadbfa8a0bcd4aff16b2e8",
-    "issue-reconcile": "6f33db6ad0b57c36909229694b78891a",
+    "issue-reconcile": "53e068c533e989ae31025fdfd4a3ecf9",
     "jira-sprint-manager": "3e63c8a3bdf0d5a05a30faaa2dc07980",
     "jira-status-report": "9d374a9d8ccb92c5c8fd0aa9899e79a5",
     "mobile-responsive": "16d8e7f63a673a2de48994c0ac08ef3d",
+    "model-comparison-refresh": "dc1702b07c7fb8be6165feb776d5acb6",
     "module-hygiene": "3b7671cd44f719d4b2116b96a279e6d0",
     "observability": "fdb4d77df5891cfb653a5da2553ecf8a",
     "performance": "672bd3958b12afb0f382bcebb6dc3b33",
     "plan-feature": "87f71a894757f89354da4e2119e07118",
     "plan-task": "b85fe92999aa4ee4a8910320457c4242",
-    "pr-reviewer": "679680b3b382aeb6786df01c4d1a90c6",
-    "pr-reviewer-eligibility": "7e35acefd33f05145544e2702d065bfd",
-    "pr-reviewer-review": "76d1d8265d4d56ae6a4c00d64e8787a8",
-    "pr-reviewer-security": "a993798467b8d773b0e44b3e3d303bd0",
-    "pr-watcher": "53ead8e26d396849bfa78f28550bd691",
+    "plan-task-claim": "910802d67f3b5a785f068f4d90178543",
+    "pr-reviewer": "de9c295018df7c403a722a9ac2e780af",
+    "pr-reviewer-eligibility": "a5652f7bcb7e2e50b1cfb9a54a6fabe0",
+    "pr-reviewer-review": "a4b35a1dc44e03b3d0ecf1a4e1bae6df",
+    "pr-reviewer-security": "d1e99626b12939ee39ab38eaa7d23f59",
+    "pr-watcher": "5246968aa90bb2bbf7957dcd9ae13a51",
     "react-lifecycle": "14b3816d1bcc10f0d7d6357e55cc5e69",
     "reference-watch": "e0e20754700fb08d5159b8437d9c260b",
     "refresh-local-llm-catalog": "9741ca6a8419fcdea2743e3b64781a8b",
@@ -43,14 +45,14 @@
     "test-coverage": "0d8359170529da12cd63356610b2e220",
     "typing": "1f2758ce0bb62d789a21aec241549531",
     "ui-bugs": "def9ad96bd74ab397233f234d79a1974",
-    "user-action-review": "945a716d446d26a03e2805d28bd1ae16",
+    "user-action-review": "1a083430e43f60cdd586cfffbdebc583",
     "ux": "e03d03fc7c16faa5b5db93be2896b9ad"
   },
   "PROMPT_VERSIONS": {
     "accessibility": 2,
     "api-contract": 1,
-    "branch-reconcile": 3,
-    "claim-issue": 24,
+    "branch-reconcile": 5,
+    "claim-issue": 25,
     "claim-issue-gitlab": 22,
     "claim-issue-jira": 16,
     "code-quality": 3,
@@ -64,17 +66,18 @@
     "documentation": 6,
     "error-handling": 2,
     "feature-ideas": 11,
-    "issue-reconcile": 4,
+    "issue-reconcile": 5,
     "jira-sprint-manager": 1,
     "jira-status-report": 1,
     "mobile-responsive": 2,
+    "model-comparison-refresh": 1,
     "module-hygiene": 1,
     "observability": 1,
     "performance": 2,
     "plan-feature": 5,
     "plan-task": 18,
-    "pr-reviewer": 4,
-    "pr-watcher": 1,
+    "pr-reviewer": 5,
+    "pr-watcher": 2,
     "react-lifecycle": 1,
     "reference-watch": 3,
     "refresh-local-llm-catalog": 4,
@@ -86,7 +89,7 @@
     "test-coverage": 2,
     "typing": 2,
     "ui-bugs": 2,
-    "user-action-review": 1,
+    "user-action-review": 2,
     "ux": 1
   },
   "REFERENCE_WATCH_AUDITED_VERSION": 3,
@@ -97,7 +100,9 @@
     ],
     "branch-reconcile": [
       "7ef2b5f7d8f05937d4912b26ad45f42e",
-      "ecb0621588a751b1383ecd89cf514382"
+      "ecb0621588a751b1383ecd89cf514382",
+      "16479f4b64395103fd222dc9608830b1",
+      "7c296ced3f0dec6e764d123f24009ccc"
     ],
     "claim-issue": [
       "37949d1b1fa8d461a15658f8f4192d97",
@@ -122,7 +127,8 @@
       "6a9bebb3f31b7c1b0a0728def0fe5b3c",
       "af99e76b4881d1a18234eff0d58d49a4",
       "9bf278ab141120625cd6faf854622f91",
-      "688661e7e7b0b4b5af95288dd86a23e8"
+      "688661e7e7b0b4b5af95288dd86a23e8",
+      "78325cbcfb0e5698018fcd16b3aa8b49"
     ],
     "claim-issue-gitlab": [
       "fae92c45c89c65455930b4b06a1b88c4",
@@ -205,6 +211,7 @@
       "d3282f16da29efe2d53595b3b34778bc"
     ],
     "issue-reconcile": [
+      "6f33db6ad0b57c36909229694b78891a",
       "c57a39aaa118173a496f030f5878bfc1",
       "c87d7adb57de208c069964760c9c6276",
       "a30f5d76b980bc9016f576047c9d5bb1"
@@ -240,11 +247,14 @@
       "910802d67f3b5a785f068f4d90178543"
     ],
     "pr-reviewer": [
+      "679680b3b382aeb6786df01c4d1a90c6",
       "9ceeed08f238b3787fc1201a0ce8e023",
       "f64e5d8176a871304fa691df812cda61",
       "add27b67daa6aa2c75717ac96a6bd625"
     ],
-    "pr-watcher": [],
+    "pr-watcher": [
+      "53ead8e26d396849bfa78f28550bd691"
+    ],
     "reference-watch": [
       "f9322140bff7d3f603799c09ce468da9",
       "722ca590fb4b6323c98850a176b9b309"
@@ -284,6 +294,9 @@
     ],
     "ui-bugs": [
       "01d2a7e034713195f33071f2c71a3c99"
+    ],
+    "user-action-review": [
+      "945a716d446d26a03e2805d28bd1ae16"
     ]
   }
 }

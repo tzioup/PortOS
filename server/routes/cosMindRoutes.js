@@ -1,3 +1,5 @@
+import { persistentMindMemoryProtectionSchema } from '../lib/persistentMindMemory.js';
+import { getPersistentMindThinkingRequestCatalog, cancelPersistentMindThinkingRequest } from '../services/persistentMindThinkingRequests.js';
 /** Persistent Chief-of-Staff mind conversation and lifecycle routes. */
 
 import { Router } from 'express';
@@ -19,8 +21,15 @@ import {
   parsePersistentMindCursor,
 } from '../lib/persistentMindTrajectory.js';
 import { normalizePersistentMindProfile } from '../lib/persistentMindProfile.js';
+import {
+  normalizePersistentMindThinkingPresets,
+  persistentMindThinkingPresetSchema,
+  persistentMindThinkingSelectionSchema,
+} from '../lib/persistentMindThinkingPresets.js';
 import { normalizePersistentMindPrompt } from '../lib/persistentMindPrompt.js';
+import { composePersistentMindInstructions, normalizePersistentMindPlaybook, PERSISTENT_MIND_PLAYBOOK_CATALOG } from '../lib/persistentMindPlaybook.js';
 import { publicPersistentMindState } from '../lib/persistentMindPublic.js';
+import { publicPersistentMindTurnExecutions } from '../lib/persistentMindTrajectory.js';
 import { validateRequest } from '../lib/validation.js';
 import { readPersistentMindEvents, readPersistentMindHistory } from '../services/agentRunEventLog.js';
 import { loadState } from '../services/cosState.js';
@@ -77,7 +86,20 @@ const messageSchema = z.object({
   id: idempotencyId,
   text: messageText,
   images: z.array(imageReference).max(PERSISTENT_MIND_LIMITS.MAX_MESSAGE_IMAGES).optional(),
+  // "Send with another model": one saved preset, for this message's single turn
+  // only. Absent, empty, and null all mean the same thing here — the mind's
+  // unchanged default route — so a composer that clears its picker does not
+  // have to omit the key to say "no override".
+  thinkingPresetId: z.union([
+    persistentMindThinkingPresetSchema.shape.id,
+    z.literal(''),
+    z.null(),
+  ]).optional(),
+  thinkingPreset: persistentMindThinkingSelectionSchema.optional(),
 }).strict().superRefine((value, ctx) => {
+  if (value.thinkingPreset && value.thinkingPreset.id !== value.thinkingPresetId) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['thinkingPreset'], message: 'The displayed selection must match thinkingPresetId' });
+  }
   const images = Array.isArray(value.images) ? value.images : [];
   const ids = images.map((image) => typeof image === 'string' ? image : image.attachmentId);
   if (!value.text && ids.length === 0) {
@@ -113,6 +135,7 @@ const promotionSchema = z.object({
 }).strict();
 const memoryType = z.enum(['fact', 'learning', 'observation', 'decision', 'preference', 'context']);
 const memoryFields = {
+  protection: persistentMindMemoryProtectionSchema.optional(),
   content: z.string().trim().min(1).max(10_240),
   summary: z.string().trim().max(500).optional(),
   type: memoryType,
@@ -169,9 +192,13 @@ router.get('/mind', asyncHandler(async (req, res) => {
   const capabilities = normalizePersistentMindCapabilities(root.config?.persistentMindCapabilities);
   const provider = profile.providerId ? await getProviderById(profile.providerId) : null;
   const imageCapability = await resolvePersistentMindImageCapability({ provider, model: profile.model });
-  const { snapshot: _snapshot, ...publicHistory } = history;
+  // The full replay projection carries message bodies; only the per-turn
+  // execution receipts (route, run ids, elapsed time, outcome, usage) are safe
+  // to serve, and they are what answers 'what did this turn actually spend'.
+  const { snapshot, ...publicHistory } = history;
   res.json({
     ...publicHistory,
+    turnExecutions: publicPersistentMindTurnExecutions(snapshot),
     state: publicPersistentMindState(state),
     profile: {
       enabled: profile.enabled,
@@ -181,6 +208,8 @@ router.get('/mind', asyncHandler(async (req, res) => {
       thinkingInterface: profile.thinkingInterface,
       wakeIntervalMinutes: profile.wakeIntervalMinutes,
     },
+    thinkingRequests: await getPersistentMindThinkingRequestCatalog({ human: true }),
+    thinkingPresets: normalizePersistentMindThinkingPresets(root.config?.persistentMindThinkingPresets),
     capabilities,
     harness: persistentMindHarnessInfo(provider),
     imageCapability,
@@ -188,9 +217,14 @@ router.get('/mind', asyncHandler(async (req, res) => {
   });
 }));
 
+router.delete('/mind/thinking-request', asyncHandler(async (_req, res) => {
+  res.json(await cancelPersistentMindThinkingRequest());
+}));
+
 router.get('/mind/context', asyncHandler(async (_req, res) => {
   const root = await loadState();
   const prompt = normalizePersistentMindPrompt(root.config?.persistentMindPrompt);
+  const playbook = normalizePersistentMindPlaybook(root.config?.persistentMindPlaybook);
   const profile = normalizePersistentMindProfile(root.config?.persistentMindProfile);
   const [memories, rollups, provider] = await Promise.all([
     readPersistentMindMemories(PERSISTENT_MIND_ID),
@@ -200,11 +234,13 @@ router.get('/mind/context', asyncHandler(async (_req, res) => {
   const preview = await preparePersistentMindContext({
     mindId: PERSISTENT_MIND_ID,
     identity: prompt.identity,
-    instructions: prompt.instructions,
+    instructions: composePersistentMindInstructions(prompt.instructions, playbook),
     memories,
   });
   res.json({
     prompt,
+    playbook,
+    playbookCatalog: PERSISTENT_MIND_PLAYBOOK_CATALOG,
     preview,
     memories,
     rollups,
@@ -228,7 +264,9 @@ router.get('/mind/tools', asyncHandler(async (_req, res) => {
       granted: !allowed || allowed.has(app.id),
     }));
   }
+  const { getCosToolCatalog } = await import('../services/cosToolRegistry.js');
   res.json({
+    semanticTools: getCosToolCatalog({ scope: 'mind', capabilities }).tools,
     schemaVersion: PERSISTENT_MIND_CAPABILITIES_SCHEMA_VERSION,
     capabilities,
     boundaries: PERSISTENT_MIND_TOOL_BOUNDARIES,

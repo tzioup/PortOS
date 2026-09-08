@@ -59,11 +59,13 @@ export { default as useMusicVideoYoutubeImport } from './useMusicVideoYoutubeImp
 export { default as useBeeperOutbox } from './useBeeperOutbox.js';
 export { default as useBeeperRealtime } from './useBeeperRealtime.js';
 export { default as useMoltworldWs } from './useMoltworldWs.js';
+export { default as useCharacterAugmentation } from './useCharacterAugmentation.js';
 export { default as useMounted } from './useMounted.js';
 export { default as usePendingListRows } from './usePendingListRows.js';
 export { default as usePopoverPosition } from './usePopoverPosition.js';
 export { default as useAgyModels } from './useAgyModels.js';
 export * from './useAgyModels.js';
+export { default as useLocalLlmStatus } from './useLocalLlmStatus.js';
 export { default as useLocalModels } from './useLocalModels.js';
 export { default as useVisionModelIds } from './useVisionModelIds.js';
 export { default as useToolUseModelIds } from './useToolUseModelIds.js';
@@ -96,6 +98,7 @@ export { default as useMidiNotes } from './useMidiNotes.js';
 export { default as useMidiPlayer } from './useMidiPlayer.js';
 export { default as useCanvasDprSize } from './useCanvasDprSize.js';
 export { default as useCanvasRollPalette } from './useCanvasRollPalette.js';
+export { default as usePrefersReducedMotion } from './usePrefersReducedMotion.js';
 export { default as useLiveSuggest } from './useLiveSuggest.js';
 export { default as useSidebarResize } from './useSidebarResize.js';
 export { default as useTokenPopover } from './useTokenPopover.js';
@@ -123,6 +126,7 @@ export * from './useInstallStream.js';
 export * from './useProcessLogs.js';
 export * from './useOpenClawStream.js';
 export * from './usePipelineProgress.js';
+export * from './usePortosRestartWatch.js';
 export * from './useReaderPanel.js';
 export * from './useSeriesEditorial.js';
 export * from './useImageTo3dTargets.js';
@@ -131,6 +135,7 @@ export * from './useStoryStepRuns.jsx';
 export * from './useModelDownloadStatus.js';
 
 // === Media (annotations, completion, attachments) ===
+export * from './useAvatarCapabilities.js';
 export * from './useMediaAnnotations.js';
 export * from './useSpritePendingRenders.js';
 export { default as useSpriteRecordCrud } from './useSpriteRecordCrud.js';
@@ -138,6 +143,7 @@ export * from './useMediaCompletionRefresh.js';
 export * from './useOpenClawAttachments.js';
 
 // === Settings-derived shared state ===
+export { default as useClaimReviewers } from './useClaimReviewers.js';
 export * from './useCodeReviewDefaults.jsx';
 export { default as useCatalogTypes } from './useCatalogTypes.jsx';
 export * from './useCatalogTypes.jsx';
@@ -194,6 +200,7 @@ export * from './useCanonPatch.js';
 export * from './useDeathClock.js';
 export * from './useFederatedMediaTarget.js';
 export * from './useGoalDetail.js';
+export * from './useHealthWarningDismiss.jsx';
 export * from './usePostSession.js';
 export * from './useRecordMerge.js';
 export * from './useRenderJobQueue.js';
@@ -209,3 +216,4 @@ export * from './useVideoGenForm.js';
 export * from './useVideoGenSubmitFlow.js';
 export * from './useVideoGenValidation.js';
 export * from './useVoiceUiSync.js';
+export { default as useEidoverseFrame } from './useEidoverseFrame.js';

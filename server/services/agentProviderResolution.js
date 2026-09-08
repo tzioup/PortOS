@@ -1,3 +1,5 @@
+import { isPrivateSecurityTask, PRIVATE_SECURITY_DELIVERY } from '../lib/privateSecurityPolicy.js';
+import { supportsPublicReviewProvider } from '../lib/providerVendors.js';
 /**
  * Agent Provider Resolution
  *
@@ -13,10 +15,15 @@
  * widened try/catch the same way the inline code did.
  */
 
+import { MODEL_TIERS } from '../lib/aiToolkit/constants.js';
 import { emitLog } from './cosEvents.js';
+import { isPublicReviewNoToolProfile } from '../lib/agentExecutionProfiles.js';
 import { getActiveProvider, getAllProviders, getProviderById } from './providers.js';
 import { isProviderAvailable, getFallbackProvider, getProviderStatus } from './providerStatus.js';
-import { selectModelForTask } from './agentModelSelection.js';
+import { selectModelForRole, selectModelForTask } from './agentModelSelection.js';
+import { modelPinIsOffered } from '../lib/localProviderRuntime.js';
+import { allowedModesFor, callerModeRejection } from '../lib/callerModePolicy.js';
+import { PRIMARY_ORCHESTRATION_ROLE, roleAssignment } from '../lib/orchestrationProfile.js';
 import { publicReviewPostureForTask, resolvePublicReviewProvider } from './publicReviewProviderSelection.js';
 
 /**
@@ -29,6 +36,48 @@ import { publicReviewPostureForTask, resolvePublicReviewProvider } from './publi
  * >}
  */
 export async function resolveAgentProviderAndModel(task) {
+  if (task?.metadata?.videoProduction) {
+    const { assertVideoAttemptDispatch } = await import('./creativeDirector/videoExecution.js');
+    const marker = task.metadata.videoProduction;
+    const project = await assertVideoAttemptDispatch(marker.projectId, marker.attemptId).catch(() => null);
+    if (!project) return { ok: false, permanent: true, error: 'Video production is paused or changed. Review and Resume from the project.' };
+    const choice = project.videoExecution.choices[marker.kind === 'evaluate' ? 'evaluation' : marker.kind];
+    const provider = choice?.providerId ? await getProviderById(choice.providerId) : null;
+    if (!provider || provider.enabled === false || provider.type === 'api' || !await isProviderAvailable(provider.id)) {
+      return { ok: false, permanent: true, error: 'The reviewed Video agent provider is unavailable. Change Models or Settings and Resume.' };
+    }
+    return { ok: true, provider, selectedModel: choice.model, modelSelection: { model: choice.model, tier: 'user-specified', reason: 'Reviewed Video production choice' } };
+  }
+  if (isPrivateSecurityTask(task)) {
+    const { privateSecurityEndpoint } = await import('../lib/privateSecuritySandbox.js');
+    Object.assign(task.metadata, PRIVATE_SECURITY_DELIVERY);
+    delete task.metadata.pipeline;
+    const provider = task.metadata.provider ? await getProviderById(task.metadata.provider) : null;
+    const model = task.metadata.model;
+    if (process.platform !== 'darwin' || !provider || provider.enabled === false
+      || !privateSecurityEndpoint(provider) || !supportsPublicReviewProvider(provider)
+      || typeof model !== 'string' || !model.trim() || /:cloud(?:$|[\s/])/i.test(model)
+      || Object.values(MODEL_TIERS).includes(model)) {
+      return { ok: false, permanent: true, error: 'Private security assessment requires macOS Seatbelt and an explicitly pinned loopback Ollama/LM Studio CLI provider and local model. No cloud or unsandboxed fallback is allowed.' };
+    }
+    return { ok: true, provider, selectedModel: model, modelSelection: { model, tier: 'user-specified', reason: 'Private local assessment pin' } };
+  }
+
+  // Old schedules may already have queued raw issue-watcher prompts. New runs
+  // execute entirely in the server's constrained analysis boundary; an upgrade
+  // must not let the old backlog retain a general-purpose agent harness.
+  if (task?.metadata?.analysisType === 'issue-watcher') {
+    return { ok: false, permanent: true,
+      error: 'This legacy issue-watcher task cannot run in an agent. Run Issue Watcher again from the schedule to use screened, tool-free analysis.' };
+  }
+  if (['pr-watcher', 'issue-reconcile'].includes(task?.metadata?.analysisType) && task.metadata.forgeMaintenanceVersion !== 1) {
+    return { ok: false, permanent: true,
+      error: 'This legacy forge maintenance task has not passed the current author and discussion gates. Run its schedule again to gather fresh screened evidence.' };
+  }
+  if (task?.metadata?.analysisType === 'pr-reviewer' && !isPublicReviewNoToolProfile(task.metadata.executionProfile)) {
+    return { ok: false, permanent: true,
+      error: 'This legacy PR review task permits tools. Run PR Reviewer again to use the screened, tool-free review pipeline.' };
+  }
   // A public-review stage is resolved against the POSTURE it declares, not the
   // usual pin → active → fallback chain: the ordinary chain is allowed to swap
   // onto any healthy provider, and swapping untrusted contributor content onto
@@ -62,12 +111,45 @@ async function resolvePublicReviewAgentProvider(task, posture) {
       providerId: provider.id,
     });
   }
-  // A model pin only survives when it was chosen FOR this provider; otherwise
-  // fall back to the provider's own default rather than handing one vendor's
-  // model id to another (the failure mode documented in the ordinary path).
-  const modelSelection = await selectModelForTask(task, provider);
+  // A model pin only survives when it was chosen FOR this provider AND that
+  // provider still offers it; otherwise fall back to the provider's own default
+  // rather than handing one vendor's model id to another (the failure mode
+  // documented in the ordinary path). Matching the provider alone is not
+  // enough: a stage pin outlives edits to that provider's own `models` list,
+  // and a retired id reaches the CLI as a model it cannot serve, so the stage
+  // spawns, produces no output, and is retried. The ordinary path guards this
+  // at its list check, by a different rule (it exempts any user pin outright).
+  // Three other sites still hand-roll a raw `models.includes` — see #6151.
   const pinnedModel = task.metadata?.model;
-  const selectedModel = pinnedModel && task.metadata?.provider === provider.id
+  const isTierRequest = Object.values(MODEL_TIERS).includes(pinnedModel);
+  const pinnedForThisProvider = !isTierRequest && Boolean(pinnedModel) && task.metadata?.provider === provider.id;
+  // `modelPinIsOffered` owns which provider records may invalidate a pin at all
+  // — an empty catalog and a local daemon's cached snapshot are both
+  // pass-throughs (see its doc comment).
+  const honorPin = pinnedForThisProvider && modelPinIsOffered(provider, pinnedModel);
+  const pinRejected = pinnedForThisProvider && !honorPin;
+  // Strip a pin that will NOT be honored, BEFORE model selection.
+  // `selectModelForTask` returns `metadata.model` verbatim as its
+  // highest-priority answer, so leaving it on the task defeats both guards
+  // above: a REJECTED pin came straight back while the warning below promised a
+  // default the run never used, and a pin belonging to a DIFFERENT provider
+  // (`pinnedForThisProvider` false, after the posture swap above chose someone
+  // else) was handed to the new provider — the exact cross-vendor leak this
+  // function's header says it prevents. Both are the same "will not be honored"
+  // case, so both strip here.
+  const modelSelection = await selectModelForTask(
+    pinnedModel && !isTierRequest && !honorPin ? { ...task, metadata: { ...task.metadata, model: null } } : task,
+    provider,
+  );
+  if (pinRejected) {
+    emitLog('warn', `Public-review stage model "${pinnedModel}" is not offered by provider "${provider.id}" — using its default instead`, {
+      taskId: task.id,
+      requestedModel: pinnedModel,
+      providerId: provider.id,
+      validModels: provider.models,
+    });
+  }
+  const selectedModel = honorPin
     ? pinnedModel
     : (modelSelection.model || provider.defaultModel || null);
   emitLog('info', `Public-review stage (${posture}) resolved to provider ${provider.id}${selectedModel ? ` model ${selectedModel}` : ''}`, {
@@ -78,6 +160,14 @@ async function resolvePublicReviewAgentProvider(task, posture) {
   return { ok: true, provider, selectedModel, modelSelection };
 }
 
+/**
+ * A CoS agent task needs a harness that can read/write files and run commands,
+ * so `api` records are ineligible however they are reached — by a task pin, by
+ * `activeProvider` inheritance, or by the fallback chain. Naming the policy once
+ * is what keeps the pin gate and the fallback gate from drifting apart.
+ */
+const AGENT_CALLER_POLICY = 'agent-harness';
+
 async function resolveOrdinaryProviderAndModel(task) {
   // A task can pin a specific provider via metadata.provider (e.g. a CoS job's
   // per-job AI override). Resolve it BEFORE the active-provider availability
@@ -86,7 +176,13 @@ async function resolveOrdinaryProviderAndModel(task) {
   // whole point of pinning. The pinned provider then runs through the same
   // availability/fallback logic below as any other resolved provider.
   let provider = null;
-  const userProviderId = task.metadata?.provider;
+  // An orchestration profile (#5992) pins the top-level agent's provider under
+  // the architect role — that agent is the one that plans and delegates. It is
+  // read as an ordinary provider pin so it inherits the whole chain below
+  // (availability, fallback swap, the model-pin invalidation a swap triggers)
+  // rather than growing a second, subtly-different resolution path. Null on a
+  // `direct` task, so the metadata pin stays authoritative as before.
+  const userProviderId = roleAssignment(task, PRIMARY_ORCHESTRATION_ROLE)?.provider || task.metadata?.provider;
   let userProviderMissing = false;
   if (userProviderId) {
     const userProvider = await getProviderById(userProviderId);
@@ -139,7 +235,12 @@ async function resolveOrdinaryProviderAndModel(task) {
     const providersMap = Object.fromEntries(providerList.map((p) => [p.id, p]));
     const taskFallbackId = task.metadata?.fallbackProvider;
     const taskFallbackModel = task.metadata?.fallbackModel;
-    const fallbackResult = await getFallbackProvider(provider.id, providersMap, taskFallbackId, taskFallbackModel);
+    // The caller's mode policy travels WITH the fallback request, so an
+    // ineligible candidate is skipped during selection rather than picked and
+    // then rejected below — which used to burn the one retry the cascade had.
+    const fallbackResult = await getFallbackProvider(provider.id, providersMap, taskFallbackId, taskFallbackModel, {
+      allowedModes: allowedModesFor(AGENT_CALLER_POLICY),
+    });
 
     if (fallbackResult) {
       emitLog('info', `Using fallback provider: ${fallbackResult.provider.id} (source: ${fallbackResult.source})`, {
@@ -165,31 +266,35 @@ async function resolveOrdinaryProviderAndModel(task) {
     }
   }
 
-  // Harness boundary guard. `api`-type providers (Ollama / LM Studio / kimi over
-  // HTTP) return plain text with NO filesystem tool harness — they can't
-  // Read/Write/Edit/Bash, so a CoS agent task resolved onto one would spawn a
-  // child process that writes nothing to disk. Fail clearly instead. This catches
-  // an api provider arriving via a task pin OR via the fallback chain (the default
-  // fallback priority includes lmstudio/ollama). The fix for users: add a CLI
-  // coding provider — e.g. Claude Ollama, or OpenCode MTPLX when a separate
-  // MTPLX runtime is already running locally.
-  if (provider.type === 'api') {
+  // Harness boundary guard — the LAST line of the same policy the fallback
+  // request above carries, so it still fires for a provider that never went
+  // through fallback selection: a task pin or the inherited active provider.
+  // `api`-type providers (Ollama / LM Studio / kimi over HTTP) return plain text
+  // with NO filesystem tool harness — they can't Read/Write/Edit/Bash, so a CoS
+  // agent task resolved onto one would spawn a child process that writes nothing
+  // to disk. A record with no recognizable mode at all is refused here too. The
+  // fix for users: add a CLI coding provider — e.g. Claude Ollama, or OpenCode
+  // MTPLX when a separate MTPLX runtime is already running locally.
+  const harnessRejection = callerModeRejection(provider, AGENT_CALLER_POLICY);
+  if (harnessRejection) {
     return {
       ok: false,
       // PERMANENT config error when the DIRECTLY-resolved (pinned/active) provider
-      // was itself api — no CLI/TUI harness is reachable for this task no matter
-      // how many times it re-dispatches, so the caller must retire it rather than
-      // leave it silently re-failing forever. An api provider reached by falling
-      // back from a CLI primary (directProviderType 'cli') is instead TRANSIENT:
-      // the primary may recover, so the task stays retryable.
-      permanent: directProviderType === 'api',
-      error: `Provider "${provider.id}" is an HTTP API provider with no file-writing harness — CoS agent tasks need a CLI/TUI coding provider (claude, codex, "Claude Ollama", or "OpenCode MTPLX").`,
+      // was itself ineligible — no CLI/TUI harness is reachable for this task no
+      // matter how many times it re-dispatches, so the caller must retire it
+      // rather than leave it silently re-failing forever. An ineligible provider
+      // reached by falling back from a CLI primary (directProviderType 'cli') is
+      // instead TRANSIENT: the primary may recover, so the task stays retryable.
+      permanent: Boolean(callerModeRejection({ type: directProviderType }, AGENT_CALLER_POLICY)),
+      error: `Provider "${provider.id}" ${harnessRejection.reason} — it has no file-writing harness, and CoS agent tasks need a CLI/TUI coding provider (claude, codex, "Claude Ollama", or "OpenCode MTPLX").`,
       providerId: provider.id
     };
   }
 
-  // Select optimal model for this task (async to allow learning-based suggestions)
-  const modelSelection = await selectModelForTask(task, provider);
+  // Select optimal model for this task (async to allow learning-based suggestions).
+  // Routed through the ARCHITECT role so an orchestrated task's planning model
+  // wins here; with no profile this is `selectModelForTask` unchanged.
+  const modelSelection = await selectModelForRole(task, PRIMARY_ORCHESTRATION_ROLE, provider);
   let selectedModel = modelSelection.model;
 
   // A configured "Fallback Model" pin (from the provider- or task-level
@@ -257,7 +362,8 @@ async function resolveOrdinaryProviderAndModel(task) {
         providerId: provider.id,
         validModels: provider.models
       });
-      selectedModel = modelSelection.tier === 'heavy' ? provider.heavyModel :
+      selectedModel = modelSelection.tier === 'ultra' ? ([provider.heavyModel, provider.defaultModel].find(model => model && provider.models.includes(model)) || null) :
+                      modelSelection.tier === 'heavy' ? provider.heavyModel :
                       modelSelection.tier === 'light' ? provider.lightModel :
                       modelSelection.tier === 'medium' ? provider.mediumModel :
                       provider.defaultModel;

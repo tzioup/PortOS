@@ -318,8 +318,10 @@ export const VIDEO_MODEL_DISCLOSURES = Object.freeze({
     },
   },
   // The FastMetal repos bundle their own text encoder and VAE beside the MLX
-  // DiT, and the entries declare no `repoFiles`, so the download is the whole
-  // snapshot — several times the DiT-only size their display names quote.
+  // DiT, so the download is several times the DiT-only size. The 1.3B and 5B
+  // rows declare no `repoFiles` and pull the whole snapshot; the 14B row does
+  // (#5871), dropping the duplicated `ema/` DiT, so its figure is the narrowed
+  // pull rather than the 42.3 GB the full snapshot would cost.
   fastmetal_1_3b_qad: {
     shippedRepo: 'FastVideo/FastMetal-1.3B-QAD',
     disclosure: {
@@ -346,7 +348,7 @@ export const VIDEO_MODEL_DISCLOSURES = Object.freeze({
       modelCardUrl: hfModelCard('FastVideo/FastMetal-14B-QAD'),
       weightsLicense: APACHE_2,
       runtimeLicense: RUNTIME_LICENSE.fastvideo,
-      estimatedDownloadGb: 42.3,
+      estimatedDownloadGb: 27.1,
       reviewedAt: VIDEO_DISCLOSURE_REVIEWED_AT,
     },
   },

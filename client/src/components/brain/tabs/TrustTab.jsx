@@ -268,7 +268,7 @@ export default function TrustTab({ onRefresh }) {
 
                   <button
                     onClick={() => setExpandedId(isExpanded ? null : entry.id)}
-                    className="p-1.5 text-gray-400 hover:text-white rounded hover:bg-port-border/50"
+                    className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1.5 text-gray-400 hover:text-white rounded hover:bg-port-border/50"
                     title={isExpanded ? 'Hide details' : 'View details'}
                     aria-label={isExpanded ? 'Hide details' : 'View details'}
                   >
@@ -279,7 +279,7 @@ export default function TrustTab({ onRefresh }) {
                 {isExpanded && (
                   <div className="mt-3 p-3 bg-port-bg rounded-lg">
                     <h4 className="text-xs font-medium text-gray-400 mb-2">Full Classification Data</h4>
-                    <pre className="text-xs text-gray-300 overflow-x-auto whitespace-pre-wrap">
+                    <pre className="text-xs text-gray-300 overflow-x-auto whitespace-pre-wrap break-all">
                       {JSON.stringify({
                         id: entry.id,
                         capturedAt: entry.capturedAt,

@@ -35,11 +35,13 @@ import {
   localLlmLmStudioServiceSchema,
   localLlmMtplxStartSchema,
   localLlmSlotstreamStartSchema,
+  localLlmSlotstreamDownloadSchema,
   localLlmMtplxSearchSchema,
   localLlmMtplxPullSchema,
   localLlmMtplxRemoveSchema,
   localLlmSpecModelDownloadSchema,
   localLlmDownloadPreflightSchema,
+  localPersistentMindSetupApplySchema,
 } from '../lib/validation.js'
 import {
   getLlamaServerStatus,
@@ -51,9 +53,10 @@ import {
 } from '../services/llamaServerManager.js'
 import { MTPLX_APP, getMtplxServerStatus, startMtplxServer, stopMtplxServer, installMtplx } from '../services/mtplxServerManager.js'
 import { SLOTSTREAM_APP, getSlotstreamServerStatus, startSlotstreamServer, stopSlotstreamServer, installSlotstream } from '../services/slotstreamServerManager.js'
+import { cancelSlotstreamModelDownload, downloadSlotstreamModel, previewSlotstreamDownload } from '../services/slotstreamModelManager.js'
 import { searchMtplxCatalog, pullMtplxModel, previewMtplxPull, removeMtplxModel } from '../services/mtplxModelManager.js'
 import { saveProcessList } from '../services/pm2.js'
-import { getSpecDecodePresetStatus, downloadSpecDecodeModel, previewSpecDecodeDownload, cancelSpecDecodeModelDownload } from '../services/specDecodeModels.js'
+import { getSpecDecodePresetStatus, downloadSpecDecodeModel, previewSpecDecodeDownload, cancelSpecDecodeModelDownload, removeSpecDecodeModel } from '../services/specDecodeModels.js'
 import { SPEC_TYPE_SUGGESTIONS } from '../lib/specDecodePresets.js'
 import { resetProviderReadinessCache } from '../services/providerReadiness.js'
 import { MODEL_ABUSE_GUARD } from '../lib/modelAbuseGuard.js'
@@ -79,6 +82,10 @@ import { runOpenCodeAgentBenchmark } from '../services/localModelAgentBenchmark.
 import { getCapabilityTestReport, getCapabilityTestResult, runCapabilityTest } from '../services/modelCapabilityTests.js'
 import { deleteResult as deleteCapabilityTestResult } from '../services/modelCapabilityTestStore.js'
 import { listUserModels } from '../services/audioModels.js'
+import {
+  describeLocalPersistentMindSetup,
+  applyLocalPersistentMindSetup,
+} from '../services/localPersistentMindSetup.js'
 import { ENGINES } from '../services/pipeline/musicGen.js'
 import { abortSignalFromResponse } from '../lib/requestAbort.js'
 import { awaitWritableDrain } from '../lib/streamBackpressure.js'
@@ -99,6 +106,30 @@ const emitter = (req) => {
   const io = req.app.get('io')
   return (event, message, extra) => io?.emit('localLlm:progress', { event, message, ...extra })
 }
+
+
+// GET /api/local-llm/persistent-mind-setup — Grok-box / CPU-only free local
+// Persistent Mind checklist (Ollama + Qwen2.5 7B Instruct). Applicable hosts
+// only; curated GPU coding hosts get applicable:false.
+router.get('/persistent-mind-setup', asyncHandler(async (_req, res) => {
+  res.json(await describeLocalPersistentMindSetup())
+}))
+
+// POST /api/local-llm/persistent-mind-setup/apply — enable the ollama provider
+// and optionally pin the Persistent Mind profile. Never installs Ollama or
+// pulls weights (those stay on install-backend / install / ollama-service).
+router.post('/persistent-mind-setup/apply', asyncHandler(async (req, res) => {
+  const body = validateRequest(localPersistentMindSetupApplySchema, req.body || {})
+  const result = await applyLocalPersistentMindSetup(body)
+  if (!result.success) {
+    throw new ServerError(result.error || 'Could not apply local Persistent Mind setup', {
+      status: 400,
+      context: { applicable: result.status?.applicable === true },
+    })
+  }
+  resetProviderReadinessCache()
+  res.json(result)
+}))
 
 // GET /api/local-llm/status — both backends + active marker
 router.get('/status', asyncHandler(async (req, res) => {
@@ -202,6 +233,12 @@ router.post('/security-guard/install', asyncHandler(async (req, res) => {
       ? 'Add a Hugging Face read token before installing Prompt Guard.'
       : code === 'security-guard-huggingface-access-required'
         ? 'Hugging Face has not granted Prompt Guard access yet. Submit the usage request on its model card, then retry.'
+        : code === 'security-guard-python-unavailable'
+          ? 'Install Python 3.10 or newer on this machine, restart PortOS if needed to detect it, then refresh Abuse Guard status.'
+          : code === 'security-guard-self-test-failed'
+            ? 'Prompt Guard could not complete its local verification. Repair the dedicated runtime from Models > LLMs > Abuse Guard before retrying.'
+            : code === 'security-guard-runtime-install-failed'
+              ? 'Classifier package installation failed. Check internet access and Python compatibility, then retry from Models > LLMs > Abuse Guard.'
         : code
     emit('error', message, { scope: 'security-guard' })
     throw new ServerError(message, { status: 502, code })
@@ -327,6 +364,10 @@ router.post('/download-preflight', asyncHandler(async (req, res) => {
   }
   if (body.kind === 'mtplx') {
     res.json(await previewMtplxPull({ model: body.model }))
+    return
+  }
+  if (body.kind === 'slotstream') {
+    res.json(await previewSlotstreamDownload({ model: body.model }))
     return
   }
   res.json(await previewInstallModel(body.backend, body.modelId))
@@ -741,6 +782,17 @@ router.post('/llama-server/download-model/cancel', asyncHandler(async (req, res)
   res.json({ success: true, cancelled })
 }))
 
+// POST /api/local-llm/llama-server/download-model/remove — delete an already
+// downloaded preset GGUF to free disk space for a method the user has decided
+// not to use. removeSpecDecodeModel refuses on its own while llama-server is
+// running that exact file, so unloading can't unlink weights out from under
+// an active launch.
+router.post('/llama-server/download-model/remove', asyncHandler(async (req, res) => {
+  const { presetId, role } = validateRequest(localLlmSpecModelDownloadSchema, req.body)
+  const result = await removeSpecDecodeModel({ presetId, role })
+  res.json(result)
+}))
+
 // Each of the three actions below changes exactly what the provider-readiness
 // probes remember — is the binary there, is something answering — so each drops
 // those caches. Without it the Providers page keeps reporting "llama.cpp setup
@@ -909,6 +961,32 @@ router.post('/slotstream/install', asyncHandler(async (req, res) => {
   resetProviderReadinessCache()
   emit('complete', 'Slotstream installed')
   res.json(result)
+}))
+
+// POST /api/local-llm/slotstream/models/download — fetch one checkpoint into
+// Slotstream's cache. Byte progress streams over `slotstream:download`, which
+// is what the card's bar trusts: a 100 GB+ transfer outlives the request that
+// started it, so a terminal frame — not the HTTP response — is what clears the
+// bar and re-reads the cache. A start still never downloads anything; this is
+// the explicit, separate action that does.
+router.post('/slotstream/models/download', asyncHandler(async (req, res) => {
+  const { model } = validateRequest(localLlmSlotstreamDownloadSchema, req.body)
+  const io = req.app.get('io')
+  const result = await downloadSlotstreamModel({ model, onProgress: (frame) => io?.emit('slotstream:download', frame) })
+  // A cache that just went from empty to servable is exactly what the readiness
+  // probes remember as "Slotstream has no checkpoint".
+  if (result.success) resetProviderReadinessCache()
+  res.json(result)
+}))
+
+// POST /api/local-llm/slotstream/models/download/cancel — a checkpoint download
+// is server-owned so it survives navigation, but a 100 GB+ transfer that is
+// merely SLOW never trips the idle watchdog, and waiting one out is the only
+// other way to release the single transfer slot. Partial files are kept, so a
+// later download resumes rather than restarting.
+router.post('/slotstream/models/download/cancel', asyncHandler(async (req, res) => {
+  const { model } = validateRequest(localLlmSlotstreamDownloadSchema, req.body)
+  res.json({ success: true, cancelled: cancelSlotstreamModelDownload({ model }) })
 }))
 
 // POST /api/local-llm/save-startup — `pm2 save`, so the PM2-managed local

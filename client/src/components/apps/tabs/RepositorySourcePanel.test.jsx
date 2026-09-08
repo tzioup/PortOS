@@ -6,6 +6,8 @@ vi.mock('../../../services/api', () => ({
   getAppRepositorySources: vi.fn(),
   syncAppRepositoryFork: vi.fn(),
   handleSelfRestart: vi.fn(),
+  getProviders: vi.fn(),
+  addCosTask: vi.fn(),
 }));
 vi.mock('../../../hooks/useAppOperation', () => ({
   useAppOperation: vi.fn(),
@@ -14,6 +16,7 @@ vi.mock('../../../hooks/useAppOperation', () => ({
 import * as api from '../../../services/api';
 import { useAppOperation } from '../../../hooks/useAppOperation';
 import RepositorySourcePanel from './RepositorySourcePanel';
+import { MemoryRouter } from 'react-router';
 
 const source = ({
   id,
@@ -23,6 +26,7 @@ const source = ({
   origin,
   localVsOrigin = { ahead: 0, behind: 0, state: 'current' },
   forkVsUpstream = null,
+  forkSyncable,
 }) => ({
   id,
   label,
@@ -44,6 +48,12 @@ const source = ({
   },
   localVsOrigin,
   forkVsUpstream,
+  // Mirrors the server's `isForkSyncable` so fixtures carry the payload the
+  // client actually reads (server/services/managedAppRepositories.js).
+  forkSyncable: forkSyncable ?? (id === 'primary'
+    && Boolean(origin?.isFork)
+    && origin?.canPush !== false
+    && forkVsUpstream?.state !== 'diverged'),
   remoteFresh: true,
   remoteError: null,
 });
@@ -145,6 +155,45 @@ describe('managed app repository sources', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Sync fork' }));
     await waitFor(() => expect(api.syncAppRepositoryFork).toHaveBeenCalledWith('app-example', { silent: true }));
     expect(useAppOperation.mock.results[0].value.startUpdate).not.toHaveBeenCalled();
+  });
+
+  // Eidoverse's video checkout is cloned from `anima-research`'s fork of a third
+  // project. The drift from upstream is real and worth reporting, but PortOS can
+  // only read that fork — so the panel must say so instead of offering a sync
+  // that would 403 and a badge that reads like a pending chore (#6321).
+  it('reports a read-only fork\'s drift without offering a sync it cannot perform', async () => {
+    const status = canonicalStatus();
+    status.updateAvailable = false;
+    status.sources[0] = source({
+      id: 'primary',
+      label: 'Example App',
+      branch: 'main',
+      head: '1'.repeat(40),
+      origin: { fullName: 'anima-research/example-app', isUpstream: true, isFork: false },
+    });
+    status.sources[1] = source({
+      id: 'companion-1',
+      label: 'example-runtime',
+      branch: 'prod-serving',
+      head: '2'.repeat(40),
+      origin: {
+        fullName: 'other-owner/example-runtime',
+        isUpstream: false,
+        isFork: true,
+        canPush: false,
+      },
+      forkVsUpstream: { available: true, ahead: 0, behind: 12, state: 'behind', error: null },
+    });
+    api.getAppRepositorySources.mockResolvedValue(status);
+    render(<RepositorySourcePanel appId="app-example" appName="Example App" />);
+
+    const companion = await screen.findByTestId('repository-source-companion-1');
+    expect(companion).toHaveTextContent('Fork is 12 commits behind');
+    expect(companion).toHaveTextContent('cannot push to it');
+    // Not "Fork 12 behind": that badge is a call to action, and there is none.
+    expect(within(companion).getByText('Custom origin')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Sync fork' })).toBeNull();
+    expect(screen.getByText('All checkouts are current.')).toBeInTheDocument();
   });
 
   it('confirms that one managed update syncs the fork and updates every checkout', async () => {
@@ -276,6 +325,54 @@ describe('managed app repository sources', () => {
     expect(screen.getByText('Remote freshness is unknown; a managed update can retry the source checkouts.')).toBeInTheDocument();
   });
 
+  it('offers to update from a fork as-is after a FORK_SYNC_REQUIRED refusal', async () => {
+    useAppOperation.mockReturnValue({
+      steps: [], isOperating: false, operationType: 'update',
+      error: 'Running from a fork (alice/PortOS). Sync your fork first, or acknowledge.',
+      errorCode: 'FORK_SYNC_REQUIRED', completed: false,
+      startUpdate: vi.fn(),
+    });
+    render(<RepositorySourcePanel appId="portos-default" appName="PortOS" />);
+
+    const retryButton = await screen.findByRole('button', { name: 'Update from fork as-is' });
+    fireEvent.click(retryButton);
+
+    expect(useAppOperation.mock.results[0].value.startUpdate).toHaveBeenCalledWith(
+      'portos-default', 'PortOS', { acknowledgeFork: true },
+    );
+  });
+
+  it('offers to update anyway after a PERSISTENT_MIND_IMAGES_IN_FLIGHT refusal', async () => {
+    useAppOperation.mockReturnValue({
+      steps: [], isOperating: false, operationType: 'update',
+      error: 'Persistent Mind has 1 queued image message.',
+      errorCode: 'PERSISTENT_MIND_IMAGES_IN_FLIGHT', completed: false,
+      startUpdate: vi.fn(),
+    });
+    render(<RepositorySourcePanel appId="portos-default" appName="PortOS" />);
+
+    const retryButton = await screen.findByRole('button', { name: 'Update anyway (back up first)' });
+    fireEvent.click(retryButton);
+
+    expect(useAppOperation.mock.results[0].value.startUpdate).toHaveBeenCalledWith(
+      'portos-default', 'PortOS', { acknowledgePersistentMindImageBackup: true },
+    );
+  });
+
+  it('does not offer an acknowledgement retry for a refusal with no acknowledgement (AGENTS_ACTIVE)', async () => {
+    useAppOperation.mockReturnValue({
+      steps: [], isOperating: false, operationType: 'update',
+      error: '1 CoS agent is running — updating would restart PortOS and sever it.',
+      errorCode: 'AGENTS_ACTIVE', completed: false,
+      startUpdate: vi.fn(),
+    });
+    render(<RepositorySourcePanel appId="portos-default" appName="PortOS" />);
+
+    await screen.findByText(/CoS agent is running/);
+    expect(screen.queryByRole('button', { name: 'Update from fork as-is' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Update anyway (back up first)' })).not.toBeInTheDocument();
+  });
+
   it('does not mislabel an undiscovered repository topology as a custom origin', async () => {
     const status = canonicalStatus();
     status.updateAvailable = false;
@@ -299,3 +396,43 @@ describe('managed app repository sources', () => {
     expect(screen.getByRole('button', { name: 'Update app' })).toBeInTheDocument();
   });
 });
+
+describe('PortOS self-update restart handoff', () => {
+  it('swaps the banner copy to the restart notice once useAppOperation reports it', async () => {
+    // The detection itself lives in useAppOperation (see its own suite). What
+    // this panel owes the user is telling them the page will come back rather
+    // than leaving "Stopping PortOS apps..." on screen with no explanation.
+    useAppOperation.mockReturnValue({
+      steps: [{ step: 'pm2-stop', status: 'running', message: 'Stopping PortOS apps...' }],
+      isOperating: true, operationType: 'update', error: null, errorCode: null, completed: false,
+      restarting: true,
+      startUpdate: vi.fn(),
+    });
+    render(<RepositorySourcePanel appId="portos-default" appName="PortOS" />);
+
+    expect(await screen.findByText(
+      'PortOS is restarting — this page reloads once it answers again.',
+    )).toBeInTheDocument();
+    // Every action stays locked while the install is coming back.
+    expect(screen.getByRole('button', { name: 'Check sources' })).toBeDisabled();
+  });
+});
+
+ it('replaces unsafe dirty-checkout updates with an explicitly configured recovery task', async () => {
+  const status = canonicalStatus();
+  status.sources[0].clean = false;
+  api.getAppRepositorySources.mockResolvedValue(status);
+  api.getProviders.mockResolvedValue({ activeProvider: 'example-cli', providers: [{ id: 'example-cli', name: 'Example CLI', type: 'cli', enabled: true, models: ['example-model'], defaultModel: 'example-model' }] });
+  api.addCosTask.mockResolvedValue({ id: 'task-example' });
+  render(<MemoryRouter><RepositorySourcePanel appId="app-example" appName="Example App" /></MemoryRouter>);
+  fireEvent.click(await screen.findByRole('button', { name: 'Resolve with agent' }));
+  expect(screen.queryByRole('button', { name: 'Update app' })).not.toBeInTheDocument();
+  expect(api.addCosTask).not.toHaveBeenCalled();
+  const start = screen.getByRole('button', { name: 'Start recovery agent' });
+  await waitFor(() => expect(start).toBeEnabled());
+  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'example-model' } });
+  fireEvent.click(start);
+  await screen.findByRole('link', { name: 'Recovery queued · View agents' });
+  expect(api.addCosTask).toHaveBeenCalledWith(expect.objectContaining({ app: 'app-example', provider: 'example-cli', model: 'example-model', useWorktree: false, openPR: false, whenDone: 'commit-push', prompt: expect.stringContaining('including untracked files and the index') }), { silent: true });
+  expect(useAppOperation().startUpdate).not.toHaveBeenCalled();
+ });

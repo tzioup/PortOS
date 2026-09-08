@@ -31,6 +31,17 @@ export const HF_LORA_FAMILIES = Object.freeze([
 ]);
 
 export const HF_API = 'https://huggingface.co/api/models';
+
+/**
+ * `owner/name` — the only shape PortOS hands to an HF download or an argv slot.
+ *
+ * Each segment must START alphanumeric, so neither `owner/..` (which a path
+ * walk would follow out of a cache directory) nor a leading `-` (which an
+ * argument parser would read as a flag) can get through. One definition because
+ * two copies of a security rule drift: the MTPLX pull/remove schema and the
+ * Slotstream checkpoint catalog both validate against this.
+ */
+export const HF_REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const HF_HOSTS = new Set(['huggingface.co', 'www.huggingface.co']);
 
 // Parse any HuggingFace ref shape into `{ repo, revision, file }`:
@@ -119,15 +130,20 @@ export const buildHfResolveUrl = (repo, revision, file) =>
 // Fetch model metadata from the public HF API. Returns the parsed JSON with
 // `siblings` (file list), `tags`, and `cardData` (carries `base_model`).
 // fetchImpl is injectable for tests.
-// The `blobs=true` expand isn't needed — siblings carry rfilename, and we
-// size-rank via the resolve HEAD only if multiple LoRA files tie.
-export const fetchHuggingfaceModel = async (repo, { token, revision, fetchImpl = fetch, signal } = {}) => {
+// The LoRA picker doesn't need `blobs=true` — siblings carry rfilename, and it
+// size-ranks via the resolve HEAD only if multiple LoRA files tie. Pass
+// `blobs: true` when the caller needs per-file SIZES up front instead: a
+// whole-repo download has to total them before it can preflight the disk, and
+// one HEAD per file across a 30-shard checkpoint is 30 round trips for numbers
+// this expand already carries.
+export const fetchHuggingfaceModel = async (repo, { token, revision, fetchImpl = fetch, signal, blobs = false } = {}) => {
   if (!/^[^/\s]+\/[^/\s]+$/.test(String(repo))) {
     throw new ServerError(`Invalid HuggingFace repo id: ${repo}`, { status: 400, code: 'HF_BAD_URL' });
   }
-  const url = revision
+  const path = revision
     ? `${HF_API}/${repo}/revision/${encodeURIComponent(revision)}`
     : `${HF_API}/${repo}`;
+  const url = blobs ? `${path}?blobs=true` : path;
   const res = await fetchImpl(url, { headers: { Accept: 'application/json', ...buildHfAuthHeaders(token) }, signal });
   if (!res.ok) {
     if (res.status === 404) {
@@ -142,6 +158,58 @@ export const fetchHuggingfaceModel = async (repo, { token, revision, fetchImpl =
     throw new ServerError(`HuggingFace metadata fetch failed: ${res.status}`, { status: 502, code: 'HF_FETCH_FAILED' });
   }
   return readResponseJson(res);
+};
+
+// Host allowlist for a `cursor` continuation URL — see searchHuggingfaceLoraModels.
+const HF_SEARCH_HOST = 'huggingface.co';
+
+/**
+ * Public HF `/api/models` list-search endpoint — lightweight per-entry shape
+ * (id, tags, downloads, likes; no siblings/cardData). Backs the video-LoRA
+ * search catalog: candidates found here still need a full
+ * `fetchHuggingfaceModel()` per repo before they can be classified/installed.
+ *
+ * `cursor`, when passed, is used AS THE ENTIRE REQUEST URL rather than folded
+ * into new params — it's the opaque continuation link HF returned in the
+ * previous page's `Link: rel="next"` response header, which already encodes
+ * its own search/offset state. Only a `huggingface.co` URL is accepted (the
+ * caller's own prior response is the only legitimate source of this value,
+ * but it still crossed a third-party HTTP response once, so re-validate
+ * rather than trust it blindly).
+ *
+ * Returns `{ items, nextCursor }` — `nextCursor` is the next page's Link URL
+ * (string) or null when exhausted. fetchImpl is injectable for tests.
+ */
+export const searchHuggingfaceLoraModels = async ({ query, author, tag = 'lora', limit = 12, cursor = null, token, fetchImpl = fetch, signal } = {}) => {
+  let url;
+  if (cursor) {
+    if (!URL.canParse(cursor) || new URL(cursor).hostname.toLowerCase() !== HF_SEARCH_HOST) {
+      throw new ServerError('Invalid HuggingFace search cursor', { status: 400, code: 'HF_BAD_CURSOR' });
+    }
+    url = cursor;
+  } else {
+    const params = new URLSearchParams();
+    const trimmedQuery = typeof query === 'string' ? query.trim() : '';
+    const trimmedAuthor = typeof author === 'string' ? author.trim() : '';
+    if (trimmedQuery) params.set('search', trimmedQuery);
+    if (trimmedAuthor) params.set('author', trimmedAuthor);
+    if (tag) params.set('filter', tag);
+    params.set('limit', String(Math.max(1, Math.min(50, limit))));
+    params.set('sort', 'downloads');
+    params.set('direction', '-1');
+    url = `${HF_API}?${params.toString()}`;
+  }
+  const res = await fetchImpl(url, { headers: { Accept: 'application/json', ...buildHfAuthHeaders(token) }, signal });
+  if (!res.ok) {
+    throw new ServerError(`HuggingFace search failed: ${res.status}`, { status: 502, code: 'HF_SEARCH_FAILED' });
+  }
+  const items = await readResponseJson(res, { fallback: [] });
+  const linkHeader = typeof res.headers?.get === 'function' ? res.headers.get('link') : null;
+  const nextMatch = typeof linkHeader === 'string' ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null;
+  return {
+    items: Array.isArray(items) ? items : [],
+    nextCursor: nextMatch ? nextMatch[1] : null,
+  };
 };
 
 // All sibling rfilenames of an HF model response (any extension). Shared by the

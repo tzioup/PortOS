@@ -45,7 +45,9 @@ import { trainingEvents } from '../loraTraining/events.js';
 import { audioGenEvents } from '../audioGen/events.js';
 import { getSettings } from '../settings.js';
 import { IMAGE_GEN_MODE, CLOUD_IMAGE_GEN_MODES } from '../imageGen/modes.js';
+import { VIDEO_GEN_MODE, CLOUD_VIDEO_GEN_MODES, mediaJobExecutionLane } from '../../lib/generationModes.js';
 import { REMOTE_MEDIA_MODULES, isRemoteMediaJob } from './remoteMediaJob.js';
+import { createVideoHolds } from './videoHolds.js';
 import { routedJobParams } from '../federatedMedia/routedJobParams.js';
 
 // Cloud-CLI jobs (Codex/Grok/Agy images, Grok videos) share one parallel lane —
@@ -56,8 +58,7 @@ import { routedJobParams } from '../federatedMedia/routedJobParams.js';
 // under the codex name for backward compat — it now bounds every cloud CLI
 // renders combined).
 const isCloudImageJob = (j) =>
-  (j.kind === 'image' && CLOUD_IMAGE_GEN_MODES.includes(j.params?.mode))
-  || (j.kind === 'video' && j.params?.mode === IMAGE_GEN_MODE.GROK);
+  mediaJobExecutionLane({ kind: j.kind, mode: j.params?.mode }) === 'cloud';
 
 // The federated-kind map and its predicate live in ./remoteMediaJob.js so light
 // consumers (sanitizeJob, route handlers) can ask "is this routed?" without
@@ -65,11 +66,11 @@ const isCloudImageJob = (j) =>
 // always found it.
 export { isRemoteMediaJob };
 
-const jobLane = (job) => {
-  if (isRemoteMediaJob(job)) return 'remote';
-  if (isCloudImageJob(job)) return 'cloud';
-  return 'gpu';
-};
+const jobLane = (job) => mediaJobExecutionLane({
+  kind: job.kind,
+  mode: job.params?.mode,
+  remote: isRemoteMediaJob(job),
+});
 
 // Boot restoration is the second way a job enters the queue, so it needs the
 // same routed-job normalization enqueueJob applies (#4683). A job written by a
@@ -147,7 +148,13 @@ async function safeUnlinkUpload(path) {
   await unlink(path).catch(() => {});
 }
 
-export const JOB_KINDS = Object.freeze(['video', 'image', 'training', 'audio']);
+// 'video-upscale' (#6511) is its OWN kind rather than a 'video' mode so the
+// generative upscale can never be offered to a peer: the federation layer's
+// kind maps (REMOTE_MEDIA_MODULES here, ROUTABLE_MEDIA_KINDS and
+// KNOWN_MEDIA_KINDS in federatedMedia/) are closed lists that do not name it,
+// so shipping a user's source video across the wire would take a deliberate
+// edit to one of them rather than a mode string slipping through.
+export const JOB_KINDS = Object.freeze(['video', 'video-upscale', 'image', 'training', 'audio']);
 export const JOB_STATUSES = Object.freeze(['queued', 'running', 'completed', 'failed', 'canceled']);
 
 // Returns a Promise that resolves to the gen module for the given job's
@@ -160,7 +167,10 @@ function getGenModuleForJob(job) {
   // later local branch would happily claim it and render a second time on this
   // machine.
   if (isRemoteMediaJob(job)) return REMOTE_MEDIA_MODULES[job.kind]();
+  if (job.kind === 'video-upscale') return import('../videoGen/upscaleJob.js');
   if (job.kind === 'video' && job.params?.mode === IMAGE_GEN_MODE.GROK) return import('../videoGen/grok.js');
+  if (job.kind === 'video' && job.params?.mode === VIDEO_GEN_MODE.FAL) return import('../videoGen/fal.js');
+  if (job.kind === 'video' && job.params?.mode === VIDEO_GEN_MODE.REACTOR) return import('../videoGen/reactor.js');
   if (job.kind === 'video') return import('../videoGen/local.js');
   if (job.kind === 'training') return import('../loraTraining/index.js');
   if (job.kind === 'audio') return import('../audioGen/local.js');
@@ -195,7 +205,7 @@ async function resolveLiveParams(job, safeParams) {
   // mflux training runs in the same venv as local image renders, so the
   // live settings pythonPath wins there too. flux2 training resolves its
   // own venv (resolveFlux2Python) inside runTraining — skip it here.
-  const usesLocalPython = (job.kind === 'video' && job.params?.mode !== IMAGE_GEN_MODE.GROK)
+  const usesLocalPython = (job.kind === 'video' && !CLOUD_VIDEO_GEN_MODES.includes(job.params?.mode))
     || (job.kind === 'image' && !CLOUD_IMAGE_GEN_MODES.includes(job.params?.mode))
     || (job.kind === 'training' && job.params?.runtime === 'mflux');
   if (!usesLocalPython) return;
@@ -225,6 +235,7 @@ let running = null;
 const cloudRunning = [];
 const remoteRunning = [];
 const archive = [];
+const videoHolds = createVideoHolds();
 
 // One install can route to several peers, while each provider remains the
 // authority on its own capacity. This bound prevents corrupted persisted state
@@ -431,7 +442,7 @@ async function persistImpl() {
   const serializable = live.map(({ id, kind, owner, status, queuedAt, startedAt, completedAt, params, result, error, position, progress, statusMsg, etaMs }) =>
     ({ id, kind, owner, status, queuedAt, startedAt, completedAt, params, result, error, position, progress, statusMsg, etaMs }),
   );
-  await atomicWrite(JOBS_FILE, { jobs: serializable });
+  await atomicWrite(JOBS_FILE, { jobs: serializable, videoHolds: videoHolds.snapshot() });
 }
 
 export async function initMediaJobQueue() {
@@ -457,6 +468,13 @@ export async function initMediaJobQueue() {
       // indication that repairing or deleting one file restores it.
       console.error(`❌ media-job queue: ${JOBS_FILE} is present but unreadable — starting empty and NOT persisting so it is preserved; repair or delete it and restart to re-enable persistence`);
     }
+    const holdsReadable = videoHolds.restore(data?.videoHolds);
+    if (!holdsReadable) {
+      // A malformed hold must neither kill server boot nor silently release a
+      // batch. Preserve the snapshot under the existing unreadable-file latch.
+      persistBlocked = true;
+      console.error('❌ media-job queue: invalid video holds — snapshot preserved and local video held; repair the holds and restart');
+    }
     const persistedJobs = Array.isArray(data?.jobs) ? data.jobs : [];
     const restartedFailedIds = [];
     // #1332: training jobs whose detached trainer survived the restart, to be
@@ -475,8 +493,15 @@ export async function initMediaJobQueue() {
     // present is an orphan from the prior process.
     const videoReap = await reapAndCleanDetachedDirs(join(PATHS.videos, '.detached')).catch(() => ({ reaped: 0 }));
     if (videoReap.reaped) console.log(`🧹 reaped ${videoReap.reaped} surviving render(s) on boot`);
-
     for (const j of persistedJobs) {
+      // Explicit Video Start grants one process lifetime. Restored jobs wait for
+      // project reconciliation; replaying an unknown paid submit could charge twice.
+      if (j.params?.videoProduction && ['queued', 'running'].includes(j.status)) {
+        archive.push({ ...j, status: 'failed', error: 'Video production paused after restart', completedAt: new Date().toISOString(),
+          params: { ...restoredParams(j), videoProduction: { ...j.params.videoProduction, submissionUncertain: j.status === 'running' } } });
+        restartedFailedIds.push(j.id);
+        continue;
+      }
       if (j.status === 'running') {
         // A remote provider job survives this process: its local queue id is
         // also the stable Idempotency-Key. Re-enqueue the same record and let
@@ -563,6 +588,8 @@ export async function initMediaJobQueue() {
     if (persistedJobs.length) {
       console.log(`📦 mediaJobQueue restored: ${queue.length} queued, ${archive.length} archived`);
     }
+    await videoHolds.resolveCohorts(queue);
+    videoHolds.updateQueued(queue);
     // Pre-seed terminal SSE payloads for each restart-failed job so that any
     // client that reconnects to /:jobId/events after a restart (the route
     // attaches via attachSseClient → attachSse, which replays lastPayload)
@@ -640,14 +667,20 @@ function startLaneJob(job, { lane }) {
       // not configured). Recover so a single bad job can't freeze its lane.
       console.log(`❌ media-job [${job.id.slice(0, 8)}] ${label} runJob threw: ${err.message}`);
       if (job.status === 'running') {
-        job.status = 'failed';
-        job.error = `runJob threw: ${err.message}`;
+        job.status = job.cancelRequested ? 'canceled' : 'failed';
+        videoHolds.captureFailure(job, err);
+        job.error = job.cancelRequested ? 'Canceled' : `runJob threw: ${err.message}`;
         job.completedAt = new Date().toISOString();
-        broadcastSse(ensureSseEntry(job.id), { type: 'error', error: job.error });
+        broadcastSse(ensureSseEntry(job.id), job.cancelRequested
+          ? { type: 'canceled', reason: job.error } : { type: 'error', error: job.error });
         closeJobAfterDelay(sseJobs, job.id);
-        mediaJobEvents.emit('failed', job);
+        mediaJobEvents.emit(job.status, job);
       }
     }
+    // Count once, after every terminal path (including pre-dispatch throws),
+    // and before releasing the lane. Boot reconciliation never comes here.
+    videoHolds.recordTerminal(job);
+    videoHolds.updateQueued(queue);
     if (lane === 'cloud') {
       const idx = cloudRunning.indexOf(job);
       if (idx >= 0) cloudRunning.splice(idx, 1);
@@ -668,12 +701,16 @@ function startLaneJob(job, { lane }) {
 
 async function drainLoop() {
   while (true) {
+    const candidates = queue.slice();
+    await videoHolds.resolveCohorts(candidates);
+    videoHolds.updateQueued(queue);
     // Single queue scan, promoting work independently into each open lane.
     let gpuOpen = !running;
     let cloudSlots = codexParallelLimit - cloudRunning.length;
     let remoteSlots = REMOTE_MEDIA_PARALLEL_LIMIT - remoteRunning.length;
     if ((gpuOpen || cloudSlots > 0 || remoteSlots > 0) && queue.length > 0) {
-      for (const job of queue.slice()) {
+      for (const job of candidates) {
+        if (job.status !== 'queued' || job.hold) continue;
         const lane = jobLane(job);
         if (lane === 'remote') {
           if (remoteSlots > 0) {
@@ -737,6 +774,7 @@ export function runJobNow(jobId) {
 // /:jobId/events would keep showing the position from its original enqueue
 // frame even after the line ahead of it cleared.
 function recomputeQueuePositions() {
+  videoHolds.updateQueued(queue);
   const cloudJobs = queue.filter(isCloudImageJob);
   const remoteJobs = queue.filter(isRemoteMediaJob);
   const gpuJobs = queue.filter((j) => jobLane(j) === 'gpu');
@@ -783,7 +821,7 @@ function recomputeQueuePositions() {
 // the queue, even though the underlying emitters don't supply one.
 function synthesizeMessage(e, kind) {
   if (typeof e.step === 'number' && typeof e.totalSteps === 'number' && e.totalSteps > 0) {
-    const verb = kind === 'video' ? 'Rendering' : kind === 'training' ? 'Training' : 'Generating';
+    const verb = kind === 'video' ? 'Rendering' : kind === 'video-upscale' ? 'Upscaling' : kind === 'training' ? 'Training' : 'Generating';
     return `${verb} step ${e.step}/${e.totalSteps}`;
   }
   return undefined;
@@ -846,7 +884,7 @@ function makeGenDispatcher(emitter, job, handlers) {
     }
   };
   const onCompleted = (e) => { if (e.generationId === job.id) handlers.completed(e); };
-  const onFailed = (e) => { if (e.generationId === job.id) handlers.failed({ error: e.error }); };
+  const onFailed = (e) => { if (e.generationId === job.id) handlers.failed(e); };
   return {
     attach() {
       emitter.on('progress', onProgress);
@@ -931,6 +969,12 @@ async function runJob(job) {
     // (how far it got) — consumers gate the progress UI on status === 'running',
     // so the residual values are not displayed for terminal jobs.
     job.completedAt = new Date().toISOString();
+    if (job.params?.videoProduction) {
+      const { settleVideoAttempt } = await import('../creativeDirector/videoExecution.js');
+      const tag = job.params.videoProduction;
+      await settleVideoAttempt(tag.projectId, tag.attemptId, { jobId: job.id, status: job.params.videoProduction.submissionUncertain || (state === 'failed' && /timeout|timed out|interrupted/i.test(job.error || '')) ? 'uncertain' : state })
+        .catch(error => console.error(`❌ Video receipt could not settle: ${error.message}`));
+    }
     // Wake the lane finalizer without polling. Some providers emit their
     // terminal event just before their kickoff promise resolves; the promise
     // retains that signal until runJob reaches the await below.
@@ -991,7 +1035,10 @@ async function runJob(job) {
         return;
       }
       trackTerminalOperation(
-        terminate('failed', (j) => { j.error = payload.error || 'unknown error'; })
+        terminate('failed', (j) => {
+          j.error = payload.error || 'unknown error';
+          videoHolds.captureFailure(j, j.error, payload);
+        })
           .catch((e) => console.log(`⚠️ media-job [${job.id.slice(0, 8)}] terminal handler failed: ${e.message}`)),
       );
     },
@@ -1003,6 +1050,11 @@ async function runJob(job) {
   // corrupted path from a hand-edited media-jobs.json. Null it out here if
   // it doesn't resolve under PATHS.uploads so the constraint holds end-to-end.
   const safeParams = { ...job.params };
+  // Freeze only the dispatch copy to the default whose cohort passed the hold
+  // check. The retained job's original parameters stay unchanged.
+  if (job.videoCohort && (safeParams.modelId === undefined || safeParams.modelId === '')) {
+    safeParams.modelId = job.videoCohort.modelId;
+  }
   if (safeParams.uploadedTempPath && (typeof safeParams.uploadedTempPath !== 'string' || !isUnderUploadsRoot(safeParams.uploadedTempPath))) {
     console.log(`⚠️ media-job [${job.id.slice(0, 8)}] uploadedTempPath outside PATHS.uploads — nulled before gen invoke: ${safeParams.uploadedTempPath}`);
     safeParams.uploadedTempPath = null;
@@ -1023,7 +1075,7 @@ async function runJob(job) {
 
   await resolveLiveParams(job, safeParams);
 
-  const emitter = job.kind === 'video' ? videoGenEvents
+  const emitter = job.kind === 'video' || job.kind === 'video-upscale' ? videoGenEvents
     : job.kind === 'training' ? trainingEvents
     : job.kind === 'audio' ? audioGenEvents
     : imageGenEvents;
@@ -1043,6 +1095,9 @@ async function runJob(job) {
     // the chunk-scaled local-video one (the provider emits 'activity' on
     // stdout so a long-but-active render never trips the idle cap).
     if (isCloudImageJob(job)) return WATCHDOG_CODEX_MS;
+    // An upscale is a single GPU render with no chunking, so it takes the
+    // video idle window flat rather than the chunk-scaled one.
+    if (job.kind === 'video-upscale') return WATCHDOG_VIDEO_MS;
     if (job.kind === 'video') return WATCHDOG_VIDEO_MS * Math.max(1, Number(safeParams.chunks) || 1);
     if (job.kind === 'training') return WATCHDOG_TRAINING_MS;
     if (job.kind === 'audio') return WATCHDOG_AUDIO_MS;
@@ -1103,6 +1158,10 @@ async function runJob(job) {
 
   try {
     const mod = await getGenModuleForJob(job);
+    if (job.params?.videoProduction) {
+      const { assertVideoAttemptDispatch } = await import('../creativeDirector/videoExecution.js');
+      await assertVideoAttemptDispatch(job.params.videoProduction.projectId, job.params.videoProduction.attemptId, { jobId: job.id });
+    }
     if (!mod) throw new Error(`Unknown job kind: ${job.kind}`);
     // A cancel that arrived while this job was still queued lives on the
     // persisted marker, not on any in-memory adapter state. Re-stamp it for
@@ -1119,6 +1178,8 @@ async function runJob(job) {
       await mod.generateChainedVideo({ ...safeParams, jobId: job.id });
     } else if (job.kind === 'video') {
       await mod.generateVideo({ ...safeParams, jobId: job.id });
+    } else if (job.kind === 'video-upscale') {
+      await mod.runVideoUpscale({ ...safeParams, jobId: job.id });
     } else if (job.kind === 'training') {
       await mod.runTraining({ ...safeParams, jobId: job.id });
     } else if (job.kind === 'audio') {
@@ -1139,7 +1200,7 @@ async function runJob(job) {
     for (const p of normalizeTempPaths(job.params?.uploadedTempPaths)) {
       await safeUnlinkUpload(p);
     }
-    handlers.failed({ error: err.message });
+    handlers.failed({ error: err.message, code: err.code });
   }
 
   // The gen modules emit completed/failed asynchronously after kickoff. Await
@@ -1188,6 +1249,28 @@ export function enqueueJob({ kind, params, owner = null }) {
   startWorker();
   console.log(`📥 media-job [${id.slice(0, 8)}] ${kind} queued (position ${job.position})`);
   return { jobId: id, position: job.position, status: 'queued' };
+}
+
+// Admission can query a cohort even after its last retained job is canceled.
+export function listVideoHolds() {
+  videoHolds.updateQueued(queue);
+  const counts = new Map();
+  for (const job of queue) {
+    if (job.hold) counts.set(job.hold.id, (counts.get(job.hold.id) || 0) + 1);
+  }
+  return videoHolds.snapshot().map((hold) => ({ ...hold, heldJobCount: counts.get(hold.id) || 0 }));
+}
+
+export function isVideoModelHeld(modelId, runtime) {
+  return videoHolds.has({ modelId, runtime: runtime || 'mlx_video' });
+}
+
+// Resume retained work only; failed jobs are never re-enqueued.
+export async function resumeVideoHold(holdId) {
+  if (!videoHolds.resume(holdId)) return false;
+  videoHolds.updateQueued(queue);
+  await persist();
+  return true;
 }
 
 // Bulk-cancel every queued job (optionally filtered by kind: 'image' | 'video').
@@ -1265,6 +1348,10 @@ export async function cancelJob(jobId) {
     // cancelRequested flips the dispatcher's `failed` handler into the
     // `canceled` branch instead of marking it failed.
     runningJob.cancelRequested = true;
+    if (runningJob.params?.videoProduction && ['reactor', 'fal', 'grok'].includes(runningJob.params.mode)) {
+      runningJob.params.videoProduction = { ...runningJob.params.videoProduction, submissionUncertain: true };
+      await persist();
+    }
     if (isRemoteMediaJob(runningJob)) {
       // Remote cancellation can outlive this process when the peer is down.
       // Persist the intent before signaling the adapter so boot reconciliation
@@ -1349,6 +1436,7 @@ export function __resetForTests() {
   cloudRunning.length = 0;
   remoteRunning.length = 0;
   archive.length = 0;
+  videoHolds.clear();
   sseJobs.clear();
   workerStarted = false;
   initPromise = null;

@@ -16,6 +16,10 @@ import {
   validateRequest, videoModelTermsSchema,
 } from '../lib/validation.js';
 import { grokVideoDurationSchema } from '../lib/sharedSchemas.js';
+import {
+  REACTOR_MAX_CLIP_ID_LENGTH, REACTOR_MIN_CLIP_SECONDS, REACTOR_MAX_CLIP_SECONDS,
+  REACTOR_ASPECTS,
+} from '../lib/reactorVideoClip.js';
 import { MIN_CONTEXT_FRAMES, MAX_CONTEXT_FRAMES } from '../lib/videoContinuity.js';
 import { I2V_REFERENCE_MODES } from '../lib/videoReferenceModes.js';
 import {
@@ -23,6 +27,7 @@ import {
   videoModelTermsGateId,
 } from '../lib/videoDisclosure.js';
 import { getSettings, updateSettingsWith } from '../services/settings.js';
+import { recordUserAction } from '../services/userActions.js';
 import { checkPackages, isAllowedPython } from '../lib/pythonSetup.js';
 import {
   listVideoModels,
@@ -38,26 +43,36 @@ import {
   extractLastFrame,
   stitchVideos,
   upscaleHistoryItem,
+  planUpscaleHistoryItem,
   resolveFflfLtx2PixelBudget,
 } from '../services/videoGen/local.js';
+// The method enum comes from the pure contract module rather than through
+// local.js's re-export: it is a constant, and reading it off the mockable
+// provider surface would make every suite that mocks local.js responsible for
+// re-declaring it just so this file's route schemas can be built.
+import { UPSCALE_METHODS, DEFAULT_UPSCALE_METHOD } from '../services/videoGen/upscalePlan.js';
+import { enqueueLtxUpscale } from '../services/videoGen/upscaleJob.js';
 import { cleanupMultipartTemp } from '../services/videoGen/prepareParams.js';
 import { submitVideoGenJob } from '../services/videoGen/submitJob.js';
+import { resolveReactorApiKey, mintReactorToken } from '../services/videoGen/reactor.js';
+import { isVideoModeUsable, VIDEO_GEN_MODE } from '../services/videoGen/modes.js';
+import { MAX_VIDEO_BATCH_SIZE } from '../services/videoGen/batch.js';
 import { VIDEO_GEN_LOCAL_ONLY_FIELDS } from '../services/videoGen/requestFields.js';
 import { attachSseClient, cancelJob, listJobs } from '../services/mediaJobQueue/index.js';
-import { repoForModel, getTextEncoderRepo, isHfRepoId } from '../lib/mediaModels.js';
+import { getTextEncoderRepo, isHfRepoId } from '../lib/mediaModels.js';
 import {
-  IC_LORA_MODE_VALUES, icLoraSpecForMode, icLoraRepos, listIcLoraWeights,
-  icLoraWeightCandidates, findCachedIcLoraWeight,
+  IC_LORA_MODE_VALUES, icLoraSpecForMode, listIcLoraWeights, listIcLoraRemixModes,
+  icLoraWeightCandidates, findCachedIcLoraWeight, icLoraWeightKey, icLoraProbesExactFile,
 } from '../lib/icLoraWeights.js';
+import { publicTextEncoderOption } from '../lib/videoTextEncoders.js';
+import { DRAFT_DECODE_IDS } from '../lib/videoDraftDecoders.js';
+import { VIDEO_STREAMING_MODES } from '../lib/videoStreamingMode.js';
+import { repairModelCache, repairCachedFile, summarizeVerify } from '../lib/hfCache.js';
 import {
-  downloadableVideoTextEncoders, downloadableVideoTextEncoder, publicTextEncoderOption,
-} from '../lib/videoTextEncoders.js';
-import { DRAFT_DECODE_IDS, downloadableVideoDraftDecoders } from '../lib/videoDraftDecoders.js';
-import {
-  inspectModelCache, verifyModelCache, repairModelCache, repairCachedFile,
-  verifyCachedRepoFiles, repairCachedRepoFiles, summarizeVerify, aggregateVerifies,
-  isSafeHfRepoRelativePath,
-} from '../lib/hfCache.js';
+  modelDownloadTargets, textEncoderDownloadTarget, textEncoderDownloadTargets,
+  verifyDownloadTarget, repairDownloadTarget, reposToVerify,
+  repoCacheStatus, modelCacheStatus, icLoraSpecFromParam, textEncoderFromParam,
+} from '../services/videoGen/modelCache.js';
 import { startHfDownloadStream } from '../services/hfDownloadStream.js';
 import { openSseStream } from '../lib/sseDownload.js';
 import { saveUploadedGalleryVideo } from '../services/videoUpload.js';
@@ -72,7 +87,7 @@ import {
   streamVideoRuntimeInstall,
 } from '../services/videoGen/runtimeInstaller.js';
 import { detectSystemCapabilities, withHardwareCompatibility } from '../lib/systemCapabilities.js';
-import { isDisplaySleepEnabled } from '../services/displayPower.js';
+import { isDisplaySleepEnabled } from '../services/videoGen/displayPower.js';
 
 const router = Router();
 
@@ -85,6 +100,33 @@ const hardwareAwareVideoModels = async () => {
       capabilities,
       model.hardwareRequirements,
     )),
+  };
+};
+
+// The model list plus the three numbers that decide which entry the picker
+// auto-selects. Deliberately free of any python probe: /status shells out to
+// the interpreter on every call (~1-2s) and the Model field used to wait on it,
+// so `/model-context` serves the same fields off the registry and the cached
+// hardware probe alone. /status keeps returning them for its other readers —
+// this is the single builder both routes share, so the two can't drift.
+const videoModelContext = async () => {
+  const { capabilities, models } = await hardwareAwareVideoModels();
+  return {
+    // Each entry carries its optional `disclosure` block (provenance, weights/
+    // runtime licenses, pinned-snapshot download size) straight off the
+    // registry — absent for custom models, which the UI renders as Unknown.
+    models,
+    defaultModel: defaultVideoModelId(capabilities),
+    // Total system memory in GB — the client uses this to auto-select the
+    // highest-memory mode-compatible model that fits on this machine.
+    // Rounded to nearest GB; sub-GB precision isn't useful for the
+    // model-size comparison and reads more cleanly in the UI.
+    systemMemoryGb: Math.round(os.totalmem() / 1024 ** 3),
+    // Effective FFLF/ltx2 stage-2 pixel-frame budget (honors
+    // FFLF_LTX2_PIXEL_BUDGET). The multi-keyframe picker mirrors the
+    // back-solve so it can reject out-of-budget keyframe indices before
+    // submit instead of letting the worker 400 mid-render.
+    fflfLtx2PixelBudget: resolveFflfLtx2PixelBudget(),
   };
 };
 
@@ -153,7 +195,7 @@ const optionalInt = (min, max, label) => z.preprocess(
 // weight raising its own maxReferences doesn't get rejected by a stale literal in
 // the schema before the per-mode assertion below can speak. Per-weight bounds are
 // still enforced against the mode's own spec (assertIcReferenceCount).
-const MAX_IC_REFERENCES = Math.max(...listIcLoraWeights().map((s) => s.maxReferences));
+const MAX_IC_REFERENCES = Math.max(...listIcLoraRemixModes().map((s) => s.maxReferences));
 
 // Chain ceiling — 8 × ~5min ≈ 40min on an M3 Max keeps the worst-case wall time
 // bounded. Shared by `chunks` and the per-chunk prompt list so the two can never
@@ -180,6 +222,7 @@ export const LOCAL_ONLY_VIDEO_PARAMS = Object.freeze({
   [VIDEO_GEN_LOCAL_ONLY_FIELDS.FPS]: optionalNum(1, 60, 'fps'),
   [VIDEO_GEN_LOCAL_ONLY_FIELDS.STEPS]: optionalNum(1, 200, 'steps'),
   [VIDEO_GEN_LOCAL_ONLY_FIELDS.GUIDANCE_SCALE]: optionalNum(0, 30, 'guidanceScale'),
+  [VIDEO_GEN_LOCAL_ONLY_FIELDS.BATCH_SIZE]: optionalInt(1, MAX_VIDEO_BATCH_SIZE, 'batchSize'),
   [VIDEO_GEN_LOCAL_ONLY_FIELDS.SEED]: optionalNum(0, Number.MAX_SAFE_INTEGER, 'seed'),
   [VIDEO_GEN_LOCAL_ONLY_FIELDS.IMAGE_STRENGTH]: optionalNum(0, 1, 'imageStrength'),
   // What the conditioning image PROMISES (#4874) — 'anchor' (default) pins it as
@@ -213,21 +256,63 @@ export const LOCAL_ONLY_VIDEO_PARAMS = Object.freeze({
   // either: an unsupported model, an old runner checkout, a missing download or
   // a delivery render all fall back to the full decoder with the reason logged.
   [VIDEO_GEN_LOCAL_ONLY_FIELDS.DRAFT_DECODE]: z.enum(DRAFT_DECODE_IDS).optional(),
+  // Block-streaming request for LTX-2/2.5 MLX renders (#6499). Unlike
+  // draftDecode/speedProfileId this is NOT a "degrade, never reject" knob:
+  // scripts/generate_ltx2.py#resolve_streaming_policy() refuses an explicit
+  // 'stream' request before loading weights when the mode's pinned pipeline
+  // has no streaming parameter (Extend), so this stays a validated pass-
+  // through rather than a route-level 400 — the bridge, which can inspect
+  // the live pin, owns accept/refuse. Absence and 'auto' are the same
+  // request (the bridge's own default).
+  [VIDEO_GEN_LOCAL_ONLY_FIELDS.STREAMING_MODE]: z.enum(VIDEO_STREAMING_MODES).optional(),
 });
 
 const generateBodySchema = z.object({
-  // Render backend: the local runtimes (default) or the Grok Build CLI's
-  // image-first image_to_video flow (#2859 phase 2). Grok ignores the
-  // local-only knobs below; it reads prompt/negativePrompt, width/height
-  // (mapped to an aspect ratio), sourceImageFile/sourceImage, and
-  // grokDuration.
-  backend: z.enum(['local', 'grok']).optional(),
+  // Render backend: the local runtimes (default), the Grok Build CLI's
+  // image-first image_to_video flow (#2859 phase 2), fal.ai's queue REST API
+  // (#6213), or reactor.inc's fast-h3 API (#6214). Grok, fal, and reactor all
+  // ignore the local-only knobs below; they read prompt/negativePrompt,
+  // width/height (mapped to an aspect ratio), sourceImageFile/sourceImage,
+  // and their own duration field.
+  backend: z.enum(['local', 'grok', 'fal', 'reactor']).optional(),
   // Grok image_to_video clip length in seconds — the shared schema (see
   // lib/grokVideoClip.js for which lengths grok actually delivers). Multipart
   // bodies arrive as strings, so coerce first.
   grokDuration: z.preprocess(
     (v) => (v == null || v === '' ? undefined : Number(v)),
     grokVideoDurationSchema.optional(),
+  ),
+  // fal.ai model id (e.g. 'fal-ai/minimax/hailuo-02/standard/text-to-video')
+  // and clip duration in seconds — loosely validated since fal's own model
+  // catalog, not PortOS, owns the set of valid ids/durations per model.
+  falModelId: z.string().min(1).max(200).optional(),
+  falDuration: z.preprocess(
+    (v) => (v == null || v === '' ? undefined : Number(v)),
+    optionalNum(1, 60, 'falDuration'),
+  ),
+  // reactor.inc fast-h3 (#6214): the clip id to chain from
+  // (continue_from_clip_id — frame-accurate continuation, unlike fal/grok
+  // which start a fresh render each time) and clip length in seconds. The
+  // bounds come from lib/reactorVideoClip.js rather than a hand-copied 1-60,
+  // which accepted lengths the fast-h3 API rejects outright.
+  reactorClipId: z.string().min(1).max(REACTOR_MAX_CLIP_ID_LENGTH).optional(),
+  reactorSeconds: z.preprocess(
+    (v) => (v == null || v === '' ? undefined : Number(v)),
+    optionalNum(REACTOR_MIN_CLIP_SECONDS, REACTOR_MAX_CLIP_SECONDS, 'reactorSeconds'),
+  ),
+  reactorSeed: z.preprocess(
+    (v) => (v == null || v === '' ? undefined : Number(v)),
+    optionalNum(0, 2 ** 32 - 1, 'reactorSeed'),
+  ),
+  // fast-h3 session canvas — a `set_canvas` aspect, NOT width/height: every
+  // canvas holds a 768px short edge so the aspect is the whole choice. Omitted
+  // means "derive it from the starting frame" (the picker's Auto entry), which
+  // is what keeps a portrait image off the 1344x768 canvas every render used to
+  // open with. Multipart bodies arrive as strings, so the empty-string sentinel
+  // has to read as omitted rather than as an invalid enum value.
+  reactorAspect: z.preprocess(
+    (v) => (v === '' ? undefined : v),
+    z.enum(REACTOR_ASPECTS).optional(),
   ),
   prompt: z.string().min(1).max(8000),
   negativePrompt: z.string().max(8000).optional(),
@@ -237,6 +322,12 @@ const generateBodySchema = z.object({
   ...LOCAL_ONLY_VIDEO_PARAMS,
   audioStartSec: optionalNum(0, 36000, 'audioStartSec'),
   disableAudio: z.union([z.boolean(), z.literal('true'), z.literal('false')]).optional(),
+  // Per-render override of the install-wide display-sleep default
+  // (settings.videoGen.displaySleep, opt-in). Absent means "use the install
+  // default" — the local-only branch of submitVideoGenJob only forwards this
+  // when the client actually sent a choice, so an omitted field can never
+  // clobber the settings-level default with a stale false.
+  displaySleep: z.union([z.boolean(), z.literal('true'), z.literal('false')]).optional(),
   sourceImageFile: z.string().max(512).optional(),
   // Gallery-pick filename for the FFLF end-frame. The end-frame can also
   // arrive as a multipart `lastImage` upload (handled below) — when both
@@ -400,18 +491,17 @@ router.get('/status', asyncHandler(async (_req, res) => {
   const s = await getSettings();
   const py = s.imageGen?.local?.pythonPath || null;
   const { connected, reason, missing, pythonVersion } = await resolveLocalPythonHealth(py);
-  const { capabilities, models } = await hardwareAwareVideoModels();
   res.json({
     connected,
     pythonPath: py,
     pythonVersion: pythonVersion || null,
     reason,
     missingPackages: missing,
-    // Each entry carries its optional `disclosure` block (provenance, weights/
-    // runtime licenses, pinned-snapshot download size) straight off the
-    // registry — absent for custom models, which the UI renders as Unknown.
-    models,
-    defaultModel: defaultVideoModelId(capabilities),
+    // `models` / `defaultModel` / `systemMemoryGb` / `fflfLtx2PixelBudget` —
+    // kept here for the callers that already read them off /status. The Video
+    // Gen page takes them from GET /model-context instead, so its Model picker
+    // never waits on the python probe above.
+    ...(await videoModelContext()),
     // Server-owned execution + policy scope per render backend (#3674). The
     // client renders these strings verbatim so the wording can't drift between
     // the two surfaces.
@@ -419,16 +509,6 @@ router.get('/status', asyncHandler(async (_req, res) => {
     // Authoritative list of bring-your-own-venv runtimes — lets the client
     // gate the install-banner probe without hardcoding the same Set.
     byovRuntimes: Object.keys(BYOV_RUNTIME_INFO),
-    // Total system memory in GB — the client uses this to auto-select the
-    // highest-memory mode-compatible model that fits on this machine.
-    // Rounded to nearest GB; sub-GB precision isn't useful for the
-    // model-size comparison and reads more cleanly in the UI.
-    systemMemoryGb: Math.round(os.totalmem() / 1024 ** 3),
-    // Effective FFLF/ltx2 stage-2 pixel-frame budget (honors
-    // FFLF_LTX2_PIXEL_BUDGET). The multi-keyframe picker mirrors the
-    // back-solve so it can reject out-of-budget keyframe indices before
-    // submit instead of letting the worker 400 mid-render.
-    fflfLtx2PixelBudget: resolveFflfLtx2PixelBudget(),
     // Runtime fingerprint — host chip/os + resolved ltx/mlx/torch versions per
     // installed BYOV runtime — so the UI can show the exact numerical stack and
     // bug reports for garbled/"mosaic" output carry the version info that makes
@@ -439,12 +519,20 @@ router.get('/status', asyncHandler(async (_req, res) => {
     // reject the whole /status response.
     runtime: await resolveRuntimeFingerprint().catch(() => null),
     // Will a render on this install actually sleep the display? macOS-only, and
-    // the user can opt out (settings.videoGen.displaySleep). Paired with each
+    // OFF unless the user opted in (settings.videoGen.displaySleep). Paired with each
     // model's `sleepsDisplayDuringRender`, this is what lets the UI warn BEFORE
     // the screen goes dark — a user who is not warned reads it as a crash and
     // wakes the display, re-introducing the exact GPU-watchdog contention the
     // sleep is there to avoid.
     displaySleepOnRender: isDisplaySleepEnabled(s.videoGen),
+    // Backend usability for the two metered-API video providers (#6213/#6214).
+    // Computed server-side through the SAME resolver `isVideoModeUsable` uses
+    // to gate an actual render, so a key set only via FAL_KEY/REACTOR_API_KEY
+    // env var (no Settings-form entry) still surfaces the backend switcher —
+    // the client can't see env vars, and re-deriving "has a key" from the
+    // settings object alone missed that case entirely.
+    falEnabled: isVideoModeUsable(s, VIDEO_GEN_MODE.FAL),
+    reactorEnabled: isVideoModeUsable(s, VIDEO_GEN_MODE.REACTOR),
   });
 }));
 
@@ -479,6 +567,18 @@ router.post('/model-terms', asyncHandler(async (req, res) => {
     return { ...current, videoGen: { ...(current.videoGen || {}), acceptedModelTerms: updated } };
   });
   res.json({ accepted: acceptedVideoModelTerms(next) });
+}));
+
+// Mints a short-lived reactor.inc session JWT scoped to `reactor/fast-h3`
+// (#6214) — the raw REACTOR_API_KEY never reaches the client. Load-bearing
+// security pattern: never cached, and the scope/session bound is set by
+// reactor.js#mintReactorToken, not by the caller.
+router.get('/reactor/token', asyncHandler(async (_req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  const settings = await getSettings();
+  const apiKey = resolveReactorApiKey(settings);
+  const { jwt, expiresAt } = await mintReactorToken(apiKey);
+  res.json({ jwt, expires_at: expiresAt });
 }));
 
 // `installed` here means "fully ready to render" — both the venv binary
@@ -530,141 +630,13 @@ router.get('/models', asyncHandler(async (_req, res) => {
   res.json(models);
 }));
 
-// Resolve the repo set an integrity scan should cover. A specific `modelId`
-// scopes to that model's repo; no modelId scans every model repo plus the
-// shared text encoder.
-// One definition of "a valid `only` list" for every download target this file
-// builds — model repos, their required weights, and the substitutable prompt
-// conditioners. `owner` is only used to name the offender in the error, so a
-// conditioner entry can pass its own registry id.
-const safeOnlyList = (owner, files, label) => {
-  const only = Array.isArray(files) ? files.filter((file) => typeof file === 'string' && file.length > 0) : [];
-  if (only.some((file) => !isSafeHfRepoRelativePath(file))) {
-    throw new ServerError(
-      `${owner} has an unsafe ${label} path. Use repo-relative POSIX filenames only.`,
-      { status: 500, code: 'VIDEO_MODEL_MISCONFIGURED' },
-    );
-  }
-  return only;
-};
-
-const videoModelLabel = (model) => `Video model "${model?.id}"`;
-
-const modelDownloadTargets = (model) => {
-  const repo = repoForModel(model);
-  if (!repo) return [];
-  // `repoFiles` narrows the model's OWN repo to an explicit file list, the way
-  // `requiredWeights[].files` already does for a secondary repo. It is required
-  // — not an optimization — whenever the model's repo is an aggregate that
-  // holds more than the one component set the runner loads: MiniMax H3 ships
-  // its diffusers layout, a second transformer partition and the original
-  // non-diffusers layout in one ~498 GB repo, so the default whole-snapshot
-  // target would pull 3.5x what the render path can use. Absent (every other
-  // model) still means "snapshot the repo".
-  const targets = [{
-    repo,
-    revision: model?.revision || null,
-    only: safeOnlyList(videoModelLabel(model), model?.repoFiles, 'repo-file'),
-  }];
-  for (const dep of Array.isArray(model?.requiredWeights) ? model.requiredWeights : []) {
-    if (typeof dep?.repo !== 'string') continue;
-    const only = safeOnlyList(videoModelLabel(model), dep.files, 'required-weight');
-    if (only.length > 0) targets.push({ repo: dep.repo, revision: dep.revision || null, only });
-  }
-  // The model's preview-fidelity decoder (#5423), when it declares one. Scoped
-  // to its pinned file for the same reason every other entry here is — and
-  // listed under the MODEL rather than as a standalone target, because it is
-  // useless without the checkpoint it decodes for, so the download badge that
-  // offers it belongs beside that model's own.
-  for (const decoder of downloadableVideoDraftDecoders([model])) {
-    targets.push({
-      repo: decoder.repo,
-      revision: decoder.revision || null,
-      only: safeOnlyList(`Draft decoder "${decoder.id}"`, decoder.files, 'weight-file'),
-    });
-  }
-  return targets;
-};
-
-// One download target per substitutable prompt conditioner. Each names an
-// explicit file list inside a repo that holds more than the loader can use —
-// quantizations and generation tails in a repack, or the language layers past
-// the conditioning depth in an upstream checkpoint — so these are ALWAYS scoped
-// to `only: entry.files`. A repo-wide snapshot would pull ~130 GB of unusable
-// variants for the repack and ~10 GB of never-built layers for the upstream one.
-const textEncoderDownloadTarget = (entry) => ({
-  repo: entry.repo,
-  revision: entry.revision || null,
-  only: safeOnlyList(`Text encoder "${entry.id}"`, entry.files, 'weight-file'),
-});
-// Paired with its entry so the status lane can project the registry fields
-// (label, size) alongside the cache verdict without a second lookup.
-const textEncoderDownloadTargets = () => downloadableVideoTextEncoders()
-  .map((entry) => ({ entry, target: textEncoderDownloadTarget(entry) }));
-
-const targetKey = (target) => `${target.repo}@${target.revision || 'latest'}::${target.only.join(',')}`;
-const targetVerifyOptions = (target, deep) => ({
-  deep,
-  ...(target.revision ? { revision: target.revision } : {}),
-});
-const verifyDownloadTarget = (target, { deep = false } = {}) => target.only.length > 0
-  ? verifyCachedRepoFiles(target.repo, target.only, targetVerifyOptions(target, deep))
-  : verifyModelCache(target.repo, targetVerifyOptions(target, deep));
-const repairDownloadTarget = (target, { deep = false } = {}) => target.only.length > 0
-  ? repairCachedRepoFiles(target.repo, target.only, targetVerifyOptions(target, deep))
-  : repairModelCache(target.repo, targetVerifyOptions(target, deep));
-
-const reposToVerify = (modelId) => {
-  if (modelId) {
-    const m = listVideoModels().find((x) => x.id === modelId);
-    return m ? modelDownloadTargets(m) : [];
-  }
-  const targets = listVideoModels().flatMap(modelDownloadTargets);
-  const enc = getTextEncoderRepo();
-  if (isHfRepoId(enc)) targets.push({ repo: enc, only: [] });
-  // Substitutable prompt conditioners are single pinned files the render path
-  // depends on, so an unscoped scan must reach them too — a truncated one
-  // otherwise only surfaces as a load failure minutes into a render.
-  targets.push(...textEncoderDownloadTargets().map(({ target }) => target));
-  // IC-LoRA remix weights are separate HF pulls that the render path depends
-  // on, so an unscoped integrity scan must cover them too — otherwise a
-  // corrupt IC weight only surfaces as a garbled render.
-  targets.push(...icLoraRepos().map((repo) => ({ repo, only: [] })));
-  return [...new Map(targets.map((target) => [targetKey(target), target])).values()];
-};
-
-// Per-model download status — see /api/image-gen/models/status for the
-// shape contract. We also surface the active text-encoder repo so the
-// video form can warn when the Gemma encoder isn't downloaded yet (a
-// surprise multi-GB pull on top of the model itself).
-// Cache + integrity for one HF repo, in the `{ cached, sizeBytes, integrity }`
-// shape every download badge consumes. The integrity check only runs for a repo
-// that's actually downloaded — a not-yet-cached repo gets the Download badge,
-// not a Repair banner. Shared by all three lanes of /models/status below so the
-// badge semantics can't drift between models, the encoder, and IC weights.
-const repoCacheStatus = async (repo) => {
-  const { cached, sizeBytes } = await inspectModelCache(repo);
-  return { cached, sizeBytes, integrity: cached ? summarizeVerify(await verifyModelCache(repo)) : null };
-};
-
-const modelCacheStatus = async (model, cache = null) => {
-  const targets = modelDownloadTargets(model);
-  if (targets.length === 0) return { repo: null, cached: null, sizeBytes: 0, integrity: null };
-  const readTarget = (target) => {
-    if (!cache) return verifyDownloadTarget(target);
-    const key = targetKey(target);
-    if (!cache.has(key)) cache.set(key, verifyDownloadTarget(target));
-    return cache.get(key);
-  };
-  const verifies = await Promise.all(targets.map(readTarget));
-  return {
-    repo: targets[0].repo,
-    requiredRepos: [...new Set(targets.map((target) => target.repo))],
-    cached: verifies.every((verify) => verify.status === 'ok'),
-    sizeBytes: verifies.reduce((sum, verify) => sum + (verify.sizeBytes || 0), 0),
-    integrity: aggregateVerifies(verifies),
-  };
-};
+// Everything the Model picker needs to render AND auto-select, with no python
+// probe in the way. A sibling route rather than a wrapper around /models so the
+// bare-array shape that route has always returned stays intact for its existing
+// callers (and for an older client talking to a newer server).
+router.get('/model-context', asyncHandler(async (_req, res) => {
+  res.json(await videoModelContext());
+}));
 
 router.get('/models/status', asyncHandler(async (_req, res) => {
   // Text encoder is shared across all video renders. A registry entry with
@@ -702,22 +674,27 @@ router.get('/models/status', asyncHandler(async (_req, res) => {
         integrity: cached ? summarizeVerify(verify) : null,
       };
     })),
-    // IC-LoRA remix weights (issue #3100). Each is a separate several-hundred-MB
-    // pull the IC render path needs, so they get the same cached/size/integrity
-    // shape as the models — that's what lets the mode panel render a Download
-    // badge and a Repair banner with the existing components.
+    // IC-LoRA weights (issue #3100). Each is a separate several-hundred-MB pull,
+    // so they get the same cached/size/integrity shape as the models — that's
+    // what lets the mode panel render a Download badge and a Repair banner with
+    // the existing components. This is the PROVISIONING list, so it spans weights
+    // that are not remix modes (the LTX-2.5 upscale adapter, #6502) and reports
+    // each by its `icLoraWeightKey` rather than assuming a `mode` value exists.
     Promise.all(listIcLoraWeights().map(async (spec) => {
-      // A mirrored spec (Ingredients) can't use the repo-wide verdict: its
-      // official repo is gated and its mirror is a 708 GB aggregate that reports
-      // `cached` off any unrelated weight. Probe the ONE file across both
-      // candidates instead, and skip the integrity walk (which would stat/hash
-      // every sibling weight in that mirror).
-      if (spec.mirrorRepo) {
+      // A spec that must be located by its exact file can't use the repo-wide
+      // verdict. Two reasons, both fatal to it: a mirrored spec (Ingredients)
+      // has a 708 GB aggregate mirror that reports `cached` off any unrelated
+      // weight, and a revision-pinned spec would accept a DIFFERENT commit's
+      // snapshot. Probe the ONE file across the candidates instead, and skip the
+      // integrity walk (which would stat/hash every sibling weight in a mirror).
+      if (icLoraProbesExactFile(spec)) {
         const found = await findCachedIcLoraWeight(spec);
         return {
-          id: spec.mode, repo: spec.repo, label: spec.label,
+          id: icLoraWeightKey(spec), repo: spec.repo, label: spec.label,
+          baseModel: spec.baseModel, revision: spec.revision || null,
+          requiresPreDownload: !!spec.requiresPreDownload,
           estimatedBytes: spec.sizeBytes,
-          gated: !!spec.gated, mirrorRepo: spec.mirrorRepo,
+          gated: !!spec.gated, mirrorRepo: spec.mirrorRepo || null,
           cached: !!found,
           resolvedRepo: found?.repo || null,
           // The badge falls back to `estimatedBytes` when sizeBytes is 0, and the
@@ -728,7 +705,9 @@ router.get('/models/status', asyncHandler(async (_req, res) => {
         };
       }
       return {
-        id: spec.mode, repo: spec.repo, label: spec.label,
+        id: icLoraWeightKey(spec), repo: spec.repo, label: spec.label,
+        baseModel: spec.baseModel, revision: spec.revision || null,
+        requiresPreDownload: !!spec.requiresPreDownload,
         estimatedBytes: spec.sizeBytes,
         gated: !!spec.gated,
         ...await repoCacheStatus(spec.repo),
@@ -796,36 +775,31 @@ router.get('/models/:modelId/download', asyncHandler(async (req, res) => {
 // but are NOT listVideoModels() entries, so the model-id-keyed routes above
 // can't reach them. Keyed by the PortOS remix mode ('ic-control', …) so the
 // client uses the same identifier it puts in the render payload.
-const icLoraSpecFromParam = (mode) => {
-  const spec = icLoraSpecForMode(mode);
-  if (!spec) {
-    throw new ServerError(
-      `Unknown IC-LoRA remix mode: ${mode} (expected one of ${IC_LORA_MODE_VALUES.join(', ')})`,
-      { status: 404, code: 'IC_LORA_UNKNOWN_MODE' },
-    );
-  }
-  return spec;
-};
-
-// Download one IC weight. A spec with a `mirrorRepo` is fetched SINGLE-FILE and
-// only ever single-file: the official Ingredients repo is gated (an anonymous
-// pull 401s) and its un-gated mirror is the ~708 GB `DeepBeepMeep/LTX-2`
-// aggregate, so a snapshot of either would either fail or fill the user's disk.
-// Candidates are tried in order (official → mirror) so a user WITH an HF token
-// gets the first-party weight and a user without one still succeeds via the
-// mirror — no token, no extra button. The exact filename is pinned so the mirror
-// can't hand back a sibling weight.
+// Download one IC weight. An exact-file spec is fetched SINGLE-FILE and only ever
+// single-file. For Ingredients that is because the official repo is gated (an
+// anonymous pull 401s) and its un-gated mirror is the ~708 GB `DeepBeepMeep/LTX-2`
+// aggregate, so a snapshot of either would either fail or fill the user's disk;
+// for a revision-pinned spec it is because the pinned commit and filename are the
+// whole point of the pin. Candidates are tried in order (official → mirror) so a
+// user WITH an HF token gets the first-party weight and a user without one still
+// succeeds via the mirror — no token, no extra button. The exact filename is
+// pinned so a mirror can't hand back a sibling weight.
+//
+// A spec with NO mirror (the LTX-2.5 upscaler) therefore has exactly one
+// candidate: a gated failure surfaces with its actionable "accept the license"
+// message rather than being downgraded on the way to a fallback that isn't there.
 router.get('/ic-loras/:mode/download', asyncHandler(async (req, res) => {
   const spec = icLoraSpecFromParam(req.params.mode);
   const force = req.query.force === '1';
-  if (!spec.mirrorRepo) {
+  if (!icLoraProbesExactFile(spec)) {
     await startHfDownloadStream({ req, res, repo: spec.repo, force });
     return;
   }
   await startHfDownloadStream({
     req,
     res,
-    fallbacks: icLoraWeightCandidates(spec).map((c) => ({ repo: c.repo, only: [c.filename] })),
+    fallbacks: icLoraWeightCandidates(spec)
+      .map((c) => ({ repo: c.repo, only: [c.filename], revision: c.revision })),
     // The repo-wide `cached` verdict is meaningless for the aggregate mirror (it
     // reports cached as soon as ANY unrelated weight is resident), so gate the
     // already-have short-circuit on this exact weight instead.
@@ -843,7 +817,7 @@ router.post('/ic-loras/:mode/repair', asyncHandler(async (req, res) => {
   // the WHOLE snapshot — against the 708 GB aggregate mirror that would stat (and
   // under `deep`, hash) every unrelated LTX weight the user has. Delete just this
   // weight and let the single-file download re-fetch it.
-  if (spec.mirrorRepo) {
+  if (icLoraProbesExactFile(spec)) {
     const found = await findCachedIcLoraWeight(spec);
     if (!found) return res.json({ deep, deleted: [], repos: [spec.repo] });
     await repairCachedFile(found.path);
@@ -862,18 +836,6 @@ router.post('/ic-loras/:mode/repair', asyncHandler(async (req, res) => {
 // Distinct from the /text-encoder/* pair below, which is the SHARED LTX encoder
 // (one repo, install-wide, selected in the media-models registry). These are
 // per-model alternatives chosen per render.
-const textEncoderFromParam = (id) => {
-  const entry = downloadableVideoTextEncoder(id);
-  if (!entry) {
-    const known = downloadableVideoTextEncoders().map((e) => e.id);
-    throw new ServerError(
-      `Unknown text encoder: ${id}${known.length ? ` (expected one of ${known.join(', ')})` : ''}`,
-      { status: 404, code: 'VIDEO_TEXT_ENCODER_UNKNOWN' },
-    );
-  }
-  return entry;
-};
-
 // Always the entry's pinned file list, never a snapshot: these repos publish
 // more than the loader can read — INT8 ConvRot / NVFP4 quantizations and 50-63
 // generation tails in a repack, the language layers past the conditioning depth
@@ -945,7 +907,23 @@ router.post('/', frameImageUpload, asyncHandler(async (req, res) => {
     await cleanupMultipartTemp(uploads);
     failValidation(parsed);
   }
-  res.json(await submitVideoGenJob(parsed.data, uploads));
+  const queued = await submitVideoGenJob(parsed.data, uploads);
+  try {
+    const happenedAt = new Date().toISOString();
+    await recordUserAction({
+      type: 'media.video.enqueue',
+      actor: 'user',
+      target: queued.jobId,
+      summary: 'enqueued video job',
+      payload: { jobId: queued.jobId },
+      source: { route: `${req.baseUrl}${req.route?.path ?? ''}`, method: req.method },
+      happenedAt,
+      dedupeKey: `media.video.enqueue:${queued.jobId}`,
+    });
+  } catch (error) {
+    console.error(`❌ Failed to record media.video.enqueue: ${error.message}`);
+  }
+  res.json(queued);
 }));
 
 // Currently-running video job (if any) so the page can re-attach after a
@@ -966,7 +944,7 @@ const ACTIVE_JOB_PARAM_FIELDS = [
   'prompt', 'negativePrompt', 'modelId',
   'width', 'height', 'numFrames', 'fps',
   'steps', 'guidanceScale', 'seed',
-  'tiling', 'disableAudio', 'mode', 'chunks', 'chunkPrompts', 'contextFrames', 'imageStrength',
+  'tiling', 'disableAudio', 'displaySleep', 'mode', 'chunks', 'chunkPrompts', 'contextFrames', 'imageStrength',
   // Plain enum, no path — safe to echo so a reloading page restores the promise the
   // in-flight render is actually keeping.
   'i2vReferenceMode',
@@ -980,11 +958,20 @@ const ACTIVE_JOB_PARAM_FIELDS = [
   // picked, so a reloading page restores the control instead of snapping back
   // to Full.
   'draftDecode',
+  // Block-streaming request (#6499) — a closed enum with no path, safe to
+  // echo so a reloading page restores the picker instead of snapping back to
+  // Auto.
+  'streamingMode',
   'audioStartSec',
   // Grok jobs (#2859 phase 2): the semantic t2v/i2v mode ('mode' holds the
   // 'grok' discriminator for them) and the clip duration — both plain
   // values, safe to echo for the reloading page's form restore.
   'videoMode', 'duration',
+  // reactor.inc jobs (#6214): the clip to chain from, the clip length, and the
+  // fast-h3 session canvas — all plain scalars (no filesystem path), safe to
+  // echo for the reloading page's form restore. `seed` above already covers
+  // reactor's seed field.
+  'continueFromClipId', 'seconds', 'aspect',
   // loras are { filename, scale } basenames (no server filesystem paths), so
   // they're safe to echo back for the resuming picker to repopulate.
   'loras',
@@ -1099,6 +1086,25 @@ router.post('/cancel', asyncHandler(async (req, res) => {
   res.json({ ok: false, reason: 'no active or queued video render' });
 }));
 
+// The ONE contract every `/history/:id*` route resolves its record id through
+// (#5713) — GET, DELETE, visibility and prompt all name the same stored row, so
+// they share one schema instead of three (loose / strict / none).
+//
+// It stays looser than `historyIdSchema` below on purpose: that UUID check suits
+// ids this install MINTS, but entries also arrive from a caller-supplied
+// download id and from federated peers, so a `.guid()` gate here would 400 rows
+// that are legitimately in the list. The charset bound is the floor — every
+// legitimate id is `[A-Za-z0-9._-]+`, and a value carrying a path segment or a
+// `..` can no longer parse, so `safeUnder()` two modules away in historyOps is
+// defense in depth rather than the only thing standing between a hostile id and
+// an unlink loop.
+const historyRecordIdSchema = z.string().trim().min(1).max(200)
+  .regex(/^[A-Za-z0-9._-]+$/, 'invalid history id');
+const updatePromptSchema = z.object({ prompt: z.string().max(8000) });
+// `hidden` is required: reading an absent body as `false` turned a malformed
+// request into a silent unhide.
+const visibilitySchema = z.object({ hidden: z.boolean() });
+
 router.get('/history', asyncHandler(async (_req, res) => {
   res.json(await loadHistory());
 }));
@@ -1109,18 +1115,8 @@ router.get('/history', asyncHandler(async (_req, res) => {
 // `finalVideoId`, an EpisodeVideoStage final) has to ask the server which file
 // it points at. Before this route existed, every such surface pulled the WHOLE
 // history list to find one row.
-//
-// The id is validated loosely on purpose: `historyIdSchema`'s UUID check below
-// suits ids this install MINTS, but entries also arrive from a caller-supplied
-// download id and from federated peers, so a `.guid()` gate here would 400 rows
-// that are legitimately in the list. Nothing is interpolated into a path — the
-// value is only compared against stored ids — so a length-capped string is the
-// right bound.
-const historyLookupIdSchema = z.string().min(1).max(200);
-const updatePromptSchema = z.object({ prompt: z.string().max(8000) });
-
 router.get('/history/:id', asyncHandler(async (req, res) => {
-  const parsed = historyLookupIdSchema.safeParse(req.params.id);
+  const parsed = historyRecordIdSchema.safeParse(req.params.id);
   if (!parsed.success) failValidation(parsed);
   const entry = await getHistoryItem(parsed.data);
   if (!entry) throw new ServerError('Not found', { status: 404, code: 'NOT_FOUND' });
@@ -1148,15 +1144,21 @@ router.post('/upload', asyncHandler(async (req, res) => {
 }));
 
 router.delete('/history/:id', asyncHandler(async (req, res) => {
-  res.json(await deleteHistoryItem(req.params.id));
+  const parsed = historyRecordIdSchema.safeParse(req.params.id);
+  if (!parsed.success) failValidation(parsed);
+  res.json(await deleteHistoryItem(parsed.data));
 }));
 
 router.post('/history/:id/visibility', asyncHandler(async (req, res) => {
-  res.json(await setHistoryItemHidden(req.params.id, !!req.body?.hidden));
+  const parsedId = historyRecordIdSchema.safeParse(req.params.id);
+  if (!parsedId.success) failValidation(parsedId);
+  const body = visibilitySchema.safeParse(req.body ?? {});
+  if (!body.success) failValidation(body);
+  res.json(await setHistoryItemHidden(parsedId.data, body.data.hidden));
 }));
 
 router.patch('/history/:id/prompt', asyncHandler(async (req, res) => {
-  const parsedId = historyLookupIdSchema.safeParse(req.params.id);
+  const parsedId = historyRecordIdSchema.safeParse(req.params.id);
   if (!parsedId.success) failValidation(parsedId);
   const body = updatePromptSchema.safeParse(req.body ?? {});
   if (!body.success) failValidation(body);
@@ -1164,9 +1166,10 @@ router.patch('/history/:id/prompt', asyncHandler(async (req, res) => {
 }));
 
 // Render jobs use UUID history ids, while shared-gallery uploads use an
-// `upload-<uuid8>` id. These mutating operations only resolve a stored history
-// record and subsequently derive the path from its guarded filename, so both
-// known id forms are valid here.
+// `upload-<uuid8>` id. These operations derive a NEW artifact path from the
+// resolved record (an anchor frame, an upscale, a stitch output) rather than
+// merely reading or mutating the row, so they hold the tighter of the two
+// contracts and accept only the two id forms this install can mint.
 const historyIdSchema = z.string().regex(
   /^(?:[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|upload-[a-f0-9]{8})$/i,
   'invalid history id',
@@ -1178,10 +1181,42 @@ router.post('/last-frame/:id', asyncHandler(async (req, res) => {
   res.json(await extractLastFrame(parsed.data));
 }));
 
+// The method choice, shared by the action's body and the plan endpoint's query
+// so the two can never disagree on what is accepted or what an omission means.
+// An absent method is exactly Lanczos, so every pre-#6509 client keeps its
+// current behavior without sending anything new.
+const upscaleMethodSchema = z.object({
+  method: z.enum(UPSCALE_METHODS).default(DEFAULT_UPSCALE_METHOD),
+});
+
+// What the user must see BEFORE submitting (#6509): source geometry, the target
+// the method would produce, the padding the model grid needs, and whether this
+// machine can actually run the method. Read-only — it queues no job and pulls
+// no weight.
+router.get('/upscale/:id/plan', asyncHandler(async (req, res) => {
+  const parsed = historyIdSchema.safeParse(req.params.id);
+  if (!parsed.success) failValidation(parsed);
+  const query = upscaleMethodSchema.safeParse(req.query ?? {});
+  if (!query.success) failValidation(query);
+  res.json({ ok: true, plan: await planUpscaleHistoryItem(parsed.data, query.data) });
+}));
+
+// The two methods answer with materially different things, so they answer with
+// different KEYS rather than one overloaded field. Lanczos is an inline ffmpeg
+// pass that returns the finished row; the generative method is a multi-minute
+// GPU render, so it returns the queued job to watch and the row appears in
+// history when it lands (#6511). Every pre-#6511 client omits `method`, gets
+// Lanczos, and still reads `video` exactly as before.
 router.post('/upscale/:id', asyncHandler(async (req, res) => {
   const parsed = historyIdSchema.safeParse(req.params.id);
   if (!parsed.success) failValidation(parsed);
-  const entry = await upscaleHistoryItem(parsed.data);
+  const body = upscaleMethodSchema.safeParse(req.body ?? {});
+  if (!body.success) failValidation(body);
+  if (body.data.method === 'ltx') {
+    res.json({ ok: true, job: await enqueueLtxUpscale(parsed.data) });
+    return;
+  }
+  const entry = await upscaleHistoryItem(parsed.data, body.data);
   res.json({ ok: true, video: entry });
 }));
 

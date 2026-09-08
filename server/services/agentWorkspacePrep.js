@@ -1,3 +1,4 @@
+import { isPrivateSecurityTask } from '../lib/privateSecurityPolicy.js';
 /**
  * Agent Workspace Preparation
  *
@@ -38,8 +39,11 @@ import { createWorktree, adoptWorktree, findAdoptableWorktreeForBranch, isBranch
 import { resolveSpawnCwd, usesCreativeDirectorScratchCwd, creativeDirectorScratchCwd } from '../lib/spawnCwd.js';
 import { enforceSafeBranchUpstream } from '../lib/branchUpstreamGuard.js';
 import { resolveTaskTargetBranch } from '../lib/taskTargetBranch.js';
-import { getAppWorkspace, getAppDataForTask, createJiraTicketForTask } from './agentPromptBuilder.js';
+import { resolveTaskForkHead } from '../lib/forkHead.js';
+import { getAppWorkspace, getAppDataForTask } from './agentAppWorkspace.js';
+import { createJiraTicketForTask } from './promptSections/appContext.js';
 import { INVESTIGATION_TASK_DELIVERY, isInvestigationTask } from '../lib/investigationTasks.js';
+import { isNonCommittingCoordinatorTask } from './taskTypeHooks.js';
 
 const ROOT_DIR = PATHS.root;
 
@@ -100,10 +104,15 @@ async function getProtectedAgentIds() {
  *
  * `findAdoptableWorktreeForBranch` refuses every holder PortOS doesn't own
  * outright, so this can never move the user's checkout or a live agent's tree.
+ * The one caller-gated exception is `allowLiveClaim`: a non-committing
+ * coordinator follow-up (`isNonCommittingCoordinatorTask` — a review-loop
+ * resolve-and-merge or a PR-remediation follow-up) may take over a `claim-*`
+ * holder too, because its whole deliverable names that exact branch as the one
+ * to finish and land.
  *
  * @returns {Promise<{ worktreeInfo: object, adoptedFrom: string }|null>}
  */
-async function adoptWorktreeHoldingBranch({ agentId, workspacePath, branchName, preferredPath = null, taskId }) {
+async function adoptWorktreeHoldingBranch({ agentId, workspacePath, branchName, preferredPath = null, taskId, allowLiveClaim = false }) {
   // Fail CLOSED on an unreadable agent list: an empty protected set would read as
   // "nothing is running", which is the one wrong answer here — it would move a
   // live run's directory. The caller's timed pause is the safe outcome instead.
@@ -113,7 +122,7 @@ async function adoptWorktreeHoldingBranch({ agentId, workspacePath, branchName, 
   });
   if (!activeAgentIds) return null;
 
-  const holder = await findAdoptableWorktreeForBranch(workspacePath, branchName, { activeAgentIds, preferredPath });
+  const holder = await findAdoptableWorktreeForBranch(workspacePath, branchName, { activeAgentIds, preferredPath, allowLiveClaim });
   if (!holder) return null;
 
   const worktreeInfo = await adoptWorktree(agentId, workspacePath, holder.path, branchName).catch(err => {
@@ -135,6 +144,7 @@ async function prepareRequestedWorktree({
   workspacePath,
   task,
   existingBranch,
+  forkHead,
   allowSharedWorkspaceFallback,
 }) {
   // Detecting the base branch and resolving the branch holder are independent
@@ -148,6 +158,16 @@ async function prepareRequestedWorktree({
   // same safe adoption path review-loop follow-ups use, rather than cutting a
   // fresh branch merely because a cached path could not be moved.
   const resumeWorktreePath = existingBranch ? task.metadata?.resumeWorktreePath : null;
+  // A review-loop / PR-remediation follow-up's whole purpose is landing THIS
+  // branch, and the user's own "resolve and merge" trigger (or pr-reviewer's own
+  // dispatch) is the signal to finish whatever a `/do:next` claim left on it — so
+  // these are the callers allowed to take over a `claim-*` holder instead of
+  // retrying against it until the task gives up (#6243). `isNonCommittingCoordinatorTask`
+  // is the shared predicate for exactly this "same shape" set (taskTypeHooks.js) —
+  // reused here rather than re-listing the flags, so a future follow-up type of the
+  // same shape inherits the carve-out too. A plain resume never targets a claim tree
+  // (its pointer names a CoS `agent-*` worktree) and doesn't set either follow-up
+  // flag, so the predicate is a no-op there.
   const takeoverPromise = existingBranch
     ? adoptWorktreeHoldingBranch({
       agentId,
@@ -155,6 +175,7 @@ async function prepareRequestedWorktree({
       branchName: existingBranch,
       preferredPath: resumeWorktreePath,
       taskId: task.id,
+      allowLiveClaim: isNonCommittingCoordinatorTask(task),
     })
     : Promise.resolve(null);
 
@@ -181,6 +202,10 @@ async function prepareRequestedWorktree({
   const worktreeInfo = takeover?.worktreeInfo || await createWorktree(agentId, workspacePath, task.id, {
     baseBranch: detectedBase || undefined,
     existingBranch: existingBranch || undefined,
+    // Only consulted when `existingBranch` names a FORK PR's head, which has no
+    // `origin/<branch>` to attach to (#6064). Null for every other task, which
+    // is the behavior that predates it.
+    forkHead: forkHead || undefined,
     planId: task.metadata?.planId || undefined
   }).catch(err => {
     worktreeError = err;
@@ -243,6 +268,14 @@ async function prepareRequestedWorktree({
  * @returns {Promise<object>} discriminated outcome (see module doc)
  */
 export async function prepareAgentWorkspace({ agentId, task }) {
+  if (isPrivateSecurityTask(task)) {
+    const { privateSecurityScratchCwd } = await import('../lib/privateSecuritySandbox.js');
+    const workspacePath = privateSecurityScratchCwd(agentId);
+    await ensureDir(workspacePath);
+    return { outcome: 'ready', workspacePath, resolvedAppName: null, worktreeInfo: null,
+      jiraTicket: null, jiraBranchName: null, explicitWorktree: false };
+  }
+
   // Creative Director treatment/plan/evaluate tasks are HTTP-PATCH deliverables
   // and never asked for a worktree. Pin them to an isolated scratch cwd BEFORE
   // the PortOS-root resolution / git-pull / conflict scan, so a CLI/TUI provider
@@ -340,6 +373,9 @@ export async function prepareAgentWorkspace({ agentId, task }) {
   // detection returns `proceed` once the dead agent is gone) and silently
   // abandons the work the pointer was recorded to save.
   const existingBranch = resolveTaskTargetBranch(task.metadata);
+  // Where that branch lives when the task points at a fork PR's head — read
+  // here rather than inside the worktree layer, which has no forge client.
+  const forkHead = resolveTaskForkHead(task.metadata);
   const wantsWorktree = explicitWorktree || !!existingBranch;
 
   if (!isReadOnly) {
@@ -476,6 +512,7 @@ export async function prepareAgentWorkspace({ agentId, task }) {
       workspacePath,
       task,
       existingBranch,
+      forkHead,
       allowSharedWorkspaceFallback: !isReadOnly && !explicitWorktree,
     });
     if (worktreeOutcome.outcome !== 'ready') return worktreeOutcome;

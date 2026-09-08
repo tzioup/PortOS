@@ -7,6 +7,7 @@ import ModelsTabsHeader from '../components/models/ModelsTabsHeader';
 import Image3dRuntimes from '../components/models/Image3dRuntimes';
 import ModelStatusTab from '../components/models/ModelStatusTab';
 import CodeReviewersTab from '../components/settings/CodeReviewersTab';
+import HarnessesTab from '../components/models/HarnessesTab';
 import EmbeddingsTab from '../components/settings/EmbeddingsTab';
 import LocalModelAssessments from '../components/settings/LocalModelAssessments.jsx';
 import { LocalLlmTab } from '../components/settings/LocalLlmTab';
@@ -30,12 +31,15 @@ const MediaModels = lazyWithReload(() => import('./MediaModels'));
  *   - **3D** — image-to-3D runtime install/repair (TRELLIS.2, Pixal3D).
  *   - **Code Reviewers** — the review-loop chain and its model/effort pins.
  *   - **Embeddings** — the embedding model backing pgvector search.
+ *   - **Harnesses** — the coding-agent CLIs/TUIs, their versions and model lists.
  *   - **LLMs** — focused runtime, model-library, and abuse-guard sub-routes.
  *   - **LoRAs** — installed image/video adapters.
  *   - **Media** — image/video checkpoints and the Hugging Face cache.
  *   - **Performance** — measured assessments and launch-tuning comparison.
+ *   - **Providers** — configured AI provider connections and model catalogs.
  *   - **Status** — residency plus the downloaded-model inventory.
  *   - **Training** — LoRA fine-tuning datasets and runs.
+ *   - **Usage** — provider quota and PortOS AI usage accounting.
  *
  * What deliberately stayed OUT is output rather than weights: Three.js Models is
  * a gallery of generated meshes, and `/3d` is the render flow that consumes the
@@ -47,9 +51,11 @@ const MediaModels = lazyWithReload(() => import('./MediaModels'));
  * reachable from ⌘K and voice (`client/src/AGENTS.md`).
  */
 const TAB_CONTENT = {
+  comparison: lazyWithReload(() => import('../components/models/ModelComparison')),
   '3d': Image3dRuntimes,
   'code-reviewers': CodeReviewersTab,
   embeddings: EmbeddingsTab,
+  harnesses: HarnessesTab,
   llms: LocalLlmTab,
   loras: Loras,
   media: MediaModels,

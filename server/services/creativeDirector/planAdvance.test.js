@@ -222,10 +222,12 @@ vi.mock('../mediaJobQueue/index.js', () => ({
   listJobs: (...a) => mockListJobs(...a),
   mediaJobEvents: { on: vi.fn(), off: vi.fn() },
 }));
-vi.mock('../pipeline/seriesAutopilot.js', () => ({
+vi.mock('../pipeline/seriesAutopilot/state.js', () => ({
   autopilotEvents: ap.autopilotEvents,
-  isAutopilotActive: () => ap.ctl.active,
   AUTOPILOT_TERMINAL_TYPES: ap.AUTOPILOT_TERMINAL_TYPES,
+}));
+vi.mock('../pipeline/seriesAutopilot/session.js', () => ({
+  isAutopilotActive: () => ap.ctl.active,
 }));
 vi.mock('../pipeline/series.js', () => ({
   getSeries: async () => ap.ctl.marker && { autopilot: ap.ctl.marker },
@@ -284,6 +286,14 @@ const planProject = (steps, over = {}) => ({
 });
 
 describe('advanceAfterPlanStepSettled — executor', () => {
+  it('never plans or dispatches an inert Video production through background advancement', async () => {
+    makeStore({ ...planProject([step('a', { toolName: 'pipeline_createSeries' })]), workspace: 'video' });
+    await advanceAfterPlanStepSettled('cd-1');
+    expect(mockDispatch).not.toHaveBeenCalled();
+    expect(mockEnqueuePlanTask).not.toHaveBeenCalled();
+    expect(mockUpdateProject).not.toHaveBeenCalled();
+  });
+
   it('is a no-op for a legacy project (no directive)', async () => {
     makeStore({ id: 'cd-1', status: 'rendering', directive: null, plan: null, runs: [] });
     await advanceAfterPlanStepSettled('cd-1');

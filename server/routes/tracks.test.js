@@ -53,8 +53,9 @@ vi.mock('../services/albums/index.js', () => ({
   getAlbum: vi.fn(async () => null),
   updateAlbum: vi.fn(async (id, patch) => ({ id, ...patch })),
 }));
+// The URL rule is NOT mocked: it lives in `lib/youtubeUrl.js` and the route
+// imports it from there, so these cases exercise the real accept/reject regex.
 vi.mock('../services/trackYoutubeImport.js', () => ({
-  YOUTUBE_URL_RE: /^https?:\/\/(www\.|m\.)?(youtube\.com\/watch\?[^\s#]*\bv=[\w-]{6,}|youtu\.be\/[\w-]{6,})/i,
   startYoutubeImport: vi.fn(async () => ({ jobId: 'job-1' })),
   attachImportSseClient: vi.fn(() => true),
   cancelYoutubeImport: vi.fn(() => true),
@@ -62,6 +63,7 @@ vi.mock('../services/trackYoutubeImport.js', () => ({
 
 import * as musicLibrary from '../services/pipeline/musicLibrary.js';
 import * as albums from '../services/albums/index.js';
+import { TRACK_IDS_MAX } from '../services/albums/logic.js';
 import * as ytImport from '../services/trackYoutubeImport.js';
 import { errorMiddleware } from '../lib/errorHandler.js';
 import tracksRoutes from './tracks.js';
@@ -130,6 +132,17 @@ describe('tracks routes', () => {
       expect(r.status).toBe(202);
     });
 
+    it.each([
+      'https://music.youtube.com/watch?v=dQw4w9WgXcQ',
+      'https://www.youtube.com/shorts/dQw4w9WgXcQ',
+      'https://www.youtube.com/live/dQw4w9WgXcQ',
+      'https://www.youtube.com/embed/dQw4w9WgXcQ',
+    ])('POST /import/youtube accepts %s (#6014 — the drifted regex rejected these)', async (url) => {
+      const r = await request(app).post('/api/tracks/import/youtube').send({ url });
+      expect(r.status).toBe(202);
+      expect(ytImport.startYoutubeImport).toHaveBeenCalledWith(url);
+    });
+
     it('POST /import/youtube rejects a non-YouTube URL (never reaches the service)', async () => {
       const r = await request(app).post('/api/tracks/import/youtube').send({ url: 'https://vimeo.com/12345' });
       expect(r.status).toBe(400);
@@ -186,6 +199,31 @@ describe('tracks routes', () => {
     expect(r.status).toBe(200);
     expect(albums.updateAlbum).toHaveBeenCalledWith('album-old', { trackIds: [] });
     expect(albums.updateAlbum).toHaveBeenCalledWith('album-new', { trackIds: ['track-1'] });
+  });
+
+  // The capacity/existence contract itself is covered at the service boundary
+  // (services/trackAlbumMembership.test.js). These two pin the ROUTE wiring:
+  // a regression that reinstates the old best-effort reconcile would persist
+  // the track and answer 2xx instead of surfacing the refusal.
+  it('POST / refuses a create into a full album without persisting the track', async () => {
+    albums.getAlbum.mockResolvedValueOnce({ id: 'album-full', trackIds: Array.from({ length: TRACK_IDS_MAX }, (_, i) => `track-${i}`) });
+    const r = await request(app).post('/api/tracks').send({ title: 'Intro', albumId: 'album-full' });
+    expect(r.status).toBe(409);
+    expect(r.body.code).toBe('ALBUM_FULL');
+    expect(tracks.createTrack).not.toHaveBeenCalled();
+    expect(albums.updateAlbum).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /:id refuses a move into an album that no longer exists', async () => {
+    tracks.getTrack.mockResolvedValueOnce({ id: 'track-1', title: 'Intro', albumId: 'album-old' });
+    // An earlier case left a mockImplementation on getAlbum; clearAllMocks keeps
+    // implementations, so state the missing destination explicitly.
+    albums.getAlbum.mockResolvedValueOnce(null);
+    const r = await request(app).patch('/api/tracks/track-1').send({ albumId: 'album-missing' });
+    expect(r.status).toBe(404);
+    expect(r.body.code).toBe('ALBUM_NOT_FOUND');
+    expect(tracks.updateTrack).not.toHaveBeenCalled();
+    expect(albums.updateAlbum).not.toHaveBeenCalled();
   });
 
   it('POST / rejects a missing title', async () => {

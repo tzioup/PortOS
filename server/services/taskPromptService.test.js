@@ -8,8 +8,26 @@ vi.mock('./taskSchedule.js', () => ({
   getTaskInterval: vi.fn(async () => ({ prompt: 'before {worktreesRoot}/claim-x after' })),
 }));
 
-import { getTaskPrompt, getStagePrompt, DEFAULT_TASK_PROMPTS, PREVIOUS_DEFAULT_PROMPTS } from './taskPromptService.js';
+// Stand-in slashdo bodies. Every one carries the `$`-prefixed tokens that
+// String.replace treats as backreferences when handed a STRING replacement —
+// `$&` (the match), `$1`, and the "text before / after the match" forms — so a
+// regression to string-form replacement shows up as spliced prompt text rather
+// than passing by luck on a body that happens to contain no `$`.
+const { BACKREFERENCE_BAIT } = vi.hoisted(() => ({ BACKREFERENCE_BAIT: "regex `^[^/]+#[0-9]+$` and $& and $1 and $' end" }));
+vi.mock('../lib/slashdoLoader.js', () => ({
+  loadSlashdoFile: vi.fn(async (name) => (
+    name === 'review'
+      ? `FULL /do:review BODY ## Parse Arguments ## Copilot Code Review Loop ${BACKREFERENCE_BAIT}`
+      : name === 'replan'
+        ? `REPLAN BODY ${BACKREFERENCE_BAIT}`
+        : ''
+  )),
+  loadSlashdoLib: vi.fn(async (name) => `# ${name} lens\n${BACKREFERENCE_BAIT}`),
+}));
+
+import { getTaskPrompt, getStagePrompt, DEFAULT_TASK_PROMPTS } from './taskPromptService.js';
 import { getTaskInterval } from './taskSchedule.js';
+import { loadSlashdoFile, loadSlashdoLib } from '../lib/slashdoLoader.js';
 import { PATHS } from '../lib/fileUtils.js';
 
 describe('taskPromptService {worktreesRoot} substitution', () => {
@@ -26,6 +44,69 @@ describe('taskPromptService {worktreesRoot} substitution', () => {
   });
 });
 
+describe('slashdo placeholder substitution', () => {
+  const PR_REVIEWER_INTERVAL = {
+    prompt: null,
+    taskMetadata: {
+      pipeline: {
+        stages: [
+          { name: 'Security Scan', promptKey: 'pr-reviewer-security' },
+          { name: 'Eligibility Gate', promptKey: 'pr-reviewer-eligibility' },
+          { name: 'Code Review & Merge', promptKey: 'pr-reviewer-review' },
+        ],
+      },
+    },
+  };
+
+  it('inlines a slashdo body verbatim — backreference tokens in it never splice the prompt', async () => {
+    getTaskInterval.mockResolvedValueOnce({ prompt: 'HEAD {reviewChecklist} TAIL {slashdoReplan} END' });
+
+    const out = await getTaskPrompt('code-reviewer');
+
+    // The 2026-09-04 shape of this bug: a `$` + backtick inside the inlined
+    // /do:review re-inserted everything before the placeholder, so one Stage 3
+    // prompt carried seven copies of its own header (~400KB, ~100K tokens).
+    expect(out).toBe(`HEAD FULL /do:review BODY ## Parse Arguments ## Copilot Code Review Loop ${BACKREFERENCE_BAIT} TAIL REPLAN BODY ${BACKREFERENCE_BAIT} END`);
+    expect(out.match(/HEAD/g)).toHaveLength(1);
+  });
+
+  it('gives the public-review actions stage the review LENSES ({reviewLenses}), never the whole /do:review procedure', async () => {
+    getTaskInterval.mockResolvedValueOnce(PR_REVIEWER_INTERVAL);
+    vi.mocked(loadSlashdoFile).mockClear();
+    vi.mocked(loadSlashdoLib).mockClear();
+
+    const stage = await getStagePrompt('pr-reviewer', 2);
+
+    // The stage header appears once (no splice) and the checklist is the lens
+    // set — the argument parser, reviewer loops and PR-posting procedure of the
+    // full body are a runtime this sandboxed, network-less stage cannot use.
+    expect(stage.match(/PR Code Review & Actions \(Stage 3\)/g)).toHaveLength(1);
+    expect(stage).not.toContain('{reviewLenses}');
+    expect(stage).not.toContain('FULL /do:review BODY');
+    expect(stage).toContain('# review-surface-scan lens');
+    expect(stage).toContain('# review-security-audit lens');
+    expect(stage).toContain('# review-cross-file-contract lens');
+    expect(stage).toContain(BACKREFERENCE_BAIT);
+    expect(vi.mocked(loadSlashdoFile)).not.toHaveBeenCalledWith('review', expect.anything());
+    expect(vi.mocked(loadSlashdoLib).mock.calls.map(([name]) => name)).toEqual([
+      'review-surface-scan',
+      'review-surface-quality',
+      'review-security-audit',
+      'review-cross-file-tracing',
+      'review-cross-file-contract',
+    ]);
+  });
+
+  it('keeps {reviewChecklist} as the full /do:review body for stored and prior-default prompts', async () => {
+    getTaskInterval.mockResolvedValueOnce({ prompt: 'X {reviewChecklist} Y' });
+
+    const out = await getTaskPrompt('code-reviewer');
+
+    expect(out).toContain('FULL /do:review BODY');
+    expect(out).not.toContain('lens');
+  });
+});
+
 describe('claim-flow prompt variants', () => {
   it('keeps scheduled plan-task review-free while manual PLAN claims retain review guidance', async () => {
     getTaskInterval.mockResolvedValue({ prompt: null });
@@ -35,7 +116,7 @@ describe('claim-flow prompt variants', () => {
 
     expect(scheduled).not.toContain('## Phase 6 — Review locally');
     expect(scheduled).toContain('gh pr checks <num> --required --watch --fail-fast');
-    const expectedManual = PREVIOUS_DEFAULT_PROMPTS['plan-task'].at(-1)
+    const expectedManual = DEFAULT_TASK_PROMPTS['plan-task-claim']
       .replace(/\{worktreesRoot\}/g, PATHS.worktrees);
     expect(manual).toBe(expectedManual);
     expect(manual).toContain('## Phase 6 — Review locally');
@@ -61,7 +142,7 @@ describe('claim-flow prompt variants', () => {
 // A pipeline STAGE body (pr-reviewer-security, code-reviewer-review, …) is read
 // straight out of the catalog by its promptKey — it is never persisted and never
 // versioned, which is why editing one takes no PROMPT_VERSIONS bump and no
-// PREVIOUS_DEFAULT_PROMPTS entry (see taskPromptDefaults.test.js). That decision
+// retired-hash history entry (see taskPromptDefaults.test.js). That decision
 // is only safe while stage resolution ignores stored schedule state, so pin the
 // behavior rather than restating the absent constant: hand getStagePrompt an
 // interval carrying a STALE persisted prompt and assert the current catalog body

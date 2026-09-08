@@ -1,3 +1,4 @@
+import { PRIVATE_SECURITY_TASK_TYPE, PRIVATE_SECURITY_DELIVERY } from '../lib/privateSecurityPolicy.js';
 /**
  * Static task-type registry.
  *
@@ -10,11 +11,23 @@ import { isAuditTaskType, defaultFileIssuesFor } from '../lib/auditCatalog.js';
 import { MODEL_ABUSE_GUARD_ID } from '../lib/modelAbuseGuard.js';
 import {
   PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
-  PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
 } from '../lib/agentExecutionProfiles.js';
 import { INTERVAL_TYPES } from './taskScheduleConstants.js';
 
+// Programmatic handler types + target-scope vocabulary live in
+// `lib/taskTargetScope.js` (see that file for why); re-exported here because
+// the on-demand request gate, the global generator, and the schedule UI have
+// always read them off the registry.
+import {
+  isProgrammaticScheduledTaskType,
+  PROGRAMMATIC_SCHEDULED_TASK_TYPES,
+} from '../lib/taskTargetScope.js';
+
+export { isProgrammaticScheduledTaskType, PROGRAMMATIC_SCHEDULED_TASK_TYPES };
+
 export const SELF_IMPROVEMENT_TASK_TYPES = [
+  PRIVATE_SECURITY_TASK_TYPE,
+  'model-comparison-refresh',
   'security', 'code-quality', 'test-coverage', 'performance',
   'accessibility', 'branch-reconcile', 'issue-reconcile', 'console-errors', 'dependency-updates', 'documentation',
   'ui-bugs', 'mobile-responsive', 'feature-ideas', 'plan-task', 'claim-issue', 'claim-work', 'error-handling',
@@ -120,6 +133,16 @@ export const SELF_IMPROVEMENT_TASK_TYPES = [
   // buildTaskInput hook renders the prompt. See taskTypeHooks.js +
   // autonomousJobs/layeredIntelligenceHooks.js.
   'layered-intelligence',
+  // The two PROGRAMMATIC handlers (services/scheduledHandlers/) — the only
+  // scheduled types PortOS executes ITSELF, with no agent, no CoS task, and no
+  // spawn slot. They fill blank universe-bible sheets and render the entries
+  // that have no image, using the same domain services the Universe Builder's
+  // own buttons call. Install-wide (a universe is not a managed app's repo —
+  // see `requiresInstallWideTarget`) and ON_DEMAND with no interval, so they are
+  // never clock-due and a fresh install spends nothing until the user runs one.
+  // Quota Burn reaches the SAME handlers through `quotaBurnInvoke.js`; there
+  // is one implementation, not two.
+  ...PROGRAMMATIC_SCHEDULED_TASK_TYPES,
   // NOTE: `quota-burn` used to live here as a per-app perpetual task type. It is
   // now ONE install-level loop (services/quotaBurnRunner.js) configured on the
   // Quota Burn page — the burn plan is machine-local, and its jobs name which
@@ -197,23 +220,20 @@ export const PERPETUAL_DRAIN_DISPATCH_CAP = 5;
 export const DEFAULT_BRANCHES_PER_AGENT = 3;
 
 /**
- * Task types whose "Run Now" with NO app is the REAL run — they sweep every
- * managed app in one dispatch rather than acting on one. Surfaced per task on
- * `getScheduleStatus()` so the schedule UI can offer an "All apps" entry
- * instead of forcing every run through the app picker (which would make the
- * install-wide lane unreachable on any install that has apps).
+ * Target scope for a task type — which app (if any) a run must name.
+ *
+ * The vocabulary itself lives in `lib/taskTargetScope.js` so the quota-burn
+ * reference schemas can reach it: `server/lib` may not import upward into
+ * `server/services` (`lib/layering.test.js`). Re-exported here because the
+ * on-demand request gate, the global generator, and the schedule UI have always
+ * read it off the registry, and splitting that import would gain nothing.
  */
-export const INSTALL_WIDE_TASK_TYPES = new Set(['repo-sync', 'user-action-review']);
-
-// Task types that only make sense when pointed at a managed app. Keeping this
-// alongside the install-wide registry gives both the on-demand request gate
-// and the global generator one target-scope contract; neither has to infer
-// scope from a task name or from which generator happened to receive a call.
-export const MANAGED_APP_TARGET_TASK_TYPES = new Set(['pr-reviewer']);
-
-export function requiresManagedAppTarget(taskType) {
-  return MANAGED_APP_TARGET_TASK_TYPES.has(taskType);
-}
+export {
+  INSTALL_WIDE_TASK_TYPES,
+  MANAGED_APP_TARGET_TASK_TYPES,
+  requiresInstallWideTarget,
+  requiresManagedAppTarget,
+} from '../lib/taskTargetScope.js';
 
 // The pr-reviewer pipeline is a trust boundary, not three interchangeable
 // prompt tabs. Keep the shipped role/profile pairing in one place so the
@@ -244,7 +264,7 @@ export const createPrReviewerDefaultStages = () => ([
     executionProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
   },
   {
-    name: 'Code Review & Actions',
+    name: 'Code Review & Validated Actions',
     role: 'actions',
     promptKey: 'pr-reviewer-review',
     readOnly: true,
@@ -255,7 +275,7 @@ export const createPrReviewerDefaultStages = () => ([
     discardWorktree: true,
     noCodeOutput: true,
     managed: true,
-    executionProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+    executionProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
   },
 ]);
 
@@ -267,6 +287,8 @@ export const createPrReviewerDefaultStages = () => ([
 // is code-owned and makes the task invisible and non-runnable while that
 // install-wide feature is disabled.
 export const DEFAULT_TASK_INTERVALS = {
+  [PRIVATE_SECURITY_TASK_TYPE]: { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { ...PRIVATE_SECURITY_DELIVERY } },
+  'model-comparison-refresh': { type: INTERVAL_TYPES.ON_DEMAND, enabled: false, providerId: null, model: null, prompt: null, taskMetadata: { ...NON_COMMITTING_COORDINATOR_METADATA } },
   'security':            { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: false } },
   'code-quality':        { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: false } },
   'test-coverage':       { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: false } },
@@ -293,7 +315,7 @@ export const DEFAULT_TASK_INTERVALS = {
   // SIBLING worktrees, never in its own cwd — hence the shared non-committing
   // -coordinator posture above. On-demand by default — a manual Run is the
   // explicit consent to drive PRs; choosing a cadence enables scheduled runs.
-  'branch-reconcile':    { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, recheckCron: '0 3 * * *', drainDispatchCap: PERPETUAL_DRAIN_DISPATCH_CAP, taskMetadata: { ...NON_COMMITTING_COORDINATOR_METADATA, cleanupMerged: true, openPr: true, resolveConflicts: true, autoMerge: true, finishAbandoned: true, branchesPerAgent: DEFAULT_BRANCHES_PER_AGENT } },
+  'branch-reconcile':    { type: INTERVAL_TYPES.ON_DEMAND, perpetual: true, enabled: true, providerId: null, model: null, prompt: null, recheckCron: '0 3 * * *', drainDispatchCap: PERPETUAL_DRAIN_DISPATCH_CAP, taskMetadata: { ...NON_COMMITTING_COORDINATOR_METADATA, cleanupMerged: true, openPr: true, resolveConflicts: true, autoMerge: true, finishAbandoned: true, branchesPerAgent: DEFAULT_BRANCHES_PER_AGENT } },
   // issue-reconcile heals ZOMBIE issues: open + `in-progress` (claimed) yet with
   // their PR already MERGED and no live claim anywhere — a partial ship left the
   // claim marker on, so the queue (which skips `in-progress`) never re-picks the
@@ -310,7 +332,13 @@ export const DEFAULT_TASK_INTERVALS = {
   // issue-state mutation is its whole deliverable — hence the shared
   // non-committing-coordinator posture above. On-demand by default — a manual
   // Run is the explicit consent to mutate issue state; a cadence is opt-in.
-  'issue-reconcile':     { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, recheckCron: '0 4 * * *', drainDispatchCap: PERPETUAL_DRAIN_DISPATCH_CAP, taskMetadata: { ...NON_COMMITTING_COORDINATOR_METADATA, autoClose: true } },
+  //
+  // The SAME deterministic pre-step also unblocks `blocked` issues: one whose
+  // body names its dependency via `Blocked by #N` (portos-file-issue skill) has
+  // its label removed, with no coordinator dispatch, once every named blocker
+  // is closed (blockedIssueReconcile.js). Like releaseAbandonedClaims, this
+  // needs no model and runs every pass regardless of whether any zombie exists.
+  'issue-reconcile':     { type: INTERVAL_TYPES.ON_DEMAND, perpetual: true, enabled: true, providerId: null, model: null, prompt: null, recheckCron: '0 4 * * *', drainDispatchCap: PERPETUAL_DRAIN_DISPATCH_CAP, taskMetadata: { ...NON_COMMITTING_COORDINATOR_METADATA, autoClose: true } },
   'console-errors':      { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: false } },
   'dependency-updates':  { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null },
   'documentation':       { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: false } },
@@ -434,18 +462,12 @@ export const DEFAULT_TASK_INTERVALS = {
   'react-lifecycle':   { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: true, useWorktree: false, openPR: false } },
   'observability':     { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: true, useWorktree: false, openPR: false } },
   'copy':                { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { fileIssues: true, useWorktree: false, openPR: false } },
-  // pr-watcher polls for newly-opened PRs, so it runs on a short custom
-  // interval rather than the loose rotation/daily cadence. 30 min keeps the
-  // gh polling cheap while still reacting to a PR within one cycle. Default
-  // gate is `prAuthorFilter: 'any'` (react to every PR); the operator narrows
-  // it to 'self' or 'others' in the schedule UI. `readOnly: false` so a
-  // customized prompt can make changes if the operator wants — the shipped
-  // default prompt only reviews + comments.
-  'pr-watcher':          { type: INTERVAL_TYPES.ON_DEMAND, intervalMs: 1800000, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { prAuthorFilter: 'any', readOnly: false } },
-  // issue-watcher uses deterministic GitHub reads/mutations around a bounded
-  // reasoning-only review pass. On-demand by default: a manual Run is explicit
-  // consent to replies, assignments, reviews, branch updates, and merges.
-  'issue-watcher':       { type: INTERVAL_TYPES.ON_DEMAND, intervalMs: 1800000, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { useWorktree: true, openPR: false, discardWorktree: true } },
+  // Trusted remediation is separate from external intake. Legacy author
+  // filter settings cannot widen this lane into untrusted contributor PRs.
+  'pr-watcher':          { type: INTERVAL_TYPES.ON_DEMAND, intervalMs: 1800000, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { prAuthorFilter: 'trusted', readOnly: false } },
+  // External issue intake uses screening, a direct tool-free text API, and
+  // validated actions. No general CoS agent or checkout is provisioned.
+  'issue-watcher':       { type: INTERVAL_TYPES.ON_DEMAND, intervalMs: 1800000, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { useWorktree: false, openPR: false, readOnly: true, worktreeChangesExpected: false } },
   // plan-feature files a plan, not code — tracker-filing posture mirrors
   // reference-watch: writable (a file-based tracker commits checklist items), no
   // managed worktree, no PR. On-demand by default; when scheduled, weekly (not
@@ -474,7 +496,23 @@ export const DEFAULT_TASK_INTERVALS = {
   // agent runs in a worktree that is discarded without a commit/merge/PR
   // (discardWorktree), so it can't land code — its `.agent-done` payload is the
   // only sanctioned output (consumed by the processTaskOutput hook).
-  'layered-intelligence': { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { useWorktree: true, openPR: false, discardWorktree: true } }
+  'layered-intelligence': { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { useWorktree: true, openPR: false, discardWorktree: true } },
+  // The two PROGRAMMATIC handlers. No `prompt` (PortOS performs the work itself
+  // — there is no template to render and no DEFAULT_TASK_PROMPTS entry), and no
+  // agent posture keys, because no agent, worktree, or PR is ever involved.
+  //
+  // `taskMetadata` here is the handler's PARAMS bag, mirroring the catalog row
+  // Quota Burn renders its job form from (`QUOTA_BURN_JOB_CATALOG` in
+  // lib/quotaBurnConfig.js) so the two doors advertise the same defaults —
+  // taskScheduleRegistry.programmatic.test.js fails when they drift. A param
+  // whose catalog default is null is OMITTED rather than stored as null:
+  // "unset" means the handler resolves it (the image job falls through to the
+  // universe-bible render-target ladder), which is not the same as a value.
+  //
+  // ON_DEMAND with NO interval and NO cron: enabled so the user can press Run
+  // Now, never clock-due, so a fresh install spends nothing until they do.
+  'universe-bible-describe': { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { universeId: 'all', scope: 'all', depth: 'full', maxEntries: 10 } },
+  'universe-bible-images':   { type: INTERVAL_TYPES.ON_DEMAND, enabled: true, providerId: null, model: null, prompt: null, taskMetadata: { universeId: 'all', scope: 'all', maxEntries: 10, requireDescribed: false } }
 };
 
 // Agent-options that a task manages internally — UI locks the toggle, and
@@ -492,7 +530,8 @@ export const MANAGED_AGENT_OPTIONS = {
   // Programmatic-I/O review task: the model only returns structured judgment;
   // deterministic hooks own every GitHub mutation. Keep its worktree throwaway
   // even when a global/per-app metadata override tries to make it writable.
-  'issue-watcher': ['useWorktree', 'openPR', 'discardWorktree'],
+  'issue-watcher': ['useWorktree', 'openPR', 'readOnly', 'worktreeChangesExpected'],
+  'pr-watcher': ['prAuthorFilter'],
   // The non-committing coordinators (NON_COMMITTING_COORDINATOR_METADATA above) all
   // run in the app's LIVE checkout and ship no code, so a CoS-managed worktree is at
   // best unused and at worst harmful — branch-reconcile needs to see the sibling
@@ -510,7 +549,7 @@ export const MANAGED_AGENT_OPTIONS = {
   // fields, so an unmanaged `worktreeChangesExpected` would silently go absent and the
   // task bookkeeping would otherwise treat the clean worktree as missing code work.
   ...Object.fromEntries(
-    ['branch-reconcile', 'branch-cleanup', 'issue-reconcile', 'jira-status-report', 'stash-cleanup', 'repo-sync']
+    ['branch-reconcile', 'branch-cleanup', 'issue-reconcile', 'jira-status-report', 'stash-cleanup', 'repo-sync', 'model-comparison-refresh']
       .map((t) => [t, ['useWorktree', 'openPR', 'worktreeChangesExpected']])
   ),
   // claim-issue's prompt creates its own claim/issue-<num> worktree (same
@@ -583,6 +622,7 @@ export function enforceBranchReconcileBatch(taskType, config) {
 export const TASK_TYPE_DESCRIPTIONS = {
   'ui-bugs': 'Find UI bugs — file issues or implement fixes',
   'mobile-responsive': 'Mobile/responsive audit — file issues or implement fixes',
+  [PRIVATE_SECURITY_TASK_TYPE]: 'Private security assessment — sandboxed local model, report and remediation only; no issues or PRs',
   'security': 'Security audit — file issues or implement fixes',
   'code-quality': 'Code quality — file issues or implement fixes',
   'console-errors': 'Console errors — file issues or implement fixes',
@@ -595,14 +635,14 @@ export const TASK_TYPE_DESCRIPTIONS = {
   'claim-work': "Ship the next work item from the app's configured tracker (PLAN.md, GitHub/GitLab issues, or JIRA), routed automatically",
   'accessibility': 'Accessibility audit — file issues or implement fixes',
   'branch-reconcile': "Finish this machine's in-flight local branches: clean up merged ones, open PRs, resolve conflicts, drive review, auto-merge when green",
-  'issue-reconcile': "Heal zombie issues: open + in-progress but their PR already merged with no live claim — close + file a scoped follow-up when work remains, or release the claim so the queue re-picks it",
+  'issue-reconcile': "Remediate trusted operator and collaborator issues: heal zombies (open + in-progress but their PR already merged with no live claim — close + file a scoped follow-up or release the claim) and auto-unblock: remove the `blocked` label once every issue named in its `Blocked by #N` line has closed",
   'dependency-updates': 'Land or resolve open Dependabot/Renovate PRs, then update the dependencies they missed',
   'release-check': 'Check for release readiness',
   'error-handling': 'Failure-path audit — file issues or implement fixes',
   'typing': 'TypeScript types — file issues or implement fixes',
-  'pr-reviewer': 'Screen contributor PRs, gate eligibility, then review and act on approved changes',
-  'pr-watcher': 'Run a custom prompt on PRs newly opened against the default branch',
-  'issue-watcher': 'Watch external issues and PRs: assign volunteers, review changes, and apply deterministic GitHub actions around one reasoning pass',
+  'pr-reviewer': 'Watch external contributor PRs: screen content, gate eligibility, and validate review actions',
+  'pr-watcher': 'Remediate operator and collaborator PRs using screened activity; verify tests and reviews before merging',
+  'issue-watcher': 'Triage external issues and comments through screening, tool-free analysis, and deterministic replies or volunteer assignment',
   'code-reviewer-a': 'Review the codebase and triage/implement findings (independent provider/model instance A)',
   'code-reviewer-b': 'Review the codebase and triage/implement findings (independent provider/model instance B)',
   'do-replan': 'Audit and prune PLAN.md after merges and branch cleanup so it reflects what actually shipped',
@@ -617,11 +657,14 @@ export const TASK_TYPE_DESCRIPTIONS = {
   'react-lifecycle': 'React lifecycle/state audit — file issues (default) or implement fixes',
   'observability': 'Logging/observability audit — file issues (default) or implement fixes',
   'copy': 'Copy/text-clarity audit — file issues (default) or implement rewrites',
+  'model-comparison-refresh': 'Research sourced model quality, effort, price, latency and quota evidence for Models Comparison',
   'stash-cleanup': 'Triage git stash list — drop entries superseded by or stale relative to main, leave real unlanded work in place',
   'repo-sync': 'Sync every managed app with origin — back on the default branch, pushed and pulled, merged branches/worktrees and redundant stashes cleared',
   'plan-feature': "Brainstorm one feature and file its decision-complete plan to the app's work tracker (no code)",
   'user-action-review': 'Review the operator-action log for repeated manual work and propose automations — file issues (default) or queue CoS tasks',
-  'layered-intelligence': "Use app goals + performance metrics to file at most one deduplicated improvement issue; inspect read-only context and file a visibility gap when evidence is insufficient — no code"
+  'layered-intelligence': "Use app goals + performance metrics to file at most one deduplicated improvement issue; inspect read-only context and file a visibility gap when evidence is insufficient — no code",
+  'universe-bible-describe': 'Fill in blank universe bible sheets — one expand prompt per entry, emptiest first. No agent',
+  'universe-bible-images': 'Render images for universe bible entries that have none yet. No agent — PortOS enqueues the renders itself'
 };
 
 export function getTaskTypeDescription(taskType) {
@@ -638,17 +681,29 @@ export function getTaskTypeDescription(taskType) {
  * real execution shape without changing prompt-version migration state.
  */
 export const TASK_TYPE_PROMPT_INFO = Object.freeze({
+  [PRIVATE_SECURITY_TASK_TYPE]: Object.freeze({ mode: 'runtime-generated', description: 'Private assessment of committed source and remediation guidance. Requires a pinned local Ollama or LM Studio CLI provider/model and macOS Seatbelt; tools, remote networking and publishing are disabled. Reports appear in the local Review Hub. No issues or PRs.' }),
   'pr-reviewer': Object.freeze({
     mode: 'runtime-generated',
-    description: 'Runs a model-abuse screen, a tool-free eligibility gate, and an optional action-capable code review; only the final stage may drive the deterministic GitHub workflow.'
+    description: 'Runs a model-abuse screen, a tool-free eligibility gate, and an optional tool-free code review; the server validates every requested GitHub action.'
   }),
   'issue-watcher': Object.freeze({
     mode: 'runtime-generated',
-    description: 'Generated for each run after deterministic GitHub gathering. The reasoning agent receives bounded, untrusted issue/PR data and has no tools.'
+    description: 'Three enforced server phases: screen external issue activity, analyze it through a text-only API with no tools or private context, then validate current content before replies or assignments. Configure the source policy in Models → LLMs → Abuse Guard.'
   }),
   'layered-intelligence': Object.freeze({
     mode: 'runtime-generated',
     description: 'Generated for each run from the app\'s configured goals, metrics, and repository context.'
+  }),
+  // `programmatic` is NOT `runtime-generated`: there is no prompt at all for the
+  // user to read or a hook to render. PortOS performs the work itself, so the
+  // UI shows the settings that bound it instead of a prompt editor.
+  'universe-bible-describe': Object.freeze({
+    mode: 'programmatic',
+    description: 'PortOS sends one bible-expand prompt per entry itself — no agent and no prompt template. Scope, depth, and the per-run entry cap are the settings that bound it.'
+  }),
+  'universe-bible-images': Object.freeze({
+    mode: 'programmatic',
+    description: 'PortOS compiles the missing entries\' render prompts and enqueues them on the media job queue itself — no agent and no prompt template.'
   })
 });
 

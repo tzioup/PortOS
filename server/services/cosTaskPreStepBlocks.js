@@ -29,7 +29,7 @@ import { emitLog } from './cosEvents.js';
 import { getActiveApps } from './apps.js';
 import { getCodeReviewDefaults } from './codeReview.js';
 import { NON_ACTIONABLE_ISSUE_LABELS } from './perpetualWork.js';
-import { isReconcileDrainTaskType } from './taskScheduleConstants.js';
+import { DISPATCH_HINT_FANOUT_GUIDANCE } from '../lib/dispatchLabels.js';
 import {
   appendReviewerEffortBlock,
   buildLocalReviewerInstructions,
@@ -177,6 +177,9 @@ const SWARM_FORGE = {
  * body from any other cause — bounded at 2 rewrites plus one re-derive, because
  * Phase C blocks on every agent finishing, so an agent looping on a body it can
  * never satisfy would stall the whole batch's merge queue.
+ *
+ * Phase B carries `DISPATCH_HINT_FANOUT_GUIDANCE` because the orchestrator is the
+ * only actor in this flow that gets to CHOOSE how an agent runs.
  */
 export function resolveSwarmBlock(promptTaskType, count) {
   const n = Number.isInteger(count) ? count : 0;
@@ -195,9 +198,14 @@ export function resolveSwarmBlock(promptTaskType, count) {
 ## Phase A — Partition the batch (ONCE, up front)
 1. Run Phase 1's candidate scan + in-flight filter (below) to build the eligible-issue queue (oldest-first, honoring the author filter).
 2. From that queue pick up to ${n} issues that are **mutually independent** — no shared files/subsystems likely to collide on merge, no parent/child or dependency links; prefer issues that touch disjoint areas. **Under-fill is fine:** if fewer than ${n} independent issues exist, run a smaller swarm and say so. **If only ONE is eligible, just run the single-issue flow below and say so** — a one-agent swarm is pure overhead.
+3. **Keep each picked issue's \`model:\` / \`effort:\` labels.** Phase 1's listing already returns \`labels\` — carry them alongside the issue number, because they are what you route that issue's agent with in Phase B.
 
 ## Phase B — Fan out (one subagent per picked issue)
 For EACH picked issue, spawn a subagent that runs the single-issue **Phases 2–6 below** for that one issue — claim (own \`claim/issue-<num>\` worktree + assignee + \`in-progress\` label) → verify → implement → run the LOCAL reviewers before anything is opened → changelog → open the ${pr} → run the ${pr}-side review gate ({reviewers}) — **but with NO merge and NO Phase 7 cleanup** (the orchestrator owns those; each agent opens its ${pr} the equivalent of \`--no-merge\`). Because each agent claims through the normal Phase 2 assignee marker + race read-back, two agents can never ship the same issue.
+
+**Dispatch each agent at ITS issue's recommended model and effort.** You are the orchestrator: choosing how each fan-out agent runs is your call, and a labeled issue already carries that answer. Name the model and effort you used for each issue in your final summary, so a mis-routed backlog is visible rather than silent.
+
+${DISPATCH_HINT_FANOUT_GUIDANCE}
 
 **Each fan-out agent gets its OWN scratch subdirectory — the scratchpad root is off-limits.** Every agent in this run shares one session scratchpad path, and every agent runs these byte-identical instructions, so left to themselves two agents pick the same obvious filename (\`pr-body.md\`) and silently clobber each other — last writer wins, the command still exits 0, and the wrong text lands on the wrong ${pr}. So: **each fan-out agent writes ALL temp files under \`<scratchpad>/issue-<num>/\` (its own issue number), and NEVER writes to the scratchpad root** (the root stays the orchestrator's). That covers ${pr} body drafts, review notes, diff dumps, test output — every scratch artifact, not just the body file. Create the directory before first use (\`mkdir -p\`). Filenames inside it may be as obvious as you like; the directory is what makes them unique. **If your environment gives you no scratchpad path at all**, use \`$(mktemp -d)/issue-<num>\` instead — never a path inside the source repo or inside your worktree, where it would show up as untracked cruft or get swept into a commit.
 
@@ -248,10 +256,7 @@ export function buildPlanConstraintBlock(planId) {
  * @returns {Promise<{skip:boolean}>}
  */
 export async function applyPerpetualDrainCap(app, taskType, interval, taskSchedule) {
-  const isPerpetual = interval.type === taskSchedule.INTERVAL_TYPES.PERPETUAL;
-  const isOnDemandReconcile = interval.type === taskSchedule.INTERVAL_TYPES.ON_DEMAND
-    && isReconcileDrainTaskType(taskType);
-  if (!isPerpetual && !isOnDemandReconcile) return { skip: false };
+  if (interval.perpetual !== true) return { skip: false };
   // Coerce before validating: this key is not on the schedule route's allowlist, so
   // the only way it arrives non-numeric is a hand-edited schedule.json, where `"5"`
   // is the likeliest shape and reading it as "no cap" would silently unbound the
@@ -382,12 +387,18 @@ export async function resolveBranchReconcileBlock(app, taskType, metadata, taskS
   if (result.cleaned.length) {
     emitLog('info', `🔀 branch-reconcile ${app.name}: cleaned ${result.cleaned.length} merged branch(es)`, { appId: app.id, analysisType: taskType });
   }
-  // Branches whose SUPERSEDED verdict is already cached and still verifies were
-  // dropped from `inFlight` by the reconciler (#3842). They are real branches a
-  // human still has to reap, so name them rather than letting them vanish into a
-  // quiet park — the invisibility is the same failure mode as a lingering worktree
-  // reported as "cleaned 0".
-  const supersededSuffix = countSuffix(result.superseded, 'branch(es) already verified superseded and awaiting human reap');
+  // Reported separately from `cleaned`: a superseded branch's work is NOT on the
+  // default branch — it landed there under other names — so it survives only as
+  // the backup the reap wrote before deleting it.
+  if (result.reapedSuperseded?.length) {
+    emitLog('info', `🔀 branch-reconcile ${app.name}: reaped ${result.reapedSuperseded.length} verified-superseded branch(es) (backed up under data/cos/abandoned-worktree-backups)`, { appId: app.id, analysisType: taskType });
+  }
+  // Verified-superseded branches are reaped by the reconciler itself and counted
+  // in `cleaned`. What is left in `superseded` is the reap's leftovers — held by a
+  // lock, a live agent, or a claim window — so name them rather than letting them
+  // vanish into a quiet park; the invisibility is the same failure mode as a
+  // lingering worktree reported as "cleaned 0".
+  const supersededSuffix = countSuffix(result.superseded, 'branch(es) verified superseded, reap held back');
   // Branches somebody is actively working in (a running CoS agent, a live human
   // /claim, a locked worktree) are classified WIP and never reach `inFlight` — the
   // reconcile is DONE when they are all that's left, not stuck. Named in the park
@@ -428,10 +439,11 @@ export async function resolveBranchReconcileBlock(app, taskType, metadata, taskS
   metadata.perpetual = true;
   const supersededBlock = formatSupersededForPrompt(result.superseded || []);
   const block = [
-    formatInFlightForPrompt(actionable, {
+    await formatInFlightForPrompt(actionable, {
       defaultBranch: result.defaultBranch,
       actions,
-      branchesPerAgent: metadata.branchesPerAgent
+      branchesPerAgent: metadata.branchesPerAgent,
+      repoPath: app.repoPath
     }),
     supersededBlock
   ].filter(Boolean).join('\n');
@@ -535,7 +547,7 @@ export async function resolveRepoSyncBlock(app, taskType, metadata) {
  */
 export async function resolveIssueReconcileBlock(app, taskType, metadata, taskSchedule) {
   if (taskType !== 'issue-reconcile') return { skip: false, block: '' };
-  const { reconcile, zombieSignature, formatZombiesForPrompt } = await import('./issueReconcile.js');
+  const { reconcile, releaseAbandonedClaims, zombieSignature, formatZombiesForPrompt } = await import('./issueReconcile.js');
   const autoClose = metadata.autoClose !== false;
   // Routing mirrors resolveAppWorkTracker: JIRA is NEVER auto-selected from the
   // git host — it needs explicit per-app config.
@@ -553,6 +565,41 @@ export async function resolveIssueReconcileBlock(app, taskType, metadata, taskSc
   });
   // null = unsupported remote OR transient failure → skip WITHOUT parking.
   if (!result) return { skip: true };
+  // An abandoned volunteer claim needs no model to resolve — release it here and
+  // now, before the zombie gate, so the `in-progress` marker the claim prompt and
+  // the issue-watcher stamp always has a releaser (issue #6112). Failures are
+  // logged inside and simply retried next pass.
+  const releasedCount = await releaseAbandonedClaims(result.abandoned, {
+    forge: result.forge, repoSpec: result.repoSpec, fullName: result.fullName,
+  }).catch((err) => {
+    emitLog('warn', `issue-reconcile could not release abandoned claims for ${app.name}: ${err.message}`, { appId: app.id });
+    return 0;
+  });
+  if (releasedCount) {
+    emitLog('info', `🔓 issue-reconcile ${app.name}: released ${releasedCount} abandoned claim(s) back to the queue`, { appId: app.id, analysisType: taskType });
+  }
+  // Also deterministic, also no model needed: an issue labeled `blocked` on a
+  // genuine dependency (`Blocked by #N` convention — portos-file-issue skill)
+  // whose blocker(s) have all since closed is unlabeled here, not gated behind
+  // the zombie coordinator. gatherBlockedIssueState resolves its own forge
+  // target and returns null for anything but GitHub/GitLab (JIRA included —
+  // it has no equivalent scan), so no forge pre-check is needed here.
+  const { gatherBlockedIssueState, unblockIssues } = await import('./blockedIssueReconcile.js');
+  const blockedState = await gatherBlockedIssueState(app.repoPath, { app }).catch((err) => {
+    emitLog('warn', `issue-reconcile could not scan blocked issues for ${app.name}: ${err.message}`, { appId: app.id });
+    return null;
+  });
+  if (blockedState?.ready.length) {
+    const unblockedCount = await unblockIssues(blockedState.ready, {
+      forge: blockedState.forge, repoSpec: blockedState.repoSpec, fullName: blockedState.fullName, repoPath: app.repoPath,
+    }).catch((err) => {
+      emitLog('warn', `issue-reconcile could not unblock issues for ${app.name}: ${err.message}`, { appId: app.id });
+      return 0;
+    });
+    if (unblockedCount) {
+      emitLog('info', `🔓 issue-reconcile ${app.name}: removed the \`blocked\` label from ${unblockedCount} issue(s) whose dependency closed`, { appId: app.id, analysisType: taskType });
+    }
+  }
   if (result.stalled.length) {
     // In-progress issues with NO merged PR and NO live claim — a different stuck
     // state issue-reconcile deliberately does NOT auto-heal. Surface them.
@@ -563,6 +610,21 @@ export async function resolveIssueReconcileBlock(app, taskType, metadata, taskSc
     emitLog('info', `🧟 issue-reconcile parked for ${app.name}: no zombie issues`, { appId: app.id });
     return { skip: true };
   }
+  if (result.forge === 'github') {
+    const { screenForgeMaintenance } = await import('./forgeMaintenanceEvidence.js');
+    const { execGh } = await import('./github.js');
+    const screened = await screenForgeMaintenance({
+      records: result.zombies, kind: 'issue', host: result.repoSpec.split('/')[0],
+      repoFullName: result.fullName, runGh: execGh,
+    });
+    if (!screened.ok) {
+      emitLog('warn', `issue-reconcile held: ${screened.code}`, { appId: app.id });
+      return { skip: true };
+    }
+    const accepted = new Map(screened.records.map(record => [record.number, record]));
+    result.zombies = result.zombies.filter(record => accepted.has(record.number)).map(record => ({ ...record, maintenanceEvidence: accepted.get(record.number).maintenanceEvidence }));
+    if (screened.withheld?.length) emitLog('warn', `issue-reconcile held ${screened.withheld.length} discussion(s) while proceeding with screened issues`, { appId: app.id });
+  }
   // Convergence guards — identical to branch-reconcile's (shared helper).
   const dispatch = await resolveReconcileDrainGate(taskSchedule, taskType, app, {
     signature: zombieSignature(result.zombies),
@@ -572,6 +634,7 @@ export async function resolveIssueReconcileBlock(app, taskType, metadata, taskSc
   });
   if (!dispatch) return { skip: true };
   metadata.perpetual = true;
+  metadata.forgeMaintenanceVersion = 1;
   const block = formatZombiesForPrompt(result.zombies, {
     fullName: result.fullName, forge: result.forge, autoClose,
     projectKey: jira?.projectKey, instanceId: jira?.instanceId,
@@ -637,7 +700,7 @@ export async function resolvePrWatcherBlock(app, taskType, metadata, taskSchedul
   // cycle instead, so a disabled `pr-watcher` task can't strand them (see
   // `sweepPendingMergePrs`). This function owns only PR *discovery*.
   // prAuthorFilter was already merged + value-constrained into `metadata`.
-  const authorFilter = metadata.prAuthorFilter || 'any';
+  const authorFilter = metadata.prAuthorFilter === 'self' ? 'self' : 'trusted';
   const check = await prWatcher.checkPullRequests(app, { authorFilter });
   const checkedAt = new Date().toISOString();
   // The gh poll IS the cadence-bearing work — a poll that dispatches nothing
@@ -651,11 +714,39 @@ export async function resolvePrWatcherBlock(app, taskType, metadata, taskSchedul
     return { skip: true };
   }
 
+  let screeningError = null;
+  if (!check.firstRun && check.newPrs.length) {
+    const { screenForgeMaintenance } = await import('./forgeMaintenanceEvidence.js');
+    const { execGh } = await import('./github.js');
+    const { getOriginInfo } = await import('../lib/gitRemote.js');
+    const { githubApiHost } = await import('../lib/workTracker.js');
+    const origin = await getOriginInfo(app.repoPath);
+    const screened = await screenForgeMaintenance({
+      records: check.newPrs, kind: 'pr', host: githubApiHost(origin.host),
+      repoFullName: check.repoFullName, runGh: execGh,
+    });
+    if (!screened.ok) {
+      await prWatcher.persistPrWatcherState(app.id, { lastCheckedAt: checkedAt, lastError: screened.code });
+      await recordPoll();
+      emitLog('warn', `pr-watcher held: ${screened.code}`, { appId: app.id });
+      return { skip: true };
+    }
+    const accepted = new Set(screened.records.map(record => record.number));
+    check.newPrs = check.newPrs.filter(record => accepted.has(record.number));
+    const priorActivity = prWatcher.readPrWatcherState(app).activityByPr || {};
+    for (const held of screened.withheld || []) {
+      if (priorActivity[held.number]) check.activityByPr[held.number] = priorActivity[held.number];
+      else delete check.activityByPr[held.number];
+    }
+    screeningError = screened.code || null;
+  }
+
   // Always advance the high-water mark + clear any prior error.
   await prWatcher.persistPrWatcherState(app.id, {
     lastSeenPrNumber: check.newLastSeen,
+    activityByPr: check.activityByPr,
     lastCheckedAt: checkedAt,
-    lastError: null
+    lastError: screeningError
   });
 
   if (check.firstRun) {
@@ -669,6 +760,7 @@ export async function resolvePrWatcherBlock(app, taskType, metadata, taskSchedul
     return { skip: true };
   }
 
+  metadata.forgeMaintenanceVersion = 1;
   const block = prWatcher.formatPullRequestsForPrompt(check.newPrs, {
     repoFullName: check.repoFullName, defaultBranch: check.defaultBranch
   });
@@ -689,11 +781,11 @@ export async function resolvePrWatcherBlock(app, taskType, metadata, taskSchedul
 export async function buildImprovementTaskDescription({ promptTemplate, app, promptTaskType, metadata, blocks }) {
   // Resolve the `{reviewers}` the agent is told to run. When the task itself
   // didn't pin reviewers, fall back to the user's PortOS Code Review Defaults
-  // (Settings → Code Reviewers) rather than the hardcoded `copilot` —
+  // (Settings → Code Reviewers) rather than a hardcoded reviewer —
   // otherwise scheduled tasks like claim-issue, whose prompt drives the review
-  // loop directly, would always tell the agent to use Copilot regardless of the
-  // user's configured reviewers. Settings I/O failures degrade to the hardcoded
-  // default inside normalizeReviewers, so a read error never blocks dispatch.
+  // loop directly, would otherwise ignore the user's configured reviewers.
+  // Settings I/O failures leave the reviewer list empty, so a read error never
+  // silently enables a review.
   //
   // One resolver for the whole bundle (list + usernames + `~opt` set + the three
   // keyed pins). Local-LLM reviewers stay in the operative list; their service

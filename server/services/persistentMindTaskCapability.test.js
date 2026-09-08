@@ -8,11 +8,13 @@ const mocks = vi.hoisted(() => ({
     defaultModel: 'gpt-5', models: ['gpt-5', 'gpt-5-mini', 'gpt-5.6-sol', 'gpt-5.6-luna'],
   }],
   existing: null,
+  cosTasks: [],
   addTask: vi.fn(),
   getTaskById: vi.fn(),
   getAppWorkTracker: vi.fn(),
   resolveAppWorkTracker: vi.fn(),
   getProviderPrerequisiteReadinessMap: vi.fn(),
+  listManagedBackendModels: vi.fn(),
   workspacePreflight: vi.fn(),
   assessWorkspaceReadiness: vi.fn(),
 }));
@@ -24,9 +26,14 @@ vi.mock('./apps.js', () => ({
 vi.mock('./cosState.js', () => ({ loadState: vi.fn(async () => mocks.root) }));
 vi.mock('./cosTaskStore.js', () => ({
   addTask: (...args) => mocks.addTask(...args),
+  firstLine: (value) => (value || '').split('\n').map((line) => line.trim()).find(Boolean) || '',
+  getCosTasks: vi.fn(async () => ({ tasks: mocks.cosTasks })),
   getTaskById: (...args) => mocks.getTaskById(...args),
 }));
 vi.mock('./providers.js', () => ({ listProviders: vi.fn(async () => mocks.providers) }));
+vi.mock('./localLlm.js', () => ({
+  listManagedBackendModels: (...args) => mocks.listManagedBackendModels(...args),
+}));
 vi.mock('./providerPrerequisites.js', () => ({
   getProviderPrerequisiteReadinessMap: (...args) => mocks.getProviderPrerequisiteReadinessMap(...args),
 }));
@@ -38,10 +45,13 @@ vi.mock('./persistentMindWorkspacePreflight.js', () => ({
   assessPersistentMindWorkspaceReadiness: (...args) => mocks.assessWorkspaceReadiness(...args),
 }));
 
+const { PORTOS_APP_ID } = await import('../lib/appIdentity.js');
+
 const {
   buildPersistentMindTaskCapabilityPrompt,
   executePersistentMindTaskRequests,
   readPersistentMindTaskCatalog,
+  readPersistentMindTaskInventory,
 } = await import('./persistentMindTaskCapability.js');
 
 const taskRequest = (overrides = {}) => ({
@@ -65,10 +75,12 @@ beforeEach(() => {
     defaultModel: 'gpt-5', models: ['gpt-5', 'gpt-5-mini', 'gpt-5.6-sol', 'gpt-5.6-luna'],
   }];
   mocks.existing = null;
+  mocks.cosTasks = [];
   mocks.getAppWorkTracker.mockResolvedValue({ resolved: 'plan' });
   mocks.resolveAppWorkTracker.mockResolvedValue({ resolved: 'plan' });
   mocks.getTaskById.mockImplementation(async () => mocks.existing);
   mocks.addTask.mockResolvedValue({ id: 'sys-mind-stable', status: 'pending', autoApproved: true });
+  mocks.listManagedBackendModels.mockResolvedValue({ models: null, error: 'no daemon in tests' });
   mocks.getProviderPrerequisiteReadinessMap.mockImplementation((providers) => Object.fromEntries(
     providers.map((provider) => [provider.id, { status: 'ready', reasonCodes: [] }]),
   ));
@@ -113,6 +125,21 @@ describe('persistent mind CoS-task capability', () => {
     expect(prompt).not.toContain('command');
   });
 
+  it('flags only the PortOS baseline app and tells the mind to route by owning repo', async () => {
+    mocks.apps = [
+      { id: PORTOS_APP_ID, name: 'PortOS', repoPath: '/example/portos' },
+      { id: 'managed-app', name: 'Managed App', repoPath: '/example/managed' },
+    ];
+    const catalog = await readPersistentMindTaskCatalog();
+    expect(catalog.apps).toEqual([
+      { id: PORTOS_APP_ID, name: 'PortOS', planOnly: false, self: true },
+      { id: 'managed-app', name: 'Managed App', planOnly: false },
+    ]);
+    const prompt = buildPersistentMindTaskCapabilityPrompt({ enabled: true, catalog });
+    expect(prompt).toContain('pick the repository that will hold the change');
+    expect(prompt).toContain("marked 'self: true'");
+  });
+
   it('publishes only allowlisted task models and rejects a model outside the policy', async () => {
     mocks.root.config.persistentMindCapabilities.taskModelAllowlist = [
       { providerId: 'codex', model: 'gpt-5-mini' },
@@ -143,6 +170,60 @@ describe('persistent mind CoS-task capability', () => {
     });
     expect(result).toMatchObject({ success: true });
     expect(mocks.addTask).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5-mini' }), 'internal');
+  });
+
+  // A local provider's `models` array is a cached snapshot; the daemon on this
+  // machine is the authority, and every other model picker already offers what
+  // it reports. Building this catalog from the record rejects a model the user
+  // pulled after the record was last refreshed, as "not configured".
+  it('sources a local-runtime provider\'s models from the daemon, not its cached list', async () => {
+    mocks.providers = [{
+      id: 'grok-ollama', name: 'Grok (Ollama)', type: 'cli', enabled: true, command: 'grok',
+      ollamaBacked: true, models: ['qwen3-coder:30b'], defaultModel: 'qwen3-coder:30b',
+    }];
+    mocks.listManagedBackendModels.mockResolvedValue({
+      models: [{ id: 'qwen3-coder:30b' }, { id: 'gemma3:27b' }], error: null,
+    });
+
+    const catalog = await readPersistentMindTaskCatalog();
+    expect(catalog.providers[0].models.map((model) => model.id))
+      .toEqual(['qwen3-coder:30b', 'gemma3:27b']);
+    expect(mocks.listManagedBackendModels).toHaveBeenCalledWith('ollama');
+
+    const [result] = await executePersistentMindTaskRequests({
+      taskRequests: [taskRequest({ providerId: 'grok-ollama', model: 'gemma3:27b', effort: undefined })],
+      turnId: 'turn-daemon-model',
+      wake: { kind: 'message', message: { id: 'message-daemon-model' } },
+    });
+    expect(result).toMatchObject({ success: true });
+    expect(mocks.addTask).toHaveBeenCalledWith(expect.objectContaining({ model: 'gemma3:27b' }), 'internal');
+  });
+
+  // `null` (list unreadable) must not collapse to `[]` (nothing installed) — a
+  // daemon that is merely down would otherwise wipe the provider off the catalog.
+  it('keeps the record list when the daemon list cannot be read', async () => {
+    mocks.providers = [{
+      id: 'grok-ollama', name: 'Grok (Ollama)', type: 'cli', enabled: true, command: 'grok',
+      ollamaBacked: true, models: ['qwen3-coder:30b'], defaultModel: 'qwen3-coder:30b',
+    }];
+    mocks.listManagedBackendModels.mockResolvedValue({ models: [], error: 'daemon not running' });
+
+    const catalog = await readPersistentMindTaskCatalog();
+    // Asserting the call as well as the result: without it this passes just as
+    // green against a build that never consults the daemon at all.
+    expect(mocks.listManagedBackendModels).toHaveBeenCalledWith('ollama');
+    expect(catalog.providers[0].models.map((model) => model.id)).toEqual(['qwen3-coder:30b']);
+  });
+
+  // A cloud provider enumerates its own catalog, so a retired id is still refused.
+  it('still refuses a retired model on a non-local provider', async () => {
+    const [result] = await executePersistentMindTaskRequests({
+      taskRequests: [taskRequest({ model: 'gpt-4' })],
+      turnId: 'turn-retired-model',
+      wake: { kind: 'message', message: { id: 'message-retired-model' } },
+    });
+    expect(result).toMatchObject({ success: false, error: expect.stringContaining('not configured') });
+    expect(mocks.addTask).not.toHaveBeenCalled();
   });
 
   it('filters the model-facing catalog while retaining all apps for the settings inventory', async () => {
@@ -199,6 +280,46 @@ describe('persistent mind CoS-task capability', () => {
     expect(prompt).toContain('provider-0');
   });
 
+  it('shows the mind what the CoS queue already holds, newest first, including completed work', async () => {
+    mocks.cosTasks = [
+      {
+        id: 'sys-mind-older',
+        status: 'completed',
+        description: 'Unify the tool-calling interface\nsecond line ignored',
+        metadata: { app: 'portos', updatedAt: '2026-09-01T00:00:00.000Z' },
+      },
+      {
+        id: 'sys-newer',
+        status: 'in_progress',
+        description: 'Fix the npm engine mismatch',
+        metadata: { app: 'portos', updatedAt: '2026-09-03T00:00:00.000Z' },
+      },
+    ];
+
+    const inventory = await readPersistentMindTaskInventory();
+    expect(inventory).toEqual([
+      { id: 'sys-newer', status: 'in_progress', description: 'Fix the npm engine mismatch', appId: 'portos', queuedByMind: false },
+      { id: 'sys-mind-older', status: 'completed', description: 'Unify the tool-calling interface', appId: 'portos', queuedByMind: true },
+    ]);
+
+    const prompt = buildPersistentMindTaskCapabilityPrompt({ enabled: true, catalog: await readPersistentMindTaskCatalog(), inventory });
+    expect(prompt).toContain('Unify the tool-calling interface');
+    expect(prompt).toContain('do not re-queue it');
+  });
+
+  it('bounds a long CoS queue before it enters the reasoning prompt', async () => {
+    const inventory = Array.from({ length: 200 }, (_, index) => ({
+      id: `sys-mind-${index}`,
+      status: 'completed',
+      description: 'D'.repeat(160),
+      appId: 'portos',
+      queuedByMind: true,
+    }));
+    const prompt = buildPersistentMindTaskCapabilityPrompt({ enabled: true, catalog: { apps: [], providers: [] }, inventory });
+    expect(prompt.length).toBeLessThan(20_000);
+    expect(prompt).toContain('sys-mind-0');
+  });
+
   it('reuses tracker resolution for repeated catalog reads', async () => {
     mocks.apps = [{ id: 'cached-app', name: 'Cached App', repoPath: '/example/cached-app' }];
     await readPersistentMindTaskCatalog();
@@ -224,6 +345,19 @@ describe('persistent mind CoS-task capability', () => {
       simplify: true, approvalRequired: false,
     }), 'internal');
     expect(recordCapabilityEvent.mock.calls.map(([event]) => event.kind)).toEqual(['request', 'result']);
+  });
+
+  it('queues a setup repair despite a blocked diagnostic snapshot', async () => {
+    mocks.workspacePreflight.mockResolvedValue({
+      readiness: 'blocked', workspaceDiscovery: 'ready',
+      workspaces: [{ manifest: 'ready', engines: { node: { status: 'incompatible' } } }], warnings: [],
+    });
+    const [result] = await executePersistentMindTaskRequests({
+      taskRequests: [taskRequest({ description: 'Repair runtime setup', requiredValidation: [] })],
+      turnId: 'turn-repair', wake: { kind: 'message', message: { id: 'message-repair' } },
+    });
+    expect(result.success).toBe(true);
+    expect(mocks.addTask).toHaveBeenCalledWith(expect.objectContaining({ useWorktree: true, approvalRequired: false }), 'internal');
   });
 
   it('blocks only the validation checks a task explicitly requires', async () => {

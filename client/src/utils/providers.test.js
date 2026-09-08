@@ -1,3 +1,9 @@
+// Exercised THROUGH the `providers.js` facade on purpose: the helpers under test
+// are declared across the nine `provider*` / `localModelHeuristics` modules it
+// re-exports, so a helper that drops out of the facade fails here before any of
+// the 69 `utils/providers` importers notices. The declaring modules re-export
+// their shared tables from `server/lib`, so what is pinned here is the
+// client-side behaviour built on top of them.
 import { describe, it, expect } from 'vitest';
 import {
   ANTIGRAVITY_CONFIGURED_DEFAULT,
@@ -58,6 +64,7 @@ import {
   isCodexSubscriptionProvider,
   supportsModelRefresh,
   isAntigravityProvider,
+  isFleetHostConfigured,
   effortLevelsForProvider,
   generationControlsFor,
   resolveCliEffort,
@@ -79,6 +86,10 @@ import {
   selectableModelsForProvider,
   withStaleAntigravityPin,
   effortAwareModelOptions,
+  resolveProviderModelOptions,
+  codexCatalogModelIds,
+  providerModelList,
+  MODEL_SOURCE,
   effectiveModelFor,
   effortSurvivingModel,
   seedModelEffort,
@@ -93,15 +104,13 @@ import {
   effortLevelsForProvider as serverEffortLevelsForProvider,
   isAntigravityProvider as serverIsAntigravityProvider,
   resolveCliEffort as serverResolveCliEffort,
-  splitAntigravityModel as serverSplitAntigravityModel,
-  antigravityBaseModels as serverAntigravityBaseModels,
-  antigravityModelEffortLevels as serverAntigravityModelEffortLevels,
 } from '../../../server/lib/providerModels.js';
 
-// The client copy drives what EffortSelect DISPLAYS; the server copy decides
-// what the CLI actually receives. Any drift means the UI names a level the run
-// won't use, so every case is asserted against both implementations.
-describe('resolveCliEffort (server mirror)', () => {
+// The client resolves its own ladder and clamps through the server's
+// clampEffortToLadder; the server's resolveCliEffort decides what the CLI
+// actually receives. On a full provider record the two must agree, or the UI
+// names a level the run won't use — so every case is asserted against both.
+describe('resolveCliEffort', () => {
   const AGY = { id: 'antigravity-cli', command: 'agy' };
   const CLAUDE = { id: 'claude-code', command: 'claude' };
   const CODEX = { id: 'codex', command: 'codex' };
@@ -145,9 +154,9 @@ describe('resolveCliEffort (server mirror)', () => {
 });
 
 // These drive the Effort/model pickers in the CoS task + schedule forms. The
-// client copy is a hand-mirror of server/lib/providerModels.js (the client can't
-// import server modules at runtime), so pin both sides together here.
-describe('effortLevelsForProvider (server mirror)', () => {
+// client helper delegates to server/lib/providerModels.js and adds the
+// published-field fallback, so pin both sides together here.
+describe('effortLevelsForProvider', () => {
   const CASES = [
     ['antigravity CLI', { id: 'antigravity-cli', command: 'agy' }, ANTIGRAVITY_EFFORT_LEVELS],
     ['antigravity TUI', { id: 'antigravity-tui' }, ANTIGRAVITY_EFFORT_LEVELS],
@@ -161,6 +170,7 @@ describe('effortLevelsForProvider (server mirror)', () => {
     ['OpenCode MTPLX', { id: 'opencode-mtplx', command: 'opencode', mtplxBacked: true }, ['low', 'medium', 'high']],
     ['OpenCode vLLM TUI', { id: 'opencode-vllm-tui', command: 'opencode', vllmBacked: true }, ['low', 'medium', 'high']],
     ['OpenCode SGLang TUI', { id: 'opencode-sglang-tui', command: 'opencode', sglangBacked: true }, ['low', 'medium', 'high']],
+    ['OpenCode LM Studio', { id: 'opencode-lmstudio', command: 'opencode', lmstudioBacked: true }, ['low', 'medium', 'high']],
     ['OpenCode with no local backend', { id: 'opencode', command: 'opencode' }, null],
     // grok DOES have an effort control (`--reasoning-effort`, aliased `--effort`);
     // its ladder stops at xhigh, which is why it is not simply CLAUDE's.
@@ -175,6 +185,21 @@ describe('effortLevelsForProvider (server mirror)', () => {
   it.each(CASES)('%s', (_label, provider, expected) => {
     expect(effortLevelsForProvider(provider)).toEqual(expected);
     expect(serverEffortLevelsForProvider(provider)).toEqual(expected);
+  });
+
+  // Codex's ladder is model-gated in BOTH directions: the gpt-6 family adds
+  // `ultra` and drops `minimal` (sending it fails the run with HTTP 400
+  // `unsupported_value`). A client that still offers the rung shows the user a
+  // level whose only outcome is a dead run, so pin the gate on both sides.
+  it.each([
+    ['gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']],
+    ['gpt-6.1-nova', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['gpt-5.6-sol', ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']],
+    ['gpt-5.3-codex-spark', CODEX_EFFORT_LEVELS],
+  ])('codex ladder for %s', (model, expected) => {
+    const codex = { id: 'codex', command: 'codex' };
+    expect(effortLevelsForProvider(codex, model)).toEqual(expected);
+    expect(serverEffortLevelsForProvider(codex, model)).toEqual(expected);
   });
 });
 
@@ -205,6 +230,11 @@ describe('generationControlsFor', () => {
     // nothing reads. Sampling was never forwardable on a Claude harness either,
     // which would have left the block rendering one inert select.
     ['Claude SGLang TUI', { id: 'claude-sglang-tui', command: 'claude', sglangBacked: true }, null],
+    // LM Studio forwards temperature/top_p like any OpenAI-compatible endpoint,
+    // but reasoning is a property of the LOADED model instance there — no
+    // per-request field carries it, so the toggle would pin a value nothing
+    // reads (THINKING_STYLE.lmstudio is null on the server).
+    ['OpenCode LM Studio', { id: 'opencode-lmstudio', command: 'opencode', lmstudioBacked: true }, { temperature: true, topP: true, thinking: false }],
     ['native Ollama API', { id: 'ollama', type: 'api', endpoint: 'http://localhost:11434/v1' }, { temperature: true, topP: true, thinking: true }],
     // OrcaRouter proxies cloud models that own their own reasoning switch.
     ['OpenCode OrcaRouter', { id: 'opencode-orcarouter', command: 'opencode', orcarouterBacked: true }, { temperature: true, topP: true, thinking: false }],
@@ -217,11 +247,38 @@ describe('generationControlsFor', () => {
   });
 });
 
+describe('effortLevelsForProvider on a sanitized inventory', () => {
+  // The safe settings payload (server/services/aiAssignments.js) omits command/
+  // path/env and publishes the derived ladder instead. The server's own answer
+  // for such a record is null, so the published fields are the only rung —
+  // except for Antigravity, whose server null is final: the catalog names no
+  // tier for that model, and the provider-level ladder must not resurrect one.
+  const CATALOG = ['gemini-3.6-flash-high', 'gemini-3.6-flash-medium', 'gemini-3.6-flash-low', 'claude-sonnet-4-6'];
+
+  it('reads the published ladder, but never lets it resurrect an Antigravity tier', () => {
+    const agy = {
+      id: 'antigravity-cli',
+      models: CATALOG,
+      effortLevels: ['low', 'medium', 'high'],
+      effortLevelsByModel: { 'gemini-3.6-flash': ['low', 'medium', 'high'] },
+    };
+    expect(effortLevelsForProvider(agy, 'gemini-3.6-flash')).toEqual(['low', 'medium', 'high']);
+    expect(effortLevelsForProvider(agy, 'claude-sonnet-4-6')).toBeNull();
+    expect(effortLevelsForProvider(agy, 'not-in-catalog')).toBeNull();
+
+    const custom = { id: 'custom-agent', effortLevels: ['low', 'medium', 'high'], effortLevelsByModel: { m: ['low', 'high'] } };
+    expect(effortLevelsForProvider(custom, 'm')).toEqual(['low', 'high']);
+    expect(effortLevelsForProvider(custom)).toEqual(['low', 'medium', 'high']);
+    expect(resolveCliEffort('max', custom)).toBe('high');
+  });
+});
+
 // Antigravity lists one model id per effort tier (`gemini-3.6-flash-high`), but
 // agy also takes the BASE id with a separate `--effort` flag — so the pickers
-// show base models and carry effort as its own control. Both sides must agree on
-// the split, or a client-side base id won't match what the server rebuilds.
-describe('Antigravity base-model split (server mirror)', () => {
+// show base models and carry effort as its own control. The split is the
+// server's (re-exported), so a client-side base id always matches what the
+// server rebuilds.
+describe('Antigravity base-model split', () => {
   // The catalog `agy models` prints — the shipped provider list mirrors it.
   const CATALOG = [
     ANTIGRAVITY_CONFIGURED_DEFAULT,
@@ -243,12 +300,10 @@ describe('Antigravity base-model split (server mirror)', () => {
     ['', { base: '', effort: null }],
   ])('splitAntigravityModel(%s)', (id, expected) => {
     expect(splitAntigravityModel(id)).toEqual(expected);
-    expect(serverSplitAntigravityModel(id)).toEqual(expected);
   });
 
-  it('strips + dedupes the catalog into base models on both sides', () => {
+  it('strips + dedupes the catalog into base models', () => {
     expect(antigravityBaseModels(CATALOG)).toEqual(BASES);
-    expect(serverAntigravityBaseModels(CATALOG)).toEqual(BASES);
   });
 
   it.each([
@@ -262,7 +317,6 @@ describe('Antigravity base-model split (server mirror)', () => {
     [ANTIGRAVITY_CONFIGURED_DEFAULT, null],
   ])('antigravityModelEffortLevels(%s)', (model, expected) => {
     expect(antigravityModelEffortLevels(model, CATALOG)).toEqual(expected);
-    expect(serverAntigravityModelEffortLevels(model, CATALOG)).toEqual(expected);
   });
 
   it('narrows the picker ladder per selected model, and hides it for a tier-less model', () => {
@@ -330,6 +384,80 @@ describe('Antigravity base-model split (server mirror)', () => {
       const codex = { id: 'codex', command: 'codex', models: ['gpt-5', 'gpt-5-mini'] };
       expect(effortAwareModelOptions(codex, 'gpt-5')).toEqual(['gpt-5', 'gpt-5-mini']);
       expect(effortAwareModelOptions(null, '')).toEqual([]);
+    });
+  });
+
+  // #6306: the CoS picker must offer the SIGNED-IN account's catalog, and must
+  // never be emptied by a cold cache or a failed read.
+  describe('resolveProviderModelOptions (Codex account catalog)', () => {
+    const SHIPPED = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.4'];
+    const codex = (codexModelCatalog) => ({
+      id: 'codex', name: 'Codex CLI', type: 'cli', command: 'codex', models: SHIPPED, codexModelCatalog,
+    });
+
+    it('offers the account catalog when one was fetched', () => {
+      const result = resolveProviderModelOptions(
+        codex({ models: [{ id: 'gpt-5.4' }, { id: 'gpt-5.4-mini' }], fetchedAt: 1, error: null }),
+        'gpt-5.4',
+      );
+      expect(result.models).toEqual(['gpt-5.4', 'gpt-5.4-mini']);
+      expect(result.source).toBe(MODEL_SOURCE.account);
+      expect(result.unlistedSelection).toBe(false);
+    });
+
+    it('keeps the shipped list for a never-fetched catalog and for a failed read', () => {
+      for (const catalog of [
+        undefined,
+        { models: null, fetchedAt: null, error: null },
+        { models: null, fetchedAt: null, error: { code: 'protocol', message: 'boom' } },
+        // A failed read hands back a LAST-KNOWN-GOOD list, which is not an answer
+        // about the account either — the shipped list stands.
+        { models: [{ id: 'gpt-5.4' }], fetchedAt: 1, error: { code: 'protocol', message: 'boom' } },
+      ]) {
+        const result = resolveProviderModelOptions(codex(catalog), '');
+        expect(result.models).toEqual(SHIPPED);
+        expect(result.source).toBe(MODEL_SOURCE.shipped);
+      }
+    });
+
+    it('reports a successfully-read empty catalog as its own state, not as shipped', () => {
+      const result = resolveProviderModelOptions(codex({ models: [], fetchedAt: 1, error: null }), '');
+      expect(result.models).toEqual([]);
+      expect(result.source).toBe(MODEL_SOURCE.accountEmpty);
+    });
+
+    it('retains a stored model the catalog no longer lists, flagged', () => {
+      const result = resolveProviderModelOptions(
+        codex({ models: [{ id: 'gpt-5.4' }], fetchedAt: 1, error: null }),
+        'gpt-6-astra',
+      );
+      expect(result.models).toEqual(['gpt-5.4', 'gpt-6-astra']);
+      expect(result.unlistedSelection).toBe(true);
+    });
+
+    it('leaves a non-subscription provider on its own catalog', () => {
+      const agy = { id: 'antigravity-cli', command: 'agy', models: CATALOG, codexModelCatalog: { models: [], error: null } };
+      expect(resolveProviderModelOptions(agy, '').source).toBe(MODEL_SOURCE.shipped);
+      expect(codexCatalogModelIds({ codexModelCatalog: { models: null, error: null } })).toBeNull();
+    });
+
+    it('is the raw list every other picker reads, so none reimplements the fallback', () => {
+      // providerModelList is the ONE place the account catalog enters a picker —
+      // useProviderModels, AppProviderPin and the allowlist controls all read it.
+      expect(providerModelList(codex({ models: [{ id: 'gpt-5.4' }], fetchedAt: 1, error: null })))
+        .toEqual(['gpt-5.4']);
+      expect(providerModelList(codex({ models: null, fetchedAt: null, error: null }))).toEqual(SHIPPED);
+      // A successfully-read EMPTY catalog must NOT fall through to defaultModel:
+      // the account really has no models, and the default is one of them.
+      expect(providerModelList({ ...codex({ models: [], fetchedAt: 1, error: null }), models: [], defaultModel: 'gpt-6-astra' }))
+        .toEqual([]);
+      // Non-Codex providers keep the defaultModel fallback for an empty list.
+      expect(providerModelList({ id: 'x', models: [], defaultModel: 'only-default' })).toEqual(['only-default']);
+    });
+
+    it('is what effortAwareModelOptions returns, so every picker agrees', () => {
+      const provider = codex({ models: [{ id: 'gpt-5.4' }], fetchedAt: 1, error: null });
+      expect(effortAwareModelOptions(provider, '')).toEqual(resolveProviderModelOptions(provider, '').models);
     });
   });
 
@@ -741,7 +869,7 @@ describe('isEmbeddingModel / filterGenerationModels', () => {
   });
 });
 
-describe('isVisionModel (mirror of server localModelHeuristics)', () => {
+describe('isVisionModel', () => {
   it('flags known vision model ids', () => {
     for (const id of [
       'qwen2.5-vl:7b', 'qwen2.5vl', 'qwen2.5vl:32b', 'llava:latest', 'moondream:latest', 'minicpm-v:8b',
@@ -774,7 +902,7 @@ describe('isVisionCapableCliProvider', () => {
   });
 });
 
-describe('isToolUseModel (mirror of server localModelHeuristics)', () => {
+describe('isToolUseModel', () => {
   it('flags known tool-use-capable model ids', () => {
     for (const id of [
       'qwen2.5:7b', 'qwen3:32b', 'llama3.1:8b', 'llama3.3:70b',
@@ -1030,7 +1158,7 @@ describe('modelCapabilityInfo', () => {
   });
 });
 
-describe('knownProviderContextWindow (mirror of server stageRunner)', () => {
+describe('knownProviderContextWindow', () => {
   it('resolves vendor windows for bare commands', () => {
     expect(knownProviderContextWindow({ id: 'codex-tui', type: 'tui', command: 'codex' })).toBe(CODEX_CONTEXT_WINDOW);
     expect(knownProviderContextWindow({ id: 'antigravity-cli', type: 'cli', command: 'agy' })).toBe(GEMINI_CONTEXT_WINDOW);
@@ -1124,15 +1252,24 @@ describe('supportsModelRefresh', () => {
     expect(withButton).toEqual([
       'antigravity-cli', 'antigravity-tui', 'cerebras', 'claude-code',
       'claude-code-bedrock', 'claude-ollama', 'claude-ollama-tui',
-      'claude-sglang', 'claude-sglang-tui', 'cursor-cli',
+      'claude-sglang', 'claude-sglang-tui', 'codex', 'codex-lmstudio',
+      'codex-ollama', 'codex-tui',
+      'cursor-cli',
       'cursor-tui', 'grok', 'lmstudio', 'mtplx', 'nvidia-kimi', 'ollama',
       'opencode-llama-tui',
+      'opencode-lmstudio', 'opencode-lmstudio-tui',
       'opencode-mtplx', 'opencode-mtplx-tui', 'opencode-ollama',
       'opencode-ollama-tui', 'opencode-openrouter', 'opencode-openrouter-tui',
       'opencode-orcarouter', 'opencode-orcarouter-tui',
       'opencode-sglang', 'opencode-sglang-tui',
       'opencode-vllm', 'opencode-vllm-tui',
-      'openrouter', 'orcarouter',
+      // The Zen API record is an ordinary OpenAI-compatible endpoint. Its CLI/TUI
+      // wrappers are deliberately ABSENT: they carry no namespace marker, which
+      // is what makes OpenCode resolve `opencode/*` through its own built-in
+      // provider — nothing here can enumerate that, and Models → Harnesses
+      // ("Refresh models") is where their catalog comes from instead.
+      'opencode-zen',
+      'openrouter', 'orcarouter', 'pi-cli', 'pi-tui', 'slotstream',
     ]);
   });
 });
@@ -1145,10 +1282,6 @@ describe('cursor providers', () => {
     );
     // The GUI editor launcher is not the agent binary, so it keeps no ladder.
     expect(effortLevelsForProvider({ id: 'custom', command: 'cursor' })).toBeNull();
-  });
-
-  it('keeps the cursor ladder in lockstep with the server', () => {
-    expect(CURSOR_EFFORT_LEVELS).toEqual(serverEffortLevelsForProvider({ id: 'cursor-cli', command: 'cursor-agent' }));
   });
 
   it('is not mistaken for a claude/codex/antigravity provider by its model ids', () => {
@@ -1189,9 +1322,9 @@ describe('effectiveModelContextWindow', () => {
   });
 
   it('prefers the window the provider catalog reported for that model', () => {
-    // Mirrors the server ladder in stageRunner.js: catalog beats the regex
-    // table, and both beat the blanket 128K assumption that made a 1M-context
-    // model look capped.
+    // The same rungs as the server's effectiveContextWindow: catalog beats the
+    // regex table, and both beat the blanket 128K assumption that made a
+    // 1M-context model look capped.
     const wrapper = { id: 'opencode-openrouter-tui', type: 'tui', command: 'opencode', modelContextWindows: { 'stealth/ox-alpha': 1_000_000 } };
     expect(effectiveModelContextWindow(wrapper, 'stealth/ox-alpha')).toBe(1_000_000);
     expect(effectiveModelContextWindow(wrapper, 'openrouter/auto')).toBe(128_000);
@@ -1356,9 +1489,9 @@ describe('AI Assignments option helpers', () => {
   it('assignmentProviderOptions filters by providerTypes and flags disabled', () => {
     expect(assignmentProviderOptions({ providerTypes: ['api'] }, providers))
       .toEqual([
-        { id: 'vlm-x', name: 'VLM X (disabled)' },
-        { id: 'ollama', name: 'Ollama' },
-        { id: 'openai', name: 'OpenAI' },
+        { id: 'vlm-x', name: 'VLM X (disabled)', enabled: false },
+        { id: 'ollama', name: 'Ollama', enabled: true },
+        { id: 'openai', name: 'OpenAI', enabled: true },
       ]);
     // No providerTypes → all providers.
     expect(assignmentProviderOptions({}, providers).map((p) => p.id))
@@ -1527,6 +1660,22 @@ describe('credentialSource', () => {
     const renamed = { id: 'codex', type: 'cli', command: 'opencode', envVars: { CUSTOM_API_KEY: '' } };
     expect(isCodexSubscriptionProvider(renamed)).toBe(false);
     expect(credentialSource(renamed)).toEqual({ kind: 'env', ref: 'CUSTOM_API_KEY' });
+  });
+
+  it('exempts a local-backed Codex record from the ChatGPT subscription contract', () => {
+    // `codex --oss --local-provider ollama` generates its tokens on this machine
+    // and authenticates against nothing, so the account is not one of its
+    // prerequisites — without this the card claims "No ChatGPT account is signed
+    // in" and, worse, parks in UNKNOWN awaiting a read that never matters.
+    // MIRROR of server/lib/codexAccount.js#isCodexSubscriptionProvider.
+    const local = SHIPPED_PROVIDERS.providers['codex-ollama'];
+    expect(local.ollamaBacked).toBe(true);
+    expect(isCodexSubscriptionProvider(local)).toBe(false);
+    expect(isCodexSubscriptionProvider(SHIPPED_PROVIDERS.providers.codex)).toBe(true);
+    // An enabled copy: a codex-command card whose account read came back with
+    // no verdict parks in UNKNOWN, which this record must never reach.
+    const enabled = { ...local, enabled: true, missingPrerequisites: [] };
+    expect(providerCardState(enabled, { codexAccount: null }).state).toBe(PROVIDER_CARD_STATE.READY);
   });
 
   it('lets a wrapper carrying its own key stand down from inheritance', () => {
@@ -1965,3 +2114,71 @@ describe('publicReviewSelectionPolicy', () => {
     expect(policy.model('grok-4', GROK)).toBe(true);
   });
 });
+
+describe('isFleetHostConfigured', () => {
+  const host = {
+    peerId: 'peer-1',
+    peerName: 'Workstation GPU',
+    peerHost: 'workstation.tailnet.ts.net',
+    peerAddress: '192.168.1.50',
+    endpoint: 'http://workstation.tailnet.ts.net:18022/v1',
+    model: 'qwen3.8-27b',
+    serving: true,
+  };
+
+  it('returns false for empty host or empty providers', () => {
+    expect(isFleetHostConfigured(null, [])).toBe(false);
+    expect(isFleetHostConfigured(host, [])).toBe(false);
+    expect(isFleetHostConfigured(host, null)).toBe(false);
+  });
+
+  it('matches provider by exact endpoint', () => {
+    const providers = [
+      { id: 'p1', endpoint: 'http://workstation.tailnet.ts.net:18022/v1' },
+    ];
+    expect(isFleetHostConfigured(host, providers)).toBe(true);
+
+    const providersWithSlash = [
+      { id: 'p1', endpoint: 'http://workstation.tailnet.ts.net:18022/v1/' },
+    ];
+    expect(isFleetHostConfigured(host, providersWithSlash)).toBe(true);
+  });
+
+  it('matches provider by peerHost hostname or peerAddress', () => {
+    const providers = [
+      { id: 'p1', endpoint: 'http://workstation.tailnet.ts.net:18022/v1' },
+    ];
+    expect(isFleetHostConfigured({ peerHost: 'workstation.tailnet.ts.net' }, providers)).toBe(true);
+    expect(isFleetHostConfigured({ peerAddress: '192.168.1.50' }, [
+      { id: 'p2', endpoint: 'http://192.168.1.50:18022/v1' },
+    ])).toBe(true);
+  });
+
+  it('matches OpenCode TUI provider by OPENCODE_CONFIG_CONTENT baseURL', () => {
+    const providers = [
+      {
+        id: 'p-tui',
+        type: 'tui',
+        envVars: {
+          OPENCODE_CONFIG_CONTENT: JSON.stringify({
+            provider: {
+              vllm: {
+                options: { baseURL: 'http://workstation.tailnet.ts.net:18022/v1' },
+              },
+            },
+          }),
+        },
+      },
+    ];
+    expect(isFleetHostConfigured(host, providers)).toBe(true);
+  });
+
+  it('returns false when no provider points to the host', () => {
+    const providers = [
+      { id: 'other', endpoint: 'http://other.tailnet.ts.net:18022/v1' },
+      { id: 'local', endpoint: 'http://127.0.0.1:11434' },
+    ];
+    expect(isFleetHostConfigured(host, providers)).toBe(false);
+  });
+});
+

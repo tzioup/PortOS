@@ -19,7 +19,7 @@ vi.mock('../../../services/api', () => api);
 const toast = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }));
 vi.mock('../../ui/Toast', () => ({ default: toast }));
 
-import BeeperAttachment from './BeeperAttachment';
+import BeeperAttachment, { reservedBoxStyle } from './BeeperAttachment';
 
 afterEach(() => {
   cleanup();
@@ -74,10 +74,27 @@ describe('BeeperAttachment — image load lifecycle', () => {
     const wrapper = screen.getByTestId('attachment-skeleton').parentElement;
     const style = wrapper.getAttribute('style') || '';
     expect(style).toContain('aspect-ratio: 800 / 600');
-    // The natural width, capped by the image's own `max-h-64` (16rem) so a
-    // tall image reserves the height it will really take.
-    expect(style).toMatch(/width: min\(800px, [\d.]+rem\)/);
     expect(style).toContain('max-width: 100%');
+  });
+
+  // The width cap is asserted on the pure helper rather than the rendered
+  // style attribute: happy-dom drops any declaration whose value is a `min()`,
+  // so `width` never reaches the DOM here even though a real browser applies
+  // it. Trading the `min()` for something the test environment serializes
+  // would change real behaviour to suit the test, so the function is the seam.
+  it('caps the reserved width at the natural width and the max-h-64 bound', () => {
+    expect(reservedBoxStyle({ width: 800, height: 600 }, false)).toEqual({
+      aspectRatio: '800 / 600',
+      // 16rem * (800/600) = the width a 4:3 image takes once max-h-64 binds.
+      width: 'min(800px, calc(16rem * 1.3333))',
+      maxWidth: '100%',
+    });
+  });
+
+  it('reserves the fixed neutral box from the helper when dimensions are unknown', () => {
+    expect(reservedBoxStyle({ width: null, height: null }, false)).toEqual({ width: '8rem', height: '8rem' });
+    // Once loaded there is nothing left to reserve — the image is its own box.
+    expect(reservedBoxStyle({ width: null, height: null }, true)).toBeUndefined();
   });
 
   it('keeps the fixed neutral box, and no aspect-ratio, when dimensions are unknown', () => {

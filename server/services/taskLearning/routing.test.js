@@ -11,7 +11,7 @@ import {
   getPerformanceSummary
 } from './routing.js';
 import { loadLearningData } from './store.js';
-import { resetTaskTypeLearning } from './metrics.js';
+import { resetTaskTypeLearning } from './reset.js';
 
 // Stub ONLY the persistence + log surface of the store; every pure helper
 // (computeEffectiveSuccessRate, computeWindowedStats, isSandboxedTaskType, …)
@@ -20,7 +20,7 @@ vi.mock('./store.js', async (importOriginal) => {
   const actual = await importOriginal();
   return { ...actual, loadLearningData: vi.fn(), emitLog: vi.fn() };
 });
-vi.mock('./metrics.js', () => ({ resetTaskTypeLearning: vi.fn() }));
+vi.mock('./reset.js', () => ({ resetTaskTypeLearning: vi.fn() }));
 
 // deriveFailureSignalAvoidance is the pure "routing consumes the enriched
 // failure signatures" core added for issue #2329. It takes learning data + a
@@ -395,6 +395,13 @@ describe('windowed-rate decisions (issue #2617)', () => {
   });
 
   describe('suggestModelTier', () => {
+    it('keeps explicit Ultra outcomes out of automatic tier suggestions', async () => {
+      const data = learningWith({ 'self-improve:x': recoveredMetrics() });
+      data.routingAccuracy = { 'self-improve:x': { ultra: { succeeded: 20, failed: 0 }, medium: { succeeded: 10, failed: 0 } } };
+      loadLearningData.mockResolvedValue(data);
+      expect(await suggestModelTier('self-improve:x')).not.toMatchObject({ suggested: 'ultra' });
+    });
+
     it('no longer suggests heavy for a recovered type (effective rate in the low-success fallback)', async () => {
       loadLearningData.mockResolvedValue(learningWith({ 'self-improve:x': recoveredMetrics() }));
       expect(await suggestModelTier('self-improve:x')).toBeNull();

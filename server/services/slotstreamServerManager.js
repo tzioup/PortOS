@@ -34,6 +34,7 @@ import { probeOpenAiModels } from '../lib/openAiModelsProbe.js';
 import { isAppleSilicon, isPortInUse } from '../lib/platform.js';
 import { PORTS } from '../lib/ports.js';
 import { findCommandOnPath } from '../lib/processEnv.js';
+import { SLOTSTREAM_CATALOG } from '../lib/slotstreamCatalog.js';
 import {
   listSlotstreamCachedModels,
   pickSlotstreamCachedModel,
@@ -166,11 +167,16 @@ export async function getSlotstreamServerStatus() {
     supported,
     unsupportedReason: supported ? null : SLOTSTREAM_UNSUPPORTED_REASON,
     idleMinutes: await configuredIdleMinutes(),
+    keepLoaded: await configuredKeepLoaded(),
     launch: saved,
     memoryPlan,
     cachedModels: (cache.models || []).map((m) => m?.id).filter(Boolean),
     cacheDir: slotstreamCacheDir(),
     cacheError: cache.error,
+    // The download menu rides on the status payload rather than a route of its
+    // own: it is three frozen rows, so a second fetch (and a second cache to
+    // keep in step with the cached-checkpoint list beside it) would buy nothing.
+    catalog: SLOTSTREAM_CATALOG,
   };
 }
 
@@ -400,9 +406,11 @@ export function _resetSlotstreamServerStateForTests({
   relaunchReadyTimeout,
   relaunchPoll,
   idleMinutes = 0,
+  keepLoaded = null,
   logFiles,
 } = {}) {
   idleMinutesOverride = idleMinutes;
+  keepLoadedOverride = keepLoaded;
   slotstreamLogFiles = logFiles ? {
     stdout: logFiles.stdout || DEFAULT_SLOTSTREAM_LOG_FILES.stdout,
     stderr: logFiles.stderr || DEFAULT_SLOTSTREAM_LOG_FILES.stderr,
@@ -416,8 +424,14 @@ export function _resetSlotstreamServerStateForTests({
   relaunchPollMs = Number.isFinite(relaunchPoll) ? relaunchPoll : 1000;
 }
 
+// Test hook for pinning
+export function _setSlotstreamKeepLoadedOverrideForTests(val) {
+  keepLoadedOverride = val;
+}
+
 const readSettings = () => import('./settings.js').then((m) => m.getSettings()).catch(() => null);
 let idleMinutesOverride = null;
+let keepLoadedOverride = null;
 
 async function configuredIdleMinutes() {
   if (idleMinutesOverride !== null) return idleMinutesOverride;
@@ -426,9 +440,17 @@ async function configuredIdleMinutes() {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
 }
 
+async function configuredKeepLoaded() {
+  if (keepLoadedOverride !== null) return keepLoadedOverride;
+  const settings = await readSettings();
+  return Boolean(settings?.localLlm?.slotstream?.keepLoaded ?? settings?.localLlm?.slotstream?.pinned);
+}
+
 registerIdleDaemon({
   name: SLOTSTREAM_APP,
   getIdleMs: async () => idleWindowMs(await configuredIdleMinutes()),
+  isPinned: async () => configuredKeepLoaded(),
+  isRunning: async () => Boolean((await getAppStatusStrict(SLOTSTREAM_APP))?.status === 'online'),
   stop: () => stopSlotstreamServer(),
 });
 
@@ -516,6 +538,32 @@ export function isSlotstreamProvider(provider) {
   if (localRuntimeKind(provider) === 'slotstream') return true;
   const managedPort = currentConfig?.port;
   return Boolean(managedPort) && Number(localEndpointPort(provider.endpoint)) === managedPort;
+}
+
+/**
+ * The checkpoints THIS machine can serve, for a Slotstream provider's model
+ * refresh — the Slotstream half of `services/localCachedModels.js`.
+ *
+ * Same shape of bug as MTPLX, and worse in one way: `slotstream serve` loads one
+ * checkpoint and answers only under that id, while the shipped `slotstream`
+ * record lists THREE. So a refresh did not merely fail to add a newly downloaded
+ * checkpoint — it pruned the record's other two shipped ids down to whatever the
+ * daemon happened to have loaded, including the `defaultModel` pin whenever that
+ * was not the loaded one.
+ *
+ * `null` for a provider that is not this daemon's and for a cache that could not
+ * be READ — deliberately not `[]`, which the caller must be free to read as
+ * "read, and genuinely empty". Unlike MTPLX this costs no subprocess and needs
+ * no runtime gate: the listing is a directory read (`lib/slotstreamModels.js`).
+ *
+ * @param {{type?: string, endpoint?: string}|null} provider
+ * @returns {Promise<string[]|null>}
+ */
+export async function slotstreamCachedModelIds(provider) {
+  if (!isSlotstreamProvider(provider)) return null;
+  const { models } = await listSlotstreamCachedModels();
+  if (!Array.isArray(models)) return null;
+  return models.map((row) => row?.id).filter((id) => typeof id === 'string' && id !== '');
 }
 
 export async function ensureSlotstreamProviderReady(provider) {

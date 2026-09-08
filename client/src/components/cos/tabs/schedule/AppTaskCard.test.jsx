@@ -69,9 +69,11 @@ describe('AppTaskCard', () => {
     expect(screen.getByText(/^in /)).toBeTruthy();
   });
 
-  it('renders a clean Cron badge and next-run schedule description for cron tasks', () => {
+  it('renders a clean Scheduled badge and next-run schedule description for cron tasks', () => {
     renderCard({ type: 'cron', cronExpression: '0 6 * * 1-5' }, {}, 'layered-intelligence');
-    expect(screen.getByText('Cron')).toBeTruthy();
+    expect(screen.getByText('Scheduled')).toBeTruthy();
+    // Perpetual is an ORTHOGONAL badge, so a plain cron task never shows one.
+    expect(screen.queryByText('Perpetual')).toBeNull();
     expect(screen.getAllByTitle('Weekdays at 06:00 (0 6 * * 1-5)').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/^in .* · Weekdays at 06:00/)).toBeTruthy();
     expect(screen.getByText('layered-intelligence')).toBeTruthy();
@@ -80,6 +82,12 @@ describe('AppTaskCard', () => {
   it('shows "Manual trigger only" for on-demand tasks', () => {
     renderCard({ type: 'on-demand' });
     expect(screen.getByText('Manual trigger only')).toBeTruthy();
+  });
+
+  it('renders BOTH badges for a scheduled task that also drains perpetually', () => {
+    renderCard({ type: 'cron', cronExpression: '0 6 * * 1-5', perpetual: true });
+    expect(screen.getByText('Scheduled')).toBeTruthy();
+    expect(screen.getByText('Perpetual')).toBeTruthy();
   });
 
   it('shows "Paused" for disabled tasks', () => {
@@ -209,6 +217,15 @@ describe('AppTaskCard', () => {
       renderCardWithPins();
       expect(within(screen.getByLabelText('Provider')).getByRole('option', { name: 'Default (active provider)' })).toBeTruthy();
       expect(screen.queryByLabelText('Thinking effort')).toBeNull();
+    });
+
+    it('says the provider list is still loading instead of offering a lone bare Default', () => {
+      // Proves the card actually threads the flag; the label/disable rule itself
+      // is ProviderModelSelector's (see its own suite).
+      renderCardWithPins({}, { providers: [], providersLoaded: false });
+      const provider = screen.getByLabelText('Provider');
+      expect(within(provider).getByRole('option', { name: 'Loading providers…' })).toBeTruthy();
+      expect(provider.disabled).toBe(true);
     });
 
     it('hides a disabled provider from the picker unless the task is pinned to it', () => {

@@ -18,7 +18,8 @@ import { startAIOp } from '../aiStatusEvents.js';
 import { runStagedLLM } from '../stageRunner.js';
 import { isStr, trimTo } from '../../lib/storyBible.js';
 import { resolveLlmRoutePin } from '../../lib/llmRoutePin.js';
-import { renderCanonForPrompt } from '../../lib/universePromptRenderers.js';
+import { renderStoryCanonDigest } from '../../lib/universePromptRenderers.js';
+import { renderCharacterEvolutionListForPrompt } from '../../lib/characterEvolution.js';
 import { GRAPH_ISSUE_CODES, analyzeEpisodeGraph, describeGraphForPrompt } from '../../lib/fableLoomGraph.js';
 import {
   FABLELOOM_CAMERA_MOVEMENT_VALUES,
@@ -45,7 +46,7 @@ import {
   participationContractForPrompt,
 } from '../../lib/fableLoomParticipation.js';
 import { getUniverse } from '../universeBuilder.js';
-import { LOOM_LIMITS, findEpisode, findNode, getLoom, mutateLoom } from './records.js';
+import { LOOM_LIMITS, fableLoomEvolutionEvidenceRefs, findEpisode, findNode, getLoom, mutateLoom } from './records.js';
 import { asLoomFormat, loomFormatLabel, narrationFormatContract, sceneFormatContract } from './formats.js';
 
 const TRANSCRIPT_TURNS_MAX = 12;
@@ -137,14 +138,25 @@ const playRouting = (loom, perCall) => resolveLlmRoutePin(loom.playSettings, per
 
 /**
  * Render the linked universe's canon as a prompt digest via the shared
- * renderer (field precedence, per-kind caps, and the "+ N more" truncation
- * footer every generative prompt gets). Empty string when the loom has no
- * universe — the stages treat it as optional.
+ * composer (field precedence, per-kind caps, the "+ N more" truncation footer,
+ * and the authored Ghost/Wound/Lie/Want/Need engines every generative prompt
+ * needs to make characters drive the plot). The bound protagonist is pinned so
+ * a large cast can't push the one character the story is about past the cap.
+ * Empty string when the loom has no universe — the stages treat it as optional.
+ *
+ * Reader-facing paths do NOT call this: `playTurn` never renders canon, and the
+ * cold-opening first-time-viewer review passes its own withheld placeholder.
+ *
+ * The composer's reveal gate is left ON (its default): a character carrying a
+ * `spoiler` flag or an unresolved `revealIssue` reaches these generation stages
+ * as name + role + the authored surface stand-in, with the concealed
+ * `background`/`personality` and the psychology block both withheld (#6426).
  */
 export async function buildCanonDigest(loom) {
   if (!loom.universeId) return '';
   const universe = await getUniverse(loom.universeId).catch(() => null);
-  return universe ? renderCanonForPrompt(universe) : '';
+  if (!universe) return '';
+  return renderStoryCanonDigest(universe, { protagonistCharacterId: loom.protagonistCharacterId });
 }
 
 const seriesPlanContext = (loom, episode) => {
@@ -159,8 +171,8 @@ const seriesPlanContext = (loom, episode) => {
       const assignment = item.episodeId ? ` [planned for ${episodeLabels.get(item.episodeId) || item.episodeId}]` : ' [unassigned]';
       const challenge = fableLoomPlotPointKind(item) === 'challenge';
       return [
-        `Plot point ${index + 1} id=${item.id} kind=${challenge ? 'challenge' : 'beat'}${assignment}: ${item.title || 'Untitled'}${item.description ? ` — ${trimTo(item.description, 700)}` : ''}`,
-        challenge
+        `Plot point ${index + 1} id=${item.id} kind=${challenge ? 'challenge' : 'beat'}${assignment}: ${item.title || 'Untitled'}${item.description ? ` — ${item.description}` : ''}`,
+        challenge && (!episode || item.episodeId === episode.id)
           ? 'PLAYABLE CHALLENGE CONTRACT: map this exact plot-point id onto separate outline/teleplay beats with challengePhase values setup, decision, success, failure, and recovery. The setup must lead to the decision loop; the decision must reach both success and failure; both outcomes must continue to recovery/payoff. Failure continues with a visible cost rather than resetting or dead-ending.'
           : '',
       ].filter(Boolean).join('\n');
@@ -170,7 +182,7 @@ const seriesPlanContext = (loom, episode) => {
     .map((item) => {
       const start = item.startEpisodeId ? episodeLabels.get(item.startEpisodeId) || item.startEpisodeId : 'unassigned';
       const end = item.endEpisodeId ? episodeLabels.get(item.endEpisodeId) || item.endEpisodeId : 'unassigned';
-      return `Side quest (${item.status}; starts ${start}; ends ${end}): ${item.title || 'Untitled'}${item.description ? ` — ${trimTo(item.description, 300)}` : ''}`;
+      return `Side quest (${item.status}; starts ${start}; ends ${end}): ${item.title || 'Untitled'}${item.description ? ` — ${item.description}` : ''}`;
     });
   const delivery = plan.deliveryOptions || {};
   const deliveryLines = [];
@@ -189,7 +201,7 @@ const seriesPlanContext = (loom, episode) => {
     }
   }
   return [
-    plan.storyArc ? `Series arc: ${trimTo(plan.storyArc, 4000)}` : '',
+    plan.storyArc ? `Series arc: ${plan.storyArc}` : '',
     ...plotPoints,
     ...sideQuests,
     ...deliveryLines,
@@ -214,32 +226,32 @@ const protagonistContinuityContext = (loom) => [
   'Every scene must declare protagonist presence. Off-screen protagonist scenes are valid: use them for direct communicator conversations with the audience and keep the protagonist out of the storyboard image. For an off-screen helper scene, frame the obstacle or space the protagonist cannot see — around a corner, beyond a bend, at a distance, or otherwise outside their sightline. The communicator stays on the protagonist\'s person and out of frame; never make a standalone comms device the subject of the storyboard image.',
 ];
 
-const storyContext = (loom, episode) => [
+const storyContext = (loom, episode, { includeSeriesPlan = true } = {}) => [
   `Story: ${loom.name}`,
   `Scene format: ${loomFormatLabel(loom.format)}`,
   `Audience participation: ${audienceContract(loom, episode)}`,
   ...protagonistContinuityContext(loom),
   loom.logline ? `Logline: ${loom.logline}` : '',
   loom.premise ? `Premise: ${loom.premise}` : '',
-  ...seriesPlanContext(loom, episode),
-  episode ? `Episode ${episode.number}: ${episode.title || 'Untitled'}` : '',
+  ...(includeSeriesPlan ? seriesPlanContext(loom, episode) : []),
+  episode ? `CURRENT EPISODE ONLY: Episode ${episode.number}: ${episode.title || 'Untitled'} (id=${episode.id}). Other episode assignments are continuity context, not scenes to write here. Stop at this episode's ending; do not dramatize later episode plot points or challenge payoffs.` : '',
   episode?.synopsis ? `Synopsis: ${episode.synopsis}` : '',
 ].filter(Boolean).join('\n');
 
 const seriesPlanDigest = (loom) => JSON.stringify({
-  storyArc: trimTo(loom.seriesPlan?.storyArc, 6000),
+  storyArc: loom.seriesPlan?.storyArc || '',
   plotPoints: (loom.seriesPlan?.plotPoints || []).map((item) => ({
-    ...item, description: trimTo(item.description, 400),
+    ...item, description: item.description || '',
   })),
   sideQuests: (loom.seriesPlan?.sideQuests || []).map((item) => ({
-    ...item, description: trimTo(item.description, 400),
+    ...item, description: item.description || '',
   })),
   deliveryOptions: loom.seriesPlan?.deliveryOptions || null,
   interEpisodeVoicemails: (loom.seriesPlan?.interEpisodeVoicemails || []).map((item) => ({
-    ...item, transcript: trimTo(item.transcript, 500),
+    ...item, transcript: item.transcript || '',
   })),
   nextSeasonTeaser: loom.seriesPlan?.nextSeasonTeaser
-    ? { ...loom.seriesPlan.nextSeasonTeaser, transcript: trimTo(loom.seriesPlan.nextSeasonTeaser.transcript, 500) }
+    ? { ...loom.seriesPlan.nextSeasonTeaser, transcript: loom.seriesPlan.nextSeasonTeaser.transcript || '' }
     : null,
   protagonistCharacterId: loom.protagonistCharacterId || null,
   protagonistWardrobeId: loom.protagonistWardrobeId || null,
@@ -248,10 +260,23 @@ const seriesPlanDigest = (loom) => JSON.stringify({
     id,
     number,
     title,
-    synopsis: trimTo(synopsis, 300),
+    synopsis: synopsis || '',
     beatOutline: storyOutline ? describeStoryOutlineForPrompt(storyOutline) : '(missing)',
   })),
 }, null, 2);
+
+// The OPTIONAL five-stage evolution lens (#6443), rendered for whichever cast
+// members carry one. `seriesPlanDigest` above is a hand-picked projection of
+// `loom.seriesPlan` — it whitelists fields, so the lens would NOT ride along
+// inside it — and the plan review needs the lens gated on its own anyway:
+// unset ⇒ '', the template's {{#characterEvolutions}} section renders nothing,
+// and the review degrades to exactly its pre-lens behavior. Anchors resolve
+// against the whole loom (episode ids and scene keys are loom-wide), so a stage
+// pointing at a deleted episode reads `[stale]` instead of passing as proof.
+const characterEvolutionsDigest = (loom) => renderCharacterEvolutionListForPrompt(
+  loom.seriesPlan?.characterEvolutions,
+  fableLoomEvolutionEvidenceRefs(loom),
+) || '';
 
 const seriesTeleplayDigest = (loom) => loom.episodes.map((episode) => [
   `## Episode ${episode.number}: ${episode.title || 'Untitled'}`,
@@ -366,9 +391,12 @@ const episodeOutlineFingerprint = (loom, episode) => JSON.stringify({
 
 const outlineStructuralAnalysis = (loom, episode) => {
   const structural = analyzeStoryOutline(episode.storyOutline, {
+    nodes: episode.nodes,
     participationMode: loom.participationMode,
     requireAudienceIntroduction: requiresAudienceIntroduction(loom, episode),
     challenges: fableLoomEpisodeChallenges(loom, episode.id),
+    plotPoints: loom.seriesPlan?.plotPoints,
+    episodeId: episode.id,
   });
   const teleplaySync = analyzeStoryOutlineTeleplaySync(episode, episode.storyOutline, {
     participationMode: loom.participationMode,
@@ -425,6 +453,8 @@ export async function generateEpisodeOutline(loomId, episodeId, {
     participationMode: loom.participationMode,
     requireAudienceIntroduction: requiresAudienceIntroduction(loom, episode),
     challenges: fableLoomEpisodeChallenges(loom, episode.id),
+    plotPoints: loom.seriesPlan?.plotPoints,
+    episodeId: episode.id,
   });
   const draft = {
     ...outline,
@@ -494,6 +524,8 @@ export async function weaveEpisode(loomId, episodeId, {
       participationMode: loom.participationMode,
       requireAudienceIntroduction: requiresAudienceIntroduction(loom, episode),
       challenges: fableLoomEpisodeChallenges(loom, episode.id),
+      plotPoints: loom.seriesPlan?.plotPoints,
+      episodeId: episode.id,
     })
     : null;
   const currentOutlineErrors = expandFromOutline
@@ -560,8 +592,15 @@ export async function weaveEpisode(loomId, episodeId, {
     const outlineScene = remappedOutlineByNodeId.get(node.id);
     return outlineScene ? {
       ...node,
+      title: outlineScene.title,
+      endingLabel: outlineScene.endingLabel || '',
       plotPointId: outlineScene.plotPointId || null,
       challengePhase: outlineScene.challengePhase || null,
+      transitions: node.transitions.map((transition) => {
+        const paths = outlineScene.transitions.filter((path) => path.targetKey === transition.targetNodeId);
+        const planned = paths.find((path) => path.intent === transition.intent) || (paths.length === 1 ? paths[0] : null);
+        return { ...transition, intent: planned?.intent || transition.intent };
+      }),
     } : node;
   });
   const remappedOutlineValidation = remappedOutline
@@ -569,6 +608,8 @@ export async function weaveEpisode(loomId, episodeId, {
       participationMode: loom.participationMode,
       requireAudienceIntroduction: requiresAudienceIntroduction(loom, episode),
       challenges: fableLoomEpisodeChallenges(loom, episode.id),
+      plotPoints: loom.seriesPlan?.plotPoints,
+      episodeId: episode.id,
     })
     : null;
   const expandedOutline = remappedOutline
@@ -892,17 +933,68 @@ const analysisStrings = (value) => (Array.isArray(value) ? value : [])
   .filter(Boolean)
   .slice(0, 12);
 
+const requirePlanningVerdict = (content) => {
+  if (typeof content?.summary !== 'string' || !content.summary.trim()
+    || !Array.isArray(content.risks) || !content.risks.every((risk) => typeof risk === 'string' && risk.trim())) {
+    throw aiShapeError('The planning review returned no explicit verdict');
+  }
+};
+
 /** Read-only story-editor pass over one episode's beat outline. */
-export async function reviewEpisodeOutline(loomId, episodeId, { providerId, model, effort, operationId } = {}) {
+export async function reviewEpisodeOutline(loomId, episodeId, { providerId, model, effort, operationId, planningGate = false } = {}) {
   const loom = await requireLoom(loomId);
   const episode = findEpisode(loom, episodeId);
   if (!episode.storyOutline) {
     throw new ServerError('Draft an episode outline before reviewing it', { status: 409, code: 'OUTLINE_REQUIRED' });
   }
   const structural = outlineStructuralAnalysis(loom, episode);
+  const reviewStatus = createLoomAiStatus({ operationId }, { action: 'review-episode-outline', label: 'Reviewing episode outline' });
+  if (loom.episodes[0]?.id === episode.id) {
+    // A full bible gives the reviewer knowledge the audience has not earned.
+    // Follow the opening path, withholding synopsis, canon and later payoffs.
+    const opening = [];
+    const openingGroups = new Set();
+    const groupByKey = new Map(episode.nodes.map((node) => [node.id, node.shot?.dramaticSceneId || node.id]));
+    const byKey = new Map(episode.storyOutline.scenes.map((scene) => [scene.key, scene]));
+    let beat = byKey.get(episode.storyOutline.startKey);
+    while (beat && !opening.some((item) => item.key === beat.key)) {
+      const group = groupByKey.get(beat.key) || beat.key;
+      if (!openingGroups.has(group) && openingGroups.size >= 3) break;
+      openingGroups.add(group);
+      opening.push({ key: beat.key, title: beat.title, summary: beat.summary });
+      if (beat.playbackMode === 'decision') break;
+      beat = byKey.get(beat.transitions[0]?.targetKey);
+    }
+    const cold = await runLoomAi('fableloom-review-episode-outline', {
+      storyContext: 'COLD OPENING REVIEW ONLY. You are a first-time viewer with no synopsis or world bible. From the opening beats alone, explain who the protagonist is, what they want right now, what interrupts them, and why that matters emotionally. Cite observable actions for each answer. Do not infer missing motivation from genre or fill gaps using imagined dialogue. Mystery about the cause is welcome; confusion about the basic situation is a blocking risk. Put missing orientation, unearned emotional investment and unexplained terminology needed to follow the action in risks, not recommendations. Return the usual summary, strengths, risks and recommendations JSON; summary and risks are required. Evaluate only this opening, not absent later endings.',
+      canonDigest: '(withheld for first-time-viewer review)',
+      episodeSequence: '(withheld)',
+      outlineDigest: JSON.stringify(opening),
+      structuralDigest: '(not part of this cold read)',
+    }, { providerId, model, effort, operationId }, {
+      action: 'review-episode-outline', label: 'Checking first-time viewer understanding', source: 'fableloom-review-episode-outline', status: reviewStatus, complete: false,
+    });
+    if (typeof cold.content?.summary !== 'string' || !cold.content.summary.trim()
+      || !Array.isArray(cold.content?.risks) || !cold.content.risks.every((risk) => typeof risk === 'string' && risk.trim())) {
+      reviewStatus?.error('The opening review returned no explicit comprehension verdict');
+      throw aiShapeError('The opening review returned no explicit comprehension verdict');
+    }
+    if (cold.content.risks.length) {
+      reviewStatus?.complete('Opening needs revision', { runId: cold.runId, shellReady: false });
+      return {
+        structural, runId: cold.runId,
+        analysis: {
+          summary: trimTo(cold.content.summary, 2000),
+          strengths: analysisStrings(cold.content.strengths),
+          risks: analysisStrings(cold.content.risks),
+          recommendations: analysisStrings(cold.content.recommendations),
+        },
+      };
+    }
+  }
   const canonDigest = await buildCanonDigest(loom);
   const { content, runId } = await runLoomAi('fableloom-review-episode-outline', {
-    storyContext: storyContext(loom, episode),
+    storyContext: [storyContext(loom, episode), planningGate ? 'PLANNING GATE: Put only present contradictions, missing required beats, missing opening orientation or emotional stakes, illegible choices, or unearned consequences that require changing this outline in risks. Put execution advice for the later teleplay (for example how to avoid too much dialogue) in recommendations. Do not require finished dialogue or images at outline stage. An outline with no remaining concrete blockers should return an empty risks array.' : ''].filter(Boolean).join('\n'),
     canonDigest: canonDigest || '(none)',
     episodeSequence: episodeSequenceDigest(loom, episode.id),
     outlineDigest: describeStoryOutlineForPrompt(episode.storyOutline),
@@ -910,8 +1002,9 @@ export async function reviewEpisodeOutline(loomId, episodeId, { providerId, mode
       ? structural.issues.map((issue) => `- [${issue.severity}] ${issue.message}`).join('\n')
       : '(no structural issues)',
   }, { providerId, model, effort, operationId }, {
-    action: 'review-episode-outline', label: 'Reviewing episode outline', source: 'fableloom-review-episode-outline',
+    action: 'review-episode-outline', label: 'Reviewing episode outline', source: 'fableloom-review-episode-outline', status: reviewStatus,
   });
+  if (planningGate) requirePlanningVerdict(content);
   const analysis = {
     summary: trimTo(content?.summary, 2000),
     strengths: analysisStrings(content?.strengths),
@@ -935,7 +1028,7 @@ export async function generateSeriesPlan(loomId, { providerId, model, effort, op
   const sourceFingerprint = seriesPlanGenerationFingerprint(loom);
   const canonDigest = await buildCanonDigest(loom);
   const { content, runId } = await runLoomAi('fableloom-generate-series-plan', {
-    storyContext: storyContext(loom),
+    storyContext: storyContext(loom, undefined, { includeSeriesPlan: false }),
     canonDigest: canonDigest || '(none — invent only what the premise needs)',
     seriesPlanJson: seriesPlanDigest(loom),
   }, { providerId, model, effort, operationId }, {
@@ -968,16 +1061,18 @@ export async function generateSeriesPlan(loomId, { providerId, model, effort, op
 }
 
 /** Read-only story-editor pass over the arc, tentpole beats, side quests, and episode outline. */
-export async function reviewSeriesPlan(loomId, { providerId, model, effort, operationId } = {}) {
+export async function reviewSeriesPlan(loomId, { providerId, model, effort, operationId, planningOnly = false } = {}) {
   const loom = await requireLoom(loomId);
   const canonDigest = await buildCanonDigest(loom);
   const { content, runId } = await runLoomAi('fableloom-review-series-plan', {
-    storyContext: storyContext(loom),
+    storyContext: [storyContext(loom, undefined, { includeSeriesPlan: false }), planningOnly ? 'PRE-OUTLINE REVIEW: Evaluate the arc, challenge design and episode assignments. Missing or stale episode outlines are expected at this stage and will be drafted or repaired next; do not report their absence as a plan defect. Keep plot-point notes concise; episode beat outlines have their own fields.' : ''].filter(Boolean).join('\n'),
     canonDigest: canonDigest || '(none)',
     seriesPlanJson: seriesPlanDigest(loom),
+    characterEvolutions: characterEvolutionsDigest(loom),
   }, { providerId, model, effort, operationId }, {
     action: 'review-series-plan', label: 'Reviewing series plan', source: 'fableloom-review-series-plan',
   });
+  if (planningOnly) requirePlanningVerdict(content);
   const analysis = {
     summary: trimTo(content?.summary, 2000),
     strengths: analysisStrings(content?.strengths),
@@ -1018,7 +1113,7 @@ export async function reviewSeriesTeleplay(loomId, { providerId, model, effort, 
     return `Episode ${episode.episodeNumber}:\n${issues}`;
   }).join('\n');
   const { content, runId } = await runLoomAi('fableloom-review-series-teleplay', {
-    storyContext: storyContext(loom),
+    storyContext: storyContext(loom, undefined, { includeSeriesPlan: false }),
     canonDigest: canonDigest || '(none)',
     seriesPlanJson: seriesPlanDigest(loom),
     teleplayDigest: seriesTeleplayDigest(loom),
@@ -1049,7 +1144,7 @@ export async function feedbackSeriesPlan(loomId, {
   const loom = await requireLoom(loomId);
   const canonDigest = await buildCanonDigest(loom);
   const { content, runId } = await runLoomAi('fableloom-feedback-series-plan', {
-    storyContext: storyContext(loom),
+    storyContext: storyContext(loom, undefined, { includeSeriesPlan: false }),
     canonDigest: canonDigest || '(none)',
     seriesPlanJson: seriesPlanDigest(loom),
     feedback: instruction,
@@ -1062,7 +1157,8 @@ export async function feedbackSeriesPlan(loomId, {
   }
   const hasPlanEdit = (hasOwn(content, 'storyArc') && typeof content.storyArc === 'string')
     || Array.isArray(content.plotPointEdits) || Array.isArray(content.plotPointOrder)
-    || Array.isArray(content.sideQuestEdits) || Array.isArray(content.sideQuestOrder);
+    || Array.isArray(content.sideQuestEdits) || Array.isArray(content.sideQuestOrder)
+    || Array.isArray(content.episodeSynopsisEdits);
   if (!hasPlanEdit) throw aiShapeError('The model returned no usable series-plan edits');
 
   const updated = await mutateLoom(loomId, (current) => {
@@ -1074,6 +1170,13 @@ export async function feedbackSeriesPlan(loomId, {
     plan.sideQuests = applyPlanItemEdits(plan.sideQuests, content.sideQuestEdits, content.sideQuestOrder, {
       prefix: 'quest', fields: ['title', 'description', 'status', 'startEpisodeId', 'endEpisodeId'],
     });
+    for (const edit of (Array.isArray(content.episodeSynopsisEdits) ? content.episodeSynopsisEdits : [])) {
+      const episode = current.episodes.find((item) => item.id === edit?.id);
+      if (episode && typeof edit.synopsis === 'string') {
+        episode.synopsis = edit.synopsis;
+        episode.updatedAt = new Date().toISOString();
+      }
+    }
     current.seriesPlan = plan;
     return current;
   });
@@ -1124,6 +1227,7 @@ export const publicNode = (node, loom = null) => ({
   id: node.id,
   title: node.title,
   prose: node.prose,
+  ...(node.shot ? { shot: node.shot } : {}),
   image: node.image,
   videoHistoryId: node.videoHistoryId,
   playbackAssets: node.playbackAssets || null,
@@ -1150,9 +1254,15 @@ const transcriptDigest = (transcript) =>
  * (`transitionId`), there is no intent to map, so the move resolves straight
  * off the graph — no provider call, no latency, no spend. Free text goes
  * through the play stage, which either matches a path or answers in-world.
+ *
+ * `signal` lets a caller whose turn can be torn down mid-flight (the hosted QR
+ * session, #5786) stop the turn from SPENDING on a reader nobody is listening
+ * to any more. The stage runner has no mid-call cancellation, so this is a
+ * boundary guard, not a mid-flight abort: the record load above is a real await,
+ * and an abort landing inside it means the provider call is never made.
  */
 export async function playTurn(loomId, episodeId, {
-  nodeId, message, transitionId, transcript = [], providerId, model, effort,
+  nodeId, message, transitionId, transcript = [], providerId, model, effort, signal,
 } = {}) {
   const loom = await requireLoom(loomId);
   const episode = findEpisode(loom, episodeId);
@@ -1189,6 +1299,13 @@ export async function playTurn(loomId, episodeId, {
     t.triggers.length ? `  example phrasings: ${t.triggers.join('; ')}` : null,
     t.description ? `  leads to: ${t.description}` : null,
   ].filter(Boolean).join('\n')).join('\n');
+
+  if (signal?.aborted) {
+    throw new ServerError('Play turn was cancelled before the provider call', {
+      status: 499,
+      code: 'TURN_ABORTED',
+    });
+  }
 
   const { content, runId } = await runStagedLLM('fableloom-play-turn', {
     storyContext: storyContext(loom, episode),

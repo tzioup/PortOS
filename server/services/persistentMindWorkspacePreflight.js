@@ -20,7 +20,7 @@ import {
 } from '../lib/persistentMindCapabilities.js';
 import {
   isCliReviewer,
-  REVIEWER_VALUES,
+  isReviewer,
 } from '../lib/validation.js';
 import { compareVersions } from '../../scripts/checkNodeVersion.js';
 import * as codeReview from './codeReview.js';
@@ -564,7 +564,7 @@ const inspectReviewers = async (forge, dependencies, reviewerProbe = reviewerPro
       status: 'unknown',
     };
   }
-  const fixedReviewers = Array.isArray(defaults.reviewers) ? defaults.reviewers.filter((value) => REVIEWER_VALUES.includes(value)) : [];
+  const fixedReviewers = Array.isArray(defaults.reviewers) ? defaults.reviewers.filter((value) => isReviewer(value)) : [];
   const usernames = Array.isArray(defaults.usernames) ? defaults.usernames.filter((value) => typeof value === 'string' && value.trim()) : [];
   const optional = new Set(Array.isArray(defaults.optionalReviewers) ? defaults.optionalReviewers : []);
   const requiredEntries = fixedReviewers
@@ -601,7 +601,15 @@ const engineStatus = (workspaces) => workspaces.flatMap((workspace) => [
 
 const dependencyStatus = (workspaces) => workspaces.map((workspace) => workspace.dependencies?.status).filter(Boolean);
 
+// A repository without package.json may be a native app. A missing manifest
+// in a declared child workspace is still an incomplete Node workspace.
+const isNonNodeRepository = (workspaces) => workspaces?.length === 1
+  && workspaces[0].id === 'root' && workspaces[0].manifest === 'missing';
+
 const checkStatus = (preflight, check) => {
+  if (['dependencies', 'engines'].includes(check)
+    && preflight?.workspaceDiscovery === 'ready'
+    && isNonNodeRepository(preflight.workspaces)) return 'ready';
   if (check === 'dependencies') {
     const statuses = dependencyStatus(Array.isArray(preflight?.workspaces) ? preflight.workspaces : []);
     if (preflight?.workspaceDiscovery !== 'ready' || !statuses.length) return 'unknown';
@@ -657,12 +665,13 @@ const buildWarnings = (preflight) => {
 
 const readinessForSnapshot = (repository, checkout, workspaces, submodules, forge, reviewers) => {
   if (repository.reachable === false) return 'blocked';
-  if (workspaces.some((workspace) => workspace.manifest !== 'ready')) return 'unknown';
-  const engines = engineStatus(workspaces);
+  const nodeWorkspaces = isNonNodeRepository(workspaces) ? [] : workspaces;
+  if (nodeWorkspaces.some((workspace) => workspace.manifest !== 'ready')) return 'unknown';
+  const engines = engineStatus(nodeWorkspaces);
   if (engines.includes('incompatible')) return 'blocked';
   if (repository.reachable === null || checkout.state === 'unknown' || engines.includes('unknown')) return 'unknown';
   const degraded = checkout.state === 'dirty'
-    || dependencyStatus(workspaces).some((status) => status !== 'installed')
+    || dependencyStatus(nodeWorkspaces).some((status) => status !== 'installed')
     || submodules.status === 'uninitialized'
     || submodules.status === 'unknown'
     || forge.status === 'unavailable'
