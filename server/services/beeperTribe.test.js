@@ -144,6 +144,16 @@ vi.mock('../lib/db.js', () => ({
       row.tribe_person_id = params[2];
       return { rows: [participantRow(row)] };
     }
+    // unlinkParticipant's claim releases (#97 part B) — deletes ONLY when the
+    // claim is still owned by the given person, mirroring the real SQL's own
+    // `person_id = $1` filter; a claim someone else now holds returns rowCount 0.
+    if (/^DELETE FROM tribe_identities WHERE person_id/.test(s)) {
+      const [personId, kind, network, handle] = params;
+      const key = iKey(kind, network, handle);
+      if (db.identities.get(key) !== personId) return { rows: [], rowCount: 0 };
+      db.identities.delete(key);
+      return { rows: [], rowCount: 1 };
+    }
     throw new Error(`unmocked SQL: ${s.slice(0, 120)}`);
   }),
 }));
@@ -425,6 +435,86 @@ describe('linkParticipant', () => {
       conversationId: CONVERSATION, sourceUserId: 'user-1', personId: CLAIMING_PERSON,
     });
     expect(db.identities.get(iKey('phone', '', PHONE_NORMALIZED))).toBe(CLAIMING_PERSON);
+  });
+});
+
+describe('unlinkParticipant (#97 part B)', () => {
+  it('removes both claims the linked person holds for this participant and nulls its own cache', async () => {
+    seedParticipant({ handle: '@example_handle', network: 'discord', tribePersonId: CLAIMING_PERSON });
+    db.identities.set(iKey('handle', 'discord', 'example_handle'), CLAIMING_PERSON);
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CLAIMING_PERSON);
+
+    const result = await beeperTribe.unlinkParticipant({ conversationId: CONVERSATION, sourceUserId: 'user-1' });
+
+    expect(result.unlinkedPersonId).toBe(CLAIMING_PERSON);
+    expect(result.removedClaims).toBe(2);
+    expect(result.participant.tribePersonId).toBeNull();
+    expect(db.identities.has(iKey('handle', 'discord', 'example_handle'))).toBe(false);
+    expect(db.identities.has(iKey('beeper-user', ACCOUNT_ID, 'user-1'))).toBe(false);
+    expect(db.participants.get(pKey(CONVERSATION, 'user-1')).tribe_person_id).toBeNull();
+  });
+
+  it('nulls every other participant row the released claims were backing', async () => {
+    seedParticipant({ handle: '@example_handle', network: 'discord', tribePersonId: CLAIMING_PERSON });
+    seedParticipant({
+      conversationId: OTHER_CONVERSATION, sourceUserId: 'user-elsewhere',
+      handle: '@example_handle', tribePersonId: CLAIMING_PERSON, network: 'discord',
+    });
+    db.identities.set(iKey('handle', 'discord', 'example_handle'), CLAIMING_PERSON);
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CLAIMING_PERSON);
+
+    await beeperTribe.unlinkParticipant({ conversationId: CONVERSATION, sourceUserId: 'user-1' });
+
+    expect(db.participants.get(pKey(OTHER_CONVERSATION, 'user-elsewhere')).tribe_person_id).toBeNull();
+  });
+
+  it('never touches another person\'s claim on the same handle', async () => {
+    // The handle claim has already moved to CACHED_PERSON (a later link
+    // elsewhere); this participant's own cache is stale, still pointing at
+    // the old owner.
+    seedParticipant({ handle: '@example_handle', network: 'discord', tribePersonId: CLAIMING_PERSON });
+    db.identities.set(iKey('handle', 'discord', 'example_handle'), CACHED_PERSON);
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CLAIMING_PERSON);
+
+    const result = await beeperTribe.unlinkParticipant({ conversationId: CONVERSATION, sourceUserId: 'user-1' });
+
+    // Only the beeper-user claim (still CLAIMING_PERSON's) was removed — the
+    // handle claim, now owned by CACHED_PERSON, is untouched.
+    expect(result.removedClaims).toBe(1);
+    expect(db.identities.get(iKey('handle', 'discord', 'example_handle'))).toBe(CACHED_PERSON);
+    expect(db.identities.has(iKey('beeper-user', ACCOUNT_ID, 'user-1'))).toBe(false);
+    // The participant's own stale cache still clears via the trailing
+    // belt-and-braces UPDATE, even though the handle DELETE was a no-op.
+    expect(db.participants.get(pKey(CONVERSATION, 'user-1')).tribe_person_id).toBeNull();
+  });
+
+  it('is a 200 no-op for an already-unlinked participant, touching no claims', async () => {
+    seedParticipant({ handle: '@example_handle', network: 'discord', tribePersonId: null });
+    db.identities.set(iKey('handle', 'discord', 'example_handle'), CLAIMING_PERSON);
+
+    const result = await beeperTribe.unlinkParticipant({ conversationId: CONVERSATION, sourceUserId: 'user-1' });
+
+    expect(result.unlinkedPersonId).toBeNull();
+    expect(result.removedClaims).toBe(0);
+    // Someone else's still-active claim on this same handle is left alone.
+    expect(db.identities.get(iKey('handle', 'discord', 'example_handle'))).toBe(CLAIMING_PERSON);
+  });
+
+  it('throws 404 for an unknown participant', async () => {
+    await expect(beeperTribe.unlinkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'nobody',
+    })).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('unlinks a participant with no classifiable handle via the beeper-user claim alone', async () => {
+    seedParticipant({ handle: '', network: 'facebook', tribePersonId: CLAIMING_PERSON });
+    db.identities.set(iKey('beeper-user', ACCOUNT_ID, 'user-1'), CLAIMING_PERSON);
+
+    const result = await beeperTribe.unlinkParticipant({ conversationId: CONVERSATION, sourceUserId: 'user-1' });
+
+    expect(result.removedClaims).toBe(1);
+    expect(db.identities.has(iKey('beeper-user', ACCOUNT_ID, 'user-1'))).toBe(false);
+    expect(db.participants.get(pKey(CONVERSATION, 'user-1')).tribe_person_id).toBeNull();
   });
 });
 

@@ -76,6 +76,15 @@ const beeperLinkSchema = z.object({
   personId: z.string().guid(),
 });
 
+// Unlink a Beeper participant from whichever Tribe person currently owns it
+// (#97 part B). Same identifying pair as `beeperLinkSchema` — no `personId`
+// here, since unlink releases whatever the participant is CURRENTLY linked
+// to, and is a no-op rather than an error when that is nothing.
+const beeperUnlinkSchema = z.object({
+  conversationId: z.string().guid(),
+  sourceUserId: z.string().min(1).max(500),
+});
+
 const beeperCreateAndLinkSchema = z.object({
   conversationId: z.string().guid(),
   sourceUserId: z.string().min(1).max(500),
@@ -254,6 +263,22 @@ router.post('/beeper/link', asyncHandler(async (req, res) => {
   });
   req.app.get('io')?.emit('tribe:changed', { personId });
   res.json({ participant, displacedPersonId: displacedPersonId || null });
+}));
+
+// Unlink a Beeper participant from whichever Tribe person currently owns it
+// (#97 part B) — the counterpart POST /beeper/link never had. Idempotent: an
+// already-unlinked participant is a 200 no-op with `unlinkedPersonId: null`.
+// Releases every `tribe_identities` claim THAT person held for this
+// participant (never one another person now holds on the same handle) and
+// nulls the cache on this row and every other one those claims were backing
+// — see `beeperTribe.unlinkParticipant`.
+router.delete('/beeper/link', asyncHandler(async (req, res) => {
+  const { conversationId, sourceUserId } = validateRequest(beeperUnlinkSchema, req.body);
+  const { participant, unlinkedPersonId, removedClaims } = await beeperTribe.unlinkParticipant({
+    conversationId, sourceUserId,
+  });
+  if (unlinkedPersonId) req.app.get('io')?.emit('tribe:changed', { personId: unlinkedPersonId });
+  res.json({ participant, unlinkedPersonId, removedClaims });
 }));
 
 // Create a new Tribe person from a Beeper participant's own display name and

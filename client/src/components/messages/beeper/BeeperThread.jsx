@@ -5,6 +5,7 @@ import {
 import NetworkLogo, { networkLabel } from './BeeperNetworkLogo';
 import BeeperAttachment from './BeeperAttachment';
 import BeeperPersonPicker from './BeeperPersonPicker';
+import BeeperCreatePersonForm from './BeeperCreatePersonForm';
 import InlineConfirmRow from '../../ui/InlineConfirmRow';
 import { decodeHtmlEntities, parseMessageBody } from '../../../lib/beeperMessageBody';
 import { formatBytes } from '../../../utils/formatters';
@@ -133,57 +134,117 @@ function Avatar({ name, size = 40 }) {
 
 /**
  * A participant row with the inline "Link to Tribe person" action from #34.
- * Two shapes in one control because they are the same decision: an existing
- * person, or a new one created from the participant's own display name.
- * `tribePersonId` present means the link is already resolved — the row then
- * states who it is rather than offering the action again, and (#98 part C)
- * that state is a link straight to the person's Tribe page rather than plain
- * text, the same `?person=` deep link the title chip below uses.
+ * Three shapes in one control, all local to this row's own `mode` state:
  *
- * The unlinked branch (#98 part B) is a single search-first picker
- * (`BeeperPersonPicker`) rather than the old `<select>` + "Link" + "New"
- * button trio: choosing a result IS the link action, and "Create new…" is
- * the picker's own last row, wired to the exact same `onLinkNew` callback
- * the old "New" button called.
+ *  - **`create`** (#97 part A) — the picker's "Create new…" no longer posts
+ *    on click; it opens `BeeperCreatePersonForm` in its place, a
+ *    confirm-and-rename step. Only that form's own Create button calls
+ *    `onCreateAndLink`; Cancel returns to the picker.
+ *  - **picker** — either the row's natural unlinked state, or a linked row
+ *    that clicked "Change" (#97 part B). Choosing a result IS the link
+ *    action (unchanged from #98); on a linked row a "Cancel" link (absent
+ *    when the row was never linked — there is nothing to cancel back to)
+ *    returns to the "Linked · …" display without linking anyone.
+ *  - **linked view** — `tribePersonId` present and `mode !== 'picker'`:
+ *    states who it is (a link straight to the person's Tribe page, #98 part
+ *    C) plus "Change" (reopens the picker, pre-focused) and "Unlink"
+ *    (`onUnlink`, #97 part B).
+ *
+ * `mode` resets to the natural view whenever the participant's OWN linked
+ * state changes out from under it — a link/unlink completing, or any other
+ * cause of a thread refetch — so a stale open form/picker never survives a
+ * refresh showing a DIFFERENT link state than the one the row was left open
+ * on.
  */
 function ParticipantRow({
-  participant, people, linking, onLink, onLinkNew, onOpenPerson,
+  participant, people, linking, onLink, onCreateAndLink, onUnlink, onOpenPerson,
 }) {
   const pickerId = `beeper-link-${participant.sourceUserId}`;
   const name = participant.displayName || participant.handle || participant.sourceUserId;
+  const linkedId = participant.tribePersonId || null;
+  const [mode, setMode] = useState('view');
 
-  if (participant.tribePersonId) {
+  const prevLinkedRef = useRef(linkedId);
+  useEffect(() => {
+    if (prevLinkedRef.current !== linkedId) {
+      prevLinkedRef.current = linkedId;
+      setMode('view');
+    }
+  }, [linkedId]);
+
+  if (mode === 'create') {
     return (
-      <li className="flex items-center gap-2 py-1 text-xs text-gray-300">
+      <li className="py-1">
+        <BeeperCreatePersonForm
+          participant={participant}
+          disabled={linking}
+          onCreate={(fields) => onCreateAndLink(participant, fields)}
+          onCancel={() => setMode('view')}
+        />
+      </li>
+    );
+  }
+
+  const showPicker = !linkedId || mode === 'picker';
+  if (showPicker) {
+    return (
+      <li className="flex flex-wrap items-center gap-2 py-1 text-xs text-gray-300">
         <Avatar name={participant.displayName || participant.handle} size={22} />
         <span className="min-w-0 flex-1 truncate">{name}</span>
-        {participant.tribePersonName ? (
+        <BeeperPersonPicker
+          id={pickerId}
+          label={`Link ${participant.displayName || participant.sourceUserId} to a Tribe person`}
+          people={people}
+          disabled={linking}
+          autoFocus={mode === 'picker'}
+          onSelectPerson={(personId) => { onLink(participant, personId); setMode('view'); }}
+          onCreateNew={() => setMode('create')}
+        />
+        {linkedId && (
           <button
             type="button"
-            onClick={() => onOpenPerson(participant.tribePersonId)}
-            className="shrink-0 truncate text-[11px] text-port-success underline-offset-2 hover:underline"
+            onClick={() => setMode('view')}
+            className="shrink-0 text-[11px] text-gray-400 transition-colors hover:text-gray-200 hover:underline"
           >
-            {`Linked · ${participant.tribePersonName}`}
+            Cancel
           </button>
-        ) : (
-          <span className="shrink-0 truncate text-[11px] text-port-success">Linked</span>
         )}
+        {linking && <Loader2 size={11} className="shrink-0 animate-spin text-gray-400" />}
       </li>
     );
   }
 
   return (
-    <li className="flex flex-wrap items-center gap-2 py-1 text-xs text-gray-300">
+    <li className="flex items-center gap-2 py-1 text-xs text-gray-300">
       <Avatar name={participant.displayName || participant.handle} size={22} />
       <span className="min-w-0 flex-1 truncate">{name}</span>
-      <BeeperPersonPicker
-        id={pickerId}
-        label={`Link ${participant.displayName || participant.sourceUserId} to a Tribe person`}
-        people={people}
+      {participant.tribePersonName ? (
+        <button
+          type="button"
+          onClick={() => onOpenPerson(participant.tribePersonId)}
+          className="shrink-0 truncate text-[11px] text-port-success underline-offset-2 hover:underline"
+        >
+          {`Linked · ${participant.tribePersonName}`}
+        </button>
+      ) : (
+        <span className="shrink-0 truncate text-[11px] text-port-success">Linked</span>
+      )}
+      <button
+        type="button"
+        onClick={() => setMode('picker')}
         disabled={linking}
-        onSelectPerson={(personId) => onLink(participant, personId)}
-        onCreateNew={() => onLinkNew(participant)}
-      />
+        className="shrink-0 text-[11px] text-gray-400 transition-colors hover:text-gray-200 hover:underline disabled:opacity-40"
+      >
+        Change
+      </button>
+      <button
+        type="button"
+        onClick={() => onUnlink(participant)}
+        disabled={linking}
+        className="shrink-0 text-[11px] text-gray-400 transition-colors hover:text-port-error hover:underline disabled:opacity-40"
+      >
+        Unlink
+      </button>
       {linking && <Loader2 size={11} className="shrink-0 animate-spin text-gray-400" />}
     </li>
   );
@@ -412,6 +473,7 @@ export default function BeeperThread({
   linkingId,
   onLinkParticipant,
   onCreateAndLinkParticipant,
+  onUnlinkParticipant,
   onOpenTribePerson,
   onBack,
   onRetry,
@@ -673,7 +735,8 @@ export default function BeeperThread({
                   people={people}
                   linking={linkingId === participant.sourceUserId}
                   onLink={onLinkParticipant}
-                  onLinkNew={onCreateAndLinkParticipant}
+                  onCreateAndLink={onCreateAndLinkParticipant}
+                  onUnlink={onUnlinkParticipant}
                   onOpenPerson={onOpenTribePerson}
                 />
               ))}

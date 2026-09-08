@@ -436,6 +436,78 @@ export async function linkParticipant({
 }
 
 /**
+ * Release a participant's link to whichever Tribe person currently owns it
+ * (#97 part B) — the unlink half `linkParticipant` has never had a
+ * counterpart for. Deletes every `tribe_identities` claim THAT PERSON holds
+ * for this participant: the handle claim from `identityScopeFor`, when the
+ * handle classifies, and the `kind='beeper-user'` claim from
+ * `beeperUserScopeFor`, which almost every participant carries regardless of
+ * handle. Each DELETE is filtered on `person_id = <that person>`, so a claim
+ * someone ELSE now holds on the same handle or beeper-user pair — moved
+ * there by a later link elsewhere — is never touched.
+ *
+ * Nulls the participant's own cache column and, via the same
+ * `clearDisplacedParticipantCaches`/`clearDisplacedBeeperUserCaches` helpers
+ * a displaced-owner re-link already uses, every OTHER participant row those
+ * claims were backing — the unlinked person simply stands in as the
+ * "displaced" one here. A trailing explicit UPDATE guarantees THIS row ends
+ * up NULL regardless of whether either reuse call happened to cover it (it
+ * only fires when its own DELETE actually removed a claim) — a stale cache
+ * with no backing identity claim at all must still clear.
+ *
+ * Idempotent: a participant with no `tribePersonId` is a 200 no-op —
+ * `{ participant, unlinkedPersonId: null, removedClaims: 0 }` — rather than
+ * an error, matching `linkParticipant`'s own "last explicit action wins"
+ * posture. Throws 404 only when the participant row itself does not exist.
+ */
+export async function unlinkParticipant({ conversationId, sourceUserId }) {
+  await ensureReady();
+  const participant = await getParticipant(conversationId, sourceUserId);
+  if (!participant) throw new ServerError('Participant not found', { status: 404 });
+
+  const personId = participant.tribePersonId;
+  if (!personId) {
+    return { participant, unlinkedPersonId: null, removedClaims: 0 };
+  }
+
+  let removedClaims = 0;
+
+  const scope = identityScopeFor(participant);
+  if (scope) {
+    const result = await query(
+      `DELETE FROM tribe_identities WHERE person_id = $1 AND kind = $2 AND network = $3 AND handle = $4`,
+      [personId, scope.kind, scope.network, scope.handle],
+    );
+    const deleted = result.rowCount ?? 0;
+    removedClaims += deleted;
+    if (deleted) await clearDisplacedParticipantCaches(personId, scope);
+  }
+
+  const beeperUserScope = beeperUserScopeFor(participant);
+  if (beeperUserScope) {
+    const result = await query(
+      `DELETE FROM tribe_identities WHERE person_id = $1 AND kind = $2 AND network = $3 AND handle = $4`,
+      [personId, beeperUserScope.kind, beeperUserScope.network, beeperUserScope.handle],
+    );
+    const deleted = result.rowCount ?? 0;
+    removedClaims += deleted;
+    if (deleted) await clearDisplacedBeeperUserCaches(personId, beeperUserScope);
+  }
+
+  // Belt-and-braces: null THIS participant's own cache regardless of whether
+  // either reuse call above happened to cover it (both are gated on their
+  // own DELETE having actually removed a row).
+  await query(
+    `UPDATE beeper_participants SET tribe_person_id = NULL, updated_at = NOW()
+     WHERE conversation_id = $1 AND source_user_id = $2 AND tribe_person_id = $3`,
+    [conversationId, sourceUserId, personId],
+  );
+
+  const updated = await getParticipant(conversationId, sourceUserId);
+  return { participant: updated, unlinkedPersonId: personId, removedClaims };
+}
+
+/**
  * Create a new Tribe person from a participant's own display name and link
  * it — the other half of #10 decision 4 ("can also create a new Tribe
  * person"). Never invoked automatically; always an explicit user action. The

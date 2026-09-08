@@ -104,3 +104,13 @@ export const createTribePersonFromBeeper = ({ conversationId, sourceUserId, name
 // person's `identities[]`, not a participant key.
 export const unlinkBeeperIdentity = (identityId, options = {}) =>
   request(`/tribe/beeper/identities/${identityId}`, { method: 'DELETE', ...options });
+
+// Release a participant's link to whichever Tribe person currently owns it
+// (#97 part B) — the counterpart `linkBeeperParticipant` never had. Idempotent:
+// unlinking an already-unlinked participant is a 200 no-op, never an error.
+export const unlinkBeeperParticipant = ({ conversationId, sourceUserId }, options = {}) =>
+  request('/tribe/beeper/link', {
+    method: 'DELETE',
+    body: JSON.stringify({ conversationId, sourceUserId }),
+    ...options,
+  });

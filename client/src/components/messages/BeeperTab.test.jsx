@@ -30,6 +30,7 @@ const api = vi.hoisted(() => ({
   markBeeperConversationSeen: vi.fn(),
   linkBeeperParticipant: vi.fn(),
   createTribePersonFromBeeper: vi.fn(),
+  unlinkBeeperParticipant: vi.fn(),
   getTribePeople: vi.fn(),
   // Reached through the settings drawer. Declared here because
   // `BeeperSettingsPanel` imports them at module load, whether or not a test
@@ -1218,6 +1219,104 @@ describe('the inline Tribe link action', () => {
       { conversationId: CONV_A, sourceUserId: 'user-1', personId: '55555555-5555-4555-8555-555555555555' },
       { silent: true },
     ));
+  });
+
+  // Fork issue #97 part A: "Create new…" opens the confirm-and-rename form
+  // instead of posting immediately — this pins the wiring from the form's
+  // Create button all the way down to `createTribePersonFromBeeper`.
+  it('creates a Tribe person with the edited name, ring and relationship from the confirm-and-rename form', async () => {
+    api.getTribePeople.mockResolvedValue([]);
+    api.getBeeperConversation.mockResolvedValue(conversation({
+      title: 'Example Contact',
+      participants: [{ sourceUserId: 'user-1', displayName: 'Sam Example', handle: '', tribePersonId: null, tribePersonName: null, observedVia: 'participant-list' }],
+    }));
+    api.createTribePersonFromBeeper.mockResolvedValue({
+      person: { id: 'new-person-1', name: 'Corrected Name' },
+      participant: {},
+      created: true,
+      displacedPersonId: null,
+    });
+
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const peopleToggle = await screen.findByRole('button', { name: 'People' });
+    act(() => { peopleToggle.click(); });
+    const picker = await screen.findByLabelText('Link Sam Example to a Tribe person');
+    act(() => { picker.focus(); });
+    const createNew = await screen.findByRole('option', { name: /Create new/ });
+    act(() => { fireEvent.mouseDown(createNew); });
+
+    const nameInput = await screen.findByLabelText('Name');
+    act(() => { fireEvent.change(nameInput, { target: { value: 'Corrected Name' } }); });
+    act(() => { fireEvent.change(screen.getByLabelText('Ring'), { target: { value: 'core' } }); });
+    act(() => { fireEvent.change(screen.getByLabelText('Relationship'), { target: { value: 'Neighbor' } }); });
+    act(() => { fireEvent.click(screen.getByRole('button', { name: 'Create' })); });
+
+    await waitFor(() => expect(api.createTribePersonFromBeeper).toHaveBeenCalledWith(
+      { conversationId: CONV_A, sourceUserId: 'user-1', name: 'Corrected Name', ring: 'core', relationship: 'Neighbor' },
+      { silent: true },
+    ));
+  });
+});
+
+// Fork issue #97 part B: Change/Unlink on an already-linked participant.
+describe('the inline Tribe unlink/change actions', () => {
+  it('unlinks a linked participant', async () => {
+    api.getTribePeople.mockResolvedValue([{ id: '55555555-5555-4555-8555-555555555555', name: 'Alex Example' }]);
+    api.getBeeperConversation.mockResolvedValue(conversation({
+      title: 'Example Contact',
+      participants: [{
+        sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100',
+        tribePersonId: '55555555-5555-4555-8555-555555555555', tribePersonName: 'Alex Example', observedVia: 'participant-list',
+      }],
+    }));
+    api.unlinkBeeperParticipant.mockResolvedValue({
+      participant: {}, unlinkedPersonId: '55555555-5555-4555-8555-555555555555', removedClaims: 2,
+    });
+
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const peopleToggle = await screen.findByRole('button', { name: 'People' });
+    act(() => { peopleToggle.click(); });
+    const unlinkButton = await screen.findByRole('button', { name: 'Unlink' });
+    act(() => { unlinkButton.click(); });
+
+    await waitFor(() => expect(api.unlinkBeeperParticipant).toHaveBeenCalledWith(
+      { conversationId: CONV_A, sourceUserId: 'user-1' },
+      { silent: true },
+    ));
+  });
+
+  it('re-links via a single POST /tribe/beeper/link call when Change picks a different person', async () => {
+    api.getTribePeople.mockResolvedValue([
+      { id: '55555555-5555-4555-8555-555555555555', name: 'Alex Example' },
+      { id: '66666666-6666-4666-8666-666666666666', name: 'Blair Sample' },
+    ]);
+    api.getBeeperConversation.mockResolvedValue(conversation({
+      title: 'Example Contact',
+      participants: [{
+        sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100',
+        tribePersonId: '55555555-5555-4555-8555-555555555555', tribePersonName: 'Alex Example', observedVia: 'participant-list',
+      }],
+    }));
+    api.linkBeeperParticipant.mockResolvedValue({ participant: {}, displacedPersonId: null });
+
+    renderTab(`/messages/beeper/${CONV_A}`);
+
+    const peopleToggle = await screen.findByRole('button', { name: 'People' });
+    act(() => { peopleToggle.click(); });
+    const changeButton = await screen.findByRole('button', { name: 'Change' });
+    act(() => { changeButton.click(); });
+    const picker = await screen.findByLabelText('Link Sam Example to a Tribe person');
+    act(() => { picker.focus(); });
+    const result = await screen.findByRole('option', { name: 'Blair Sample' });
+    act(() => { fireEvent.mouseDown(result); });
+
+    await waitFor(() => expect(api.linkBeeperParticipant).toHaveBeenCalledWith(
+      { conversationId: CONV_A, sourceUserId: 'user-1', personId: '66666666-6666-4666-8666-666666666666' },
+      { silent: true },
+    ));
+    expect(api.unlinkBeeperParticipant).not.toHaveBeenCalled();
   });
 });
 

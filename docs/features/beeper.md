@@ -358,10 +358,38 @@ filter (client-side, debounced ≥200ms, over the roster the surface already loa
 the server's `GET /tribe/people?search=` param stays available for a future caller with a roster
 too large to hold client-side), navigate results with ArrowUp/ArrowDown, and Enter/click selects.
 Selecting a result **is** the link action — there is no separate "Link" button afterwards. **"Create
-new…" is always the picker's last row**, below every match, and calls the exact same
-`onCreateAndLinkParticipant` callback the old standalone "New" button called (fork issue #97 changes
-what that callback *does* — a confirm-and-rename form instead of an immediate create — not this
-wiring).
+new…" is always the picker's last row**, below every match, and opens `BeeperCreatePersonForm.jsx`
+(beside `BeeperThread.jsx`, its own component with its own test file) in place of the picker (fork
+issue #97 part A) rather than posting immediately: a name input prefilled from the participant's own
+`displayName || handle` (editable, required), a ring `<select>` built from the same `RINGS` list
+(`client/src/lib/tribe.js`) the Tribe page's own person editor renders, and an optional relationship
+input. Enter submits, Escape cancels. Only its Create button — disabled while the name is blank or a
+link is in flight — calls `onCreateAndLinkParticipant` with `{ name, ring, relationship }`, the exact
+fields `POST /tribe/beeper/link-new`'s `beeperCreateAndLinkSchema` already accepted; Cancel returns
+to the picker having posted nothing.
+
+**A linked participant offers Change and Unlink, not just a static label** (fork issue #97 part B) —
+until now, a mistaken "New" or a wrong pick from the picker was permanent from this panel. Both sit
+beside the "Linked · &lt;name&gt;" row (`ParticipantRow`'s own `mode` state in `BeeperThread.jsx`):
+
+- **Change** reopens the exact same search-first picker in the row, pre-focused (`autoFocus` on
+  `BeeperPersonPicker`), so re-pointing the link is a single selection; "Create new…" inside it opens
+  the same confirm-and-rename form as the unlinked path. Choosing a person calls the SAME
+  `onLinkParticipant` / `POST /tribe/beeper/link` a fresh link uses — verified safe to reuse rather
+  than unlink-then-link: `linkParticipant`'s `tribe_identities` writes are `ON CONFLICT ... DO
+  UPDATE`s that move the SAME row's `person_id` in place, so re-linking to someone else leaves no
+  stale claim on the old person for this participant. "The last explicit link wins" already meant one
+  row per identity, never two, so a plain re-link is a complete, correct Change on its own.
+- **Unlink** calls the new `DELETE /tribe/beeper/link` (body `{ conversationId, sourceUserId }`) →
+  `beeperTribe.unlinkParticipant`, which deletes every `tribe_identities` claim the CURRENTLY-linked
+  person holds for this participant — the handle claim from `identityScopeFor` and/or the
+  `kind='beeper-user'` claim from `beeperUserScopeFor` — each filtered on that person's own id, so a
+  claim someone else now holds on the same handle is never touched. It then nulls the participant's
+  own cache column and every other participant row those claims were backing, reusing the same
+  `clearDisplacedParticipantCaches`/`clearDisplacedBeeperUserCaches` helpers a displaced-owner re-link
+  already relies on, with the unlinked person simply standing in as the "displaced" one. Idempotent:
+  unlinking an already-unlinked participant is a 200 no-op (`unlinkedPersonId: null`), and a genuine
+  unlink emits the same `tribe:changed` socket event the link routes do.
 
 **`Tribe.jsx` accepts a `?person=<id>` deep link.** On load, and whenever the param changes, the
 page switches to the Circle tab, selects that person through the exact same path a click on their
