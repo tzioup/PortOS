@@ -32,6 +32,7 @@ vi.mock('../services/tribeOutreach.js', () => ({
 
 vi.mock('../services/beeperTribe.js', () => ({
   linkParticipant: vi.fn(),
+  unlinkParticipant: vi.fn(),
   createPersonAndLinkParticipant: vi.fn(),
   listPersonIdentitiesWithConversations: vi.fn(),
   unlinkIdentity: vi.fn(),
@@ -423,6 +424,63 @@ describe('Tribe Routes', () => {
 
       expect(response.status).toBe(400);
       expect(beeperTribe.linkParticipant).not.toHaveBeenCalled();
+    });
+
+    it('unlinks a participant, removing its claims', async () => {
+      beeperTribe.unlinkParticipant.mockResolvedValue({
+        participant: { conversationId: CONVERSATION_ID, sourceUserId: 'user-1', tribePersonId: null },
+        unlinkedPersonId: PERSON_ID,
+        removedClaims: 2,
+      });
+
+      const response = await request(app)
+        .delete('/api/tribe/beeper/link')
+        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'user-1' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.participant.tribePersonId).toBeNull();
+      expect(response.body.unlinkedPersonId).toBe(PERSON_ID);
+      expect(response.body.removedClaims).toBe(2);
+      expect(beeperTribe.unlinkParticipant).toHaveBeenCalledWith({
+        conversationId: CONVERSATION_ID, sourceUserId: 'user-1',
+      });
+      expect(emit).toHaveBeenCalledWith('tribe:changed', { personId: PERSON_ID });
+    });
+
+    it('is a 200 no-op — with no socket emit — for an already-unlinked participant', async () => {
+      beeperTribe.unlinkParticipant.mockResolvedValue({
+        participant: { conversationId: CONVERSATION_ID, sourceUserId: 'user-1', tribePersonId: null },
+        unlinkedPersonId: null,
+        removedClaims: 0,
+      });
+
+      const response = await request(app)
+        .delete('/api/tribe/beeper/link')
+        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'user-1' });
+
+      expect(response.status).toBe(200);
+      expect(response.body.unlinkedPersonId).toBeNull();
+      expect(emit).not.toHaveBeenCalled();
+    });
+
+    it('surfaces a 404 for an unknown participant on unlink', async () => {
+      const error = Object.assign(new Error('Participant not found'), { status: 404 });
+      beeperTribe.unlinkParticipant.mockRejectedValue(error);
+
+      const response = await request(app)
+        .delete('/api/tribe/beeper/link')
+        .send({ conversationId: CONVERSATION_ID, sourceUserId: 'ghost' });
+
+      expect(response.status).toBe(404);
+    });
+
+    it('rejects an unlink request missing sourceUserId', async () => {
+      const response = await request(app)
+        .delete('/api/tribe/beeper/link')
+        .send({ conversationId: CONVERSATION_ID });
+
+      expect(response.status).toBe(400);
+      expect(beeperTribe.unlinkParticipant).not.toHaveBeenCalled();
     });
 
     it('creates a new Tribe person from a participant and links it', async () => {
