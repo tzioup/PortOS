@@ -33,10 +33,13 @@
  * after a restart" is therefore `restartBeeperScheduler()` below: cancel the
  * current registration and register a fresh one, which reads
  * `getBeeperSyncConfig()` again and picks up whatever is stored right now.
- * `server/routes/settings.js` calls it when a save changes only the interval
- * (an `enabled` flip already gets a fresh registration through
- * `reconcileBeeperIngestion()`, so calling this too would just cancel and
- * re-register a second time for nothing).
+ * `server/routes/settings.js` calls it when a save changes the interval
+ * without an `enabled` flip, AND — fork issue #94 — when a flip and an
+ * interval change land in the same save but the scheduler was already
+ * registered going in (a true→false save leaves it registered; it only gates
+ * per tick), because `reconcileBeeperIngestion()`'s own registration guard
+ * (`!isBeeperSchedulerRegistered()`) then declines to re-register and the
+ * stale `intervalMs` would otherwise survive.
  *
  * No LLM calls happen on this path — ingestion is deterministic — so the
  * no-cold-bootstrap AI policy does not gate it; the opt-in is about the user's
