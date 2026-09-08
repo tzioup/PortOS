@@ -117,6 +117,12 @@ no toggle flip — takes effect the same way, without a restart: `PUT /api/setti
 scheduler's registration when `beeper.intervalMinutes` changes on its own (see
 [The mirror](#the-mirror) below).
 
+**Beeper also bridges iMessage and Signal.** An install that keeps the built-in iMessage or
+Signal reader enabled *and* connects the same account through Beeper sees those conversations
+twice, once per source. This version builds no cross-source exclusion or dedupe; pick one reader
+per network in Settings > Features (the Comms group's per-feature overrides exist for exactly
+this) and the mirror stays single-sourced.
+
 ## Connecting
 
 **OAuth is run by PortOS itself.** Beeper Desktop's authorization-server metadata advertises a
@@ -564,6 +570,12 @@ performs the POST to Beeper. No scheduler, no agent, no voice tool and no Chief-
 reaches either — `server/services/beeperOutboxHumanGate.test.js` asserts that structurally rather
 than leaving it to convention. There is no AI drafting and no AI review anywhere on this path.
 
+Send also needs the `write` scope on the stored token. Connect requests both scopes, and Beeper's
+consent screen is where the user grants them; a token granted `read` only makes Beeper refuse the
+POST with a 403, which the client maps to a terminal `FORBIDDEN`. The outbox row fails in place and
+nothing is retried or sent. That is the operator's switch for keeping send off entirely while the
+read side keeps working.
+
 Four rules the outbox exists to enforce:
 
 1. **The durable row is written before the POST**, so intent survives a crash between the click
@@ -726,35 +738,33 @@ Live probing of a real Beeper Desktop (4.3.89 on the most recent pass) establish
 authorization-server metadata document, `/v1/info`'s advertised introspection endpoint, the
 `POST /v1/assets/download` 200-with-`{error}` shape, the 502-on-missing-asset behaviour of
 `GET`/`HEAD /v1/assets/serve`, `serve` sending no `Content-Type`, the `/v1/accounts` `bridge`
-object shape, and a 105-second `app.state`/ping probe of `/v1/ws`. The following have **not**
-been observed against a real instance, and rest on unit, route and component tests plus static
-analysis:
+object shape, and a 105-second `app.state`/ping probe of `/v1/ws`.
 
-- **The OAuth flow end to end.** Dynamic registration and the browser consent step have not been
-  round-tripped; neither has a full `introspectToken` call through the `/v1/info` endpoint
-  fallback. The origin validation is proven at the unit and route boundary, but the consent
-  redirect actually landing back on the UI origin has not been re-run.
-- **Realtime domain frames through the shipped transport.** The arming fix was built against
-  mocked transports. A live socket receiving `message.upserted` / `chat.upserted` frames after an
-  in-session connect (rather than after a server restart), and the reconnect and
-  reconnect-attempt advance that follow, have not been watched.
-- **A live send.** `POST /v1/chats/{chatID}/messages` through PortOS's own outbox, and the
-  `message.upserted` confirmation frame that resolves the row, have never been exercised against
-  a real Beeper Desktop.
+A later end-to-end pass against the same instance, on the build that includes the upstream
+merge, exercised the OAuth connect flow (dynamic registration, consent, the redirect landing on
+the UI origin, disconnect revoking at the authorization server), realtime domain frames through
+the shipped transport after an in-session connect, one live send through the outbox resolved by
+its confirmation frame, the Low priority rail control's `PATCH`, attachments, and a purge. The
+Tribe linking surface (title chip, search-first picker, create-and-link, change, unlink, and the
+Tribe page's linked-handles block) was exercised by hand on a real install.
+
+The following have **not** been observed against a real instance, and rest on unit, route and
+component tests plus static analysis:
+
 - **The `HEAD /v1/assets/serve` pre-flight and byte fidelity.** Whether the instance reports a
   usable `Content-Length` on `HEAD`, and whether a mirrored file is byte-identical to the source,
   have not been checked. (The 502 behaviour on both methods has.)
-- **The Low priority rail control's `PATCH /v1/chats/{chatID}`** against a live instance.
 - **The in-flight image placeholder in a real browser.** jsdom cannot measure layout, so the
   tests pin the declared `aspect-ratio` and width, not the reserved box. Someone should watch a
   thread with an uncached image load in Chrome and confirm nothing reflows.
 - **The conversation-not-found 404's `severity: 'warning'` path** was verified by the server
   suite and by static analysis of the socket and hook chain, not observed running.
-- **The arming-kicks-a-sweep and sweep-progress-strip fixes (fork issues #79/#80)** were built and
-  tested against a mocked `beeperClient.js` — the immediate sweep on connect, the interval taking
-  effect without a restart, and the list header's "Syncing… N of M accounts" strip moving as a real
-  multi-account sweep progresses have not been watched against a live Beeper Desktop with several
+- **The list header's "Syncing… N of M accounts" strip** moving as a real multi-account sweep
+  progresses (fork issue #80) has not been watched against a live instance with several
   connected accounts.
+- **A durable Tribe identity claim surviving a purge followed by a resweep** rests on the db
+  tests and on one backfill run against a single real install; nobody has purged and resweeped a
+  linked install by hand since.
 
 ## Files
 
