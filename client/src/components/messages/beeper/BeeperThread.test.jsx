@@ -48,6 +48,7 @@ const BASE_PROPS = {
   linkingId: null,
   onLinkParticipant: vi.fn(),
   onCreateAndLinkParticipant: vi.fn(),
+  onOpenTribePerson: vi.fn(),
   onBack: vi.fn(),
   onRetry: null,
   onArchive: vi.fn(),
@@ -353,7 +354,10 @@ describe('BeeperThread — participant Tribe link display', () => {
 
     expect(screen.queryByText(/^Linked/)).not.toBeInTheDocument();
     expect(screen.getByLabelText('Link Sam Example to a Tribe person')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Link' })).toBeInTheDocument();
+    // The picker replaces the old `<select>` + Link button — no such button
+    // remains, and there is no separate "Link" step: picking a result IS it.
+    expect(screen.queryByRole('button', { name: 'Link' })).not.toBeInTheDocument();
+    expect(document.querySelector('select')).toBeNull();
   });
 
   it('still shows the Linked label (and no re-link control) for a participant with an active link', () => {
@@ -376,6 +380,32 @@ describe('BeeperThread — participant Tribe link display', () => {
 
     expect(screen.getByText('Linked · Alex Example')).toBeInTheDocument();
     expect(screen.queryByLabelText('Link Sam Example to a Tribe person')).not.toBeInTheDocument();
+  });
+
+  // #98 part C: the "Linked · <name>" row is a link straight to the Tribe
+  // page (`?person=<id>`), the same deep link the title chip uses.
+  it('jumps to the linked person\'s Tribe page when "Linked · <name>" is clicked', () => {
+    const onOpenTribePerson = vi.fn();
+    renderThread({
+      conversation: {
+        ...CONVERSATION,
+        participants: [{
+          sourceUserId: 'user-1',
+          displayName: 'Sam Example',
+          handle: '+15550100',
+          tribePersonId: 'person-1',
+          tribePersonName: 'Alex Example',
+          observedVia: 'participant-list',
+        }],
+      },
+      people: PEOPLE,
+      onOpenTribePerson,
+    });
+
+    openPeopleDrawer();
+    fireEvent.click(screen.getByText('Linked · Alex Example'));
+
+    expect(onOpenTribePerson).toHaveBeenCalledWith('person-1');
   });
 });
 
@@ -487,5 +517,168 @@ describe('BeeperThread — scroll anchoring', () => {
 
     expect(scrollSpy.mock.calls.length).toBeGreaterThan(callsAfterMount);
     scrollSpy.mockRestore();
+  });
+});
+
+/**
+ * #98 part A: the Tribe link beside the thread title. A 1:1 chat (the fork
+ * `isGroup` field, mirrored from Beeper's own `chat.type`) shows the
+ * counterpart's link state; a group chat shows a participant-count chip
+ * instead, regardless of how many rows happen to be linked.
+ */
+describe('BeeperThread — title Tribe chip', () => {
+  const linkedParticipant = {
+    sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100', tribePersonId: 'person-1', tribePersonName: 'Alex Example',
+  };
+  const unlinkedParticipant = {
+    sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100', tribePersonId: null, tribePersonName: null,
+  };
+
+  it('shows "<name> · Tribe" for a linked 1:1 counterpart, and navigates on click', () => {
+    const onOpenTribePerson = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, isGroup: false, participants: [linkedParticipant] },
+      onOpenTribePerson,
+    });
+
+    const chip = screen.getByRole('button', { name: 'Alex Example · Tribe' });
+    fireEvent.click(chip);
+    expect(onOpenTribePerson).toHaveBeenCalledWith('person-1');
+  });
+
+  it('shows "Link to Tribe" for an unlinked 1:1 counterpart, opening the participants panel on click', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, isGroup: false, participants: [unlinkedParticipant] },
+    });
+
+    expect(screen.queryByText(/Participants/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Link to Tribe/ }));
+    expect(screen.getByText(/^Participants/)).toBeInTheDocument();
+  });
+
+  it('shows a participant-count chip for a group chat, never a per-person link state', () => {
+    renderThread({
+      conversation: {
+        ...CONVERSATION,
+        isGroup: true,
+        participants: [linkedParticipant, unlinkedParticipant],
+      },
+    });
+
+    expect(screen.getByRole('button', { name: '2 people' })).toBeInTheDocument();
+    expect(screen.queryByText(/Tribe$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Link to Tribe/)).not.toBeInTheDocument();
+  });
+
+  it('marks a group-count chip partial ("+") when Beeper truncated the roster', () => {
+    renderThread({
+      conversation: {
+        ...CONVERSATION, isGroup: true, participants: [linkedParticipant], hasMoreParticipants: true,
+      },
+    });
+
+    expect(screen.getByRole('button', { name: '1+ person' })).toBeInTheDocument();
+  });
+
+  it('opens the participants panel from the group chip, the same panel the People button opens', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, isGroup: true, participants: [linkedParticipant] },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: '1 person' }));
+    expect(screen.getByText(/^Participants/)).toBeInTheDocument();
+  });
+});
+
+/**
+ * #98 part B: the search-first person picker replacing the old `<select>` in
+ * the unlinked-participant row. These exercise it through `BeeperThread`
+ * (rather than `BeeperPersonPicker` in isolation) for the wiring — that
+ * selecting a result calls `onLinkParticipant` and that "Create new…" calls
+ * `onCreateAndLinkParticipant` exactly like the old "New" button did. The
+ * picker's own filtering/keyboard behavior is covered in
+ * `BeeperPersonPicker.test.jsx`.
+ */
+describe('BeeperThread — participant picker wiring', () => {
+  const PARTICIPANT = { sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100', tribePersonId: null };
+  const PEOPLE = [{ id: 'person-1', name: 'Alex Example' }, { id: 'person-2', name: 'Blair Sample' }];
+
+  const openDrawerAndFocusPicker = () => {
+    fireEvent.click(screen.getByRole('button', { name: 'People' }));
+    const input = screen.getByLabelText('Link Sam Example to a Tribe person');
+    fireEvent.focus(input);
+    return input;
+  };
+
+  it('links directly on selecting a result — no separate Link button', () => {
+    const onLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onLinkParticipant,
+    });
+
+    openDrawerAndFocusPicker();
+    fireEvent.mouseDown(screen.getByRole('option', { name: 'Alex Example' }));
+
+    expect(onLinkParticipant).toHaveBeenCalledWith(PARTICIPANT, 'person-1');
+  });
+
+  it('puts "Create new…" last, after every match, and wires it to the same onLinkNew callback the old New button used', () => {
+    const onCreateAndLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onCreateAndLinkParticipant,
+    });
+
+    openDrawerAndFocusPicker();
+    const options = screen.getAllByRole('option');
+    expect(options[options.length - 1]).toHaveTextContent('Create new…');
+
+    fireEvent.mouseDown(options[options.length - 1]);
+    expect(onCreateAndLinkParticipant).toHaveBeenCalledWith(PARTICIPANT);
+  });
+
+  it('is keyboard-navigable: ArrowDown cycles results, Enter selects the highlighted one', () => {
+    const onLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onLinkParticipant,
+    });
+
+    const input = openDrawerAndFocusPicker();
+    // Starts on the first match (index 0); one ArrowDown moves to the second.
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(onLinkParticipant).toHaveBeenCalledWith(PARTICIPANT, 'person-2');
+  });
+
+  it('closes the results on Escape without linking anyone', () => {
+    const onLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onLinkParticipant,
+    });
+
+    const input = openDrawerAndFocusPicker();
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+    fireEvent.keyDown(input, { key: 'Escape' });
+
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    expect(onLinkParticipant).not.toHaveBeenCalled();
+  });
+
+  it('no full-roster <select> remains anywhere in the drawer', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'People' }));
+    expect(document.querySelector('select')).toBeNull();
   });
 });
