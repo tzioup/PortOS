@@ -13,6 +13,12 @@ export const getTribePeople = (options = {}) => {
 export const getTribeDuplicateIdentifiers = (options = {}) =>
   request('/tribe/duplicate-identifiers', { silent: options.silent });
 
+// Single-person read (#99) — the roster row from `getTribePeople` never carries
+// `identities` (that join only runs on this single-person read), so the person
+// form fetches this on select to render the "Linked on Beeper" block.
+export const getTribePerson = (id, options = {}) =>
+  request(`/tribe/people/${id}`, { silent: options.silent });
+
 export const getTribeCareSummary = (options = {}) => {
   const params = new URLSearchParams();
   if (options.limit) params.set('limit', String(options.limit));
@@ -92,3 +98,9 @@ export const createTribePersonFromBeeper = ({ conversationId, sourceUserId, name
     body: JSON.stringify({ conversationId, sourceUserId, name, ring, relationship }),
     ...options,
   });
+
+// Remove one Beeper identity claim from a person (#99) — the person form's
+// "Linked on Beeper" block. `identityId` is a `tribe_identities.id` from that
+// person's `identities[]`, not a participant key.
+export const unlinkBeeperIdentity = (identityId, options = {}) =>
+  request(`/tribe/beeper/identities/${identityId}`, { method: 'DELETE', ...options });

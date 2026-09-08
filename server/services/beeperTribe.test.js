@@ -157,6 +157,7 @@ vi.mock('./tribe.js', () => ({
 
 const { query } = await import('../lib/db.js');
 const beeperTribe = await import('./beeperTribe.js');
+const tribeService = await import('./tribe.js');
 
 const CONVERSATION = '00000000-0000-4000-8000-000000000001';
 const OTHER_CONVERSATION = '00000000-0000-4000-8000-000000000002';
@@ -527,5 +528,158 @@ describe('upsertParticipant — roster hoisting: personIndex loaded once, not on
     expect(first.tribePersonId).toBe(CACHED_PERSON);
     expect(second.tribePersonId).toBe(CLAIMING_PERSON);
     expect(listPeople).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('createPersonAndLinkParticipant notes text (#99)', () => {
+  it('no longer bakes the network into the Notes string', async () => {
+    seedParticipant({ network: 'discord', displayName: 'Example Person', handle: '' });
+    tribeService.createPerson.mockResolvedValue({ id: CLAIMING_PERSON, name: 'Example Person' });
+
+    await beeperTribe.createPersonAndLinkParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1',
+    });
+
+    expect(tribeService.createPerson).toHaveBeenCalledWith(expect.objectContaining({
+      notes: 'Imported from Beeper',
+      channel: 'Beeper',
+    }));
+  });
+});
+
+describe('listPersonIdentitiesWithConversations (#99)', () => {
+  it('returns an empty array for a person with no identity claims, without a second query', async () => {
+    query.mockImplementationOnce(async (sql) => {
+      expect(sql).toContain('FROM tribe_identities WHERE person_id = $1');
+      return { rows: [] };
+    });
+
+    const result = await beeperTribe.listPersonIdentitiesWithConversations(CLAIMING_PERSON);
+
+    expect(result).toEqual([]);
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it('attaches conversations to a beeper-user claim via the account/source-user join', async () => {
+    query.mockImplementationOnce(async () => ({
+      rows: [{
+        id: 'identity-1', person_id: CLAIMING_PERSON, kind: 'beeper-user', network: ACCOUNT_ID, handle: 'user-1',
+        source: 'user', linked_at: '2026-01-01T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      }],
+    }));
+    query.mockImplementationOnce(async (sql, params) => {
+      expect(sql).toContain('c.account_id = $1 AND p.source_user_id = $2');
+      expect(params).toEqual([ACCOUNT_ID, 'user-1']);
+      return {
+        rows: [{
+          conversation_id: CONVERSATION, display_name: 'Example Person', network: 'whatsapp',
+          title: 'Example Thread', account_id: ACCOUNT_ID,
+        }],
+      };
+    });
+
+    const result = await beeperTribe.listPersonIdentitiesWithConversations(CLAIMING_PERSON);
+
+    expect(result).toEqual([{
+      id: 'identity-1', personId: CLAIMING_PERSON, kind: 'beeper-user', network: ACCOUNT_ID, handle: 'user-1',
+      source: 'user', linkedAt: '2026-01-01T00:00:00.000Z', createdAt: '2026-01-01T00:00:00.000Z',
+      conversations: [{
+        conversationId: CONVERSATION, network: 'whatsapp', title: 'Example Thread',
+        accountId: ACCOUNT_ID, displayName: 'Example Person',
+      }],
+    }]);
+  });
+
+  it('attaches conversations to a handle claim via the resolved participant cache, scoped by network', async () => {
+    query.mockImplementationOnce(async () => ({
+      rows: [{
+        id: 'identity-2', person_id: CLAIMING_PERSON, kind: 'handle', network: 'whatsapp', handle: 'ada',
+        source: 'user', linked_at: '2026-01-01T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      }],
+    }));
+    query.mockImplementationOnce(async (sql, params) => {
+      expect(sql).toContain('p.tribe_person_id = $1');
+      expect(sql).toContain('c.network = $2');
+      expect(params).toEqual([CLAIMING_PERSON, 'whatsapp']);
+      return { rows: [] }; // a purged conversation / no cached row yet — an empty list, not an error
+    });
+
+    const result = await beeperTribe.listPersonIdentitiesWithConversations(CLAIMING_PERSON);
+
+    expect(result[0].conversations).toEqual([]);
+  });
+
+  it('reads a phone claim un-scoped by network (phones are network-less by design)', async () => {
+    query.mockImplementationOnce(async () => ({
+      rows: [{
+        id: 'identity-3', person_id: CLAIMING_PERSON, kind: 'phone', network: '', handle: PHONE_NORMALIZED,
+        source: 'user', linked_at: '2026-01-01T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      }],
+    }));
+    query.mockImplementationOnce(async (sql, params) => {
+      expect(sql).not.toContain('c.network = $2');
+      expect(params).toEqual([CLAIMING_PERSON]);
+      return {
+        rows: [{
+          conversation_id: OTHER_CONVERSATION, display_name: 'Example Person', network: 'imessage',
+          title: '', account_id: '',
+        }],
+      };
+    });
+
+    const result = await beeperTribe.listPersonIdentitiesWithConversations(CLAIMING_PERSON);
+
+    expect(result[0].conversations).toEqual([{
+      conversationId: OTHER_CONVERSATION, network: 'imessage', title: '', accountId: '', displayName: 'Example Person',
+    }]);
+  });
+});
+
+describe('unlinkIdentity (#99)', () => {
+  it('returns null for an unknown identity id (the route turns this into 404)', async () => {
+    query.mockImplementationOnce(async (sql) => {
+      expect(sql).toContain('DELETE FROM tribe_identities WHERE id = $1');
+      return { rows: [] };
+    });
+
+    const result = await beeperTribe.unlinkIdentity('missing-id');
+
+    expect(result).toBeNull();
+  });
+
+  it('deletes a beeper-user claim and nulls the cached participant rows for that account/user', async () => {
+    seedParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', tribePersonId: CLAIMING_PERSON,
+      network: 'whatsapp', accountId: ACCOUNT_ID,
+    });
+    query.mockImplementationOnce(async () => ({
+      rows: [{
+        id: 'identity-1', person_id: CLAIMING_PERSON, kind: 'beeper-user', network: ACCOUNT_ID, handle: 'user-1',
+        source: 'user', linked_at: '2026-01-01T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      }],
+    }));
+
+    const result = await beeperTribe.unlinkIdentity('identity-1');
+
+    expect(result).toMatchObject({ id: 'identity-1', personId: CLAIMING_PERSON, kind: 'beeper-user' });
+    expect(db.participants.get(pKey(CONVERSATION, 'user-1')).tribe_person_id).toBeNull();
+  });
+
+  it('deletes a handle claim and nulls the cached participant rows matching its scope', async () => {
+    seedParticipant({
+      conversationId: CONVERSATION, sourceUserId: 'user-1', handle: '@ada', tribePersonId: CLAIMING_PERSON,
+      network: 'discord',
+    });
+    query.mockImplementationOnce(async () => ({
+      rows: [{
+        id: 'identity-2', person_id: CLAIMING_PERSON, kind: 'handle', network: 'discord', handle: 'ada',
+        source: 'user', linked_at: '2026-01-01T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      }],
+    }));
+
+    const result = await beeperTribe.unlinkIdentity('identity-2');
+
+    expect(result).toMatchObject({ id: 'identity-2', personId: CLAIMING_PERSON, kind: 'handle' });
+    expect(db.participants.get(pKey(CONVERSATION, 'user-1')).tribe_person_id).toBeNull();
   });
 });

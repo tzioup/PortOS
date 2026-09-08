@@ -371,6 +371,23 @@ recognize (a deleted person, or a stale bookmark) is silently ignored, with no e
 title chip's linked state and the participants drawer's "Linked · <name>" row (now a link, not plain
 text) point here.
 
+**The Tribe person form shows every linked identity.** `GET /tribe/people/:id` (only the
+single-person read — the roster never pays this join) attaches `identities: [{ kind, network,
+handle, linkedAt, source, conversations }]`, one entry per `tribe_identities` claim, each carrying
+the Beeper conversations it appears in. A `beeper-user` claim's conversations come from joining
+`beeper_participants`/`beeper_conversations` on the claim's own (account, `source_user_id`) key;
+a `handle`/`phone` claim's come from the resolved participant cache
+(`beeper_participants.tribe_person_id`), scoped to the claim's network for a `handle` and
+left unscoped for a network-less `phone`. A purged conversation or a participant whose cache was
+cleared by a later re-link simply contributes no conversation entry — nothing to special-case. The
+Tribe person form's "Linked on Beeper" block renders one chip per identity — network plus handle
+or participant display name — each conversation linking to `/messages/beeper/<conversationId>`,
+with an Unlink action (`DELETE /tribe/beeper/identities/:identityId`) that removes the claim and
+nulls the cache rows it was backing. Notes no longer carries the network: a fresh Beeper import
+sets `notes` to the plain "Imported from Beeper" and leaves the network entirely to this block, so
+a second network linked later never leaves a stale first-network mention behind (existing notes
+are untouched).
+
 ### Unread badge
 
 `beeper_conversations.unread_count` is Beeper's own count, mirrored verbatim and overwritten

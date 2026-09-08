@@ -457,7 +457,14 @@ export async function createPersonAndLinkParticipant({
     name: personName,
     ring,
     relationship,
-    notes: `Imported from Beeper${participant.network ? ` (${participant.network})` : ''}`,
+    // Just "Imported from Beeper" (#99) — the network used to be baked into
+    // this string because there was nowhere else to show it; now the Tribe
+    // person form's "Linked on Beeper" block reads it from the identity read
+    // model instead (`listPersonIdentitiesWithConversations` below), so a
+    // second network linked later no longer leaves a stale first-network
+    // mention sitting in Notes. Existing notes are left untouched (no
+    // migration) — only new imports get the shorter text.
+    notes: 'Imported from Beeper',
     channel: 'Beeper',
   });
   const { displacedPersonId, ...linked } = await linkParticipant({
@@ -527,4 +534,125 @@ export async function logSenderTouchpoints(candidates = []) {
     if (touchpoint) created++;
   }
   return { created, matched };
+}
+
+/** Shape one `beeper_participants` row (joined to its conversation) into the
+ * conversation reference the Tribe person read model exposes per identity
+ * (#99): the PortOS conversation id `/messages/beeper/<conversationId>`
+ * expects, the conversation's network + title, its account, and this
+ * participant's own display name so the client can render "network ·
+ * handle-or-display-name" without a second round trip. */
+function rowToConversationRef(row) {
+  return {
+    conversationId: row.conversation_id,
+    network: row.network || '',
+    title: row.title || '',
+    accountId: row.account_id || '',
+    displayName: row.display_name || '',
+  };
+}
+
+/**
+ * The Beeper conversations one `tribe_identities` claim appears in (#99).
+ *
+ * A `kind='beeper-user'` claim joins `beeper_participants` on
+ * `source_user_id = handle` through `beeper_conversations` on
+ * `account_id = network` — `beeperUserScopeFor`'s own key, the durable pair
+ * that survives a purge + resweep, so it finds every conversation for that
+ * Beeper user even one synced after the claim was made.
+ *
+ * A `kind='handle'`/`'phone'` claim instead reads the resolved participant
+ * CACHE (`beeper_participants.tribe_person_id = personId`) rather than
+ * re-deriving the handle scope per participant row with `identityScopeFor`:
+ * the ingestion sweep's `upsertParticipant` already keeps that column in
+ * sync with `tribe_identities` for every synced participant, so the cache is
+ * already the correct, much simpler answer to "which conversations is this
+ * identity seen in" (#99 decision — documented here rather than mirroring
+ * `clearDisplacedParticipantCaches`'s per-row reclassification). A `phone`
+ * claim is network-less by design, so it reads the cache unscoped by
+ * network; a `handle` claim additionally filters to its own network, since
+ * the same cached person can hold claims on more than one network.
+ *
+ * A purged conversation or a participant row nulled by a later re-link
+ * simply produces no row here — no special-casing needed.
+ */
+async function conversationsForIdentity(personId, identity) {
+  if (identity.kind === BEEPER_USER_KIND) {
+    const { rows } = await query(
+      `SELECT p.conversation_id, p.display_name, c.network, c.title, c.account_id
+       FROM beeper_participants p
+       JOIN beeper_conversations c ON c.id = p.conversation_id
+       WHERE c.account_id = $1 AND p.source_user_id = $2
+       ORDER BY c.last_activity DESC NULLS LAST`,
+      [identity.network, identity.handle],
+    );
+    return rows.map(rowToConversationRef);
+  }
+
+  const params = [personId];
+  let networkFilter = '';
+  if (identity.kind === 'handle' && identity.network) {
+    networkFilter = 'AND c.network = $2';
+    params.push(identity.network);
+  }
+  const { rows } = await query(
+    `SELECT p.conversation_id, p.display_name, c.network, c.title, c.account_id
+     FROM beeper_participants p
+     JOIN beeper_conversations c ON c.id = p.conversation_id
+     WHERE p.tribe_person_id = $1 ${networkFilter}
+     ORDER BY c.last_activity DESC NULLS LAST`,
+    params,
+  );
+  return rows.map(rowToConversationRef);
+}
+
+/**
+ * The Tribe person form's "Linked on Beeper" block (#99): every durable
+ * identity claim for a person, each carrying the Beeper conversations that
+ * identity appears in (see `conversationsForIdentity`). Lives here rather
+ * than in `tribe.js` so the generic person read model stays Beeper-agnostic
+ * — `tribe.js` is already imported BY this module, so the reverse would be
+ * circular — and is called from the route only, on the single-person read.
+ * `tribe.listPeople` (the roster) never pays this join's cost; it has no
+ * reason to render per-person identity chips.
+ *
+ * Returns `[]` for a person with no claims.
+ */
+export async function listPersonIdentitiesWithConversations(personId) {
+  await ensureReady();
+  const identities = await tribeIdentities.listIdentitiesForPerson(personId);
+  if (identities.length === 0) return [];
+  const results = [];
+  for (const identity of identities) {
+    // eslint-disable-next-line no-await-in-loop -- one person's own identities, a handful at most
+    const conversations = await conversationsForIdentity(personId, identity);
+    results.push({ ...identity, conversations });
+  }
+  return results;
+}
+
+/**
+ * Unlink (delete) one identity claim (#99) — the Tribe person form's
+ * per-identity "Unlink" action. Deletes the durable row via
+ * `tribeIdentities.unlinkIdentity`, then reuses the SAME displaced-cache
+ * clearers a re-link uses (`clearDisplacedParticipantCaches` /
+ * `clearDisplacedBeeperUserCaches`) to null `beeper_participants.tribe_person_id`
+ * on every participant row that claim was backing — passing the just-deleted
+ * claim's OWN `personId` as the "displaced" person, since removing a claim
+ * displaces it from everyone who was resolving through it.
+ *
+ * Returns the deleted identity, or `null` when `id` is unknown (the route
+ * turns that into a 404).
+ */
+export async function unlinkIdentity(id) {
+  await ensureReady();
+  const identity = await tribeIdentities.unlinkIdentity(id);
+  if (!identity) return null;
+  const scope = { kind: identity.kind, network: identity.network, handle: identity.handle };
+  if (identity.kind === BEEPER_USER_KIND) {
+    await clearDisplacedBeeperUserCaches(identity.personId, scope);
+  } else {
+    await clearDisplacedParticipantCaches(identity.personId, scope);
+  }
+  return identity;
 }

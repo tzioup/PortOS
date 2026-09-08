@@ -123,6 +123,7 @@ const guidParam = (label) => (req, res, next, value) => {
 };
 router.param('id', guidParam('person id'));
 router.param('memoryId', guidParam('memory id'));
+router.param('identityId', guidParam('identity id'));
 
 router.get('/people', asyncHandler(async (req, res) => {
   const { search, ring } = validateRequest(listQuerySchema, req.query);
@@ -174,10 +175,16 @@ router.post('/people', asyncHandler(async (req, res) => {
   res.status(201).json(person);
 }));
 
+// `identities` (#99) is joined in here, not in `tribe.getPerson` itself —
+// keeps the generic person read model Beeper-agnostic (see
+// `beeperTribe.listPersonIdentitiesWithConversations`'s docblock) and keeps
+// the join off `listPeople` (the roster), which never renders identity
+// chips and shouldn't pay for the extra query per row.
 router.get('/people/:id', asyncHandler(async (req, res) => {
   const person = await tribe.getPerson(req.params.id);
   if (!person) throw new ServerError('Person not found', { status: 404 });
-  res.json(person);
+  const identities = await beeperTribe.listPersonIdentitiesWithConversations(person.id);
+  res.json({ ...person, identities });
 }));
 
 router.put('/people/:id', asyncHandler(async (req, res) => {
@@ -256,6 +263,16 @@ router.post('/beeper/link-new', asyncHandler(async (req, res) => {
   const result = await beeperTribe.createPersonAndLinkParticipant(data);
   req.app.get('io')?.emit('tribe:changed', { personId: result.person.id });
   res.status(201).json(result);
+}));
+
+// Unlink one Beeper identity claim (#99) — the Tribe person form's
+// per-identity "Unlink" action. `identityId` is the `tribe_identities.id`
+// the person read model's `identities[]` carries, not a participant key.
+router.delete('/beeper/identities/:identityId', asyncHandler(async (req, res) => {
+  const identity = await beeperTribe.unlinkIdentity(req.params.identityId);
+  if (!identity) throw new ServerError('Identity not found', { status: 404 });
+  req.app.get('io')?.emit('tribe:changed', { personId: identity.personId });
+  res.json({ success: true });
 }));
 
 export default router;
