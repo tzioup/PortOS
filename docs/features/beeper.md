@@ -743,8 +743,9 @@ object shape, and a 105-second `app.state`/ping probe of `/v1/ws`.
 A later end-to-end pass against the same instance, on the build that includes the upstream
 merge, exercised the OAuth connect flow (dynamic registration, consent, the redirect landing on
 the UI origin, disconnect revoking at the authorization server), realtime domain frames through
-the shipped transport after an in-session connect, one live send through the outbox resolved by
-its confirmation frame, the Low priority rail control's `PATCH`, attachments, and a purge. The
+the shipped transport after an in-session connect, sends through the outbox on several networks
+each resolved by its confirmation frame, the list header's "Syncing… N of M accounts" strip moving
+during a multi-account sweep, the Low priority rail control's `PATCH`, attachments, and a purge. The
 Tribe linking surface (title chip, search-first picker, create-and-link, change, unlink, and the
 Tribe page's linked-handles block) was exercised by hand on a real install.
 
@@ -759,9 +760,6 @@ component tests plus static analysis:
   thread with an uncached image load in Chrome and confirm nothing reflows.
 - **The conversation-not-found 404's `severity: 'warning'` path** was verified by the server
   suite and by static analysis of the socket and hook chain, not observed running.
-- **The list header's "Syncing… N of M accounts" strip** moving as a real multi-account sweep
-  progresses (fork issue #80) has not been watched against a live instance with several
-  connected accounts.
 - **A durable Tribe identity claim surviving a purge followed by a resweep** rests on the db
   tests and on one backfill run against a single real install; nobody has purged and resweeped a
   linked install by hand since.
