@@ -686,6 +686,26 @@ describe('BeeperThread — participant picker wiring', () => {
     fireEvent.click(screen.getByRole('button', { name: 'People' }));
     expect(document.querySelector('select')).toBeNull();
   });
+
+  // #105: the roster `<ul>` (`max-h-40 … overflow-y-auto`) clips an
+  // absolutely positioned child, so the results list used to extend that
+  // scroll container instead of floating over it — nearly invisible on a
+  // 1:1 chat. `BeeperPersonPicker` now portals it to `document.body`, which
+  // this pins from the roster's side: the listbox must never be a DOM
+  // descendant of the roster, portaled or not.
+  it('renders the results listbox outside the participants roster, not clipped by its scroll container', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+    });
+
+    openDrawerAndFocusPicker();
+
+    const roster = screen.getByTestId('beeper-participants-roster');
+    const listbox = screen.getByRole('listbox');
+    expect(roster.contains(listbox)).toBe(false);
+    expect(document.body.contains(listbox)).toBe(true);
+  });
 });
 
 /**

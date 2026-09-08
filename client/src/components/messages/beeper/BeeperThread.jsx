@@ -727,7 +727,7 @@ export default function BeeperThread({
           {(conversation.participants || []).length === 0 ? (
             <p className="text-xs text-gray-500">No participants mirrored yet.</p>
           ) : (
-            <ul className="max-h-40 divide-y divide-port-border/40 overflow-y-auto">
+            <ul data-testid="beeper-participants-roster" className="max-h-40 divide-y divide-port-border/40 overflow-y-auto">
               {conversation.participants.map((participant) => (
                 <ParticipantRow
                   key={participant.sourceUserId}
