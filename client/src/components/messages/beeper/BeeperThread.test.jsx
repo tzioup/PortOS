@@ -48,6 +48,7 @@ const BASE_PROPS = {
   linkingId: null,
   onLinkParticipant: vi.fn(),
   onCreateAndLinkParticipant: vi.fn(),
+  onUnlinkParticipant: vi.fn(),
   onOpenTribePerson: vi.fn(),
   onBack: vi.fn(),
   onRetry: null,
@@ -624,7 +625,7 @@ describe('BeeperThread — participant picker wiring', () => {
     expect(onLinkParticipant).toHaveBeenCalledWith(PARTICIPANT, 'person-1');
   });
 
-  it('puts "Create new…" last, after every match, and wires it to the same onLinkNew callback the old New button used', () => {
+  it('puts "Create new…" last, after every match, and opens the confirm-and-rename form instead of creating immediately (#97 part A)', () => {
     const onCreateAndLinkParticipant = vi.fn();
     renderThread({
       conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
@@ -637,7 +638,11 @@ describe('BeeperThread — participant picker wiring', () => {
     expect(options[options.length - 1]).toHaveTextContent('Create new…');
 
     fireEvent.mouseDown(options[options.length - 1]);
-    expect(onCreateAndLinkParticipant).toHaveBeenCalledWith(PARTICIPANT);
+
+    // No immediate post — the form takes the picker's place instead,
+    // prefilled from the participant's own display name.
+    expect(onCreateAndLinkParticipant).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Name')).toHaveValue('Sam Example');
   });
 
   it('is keyboard-navigable: ArrowDown cycles results, Enter selects the highlighted one', () => {
@@ -680,5 +685,197 @@ describe('BeeperThread — participant picker wiring', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'People' }));
     expect(document.querySelector('select')).toBeNull();
+  });
+});
+
+/**
+ * Fork issue #97 part A: the confirm-and-rename form "Create new…" opens
+ * instead of posting immediately. The form's own field/keyboard contract is
+ * pinned in isolation in `BeeperCreatePersonForm.test.jsx`; these cover the
+ * wiring from the row into it and back.
+ */
+describe('BeeperThread — create-person form wiring', () => {
+  const PARTICIPANT = { sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100', tribePersonId: null };
+  const PEOPLE = [{ id: 'person-1', name: 'Alex Example' }];
+
+  const openForm = () => {
+    fireEvent.click(screen.getByRole('button', { name: 'People' }));
+    const input = screen.getByLabelText('Link Sam Example to a Tribe person');
+    fireEvent.focus(input);
+    const options = screen.getAllByRole('option');
+    fireEvent.mouseDown(options[options.length - 1]);
+  };
+
+  it('calls onCreateAndLinkParticipant with the edited name, ring and relationship only on Create', () => {
+    const onCreateAndLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onCreateAndLinkParticipant,
+    });
+
+    openForm();
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Corrected Name' } });
+    fireEvent.change(screen.getByLabelText('Ring'), { target: { value: 'core' } });
+    fireEvent.change(screen.getByLabelText('Relationship'), { target: { value: 'Neighbor' } });
+    expect(onCreateAndLinkParticipant).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    expect(onCreateAndLinkParticipant).toHaveBeenCalledWith(
+      PARTICIPANT,
+      { name: 'Corrected Name', ring: 'core', relationship: 'Neighbor' },
+    );
+  });
+
+  it('returns to the picker on Cancel, without creating anyone', () => {
+    const onCreateAndLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onCreateAndLinkParticipant,
+    });
+
+    openForm();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(onCreateAndLinkParticipant).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Link Sam Example to a Tribe person')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Name')).not.toBeInTheDocument();
+  });
+
+  it('submits on Enter and cancels on Escape', () => {
+    const onCreateAndLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [PARTICIPANT] },
+      people: PEOPLE,
+      onCreateAndLinkParticipant,
+    });
+
+    openForm();
+    fireEvent.keyDown(screen.getByLabelText('Name'), { key: 'Escape' });
+    const picker = screen.getByLabelText('Link Sam Example to a Tribe person');
+    expect(picker).toBeInTheDocument();
+
+    // The drawer stays open across Escape — reopen the form without
+    // re-toggling the People button, which would otherwise close it.
+    fireEvent.focus(picker);
+    const options = screen.getAllByRole('option');
+    fireEvent.mouseDown(options[options.length - 1]);
+    fireEvent.keyDown(screen.getByLabelText('Name'), { key: 'Enter' });
+    expect(onCreateAndLinkParticipant).toHaveBeenCalledWith(
+      PARTICIPANT,
+      { name: 'Sam Example', ring: 'tribe', relationship: '' },
+    );
+  });
+});
+
+/**
+ * Fork issue #97 part B: Change and Unlink on an already-linked participant
+ * row — the "Linked · <name>" label used to be the whole story, with no way
+ * back from a mistaken or outdated link.
+ */
+describe('BeeperThread — change and unlink a linked participant', () => {
+  const LINKED_PARTICIPANT = {
+    sourceUserId: 'user-1', displayName: 'Sam Example', handle: '+15550100',
+    tribePersonId: 'person-1', tribePersonName: 'Alex Example',
+  };
+  const PEOPLE = [{ id: 'person-1', name: 'Alex Example' }, { id: 'person-2', name: 'Blair Sample' }];
+
+  const openPeopleDrawer = () => fireEvent.click(screen.getByRole('button', { name: 'People' }));
+
+  it('offers Change and Unlink beside the Linked label', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [LINKED_PARTICIPANT] },
+      people: PEOPLE,
+    });
+
+    openPeopleDrawer();
+
+    expect(screen.getByText('Linked · Alex Example')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Change' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Unlink' })).toBeInTheDocument();
+  });
+
+  it('opens the picker, pre-focused, on Change — selecting a person re-links via onLinkParticipant', () => {
+    const onLinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [LINKED_PARTICIPANT] },
+      people: PEOPLE,
+      onLinkParticipant,
+    });
+
+    openPeopleDrawer();
+    fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+
+    const picker = screen.getByLabelText('Link Sam Example to a Tribe person');
+    expect(picker).toHaveFocus();
+
+    fireEvent.mouseDown(screen.getByRole('option', { name: 'Blair Sample' }));
+    expect(onLinkParticipant).toHaveBeenCalledWith(LINKED_PARTICIPANT, 'person-2');
+  });
+
+  it('returns to the Linked label on Cancel from the Change picker', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [LINKED_PARTICIPANT] },
+      people: PEOPLE,
+    });
+
+    openPeopleDrawer();
+    fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.getByText('Linked · Alex Example')).toBeInTheDocument();
+  });
+
+  it('opens the create-person form from "Create new…" inside the Change picker too', () => {
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [LINKED_PARTICIPANT] },
+      people: PEOPLE,
+    });
+
+    openPeopleDrawer();
+    fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+    const options = screen.getAllByRole('option');
+    fireEvent.mouseDown(options[options.length - 1]);
+
+    expect(screen.getByLabelText('Name')).toHaveValue('Sam Example');
+  });
+
+  it('calls onUnlinkParticipant with the participant on Unlink', () => {
+    const onUnlinkParticipant = vi.fn();
+    renderThread({
+      conversation: { ...CONVERSATION, participants: [LINKED_PARTICIPANT] },
+      people: PEOPLE,
+      onUnlinkParticipant,
+    });
+
+    openPeopleDrawer();
+    fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
+
+    expect(onUnlinkParticipant).toHaveBeenCalledWith(LINKED_PARTICIPANT);
+  });
+
+  it('resets an open Change picker back to view when the participant\'s own linked state changes', () => {
+    const { rerender } = renderThread({
+      conversation: { ...CONVERSATION, participants: [LINKED_PARTICIPANT] },
+      people: PEOPLE,
+    });
+
+    openPeopleDrawer();
+    fireEvent.click(screen.getByRole('button', { name: 'Change' }));
+    expect(screen.getByLabelText('Link Sam Example to a Tribe person')).toBeInTheDocument();
+
+    rerender(<BeeperThread
+      {...BASE_PROPS}
+      conversation={{
+        ...CONVERSATION,
+        participants: [{ ...LINKED_PARTICIPANT, tribePersonId: 'person-2', tribePersonName: 'Blair Sample' }],
+      }}
+      people={PEOPLE}
+    />);
+
+    expect(screen.getByText('Linked · Blair Sample')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Link Sam Example to a Tribe person')).not.toBeInTheDocument();
   });
 });

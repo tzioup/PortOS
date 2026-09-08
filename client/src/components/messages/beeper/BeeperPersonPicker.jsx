@@ -22,6 +22,10 @@ import { Search, UserPlus } from 'lucide-react';
  * `onCreateNew` callback the old "New" button called — #97 changes what that
  * callback DOES (a confirm-and-rename form instead of an immediate create),
  * not this wiring.
+ *
+ * `autoFocus` (#97 part B) is only ever passed `true` from "Change" on an
+ * already-linked participant row, so re-pointing a link opens straight into
+ * a focused, ready-to-type input rather than requiring an extra click.
  */
 export default function BeeperPersonPicker({
   id,
@@ -31,6 +35,7 @@ export default function BeeperPersonPicker({
   onCreateNew,
   disabled = false,
   placeholder = 'Link to…',
+  autoFocus = false,
 }) {
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
@@ -101,6 +106,7 @@ export default function BeeperPersonPicker({
           aria-autocomplete="list"
           aria-activedescendant={open ? optionId(activeIndex) : undefined}
           disabled={disabled}
+          autoFocus={autoFocus}
           value={query}
           onChange={(event) => { setQuery(event.target.value); setActiveIndex(0); setOpen(true); }}
           onFocus={() => setOpen(true)}

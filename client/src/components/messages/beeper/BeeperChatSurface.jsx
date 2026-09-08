@@ -800,12 +800,18 @@ export default function BeeperChatSurface({
     loadThread(conversationId);
   }, [conversationId, loadThread, mountedRef]);
 
-  const createAndLinkParticipant = useCallback(async (participant) => {
+  // The confirm-and-rename form (#97 part A) hands back the edited fields
+  // rather than this callback inventing them from the participant's raw
+  // display name — the whole point of the form is that the name posted is
+  // the one the user confirmed or corrected, not whatever Beeper reported.
+  const createAndLinkParticipant = useCallback(async (participant, { name, ring, relationship } = {}) => {
     setLinkingId(participant.sourceUserId);
     const result = await api.createTribePersonFromBeeper({
       conversationId,
       sourceUserId: participant.sourceUserId,
-      name: participant.displayName || participant.handle || undefined,
+      name: name || participant.displayName || participant.handle || undefined,
+      ring,
+      relationship,
     }, { silent: true }).catch((err) => {
       toast.error(err?.message || 'Could not create a Tribe person');
       return null;
@@ -818,6 +824,32 @@ export default function BeeperChatSurface({
     api.getTribePeople({ silent: true })
       .then((data) => { if (mountedRef.current) setPeople(Array.isArray(data) ? data : (data?.people || [])); })
       .catch(() => {});
+  }, [conversationId, loadThread, mountedRef]);
+
+  // Unlink (#97 part B): the row's affordances flip immediately — cleared
+  // optimistically in the loaded thread the same shape `linkParticipant`'s
+  // successful result carries (`tribePersonId`/`tribePersonName`) — and then
+  // `loadThread` settles the truth from the server either way, the same
+  // refresh-after-write shape every other write in this surface uses.
+  const unlinkParticipant = useCallback(async (participant) => {
+    setLinkingId(participant.sourceUserId);
+    setConversation((prev) => (prev ? {
+      ...prev,
+      participants: (prev.participants || []).map((row) => (
+        row.sourceUserId === participant.sourceUserId
+          ? { ...row, tribePersonId: null, tribePersonName: null }
+          : row
+      )),
+    } : prev));
+    await api.unlinkBeeperParticipant({
+      conversationId, sourceUserId: participant.sourceUserId,
+    }, { silent: true }).catch((err) => {
+      toast.error(err?.message || 'Could not unlink this participant');
+      return null;
+    });
+    if (!mountedRef.current) return;
+    setLinkingId(null);
+    loadThread(conversationId);
   }, [conversationId, loadThread, mountedRef]);
 
   const pinned = useMemo(
@@ -1013,6 +1045,7 @@ export default function BeeperChatSurface({
             linkingId={linkingId}
             onLinkParticipant={linkParticipant}
             onCreateAndLinkParticipant={createAndLinkParticipant}
+            onUnlinkParticipant={unlinkParticipant}
             onOpenTribePerson={openTribePerson}
             onBack={clearSelection}
             onRetry={conversationId ? () => loadThread(conversationId) : null}
