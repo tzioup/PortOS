@@ -33,11 +33,11 @@
  */
 
 import { spawn } from '../../lib/childProcess.js';
-import { copyFile, mkdir, open, rename, rm, stat, unlink } from 'fs/promises';
+import { mkdir, open, stat } from 'fs/promises';
 import { isAbsolute, join, resolve as pathResolve, sep } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import { atomicWrite, detectImageFormat, ensureDir, PATHS } from '../../lib/fileUtils.js';
+import { atomicWrite, copyFileGuarded, detectImageFormat, ensureDir, PATHS, rmGuarded, unlinkGuarded } from '../../lib/fileUtils.js';
 import { ServerError } from '../../lib/errorHandler.js';
 import { autoCleanGeneratedImage } from '../../lib/imageClean.js';
 import { imageGenEvents } from '../imageGenEvents.js';
@@ -53,6 +53,7 @@ import { ensureGrokHeadlessArgs, prepareGrokPromptFile } from '../../lib/grok.js
 import {
   IMAGE_GEN_MODE, describeFidelity, grokImageTool, nearestAspectRatio, visualReferenceRole,
 } from './modes.js';
+import { GROK_ASPECT_RATIOS } from '../../lib/imageGenCapabilities.js';
 import { resolveInputImages } from './inputImages.js';
 import { cloudPromptRequired } from './cloudProviderConfig.js';
 import { withSpawnCwdEnv } from '../../lib/spawnCwd.js';
@@ -73,10 +74,11 @@ const DEFAULT_BIN = 'grok';
 const DEFAULT_HARVEST_TIMEOUT_MS = 5000;
 let harvestTimeoutMs = DEFAULT_HARVEST_TIMEOUT_MS;
 
-// Aspect ratios grok's image_gen/image_edit tools accept. Width/height from
-// PortOS callers are mapped to the closest of these; a configured default
-// (`imageGen.grok.aspectRatio`) applies when the caller sent no dimensions.
-export const GROK_ASPECT_RATIOS = Object.freeze(['1:1', '16:9', '9:16', '4:3', '3:4', '3:2', '2:3']);
+// The tool's aspect-ratio alphabet lives in the dependency-free
+// `lib/imageGenCapabilities.js` leaf (Settings offers it as the default-ratio
+// picker, and this module is unreachable from the browser bundle). Re-exported
+// so `videoGen/grok.js` and the render paths keep importing it from here.
+export { GROK_ASPECT_RATIOS };
 
 // Map a width/height pair to the closest supported grok aspect ratio, or null
 // when dimensions are absent/invalid (the tool then uses its own default).
@@ -321,7 +323,7 @@ async function runGrok(job, jobId, bin, args, {
   // scratch-dir spawn telling the child one consistent story about where it is.
   const proc = spawn(spawnBin, spawnArgs, { cwd: scratchDir, env: withSpawnCwdEnv(process.env, scratchDir), shell: false, stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
   activeProcs.set(jobId, proc);
-  const removeScratch = () => rm(scratchDir, { recursive: true, force: true }).catch(() => {});
+  const removeScratch = () => rmGuarded(scratchDir, { recursive: true, force: true }).catch(() => {});
 
   if (useStdin) {
     // POSIX: grok reads the prompt via --prompt-file /dev/stdin. EPIPE fires
@@ -394,18 +396,14 @@ async function runGrok(job, jobId, bin, args, {
         return finalizeError(job, jobId, proc, `${fabricated} ${noImageReason(stdoutTail)}`);
       }
       if (harvested.format === 'png') {
-        // Move, not copy — the staging file is PortOS-owned and disposable,
-        // so rename is a metadata-only op when tmpdir and the gallery share
-        // a filesystem. copyFile+unlink is the cross-device (EXDEV) fallback.
-        await rename(stagingPath, outputPath).catch(async () => {
-          await copyFile(stagingPath, outputPath);
-          await unlink(stagingPath).catch(() => {});
-        });
+        await copyFileGuarded(stagingPath, outputPath);
+        await unlinkGuarded(stagingPath).catch(() => {});
       } else {
         // Grok wrote a real image but not a PNG (jpeg/webp/gif) despite the
         // prompt. The gallery serves by extension and sidecars assume PNG,
         // so transcode rather than shipping mislabeled bytes.
-        await sharp(stagingPath).png().toFile(outputPath);
+        const pngBytes = await sharp(stagingPath).png().toBuffer();
+        await atomicWrite(outputPath, pngBytes);
       }
       removeScratch();
       // Degenerate-frame gate (#4173) — a decline that still emitted a flat

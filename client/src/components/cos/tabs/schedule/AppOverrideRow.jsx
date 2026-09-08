@@ -7,11 +7,20 @@ import { isCronExpression, describeCron } from '../../../../utils/cronHelpers';
 import ToggleSwitch from '../../../ToggleSwitch';
 import useFieldDraft from '../../../../hooks/useFieldDraft';
 import { INTERVAL_LABELS, setMetadataOverride } from './scheduleConstants';
+import { providerModeSelectionPolicy } from '../../../../utils/providers.js';
 
-const AppOverrideRow = memo(function AppOverrideRow({ app, taskType, globalIntervalType, globalTaskMetadata, managedAgentOptions, fileIssuesCapable, defaultFileIssues, doWorkRequiresWorktree, inheritedProviderText, providers, override, onUpdate }) {
+const AppOverrideRow = memo(function AppOverrideRow({ app, taskType, globalIntervalType, globalTaskMetadata, managedAgentOptions, fileIssuesCapable, defaultFileIssues, doWorkRequiresWorktree, inheritedProviderText, providers, providersLoaded = true, override, onUpdate }) {
   const [updating, setUpdating] = useState(false);
   const [cronEditing, setCronEditing] = useState(false);
   const isEnabled = override?.enabled === true;
+  // The row's toggle is the app's ON/OFF switch for this scheduled task, not a
+  // "use my overrides" flag — every other control on the row is inert until it
+  // is on. Say so in the accessible name and the tooltip, since the switch
+  // itself carries no visible state text.
+  const enabledToggleLabel = `${taskType} enabled for ${app.name}: ${isEnabled ? 'on' : 'off'}`;
+  const enabledToggleTitle = isEnabled
+    ? `${taskType} runs for ${app.name} on the schedule set here. Turn off to stop scheduling it for this app.`
+    : `${taskType} does not run for ${app.name}. Turn on to schedule it for this app.`;
   const currentInterval = override?.interval || null;
   const hasCron = isCronExpression(currentInterval);
   // Same effective-value rule the AGENT_OPTIONS buttons use: this app's override
@@ -105,20 +114,25 @@ const AppOverrideRow = memo(function AppOverrideRow({ app, taskType, globalInter
     }
   );
 
+  const enabledToggle = (
+    <>
+      <span className="text-[10px] uppercase tracking-wide text-gray-500">Enabled</span>
+      <ToggleSwitch
+        enabled={isEnabled}
+        onChange={handleToggle}
+        disabled={updating}
+        size="sm"
+        ariaLabel={enabledToggleLabel}
+      />
+    </>
+  );
+
   return (
     <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2 sm:gap-3 py-2 px-3 rounded hover:bg-port-card/30">
       <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto sm:flex-1">
         <AppIcon icon={app.icon || 'package'} appId={app.id} hasAppIcon={!!app.appIconPath} size={16} className="text-gray-400 shrink-0" />
         <span className="text-sm text-white truncate flex-1">{app.name}</span>
-        <div className="sm:hidden">
-          <ToggleSwitch
-            enabled={isEnabled}
-            onChange={handleToggle}
-            disabled={updating}
-            size="sm"
-            ariaLabel={`${isEnabled ? 'Disable' : 'Enable'} ${taskType} for ${app.name}`}
-          />
-        </div>
+        <div className="sm:hidden flex items-center gap-1.5 shrink-0" title={enabledToggleTitle}>{enabledToggle}</div>
       </div>
 
       <div className="flex items-center gap-2 flex-wrap">
@@ -131,12 +145,8 @@ const AppOverrideRow = memo(function AppOverrideRow({ app, taskType, globalInter
             className="bg-port-card border border-port-border rounded px-2 py-1.5 text-xs text-white min-w-[120px] min-h-[40px]"
           >
             <option value="">Inherit ({INTERVAL_LABELS[globalIntervalType] || globalIntervalType})</option>
-            <option value="rotation">Rotation</option>
-            <option value="daily">Daily</option>
-            <option value="weekly">Weekly</option>
-            <option value="once">Once</option>
             <option value="on-demand">On Demand</option>
-            <option value="cron">Cron</option>
+            <option value="cron">Scheduled</option>
           </select>
           {cronEditing ? (
             <CronInput
@@ -206,6 +216,8 @@ const AppOverrideRow = memo(function AppOverrideRow({ app, taskType, globalInter
         <div className="w-full sm:w-auto sm:min-w-[240px] sm:max-w-[360px] sm:flex-1">
           <AppProviderPin
             providers={providers}
+            selectionPolicy={taskType === 'issue-watcher' ? providerModeSelectionPolicy('direct-api') : undefined}
+            loading={!providersLoaded}
             providerId={override?.providerId}
             model={override?.model}
             onChange={handlePinChange}
@@ -306,15 +318,7 @@ const AppOverrideRow = memo(function AppOverrideRow({ app, taskType, globalInter
           </select>
         )}
 
-        <div className="hidden sm:block">
-          <ToggleSwitch
-            enabled={isEnabled}
-            onChange={handleToggle}
-            disabled={updating}
-            size="sm"
-            ariaLabel={`${isEnabled ? 'Disable' : 'Enable'} ${taskType} for ${app.name}`}
-          />
-        </div>
+        <div className="hidden sm:flex items-center gap-1.5" title={enabledToggleTitle}>{enabledToggle}</div>
 
       </div>
     </div>

@@ -14,7 +14,7 @@ import { buildPrompt } from './promptService.js';
 import { getToolsSummaryForPrompt } from './tools.js';
 import { PATHS, tryReadFile } from '../lib/fileUtils.js';
 import { loadSlashdoFile, loadSlashdoLib, writeResolvedSlashdoBody } from '../lib/slashdoLoader.js';
-import { DEFAULT_REVIEWER, DEFAULT_REVIEW_STOP_MODE, LOCAL_LLM_REVIEWERS, isCliReviewer, resolveReviewerConfig } from '../lib/validation.js';
+import { DEFAULT_REVIEWER, DEFAULT_REVIEW_STOP_MODE, isToolFreeReviewer, isCliReviewer, resolveReviewerConfig } from '../lib/validation.js';
 import { PROVIDER_TYPES } from '../lib/aiToolkit/constants.js';
 import { doneSentinelName } from '../lib/agentSentinel.js';
 import { canTypeSlashCommands, SLASHDO_INLINE_BUDGET_CHARS } from '../lib/slashdoInvocation.js';
@@ -27,7 +27,9 @@ import { detectSkillTemplates, getAgentInstructionsContext, loadSkillTemplates }
 import { buildCompactionSection, buildTaskBlock, reconcileSplitContext } from './promptSections/taskContext.js';
 import { applySlashdoInvocation } from './promptSections/slashdo.js';
 import { manualForgeCli, resolveManualForgeCli } from './promptSections/forge.js';
+import { buildOrchestrationDoctrineSection } from './promptSections/orchestrationDoctrine.js';
 import { buildPlannerAttributionSection } from './promptSections/plannerAttribution.js';
+import { isPublicReviewNoToolProfile, isPublicReviewRestrictedProfile } from '../lib/agentExecutionProfiles.js';
 import {
   DISCARD_WORKTREE_NOTE,
   buildActionOutputCompletionSection,
@@ -38,12 +40,14 @@ import {
   NO_CHANGE_AUDIT_GUIDANCE,
   buildProgrammaticOutputCompletionSection,
   buildReadOnlyCompletionSection,
+  buildToolFreeReasoningCompletionSection,
   buildResumeSection,
   buildSentinelWriteSteps,
   buildTuiCompletionSection,
   claimReviewersCsv,
   inlinePrLifecycleSection,
   isPrBranchWorktree,
+  portosMergesBranchOnExit,
   worktreeCommitGuidance,
 } from './promptSections/completion.js';
 import { buildLocalReviewLoopSection, buildReviewLoopFollowUpSection, isMergeOnlyFollowUp, prepareLocalReviewLoopBody, prepareSandboxedReviewLoopBody } from './promptSections/reviewLifecycle.js';
@@ -56,6 +60,7 @@ export {
   loadSkillTemplate,
   loadSkillTemplates,
 } from './promptSections/instructions.js';
+export { buildOrchestrationDoctrineSection } from './promptSections/orchestrationDoctrine.js';
 export { buildPlannerAttributionSection } from './promptSections/plannerAttribution.js';
 export { buildCompactionSection, buildTaskBlock, reconcileSplitContext } from './promptSections/taskContext.js';
 export {
@@ -118,6 +123,8 @@ function resolveSentinelPath(worktreeInfo, workspaceDir, agentId) {
   return `${worktreeInfo?.worktreePath || workspaceDir}/${doneSentinelName(agentId)}`;
 }
 
+const PREVIOUS_STAGE_OUTPUT_INLINE_CAP = 12_000;
+
 function pipelineContextLines(pipelineCtx) {
   if (!pipelineCtx || (!pipelineCtx.previousStageAgentId && !pipelineCtx.previousStageOutput)) return [];
 
@@ -126,18 +133,28 @@ function pipelineContextLines(pipelineCtx) {
     `Previous stage: "${pipelineCtx.stages[pipelineCtx.currentStage - 1]?.name}"`,
     '',
   ];
-  if (pipelineCtx.previousStageAgentId) {
+  const rawPreviousOutput = typeof pipelineCtx.previousStageOutput === 'string'
+    ? pipelineCtx.previousStageOutput.trim()
+    : '';
+  const clipped = rawPreviousOutput.length > PREVIOUS_STAGE_OUTPUT_INLINE_CAP;
+  const previousOutput = rawPreviousOutput.slice(0, PREVIOUS_STAGE_OUTPUT_INLINE_CAP).replace(/~+/g, "'");
+  if (!pipelineCtx.previousStageAgentId) {
+    lines.push('The previous stage completed as a direct preflight; its summary is included below.');
+  } else if (previousOutput) {
+    // A producer that hands over the output chose the inline hand-off; the file
+    // pointer would only send the agent OUTSIDE its worktree — which, under a
+    // sandboxed permission posture, is a tool-permission dialog nobody is
+    // present to answer.
+    lines.push(clipped
+      ? `The previous stage's hand-off is inlined below, clipped to its first ${PREVIOUS_STAGE_OUTPUT_INLINE_CAP} characters.`
+      : "The previous stage's hand-off is inlined below in full; there is nothing further to read from disk.");
+  } else {
     lines.push(
       "Read the previous stage's output from:",
       `\`${join(AGENTS_DIR, pipelineCtx.previousStageAgentId, 'output.txt')}\``,
     );
-  } else {
-    lines.push('The previous stage completed as a direct preflight; its summary is included below.');
   }
 
-  const previousOutput = typeof pipelineCtx.previousStageOutput === 'string'
-    ? pipelineCtx.previousStageOutput.trim().slice(0, 12_000).replace(/~+/g, "'")
-    : '';
   if (previousOutput) {
     lines.push(
       '',
@@ -283,11 +300,9 @@ export async function buildAgentPrompt(task, config, workspaceDir, worktreeInfo 
   // `settings.codeReview.reviewers`). Threaded as the `normalizeReviewers`
   // fallback so a task that pins no `reviewers` (e.g. every app-improve /
   // self-improvement scheduled task) resolves to the configured default
-  // instead of the hardcoded `copilot` — which stalls the review loop on
-  // installs without GitHub Copilot review enabled (issue #2507). Unset →
-  // `['copilot']` (getCodeReviewDefaults returns the copilot fallback), so
-  // behavior is unchanged when nothing is configured. A settings read error
-  // degrades to the hardcoded default inside normalizeReviewers.
+  // instead of a hardcoded reviewer. Unset → [] (getCodeReviewDefaults keeps
+  // code review opt-in), so a fresh install does not silently start a review
+  // loop. A settings read error likewise leaves the reviewer list empty.
   //
   // Resolved BEFORE the slashdo section below, which prunes the reviewer
   // variants a run can't reach out of the command body (#3110).
@@ -319,7 +334,8 @@ export async function buildAgentPrompt(task, config, workspaceDir, worktreeInfo 
   // leave-open, JIRA, or a merge gate with no reviewer to invoke — doesn't pay
   // for the read and the staging write. The reviewer-list term matters too: the
   // section only inlines the recipe when a SPAWNABLE CLI reviewer resolves, so a
-  // copilot-only or username-only list (the default install) would otherwise
+  // copilot-only or username-only list (including an unconfigured install)
+  // would otherwise
   // read + `atomicWrite` 56KB and then render nothing from it.
   const isInlineNeedingRecipes = inlinePrLifecycleSection(task, {
     providerType, providerId, providerCommand, leanMode, worktreeInfo, isTruthyMetaFn,
@@ -375,6 +391,9 @@ export async function buildAgentPrompt(task, config, workspaceDir, worktreeInfo 
   const plannerAttributionSection = skipDevContext
     ? ''
     : buildPlannerAttributionSection({ providerId, model: providerModel });
+  // Architect doctrine for an orchestrated run (#5992). '' for every direct-mode
+  // task, which is the default, so this is inert unless a profile is configured.
+  const orchestrationSection = buildOrchestrationDoctrineSection(task);
   // Fetch independent context sections in parallel
   const [memorySection, agentInstructionsSection, digitalTwinSection] = await Promise.all([
     skipDevContext
@@ -398,6 +417,9 @@ export async function buildAgentPrompt(task, config, workspaceDir, worktreeInfo 
   const willOpenPR = isTruthyMetaFn(task.metadata?.openPR);
   const whenDone = task.metadata?.whenDone === 'commit-push' ? 'commit-push' : 'leave-uncommitted';
   const claimFlow = isClaimFlowTask(task, isTruthyMetaFn);
+  // Worktree with no PR: PortOS merges the branch back on exit, so every
+  // commit/push instruction below is commit-only (see portosMergesBranchOnExit).
+  const portosMergesBranch = portosMergesBranchOnExit({ worktreeInfo, willOpenPR });
   const prCompletion = resolvePrCompletion(task.metadata);
   // A discard (reasoning-only) worktree: the agent reasons in it but it's thrown
   // away on exit with no commit/merge/PR (see agentWorktreeCleanup.js). Suppresses
@@ -409,6 +431,13 @@ export async function buildAgentPrompt(task, config, workspaceDir, worktreeInfo 
   // `pending` BEFORE this flag existed (persisted across an upgrade) are still
   // recognized without a metadata migration.
   const noCodeOutput = isTruthyMetaFn(task.metadata?.noCodeOutput) || isCreativeDirectorTask;
+  // A tool-free public-review stage has no sentinel, API, or command to reach
+  // for: its reply IS the deliverable. Wins over every other completion contract.
+  const toolFreeReasoning = isPublicReviewNoToolProfile(task.metadata?.executionProfile);
+  // The sandboxed review stage has tools and a discarded worktree; its output
+  // is the JSON payload in the sentinel, not an API action — so it takes the
+  // programmatic-output contract ahead of the no-code one.
+  const sentinelPayloadOutput = isPublicReviewRestrictedProfile(task.metadata?.executionProfile) && !toolFreeReasoning;
   const noChangeSuccess = isTruthyMetaFn(task.metadata?.noChangeSuccess);
   const isWorktreeOnExistingBranch = isPrBranchWorktree(task, worktreeInfo);
   const worktreeCommitNote = worktreeInfo
@@ -463,11 +492,11 @@ ${buildResumeSection(task, worktreeInfo)}` : '';
   // Discard tasks don't commit, so the simplify-before-commit step is moot.
   const simplifySection = simplifyEnabled && !isTui && !discardWorktree && !claimFlow ? `
 ## Simplify Step
-After completing your work and before committing, ${simplifyInstruction}. Fix any issues found, then ${worktreeInfo && willOpenPR ? 'commit your changes (do NOT push — on a successful run the system will push and open the PR after you exit; if the run fails, no push or PR happens)' : 'commit and push using `/do:push`'}.
+After completing your work and before committing, ${simplifyInstruction}. Fix any issues found, then ${worktreeInfo && willOpenPR ? 'commit your changes (do NOT push — on a successful run the system will push and open the PR after you exit; if the run fails, no push or PR happens)' : portosMergesBranch ? 'commit your changes (do NOT push — PortOS merges this branch back into the source checkout after you exit; a pushed copy would only be left behind on origin)' : 'commit and push using `/do:push`'}.
 ` : '';
 
   // Resolve the user's ordered reviewer list + flags (task metadata wins; else the
-  // install's configured Code Review Defaults; else `[copilot]`). Declared up here
+  // install's configured Code Review Defaults; else `[]`). Declared up here
   // so the TUI completion block can thread `--review-with …` into `/do:pr`.
   // Thread the install's Code Review Defaults as the fallback for ALL five
   // reviewer fields (not just `reviewers`) with task-over-default precedence —
@@ -501,7 +530,9 @@ After completing your work and before committing, ${simplifyInstruction}. Fix an
   // sentinel is the done signal — PortOS finalizes via the watcher and kills
   // the session, so the prompt does NOT ask the agent to `/quit` (it's a UI
   // command the agent can't invoke). See `buildTuiCompletionSection` below.)
-  const tuiCompletionCommand = willOpenPR ? '/do:pr' : '/do:push';
+  // `null` under the auto-merge posture: there is no command to run — the step
+  // is a plain commit (buildCompletionGuidelineBullet renders that case).
+  const tuiCompletionCommand = willOpenPR ? '/do:pr' : portosMergesBranch ? null : '/do:push';
   const sentinelPath = resolveSentinelPath(worktreeInfo, workspaceDir, agentId);
   // A discard task's completion is the sentinel-only contract (no push/PR/merge),
   // and this applies to every provider type — so it wins over the isTui fork and
@@ -511,7 +542,11 @@ After completing your work and before committing, ${simplifyInstruction}. Fix an
   // worktree disposal (`discardWorktree`) pick the reasoning-payload contract.
   // A task doing external work during the run must not be told the sentinel is
   // its output channel.
-  const tuiCompletionSection = noCodeOutput
+  const tuiCompletionSection = toolFreeReasoning
+    ? buildToolFreeReasoningCompletionSection()
+    : sentinelPayloadOutput
+    ? buildProgrammaticOutputCompletionSection(sentinelPath)
+    : noCodeOutput
     ? buildActionOutputCompletionSection({ isTui, sentinelPath })
     : discardWorktree
       ? buildProgrammaticOutputCompletionSection(sentinelPath)
@@ -519,7 +554,7 @@ After completing your work and before committing, ${simplifyInstruction}. Fix an
         ? buildClaimFlowCompletionSection({ isTui, sentinelPath, reviewersCsv: claimReviewersCsv(task, codeReviewDefaults, defaultReviewers) })
       : isTui
         ? buildTuiCompletionSection({
-            willOpenPR, prCompletion, simplifyEnabled, noChangeSuccess,
+            willOpenPR, prCompletion, simplifyEnabled, noChangeSuccess, portosMergesBranch,
             // Unreachable today — every `tui`/`cli` provider returns early at the
             // LIGHT_CONTEXT gate above, so `isTui` is always false on this path
             // (same situation as buildCompletionGuidelineBullet's `isTui` arm).
@@ -682,7 +717,7 @@ ${task.metadata.jiraBranch ? 'Commit your changes to this branch. Do NOT switch 
   }).catch(() => null);
 
   if (promptData?.prompt) {
-    return `${promptData.prompt}${plannerAttributionSection ? `\n\n${plannerAttributionSection}` : ''}\n\n${UNATTENDED_RUN_RULE}${uiAuditRuntimeSection ? `\n\n${uiAuditRuntimeSection}` : ''}\n\n${PM2_SAFETY_RULE}`;
+    return `${promptData.prompt}${orchestrationSection ? `\n\n${orchestrationSection}` : ''}${plannerAttributionSection ? `\n\n${plannerAttributionSection}` : ''}\n\n${UNATTENDED_RUN_RULE}${uiAuditRuntimeSection ? `\n\n${uiAuditRuntimeSection}` : ''}\n\n${PM2_SAFETY_RULE}`;
   }
 
   const taskBlock = buildTaskBlock(task, { screenshotsAsList: false });
@@ -700,7 +735,7 @@ ${taskBlock.attachments}
 ${worktreeSection}
 ${pipelineSection}
 ${jiraSection}
-${plannerAttributionSection ? `${plannerAttributionSection}\n` : ''}${simplifySection}
+${orchestrationSection ? `${orchestrationSection}\n` : ''}${plannerAttributionSection ? `${plannerAttributionSection}\n` : ''}${simplifySection}
 ${tuiCompletionSection}
 ${reviewLoopSection}
 ${reviewLoopFollowUpSection}
@@ -718,6 +753,8 @@ ${skillSection ? `## Task-Type Skill Guidelines\n\n${skillSection}\n` : ''}${too
     ? 'Follow the claim workflow prompt above; it owns its worktree, PR/MR, review, merge or human-handoff, and cleanup. Do not stop after committing.'
   : isReviewLoopFollowUp
     ? 'Follow the follow-up section above — push any fixes you make to the PR branch; a run that needed no fix makes no commit and that is a success, not a miss'
+    : portosMergesBranch
+    ? `Commit your changes (see ${isTui ? 'Completion Workflow above' : 'Git Hygiene below'}) — do NOT push, PortOS merges this branch back on exit`
     : isTui
     ? `Commit, push, and ${willOpenPR ? 'open the PR (see Completion Workflow above)' : 'push the branch (see Completion Workflow above)'}`
     : worktreeInfo && willOpenPR
@@ -736,9 +773,9 @@ ${(() => {
   const bullet = buildCompletionGuidelineBullet({
     isReadOnly: isTruthyMetaFn(task.metadata?.readOnly), whenDone,
     isTui, tuiCompletionCommand, slashdoFree: isTui && !canRunSlashCommands,
-    worktreeInfo, willOpenPR, prCompletion, discardWorktree, noCodeOutput, noChangeSuccess,
+    worktreeInfo, willOpenPR, prCompletion, discardWorktree, noCodeOutput: noCodeOutput && !sentinelPayloadOutput, noChangeSuccess,
     leavePrOpen: leavesPrForHuman(task),
-    isPrFollowUp: isReviewLoopFollowUp, claimFlow,
+    isPrFollowUp: isReviewLoopFollowUp, claimFlow, toolFreeReasoning,
   });
   return bullet ? `- ${bullet}` : '';
 })()}
@@ -748,7 +785,9 @@ ${(() => {
 - **NEVER use \`git stash\`** in any form (\`git stash push\`, \`git stash pop\`, etc.). This is a multi-agent system — stashing can silently destroy or corrupt another agent's or the user's in-progress work. Work around uncommitted changes instead. (Note: the backend may use \`--autostash\` in user-triggered pull operations — that is safe because those are single-user UI actions, not concurrent agent operations.)
 - **Only commit files YOU changed** for this task. Never use \`git add -A\` or \`git add .\` — always stage specific files by name.
 ${noChangeSuccess ? `- **No-change audits may exit cleanly.** ${NO_CHANGE_AUDIT_GUIDANCE}` : ''}
-${noCodeOutput
+${toolFreeReasoning
+  ? `- **No git at all.** You have no tools; the Completion section above is the whole contract.`
+  : noCodeOutput && !sentinelPayloadOutput
   ? `- **Do NOT commit, push, or open a PR.** This task changes no code — its result is delivered by the API call or command described above. Without this, a no-worktree task of this shape was told to \`/do:push\` **directly to the branch it is standing on**, which for a task running in the app's live checkout is its default branch.`
   : discardWorktree
   ? `- **Do NOT commit, push, or open a PR.** This worktree is discarded on exit — your only output is the completion sentinel (see the Completion section above).`
@@ -756,8 +795,10 @@ ${noCodeOutput
     ? `- **Follow the claim workflow prompt above.** It owns the claim worktree and the full PR/MR lifecycle; do not stop after committing or hand push/PR/merge/cleanup back to PortOS.`
   : isReviewLoopFollowUp
     ? `- **Push fixes straight to the PR branch you are on** (the follow-up section above is the procedure). Stage specific files, use a \`fix:\` prefix, no Co-Authored-By annotations. Do NOT open a new PR.`
-  : isTui && tuiSlashdoFree
+  : isTui && !canRunSlashCommands
     ? `- **Commit only — do NOT push.** Stage specific files, use \`feat:\`/\`fix:\`/\`breaking:\` prefix in the commit message, no Co-Authored-By annotations, then write the completion sentinel. PortOS will handle the branch after it closes the session.`
+    : portosMergesBranch
+    ? `- **Commit only — do NOT push.** Stage specific files (no \`git add -A\`), use \`feat:\`/\`fix:\`/\`breaking:\` prefix in the commit message, no Co-Authored-By annotations. PortOS merges this branch back into the source checkout after you exit and deletes it, so do NOT run \`git push\` or \`/do:push\` yourself — a pushed copy would only be left behind on origin.`
     : isTui
     ? `- **Use \`${tuiCompletionCommand}\` to ${willOpenPR ? 'commit, push, and open the PR' : 'commit and push the branch'}** — see the Completion Workflow section above. Stage specific files (no \`git add -A\`), use \`feat:\`/\`fix:\`/\`breaking:\` prefix in the commit message, no Co-Authored-By annotations.`
     : worktreeInfo && willOpenPR
@@ -823,6 +864,9 @@ function buildLightContextSections(task, workspaceDir, worktreeInfo, isTruthyMet
   task = reconcileSplitContext(task);
   const willOpenPR = isTruthyMetaFn(task.metadata?.openPR);
   const claimFlow = isClaimFlowTask(task, isTruthyMetaFn);
+  // Worktree with no PR: PortOS merges the branch back on exit, so the commit
+  // guidance and completion workflow are commit-only (portosMergesBranchOnExit).
+  const portosMergesBranch = portosMergesBranchOnExit({ worktreeInfo, willOpenPR });
   const prCompletion = resolvePrCompletion(task.metadata);
   const simplifyEnabled = isTruthyMetaFn(task.metadata?.simplify);
   const isReadOnly = isTruthyMetaFn(task.metadata?.readOnly);
@@ -833,12 +877,14 @@ function buildLightContextSections(task, workspaceDir, worktreeInfo, isTruthyMet
   // derive from a CD task's `creativeDirector` marker so pre-upgrade `pending`
   // tasks (queued before this flag existed) are recognized without a migration.
   const noCodeOutput = isTruthyMetaFn(task.metadata?.noCodeOutput) || !!task.metadata?.creativeDirector;
+  const toolFreeReasoning = isPublicReviewNoToolProfile(task.metadata?.executionProfile);
+  const sentinelPayloadOutput = isPublicReviewRestrictedProfile(task.metadata?.executionProfile) && !toolFreeReasoning;
   const noChangeSuccess = isTruthyMetaFn(task.metadata?.noChangeSuccess);
   const isReviewLoopFollowUp = isTruthyMetaFn(task.metadata?.reviewLoopFollowUp);
   const isWorktreeOnExistingBranch = isPrBranchWorktree(task, worktreeInfo);
   // Ordered reviewer list + flags for the Review Loop (task metadata wins; else
   // the install's configured Code Review Defaults threaded from buildAgentPrompt;
-  // else `[copilot]`). Flows as `/do:pr --review-with a,b,c [--review-stop-on-*]
+  // else `[]`). Flows as `/do:pr --review-with a,b,c [--review-stop-on-*]
   // [--reviewer-applies]`. All five fields fall back to the defaults with
   // task-over-default precedence (see the matching block in buildAgentPrompt and
   // resolveReviewLoopOptions) — not just the reviewer list.
@@ -896,7 +942,7 @@ function buildLightContextSections(task, workspaceDir, worktreeInfo, isTruthyMet
   // Slashdo already partitions reviewers. Plain-git completion prompts need the
   // same split spelled out: local CLIs/local LLMs inspect the committed branch
   // before it is public; Copilot and @login reviewers can only run after a PR.
-  const isLocalReviewer = reviewer => isCliReviewer(reviewer) || LOCAL_LLM_REVIEWERS.includes(reviewer);
+  const isLocalReviewer = reviewer => isCliReviewer(reviewer) || isToolFreeReviewer(reviewer);
   const localReviewers = lightReviewers.filter(isLocalReviewer);
   const localReviewRequired = localReviewers.some(reviewer => !lightOptionalReviewers.includes(reviewer));
   const reviewerPositions = [
@@ -965,6 +1011,13 @@ function buildLightContextSections(task, workspaceDir, worktreeInfo, isTruthyMet
   const lightPlannerSection = buildPlannerAttributionSection({ providerId, model: providerModel, forgeCli: resolvedForgeCli });
   if (lightPlannerSection) contractSections.push(lightPlannerSection);
 
+  // --- Orchestrated execution ---------------------------------------------
+  // Sits directly after planner attribution and before the worktree/completion
+  // contract: it reframes the whole run (specs, not code), so it has to land
+  // before the sections that tell the agent how to finish one. '' when direct.
+  const lightOrchestrationSection = buildOrchestrationDoctrineSection(task);
+  if (lightOrchestrationSection) contractSections.push(lightOrchestrationSection);
+
   // --- Worktree ----------------------------------------------------------
   if (worktreeInfo) {
     contractSections.push([
@@ -1004,7 +1057,11 @@ function buildLightContextSections(task, workspaceDir, worktreeInfo, isTruthyMet
   // matters in production — every `tui`/`cli` provider returns from the light
   // path above and never reaches the other two, so a fix applied only there is
   // no fix at all for anything a subscription-quota job can run.
-  if (noCodeOutput) {
+  if (toolFreeReasoning) {
+    // No tools at all: the reply is the deliverable (see the full path's
+    // tuiCompletionSection ternary for the same precedence).
+    contractSections.push(buildToolFreeReasoningCompletionSection());
+  } else if (noCodeOutput && !sentinelPayloadOutput) {
     contractSections.push(buildActionOutputCompletionSection({
       isTui,
       sentinelPath: resolveSentinelPath(worktreeInfo, workspaceDir, agentId),
@@ -1040,7 +1097,7 @@ function buildLightContextSections(task, workspaceDir, worktreeInfo, isTruthyMet
     }
   } else if (isTui) {
     contractSections.push(buildTuiCompletionSection({
-      willOpenPR, prCompletion, simplifyEnabled, noChangeSuccess, slashdoFree: tuiSlashdoFree, ownsPrWorkflow,
+      willOpenPR, prCompletion, simplifyEnabled, noChangeSuccess, slashdoFree: tuiSlashdoFree, ownsPrWorkflow, portosMergesBranch,
       sentinelPath: resolveSentinelPath(worktreeInfo, workspaceDir, agentId),
       branchName: worktreeInfo?.branchName || null,
       baseBranch: worktreeInfo?.baseBranch || null,

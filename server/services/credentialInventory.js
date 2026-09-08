@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { CREDENTIALS } from '../lib/credentialRegistry.js';
 import { INSTANCE_FEATURES } from '../lib/instanceFeatureRegistry.js';
 import { PATHS, readJSONFile } from '../lib/fileUtils.js';
-import { parseEnvContents } from '../lib/vllmQwenProvision.js';
+import { parseEnvContents } from '../lib/portosEnv.js';
 import { getSettings } from './settings.js';
 
 export const CREDENTIAL_SOURCES = Object.freeze([
@@ -74,6 +74,28 @@ const detectHuggingFaceCli = async () => {
   return null;
 };
 
+const detectGitHubCli = async (entry, { env, envFile }) => {
+  const { getGitHubAuthStatus } = await import('./github.js');
+  const status = await getGitHubAuthStatus({ env });
+  const envResolution = classifyEnvSource(entry.envVars, env, envFile);
+  if (!status.authenticated) {
+    if (['unreachable', 'error'].includes(status.status)) {
+      return {
+        configured: envResolution.configured ? true : null,
+        source: envResolution.source,
+        verification: 'unavailable',
+      };
+    }
+    if (status.status === 'not-installed' && envResolution.configured) {
+      return { ...envResolution, verification: 'unavailable' };
+    }
+    return { configured: false, source: 'none' };
+  }
+  return status.credentialSource === 'env' && envResolution.configured
+    ? envResolution
+    : { configured: true, source: 'cli' };
+};
+
 const detectJira = async () => {
   const { hasConfiguredInstances } = await import('./jira.js');
   return (await hasConfiguredInstances()) ? { configured: true, source: 'config' } : null;
@@ -109,6 +131,7 @@ const detectOpenclaw = async () => {
 
 const DEFAULT_DETECTORS = Object.freeze({
   huggingface: detectHuggingFaceCli,
+  github: detectGitHubCli,
   jira: detectJira,
   datadog: detectDatadog,
   spotify: detectSpotify,
@@ -130,6 +153,7 @@ const publicRow = (entry, resolution, featuresById) => {
     : [];
   return {
     id: entry.id,
+    editable: entry.privateStore === true,
     label: entry.label,
     unlocks: entry.unlocks,
     tier: entry.tier,
@@ -138,6 +162,7 @@ const publicRow = (entry, resolution, featuresById) => {
     feature: entry.feature ?? null,
     configured: resolution.configured,
     source: resolution.source,
+    ...(resolution.verification ? { verification: resolution.verification } : {}),
     unavailableFeatures,
   };
 };
@@ -172,7 +197,8 @@ export async function getCredentialInventory({
       env,
       envFile: resolvedEnvFile,
     });
-    if (!resolution.configured && typeof resolvedDetectors[entry.id] === 'function') {
+    const detectorMustVerify = entry.id === 'github';
+    if ((detectorMustVerify || !resolution.configured) && typeof resolvedDetectors[entry.id] === 'function') {
       const detected = await resolvedDetectors[entry.id](entry, {
         settings: resolvedSettings,
         env,
@@ -181,7 +207,15 @@ export async function getCredentialInventory({
         console.error(`❌ Credential "${entry.id}" detection failed: ${error.message}`);
         return null;
       });
-      if (detected?.configured) resolution = detected;
+      if (detectorMustVerify) {
+        resolution = detected || {
+          configured: resolution.configured ? true : null,
+          source: resolution.source,
+          verification: 'unavailable',
+        };
+      } else if (detected?.configured) {
+        resolution = detected;
+      }
     }
     credentials.push(assertNoSecretPayload(publicRow(entry, resolution, featuresById)));
   }

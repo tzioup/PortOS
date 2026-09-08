@@ -10,6 +10,7 @@ import * as goalProgress from '../services/goalProgress.js';
 import * as decisionLog from '../services/decisionLog.js';
 import { asyncHandler, ServerError } from '../lib/errorHandler.js';
 import { parsePagination } from '../lib/validation.js';
+import { detectIdleLeftoverBranches } from '../services/userActionDetectors.js';
 
 const router = Router();
 
@@ -48,13 +49,14 @@ router.get('/productivity/calendar', asyncHandler(async (req, res) => {
 // GET /api/cos/actionable-insights - Get prioritized action items requiring user attention
 // Surfaces the most important things to address right now across all CoS subsystems
 router.get('/actionable-insights', asyncHandler(async (req, res) => {
-  const [tasksData, learningSummary, healthCheck, notificationsModule, optimalTimeInfo, pendingFeedbackCount] = await Promise.all([
+  const [tasksData, learningSummary, healthCheck, notificationsModule, optimalTimeInfo, pendingFeedbackCount, leftoverFindings] = await Promise.all([
     cos.getAllTasks().catch(err => { console.error(`❌ Failed to load tasks: ${err.message}`); return { user: null, cos: null }; }),
     taskLearning.getLearningInsights().catch(err => { console.error(`❌ Failed to load learning insights: ${err.message}`); return null; }),
     cos.runHealthCheck().catch(err => { console.error(`❌ Failed to run health check: ${err.message}`); return { issues: [] }; }),
     import('../services/notifications.js').catch(err => { console.error(`❌ Failed to load notifications: ${err.message}`); return null; }),
     productivity.getOptimalTimeInfo().catch(() => ({ hasData: false })),
-    cos.getPendingAgentFeedbackCount().catch(err => { console.error(`❌ Failed to load pending agent feedback: ${err.message}`); return 0; })
+    cos.getPendingAgentFeedbackCount().catch(err => { console.error(`❌ Failed to load pending agent feedback: ${err.message}`); return 0; }),
+    detectIdleLeftoverBranches().catch(err => { console.error(`❌ Failed to detect leftover branches: ${err.message}`); return []; })
   ]);
 
   const notificationsData = notificationsModule ? await notificationsModule.getNotifications({ unreadOnly: true, limit: 10 }).catch(() => []) : [];
@@ -129,6 +131,42 @@ router.get('/actionable-insights', asyncHandler(async (req, res) => {
       description: 'Your ratings help CoS learn which work and providers are useful.',
       action: { label: 'Review runs', route: '/cos/agents?feedback=needs-feedback' },
       count: pendingFeedbackCount
+    });
+  }
+
+  // 4b. Leftover idle branches (#5596). The detector never enacts; the card is
+  // where the operator does. It therefore has to name WHICH apps are holding the
+  // branches — a bare total plus a link to the schedule page left them to guess
+  // which app to run branch-reconcile for, so `apps` carries the per-app
+  // breakdown the banner expands into per-app Run Now buttons.
+  if (Array.isArray(leftoverFindings) && leftoverFindings.length > 0) {
+    const apps = leftoverFindings.map(({ appId, appName, leftoverCount, states, branches, lastUserReconcileAt }) => ({
+      appId,
+      appName: appName || appId,
+      leftoverCount,
+      states: states || {},
+      branches: branches || [],
+      lastUserReconcileAt: lastUserReconcileAt || null
+    }));
+    const leftoverCount = apps.reduce((sum, app) => sum + app.leftoverCount, 0);
+    const first = apps[0];
+    const single = apps.length === 1;
+    const branchLabel = (n) => `${n} leftover branch${n === 1 ? '' : 'es'}`;
+    insights.push({
+      type: 'leftover-branches',
+      priority: 'medium',
+      icon: 'AlertTriangle',
+      title: single
+        ? `${branchLabel(first.leftoverCount)} on ${first.appName}, agents idle. Run branch-reconcile?`
+        : `${branchLabel(leftoverCount)} across ${apps.length} apps, agents idle. Run branch-reconcile?`,
+      description: single
+        ? `${first.lastUserReconcileAt
+            ? `Last manual reconcile on ${String(first.lastUserReconcileAt).slice(0, 10)}`
+            : 'No manual reconcile in the last 14 days'}. Run Now queues branch-reconcile for ${first.appName}.`
+        : apps.map(app => `${app.appName} (${app.leftoverCount})`).join(' · '),
+      action: { label: 'Run Now', route: '/cos/schedule?task=branch-reconcile' },
+      apps,
+      count: leftoverCount
     });
   }
 

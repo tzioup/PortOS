@@ -64,7 +64,7 @@ export default function MtplxServerCard({
           <button
             onClick={onRefresh}
             disabled={loading}
-            className="p-1 text-gray-400 hover:text-white transition-colors"
+            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center p-1 text-gray-400 hover:text-white transition-colors"
             title="Refresh MTPLX status"
             aria-label="Refresh MTPLX status"
           >
@@ -230,7 +230,7 @@ export default function MtplxServerCard({
             {showLogs ? 'Hide server logs' : `View server logs (${status.recentLogs.length} lines)`}
           </button>
           {showLogs && (
-            <pre className="text-[10px] text-gray-400 bg-port-bg border border-port-border/60 p-2.5 rounded max-h-40 overflow-y-auto font-mono whitespace-pre-wrap">
+            <pre className="text-[10px] text-gray-400 bg-port-bg border border-port-border/60 p-2.5 rounded max-h-40 overflow-y-auto font-mono whitespace-pre-wrap break-all">
               {status.recentLogs.join('\n')}
             </pre>
           )}

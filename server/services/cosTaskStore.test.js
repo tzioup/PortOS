@@ -308,6 +308,45 @@ describe('cosTaskStore.getAllTasks / getTasks / getTaskById', () => {
     expect(found.taskType).toBe('internal');
   });
 
+  it('looks up one task without cloning either backlog, and isolates returned metadata', async () => {
+    const { generateTasksMarkdown } = await import('../lib/taskParser.js');
+    const tasks = Array.from({ length: 1000 }, (_, index) => ({
+      id: `task-${index}`, description: `Example task ${index}`, status: 'pending',
+      priority: 'MEDIUM', metadata: { prompt: 'Example prompt', reviewers: ['codex'] }
+    }));
+    mock.files.set(USER_FILE, generateTasksMarkdown(tasks));
+    const clone = vi.spyOn(globalThis, 'structuredClone');
+    const found = await getTaskById('task-999');
+    expect(clone.mock.calls.map(([value]) => value.id)).toEqual(['task-999']);
+    clone.mockRestore();
+    found.metadata.reviewers.push('changed');
+    expect((await getTaskById('task-999')).metadata.reviewers).toEqual(['codex']);
+    expect(mock.parseCalls).toBe(1);
+  });
+
+  it('preserves user-first and first-duplicate precedence with custom paths and IDs', async () => {
+    mock.state.config = { userTasksFile: 'custom/user.md', cosTasksFile: 'custom/system.md' };
+    const { generateTasksMarkdown } = await import('../lib/taskParser.js');
+    const task = { id: 'sys-legacy', description: 'first', status: 'pending', priority: 'HIGH', metadata: {} };
+    mock.files.set(join('/root', 'custom/user.md'), generateTasksMarkdown([task, { ...task, description: 'duplicate' }]));
+    mock.files.set(join('/root', 'custom/system.md'), generateTasksMarkdown([{ ...task, description: 'internal' }]));
+    expect(await getTaskById(task.id)).toMatchObject({ description: 'first', taskType: 'user' });
+    mock.files.delete(join('/root', 'custom/user.md'));
+    expect(await getTaskById(task.id)).toMatchObject({ description: 'internal', taskType: 'internal' });
+  });
+
+  it('invalidates the ID index after store mutations, external edits, and deletion', async () => {
+    await addTask({ id: 'task-index', description: 'before' }, 'user');
+    expect((await getTaskById('task-index')).description).toBe('before');
+    await updateTask('task-index', { description: 'after' }, 'user');
+    expect((await getTaskById('task-index')).description).toBe('after');
+    mock.files.set(USER_FILE, mock.files.get(USER_FILE).replace('after', 'external'));
+    mock.mtimes.set(USER_FILE, mock.mtimes.get(USER_FILE) + 5000);
+    expect((await getTaskById('task-index')).description).toBe('external');
+    await deleteTask('task-index', 'user');
+    expect(await getTaskById('task-index')).toBeNull();
+  });
+
   it('getTaskById returns null when no source has the id', async () => {
     expect(await getTaskById('nope')).toBeNull();
   });
@@ -417,6 +456,30 @@ describe('cosTaskStore.addTask', () => {
       const reloaded = await getTaskById('sys-scheduled-prompt');
       expect(reloaded.description).toBe('Scheduled review');
       expect(reloaded.metadata.prompt).toBe(fullPrompt);
+    });
+
+    it('keeps a multiline raw description as the prompt when a multiline context note rides along', async () => {
+      // The pr-reviewer generator hands over the stage instructions as the
+      // description and the security-scan summary as a multi-line context note.
+      // Reclassifying the note first made it the "explicit" prompt and dropped
+      // the instructions, so Stage 2 ran with no gate rules and no output contract.
+      const stagePrompt = '[Improvement: Example] PR Eligibility Gate (Stage 2)\n\n## Gate\n\nReturn JSON only.';
+      const scanNote = 'Security scan status: passed.\nReviewed 1 external pull request.';
+      const created = await addTask({
+        id: 'sys-stage-with-note',
+        status: 'pending',
+        priority: 'MEDIUM',
+        priorityValue: 2,
+        description: stagePrompt,
+        metadata: { context: scanNote },
+        section: 'pending',
+      }, 'internal', { raw: true });
+      expect(created.description).toBe('[Improvement: Example] PR Eligibility Gate (Stage 2)');
+      expect(created.metadata.prompt).toBe(stagePrompt);
+      expect(created.metadata.context).toBe(scanNote);
+      const reloaded = await getTaskById('sys-stage-with-note');
+      expect(reloaded.metadata.prompt).toBe(stagePrompt);
+      expect(reloaded.metadata.context).toBe(scanNote);
     });
 
     it('preserves an explicitly empty prompt while normalizing a multiline raw description', async () => {
@@ -669,17 +732,44 @@ describe('cosTaskStore.addTask', () => {
     expect(created.metadata.investigationFingerprint).toBeUndefined();
   });
 
-  it('persists quota-burn provenance and omits it for every other task', async () => {
+  it('persists the whole quota-burn provenance block and omits it for every other task', async () => {
     // `metadata` is an allowlist, so an unlisted key is silently dropped — and a
     // dropped `quotaBurnFamily` makes the queued burn indistinguishable from any
     // other system task at the cooldown gate and the completion continuation.
+    // Every field of the block reaches disk together (#6406): mapping them one
+    // at a time is how `quotaBurnRequestId` came to reach disk on the raw path
+    // only, so the two burn lanes carried different provenance.
     const burn = await addTask(
-      { description: '[Quota burn: agy] Perf', app: 'portos', quotaBurnFamily: 'agy' },
+      {
+        description: '[Quota burn: agy] Perf',
+        app: 'portos',
+        quotaBurnFamily: 'agy',
+        quotaBurnLimitingResetAt: 1700000000000,
+        quotaBurnStepId: 'step-1',
+        quotaBurnRequestId: 'demand-7',
+      },
       'internal',
     );
-    expect(burn.metadata.quotaBurnFamily).toBe('agy');
+    expect(burn.metadata).toMatchObject({
+      quotaBurnFamily: 'agy',
+      quotaBurnLimitingResetAt: 1700000000000,
+      quotaBurnStepId: 'step-1',
+      quotaBurnRequestId: 'demand-7',
+    });
     const ordinary = await addTask({ description: 'not a burn' }, 'user');
     expect(ordinary.metadata.quotaBurnFamily).toBeUndefined();
+  });
+
+  it('leaves the request id ABSENT on the synchronous custom-job burn lane', async () => {
+    // That lane queues the task itself, so there is no on-demand request to name
+    // and a synthesized (or null) id would make a join over it silently wrong.
+    const burn = await addTask(
+      { description: '[Quota burn: agy] Custom job', app: 'portos', quotaBurnFamily: 'agy', quotaBurnStepId: 'step-2' },
+      'internal',
+    );
+    expect(burn.metadata).not.toHaveProperty('quotaBurnRequestId');
+    const { tasks } = await getCosTasks();
+    expect(tasks.find(t => t.id === burn.id).metadata).not.toHaveProperty('quotaBurnRequestId');
   });
 
   it('omits diagnostics metadata when none is supplied and ignores a non-object / array value', async () => {
@@ -1153,6 +1243,24 @@ describe('cosTaskStore.updateTask', () => {
     expect(blocked.metadata.resumeWorktreePath).toBe('/w/agent-x');
   });
 
+  // Same for a permanent provider-config block (#6193): the resolved provider is
+  // `api`-type and has no file-writing harness, so the task waits for the user to
+  // add a CLI provider. Dropping the pointer means the revived task starts on a
+  // fresh branch and orphans the worktree its dead agent left behind.
+  it('keeps the resume pointer through a provider-config block', async () => {
+    await addTask({ description: 'unrunnable provider', id: 'task-provider-config' }, 'user');
+    await updateTask('task-provider-config', {
+      metadata: { existingBranch: 'cos/b', resumedFromAgentId: 'agent-x', resumeWorktreePath: '/w/agent-x' }
+    }, 'user');
+    const blocked = await updateTask('task-provider-config', {
+      status: 'blocked',
+      metadata: { blockedCategory: 'provider-config' }
+    }, 'user');
+    expect(blocked.metadata.existingBranch).toBe('cos/b');
+    expect(blocked.metadata.resumedFromAgentId).toBe('agent-x');
+    expect(blocked.metadata.resumeWorktreePath).toBe('/w/agent-x');
+  });
+
   // An `existingBranch` with no `resumedFromAgentId` beside it was never written
   // by the resume mechanism — it is the task's OWN configuration. A merge
   // follow-up is the producer: it exists to land the PR on that branch. Stripping
@@ -1402,9 +1510,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const STORE_SRC = realReadFileSync(join(__dirname, 'cosTaskStore.js'), 'utf-8');
 
 describe('parsed-task cache — no bypass (source guards, #3497)', () => {
-  // Everything outside the two cache accessors. Any fs call the rest of the
+  // Everything outside the cache accessors. Any fs call the rest of the
   // module makes to the task files is a bypass by definition.
-  const ACCESSOR_START = 'async function readTaskFile';
+  const ACCESSOR_START = 'async function readTaskSnapshot';
   const ACCESSOR_END = '/** Test hook: forget every cached parse. */';
   const outsideAccessors = (() => {
     const start = STORE_SRC.indexOf(ACCESSOR_START);
@@ -1420,7 +1528,7 @@ describe('parsed-task cache — no bypass (source guards, #3497)', () => {
     expect(outsideAccessors, `anchors "${ACCESSOR_START}" / "${ACCESSOR_END}" not found in order`).not.toBeNull();
   });
 
-  it('every task-file read goes through readTaskFile', () => {
+  it('every task-file read goes through the snapshot cache', () => {
     // A read path calling readFile + parseTasksMarkdown directly still works,
     // but pays the full parse the cache exists to avoid and skips the
     // copy-on-read that keeps a caller's in-place mutations out of the cache.
@@ -1602,7 +1710,10 @@ describe('cosTaskStore — stale failure-artifact reaper (#2619)', () => {
       // The workspace blocks are an open decision too: the task waits for the
       // user to fix the app's Repository Path, so auto-completing it at 14 days
       // would silently retire work nobody decided to drop.
-      for (const cat of ['user-terminated', 'agent-paused', 'challenge-escalation', 'app-unresolved', 'workspace-invalid']) {
+      // `provider-config` is the same shape: an `api`-only provider can't run an
+      // agent, and only the user can fix that — so a 14-day flip to `completed`
+      // would report undropped work as done and federate that lie to every peer.
+      for (const cat of ['user-terminated', 'agent-paused', 'challenge-escalation', 'app-unresolved', 'workspace-invalid', 'provider-config']) {
         expect(blockedFailureAgeMs(blocked(cat, daysAgo(30)), NOW)).toBeNull();
         expect(isReapableBlockedFailure(blocked(cat, daysAgo(30)), { now: NOW })).toBe(false);
       }
@@ -1615,8 +1726,8 @@ describe('cosTaskStore — stale failure-artifact reaper (#2619)', () => {
     });
 
     it('falls back to lastFailureAt then updatedAt when blockedAt is absent', () => {
-      expect(blockedFailureAgeMs({ status: 'blocked', metadata: { blockedCategory: 'provider-config', lastFailureAt: daysAgo(20) } }, NOW)).toBe(20 * 24 * 60 * 60 * 1000);
-      expect(blockedFailureAgeMs({ status: 'blocked', metadata: { blockedCategory: 'provider-config', updatedAt: daysAgo(20) } }, NOW)).toBe(20 * 24 * 60 * 60 * 1000);
+      expect(blockedFailureAgeMs({ status: 'blocked', metadata: { blockedCategory: 'max-spawns', lastFailureAt: daysAgo(20) } }, NOW)).toBe(20 * 24 * 60 * 60 * 1000);
+      expect(blockedFailureAgeMs({ status: 'blocked', metadata: { blockedCategory: 'max-spawns', updatedAt: daysAgo(20) } }, NOW)).toBe(20 * 24 * 60 * 60 * 1000);
     });
 
     it('never reaps an undated block (cannot prove it is old)', () => {
@@ -1687,6 +1798,23 @@ describe('cosTaskStore — stale failure-artifact reaper (#2619)', () => {
       const after = await getUserTasks();
       expect(after.tasks.find(t => t.id === 'task-fresh').status).toBe('blocked');
       expect(after.tasks.find(t => t.id === 'task-stop').status).toBe('blocked');
+    });
+
+    // A provider-config block never self-revives — it waits for the user to add a
+    // CLI provider — so the reaper must leave it alone no matter how old it gets.
+    // Flipping it to `completed` with `resolution: 'auto-expired'` would report
+    // work nobody dropped as done, and federate that to every peer (#6193).
+    it('never auto-expires a provider-config block, however stale', async () => {
+      await addTask({ description: 'api-only provider pinned', id: 'task-pc-old', priority: 'HIGH' }, 'user', { now: NOW });
+      await updateTask('task-pc-old', { status: 'blocked', metadata: { blockedCategory: 'provider-config', blockedAt: daysAgo(90) } }, 'user', { now: NOW });
+      const res = await sweepResolvedFailureTasks({ now: NOW });
+      expect(res.reaped).toBe(0);
+      expect(res.staleBlocks).toBe(0);
+      const task = (await getUserTasks()).tasks.find(t => t.id === 'task-pc-old');
+      expect(task.status).toBe('blocked');
+      expect(task.metadata.blockedCategory).toBe('provider-config');
+      expect(task.metadata.resolution).toBeUndefined();
+      expect(task.metadata.autoExpiredReason).toBeUndefined();
     });
 
     it('flips an investigation whose originating task has completed', async () => {
@@ -1854,13 +1982,35 @@ describe('cosTaskStore.resolveTaskChallengeWithRecheck (#2471)', () => {
     expect(mock.reviewCalls[0].model).toBe('coder-7b');
   });
 
-  it('returns RECHECK_NO_MODEL (config problem, not 502) when no model is configured', async () => {
+  // The model read is keyed off `<backend>Model`, not an ollama-or-lmstudio
+  // ternary — that ternary handed a third local backend LM STUDIO's model id.
+  it("reads the re-check model from the challenged backend's own scalar", async () => {
+    const id = await seedChallenged('mtplx');
+    mock.reviewDefaults = { lmstudioModel: 'wrong-model', mtplxModel: 'mtplx-model' };
+    mock.review = { ok: true, model: 'mtplx-model', findings: 'No findings.' };
+    await resolveTaskChallengeWithRecheck(id, { recheck: { backend: 'mtplx', diff: 'diff' } });
+    expect(mock.reviewCalls[0].model).toBe('mtplx-model');
+  });
+
+  it('leaves an unconfigured model to the reviewer, which resolves it from the backend', async () => {
     const id = await seedChallenged();
     mock.reviewDefaults = { lmstudioModel: null, ollamaModel: null };
+    mock.review = { ok: true, model: 'served-by-the-daemon', findings: 'No findings.' };
+    const resolved = await resolveTaskChallengeWithRecheck(id, { recheck: { backend: 'ollama', diff: 'diff' } });
+    expect(mock.reviewCalls[0].model).toBeNull();
+    expect(resolved.status).toBe('pending');
+    // The record names the model that actually produced the verdict, not `null`.
+    expect(resolved.metadata.challengeResolution.note).toContain('served-by-the-daemon');
+  });
+
+  it('returns RECHECK_NO_MODEL (config problem, not 502) when nothing can name a model', async () => {
+    const id = await seedChallenged();
+    mock.reviewDefaults = { lmstudioModel: null, ollamaModel: null };
+    mock.review = { ok: false, code: 'NO_MODEL', error: 'No model configured for ollama reviewer and ollama is serving no models — set one on the Settings → Code Reviewers page.' };
     const result = await resolveTaskChallengeWithRecheck(id, { recheck: { backend: 'ollama', diff: 'diff' } });
     expect(result.code).toBe('RECHECK_NO_MODEL');
-    // No reviewer call attempted without a model.
-    expect(mock.reviewCalls.length).toBe(0);
+    // Surfaced verbatim: the reviewer's message says WHICH gap it is.
+    expect(result.error).toMatch(/No model configured/);
   });
 
   it('returns RECHECK_FAILED when the reviewer is unreachable', async () => {

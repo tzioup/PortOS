@@ -20,6 +20,11 @@ const api = vi.hoisted(() => ({
   getSampleProviders: vi.fn(),
   createProvider: vi.fn(),
   updateProvider: vi.fn(),
+  refreshProviderModels: vi.fn(),
+  setActiveProvider: vi.fn().mockResolvedValue({}),
+  getOrchestrationProfiles: vi.fn().mockResolvedValue({ profiles: [] }),
+  createRun: vi.fn().mockResolvedValue({ runId: 'run-1' }),
+  stopRun: vi.fn().mockResolvedValue({}),
 }));
 
 const localModels = vi.hoisted(() => ({ value: { ctxById: {}, installed: { ollama: null, lmstudio: null } } }));
@@ -32,6 +37,12 @@ const toast = vi.hoisted(() => ({
 }));
 
 vi.mock('../services/api', () => api);
+vi.mock('../services/apiProviders', () => ({
+  getFleetLlmHost: vi.fn(() => new Promise(() => {})),
+  getFleetPeerHosts: vi.fn(() => new Promise(() => {})),
+  revealFleetLlmHostKey: vi.fn(),
+  revealFleetPeerHostKey: vi.fn(),
+}));
 vi.mock('../components/ui/Toast', () => ({
   default: toast,
 }));
@@ -44,8 +55,8 @@ vi.mock('../services/socket', () => ({
 vi.mock('../hooks/useLocalModels', () => ({
   default: () => localModels.value,
 }));
-vi.mock('../components/settings/SettingsTabsHeader', () => ({
-  default: () => <div data-testid="settings-tabs-header" />,
+vi.mock('../components/models/ModelsTabsHeader', () => ({
+  default: ({ activeTab }) => <div data-testid="models-tabs-header" data-active-tab={activeTab} />,
 }));
 vi.mock('../components/install/RuntimeInstallModal', () => ({
   // `params` becomes the setup request's query string, so the test can assert
@@ -111,6 +122,42 @@ describe('AIProviders page load error handling', () => {
     api.getProviderReadiness.mockResolvedValue({ readiness: {} });
     api.getCodexAccount.mockImplementation(() => new Promise(() => {}));
     localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('renders one CLI/TUI card with one install check, explicit default modes and a TUI shell link', async () => {
+    const executionModes = [{ id: 'example', type: 'cli' }, { id: 'example-tui', type: 'tui' }];
+    api.getProviders.mockResolvedValue({ activeProvider: 'example', providers: [
+      { id: 'example', name: 'Example CLI', type: 'cli', command: 'opencode', enabled: true, models: ['model-a'], executionModes },
+      { id: 'example-tui', name: 'Example TUI', type: 'tui', command: 'opencode', enabled: true, models: ['model-a'], tuiCommandLine: 'opencode', executionModes },
+      { id: 'example-api', name: 'Example API', type: 'api', endpoint: 'http://192.0.2.10:11434', enabled: true, models: ['remote-model'] },
+    ] });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: { opencode: missingRuntime } });
+    renderPage();
+    expect(await screen.findByRole('heading', { name: 'Example', exact: true })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Example API' })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Install OpenCode CLI/ })).toHaveLength(1);
+    expect(screen.getByRole('link', { name: 'Launch in Shell' })).toHaveAttribute('href', '/shell?provider=example-tui');
+    expect(screen.getByRole('button', { name: 'CLI default' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Set TUI default' }));
+    await waitFor(() => expect(api.setActiveProvider).toHaveBeenCalledWith('example-tui'));
+    expect(await screen.findByRole('button', { name: 'TUI default' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Set CLI default' }));
+    await waitFor(() => expect(api.setActiveProvider).toHaveBeenLastCalledWith('example'));
+  });
+
+  it('gates the CLI default on transport consent but leaves the TUI default selectable', async () => {
+    const executionModes = [{ id: 'codex', type: 'cli' }, { id: 'codex-tui', type: 'tui' }];
+    api.getCodexAccount.mockResolvedValue({ readiness: { status: 'ready' } });
+    api.getCodexModels.mockResolvedValue({ models: null });
+    api.getProviders.mockResolvedValue({ activeProvider: null, providers: [
+      { id: 'codex', name: 'Codex CLI', type: 'cli', command: 'codex', enabled: true, textTransportEnabled: true, executionModes },
+      { id: 'codex-tui', name: 'Codex TUI', type: 'tui', command: 'codex', enabled: true, textTransportEnabled: false, executionModes },
+    ] });
+    renderPage();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Set CLI default' })).toBeEnabled());
+    expect(screen.getByRole('button', { name: 'Set TUI default' })).toBeEnabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Set TUI default' }));
+    await waitFor(() => expect(api.setActiveProvider).toHaveBeenCalledWith('codex-tui'));
   });
 
   it('offers an install button on the card of a provider whose CLI is missing', async () => {
@@ -273,7 +320,15 @@ describe('AIProviders page load error handling', () => {
     expect(screen.getByRole('menuitem', { name: /Compare local models/ })).toHaveAttribute('href', '/models/performance');
   });
 
-  // The page hosts SettingsTabsHeader; before #5653 it also hand-rolled a
+  it('uses the Models child navigation after Providers moves out of Settings', async () => {
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+
+    renderPage();
+
+    expect(await screen.findByTestId('models-tabs-header')).toHaveAttribute('data-active-tab', 'providers');
+  });
+
+  // The page hosts ModelsTabsHeader; before #5653 it also hand-rolled a
   // `Settings` title bar above it, so every render stacked two h1s and pushed
   // the first provider card off a phone viewport.
   it('renders exactly one h1, naming the page rather than the settings section', async () => {
@@ -572,8 +627,8 @@ describe('fleet LLM setup walkthrough', () => {
   it('creates an OpenCode provider whose actual baseURL points at the selected peer', async () => {
     renderPage('/ai/fleet');
 
-    expect(await screen.findByRole('heading', { name: 'Fleet LLM setup' })).toBeInTheDocument();
-    expect(screen.getByText(/Recommended for one RTX 3090/)).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Model host setup' })).toBeInTheDocument();
+
 
     fireEvent.click(screen.getByRole('tab', { name: 'Connect client' }));
     fireEvent.change(await screen.findByLabelText('Known PortOS peer'), { target: { value: 'peer-example' } });
@@ -585,7 +640,7 @@ describe('fleet LLM setup walkthrough', () => {
     expect(created).toMatchObject({
       type: 'tui',
       command: 'opencode',
-      endpoint: 'http://gpu-host.example.ts.net:18020/v1',
+      endpoint: 'http://gpu-host.example.ts.net:18022/v1',
       apiKey: 'example-secret',
       defaultModel: 'qwen3.8-27b',
       vllmBacked: true,
@@ -593,8 +648,8 @@ describe('fleet LLM setup walkthrough', () => {
       enabled: true,
     });
     expect(JSON.parse(created.envVars.OPENCODE_CONFIG_CONTENT).provider.vllm.options.baseURL)
-      .toBe('http://gpu-host.example.ts.net:18020/v1');
-    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Fleet LLM setup' })).not.toBeInTheDocument());
+      .toBe('http://gpu-host.example.ts.net:18022/v1');
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Model host setup' })).not.toBeInTheDocument());
     expect(toast.success).toHaveBeenCalledWith('Fleet GPU · OpenCode TUI is connected to the fleet GPU host');
   });
 
@@ -611,7 +666,7 @@ describe('fleet LLM setup walkthrough', () => {
     expect(created).toMatchObject({
       name: 'Fleet GPU · API',
       type: 'api',
-      endpoint: 'http://gpu-host.example.ts.net:18020/v1',
+      endpoint: 'http://gpu-host.example.ts.net:18022/v1',
       vllmBacked: true,
     });
     expect(created).not.toHaveProperty('command');
@@ -1738,5 +1793,175 @@ describe('vLLM-backed TUI provider', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
     await screen.findByDisplayValue('opencode');
     expect(screen.queryByLabelText('API Key')).toBeNull();
+  });
+});
+
+describe('AIProviders orchestration profiles', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getOrchestrationProfiles.mockResolvedValue({
+      profiles: [
+        {
+          id: 'deep-research',
+          name: 'Deep Research',
+          description: 'o3-mini planner + sonnet coder',
+          profile: {
+            architect: { provider: 'codex', model: 'o3-mini', effort: 'high' },
+            implementer: { provider: 'anthropic', model: 'claude-3-5-sonnet', effort: 'medium' },
+          },
+        },
+      ],
+    });
+    api.createRun.mockResolvedValue({ runId: 'run-123' });
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('renders orchestration profiles link in the more actions menu', async () => {
+    api.getProviders.mockResolvedValue({ providers: [], activeProvider: null });
+    renderPage();
+
+    await openHeaderMenu();
+    const link = await screen.findByRole('menuitem', { name: 'Orchestration profiles' });
+    expect(link).toHaveAttribute('href', '/settings/orchestration');
+  });
+
+  it('allows selecting an orchestration profile in the run panel and renders role chips', async () => {
+    api.getProviders.mockResolvedValue({
+      providers: [{ id: 'prov-1', name: 'Prov 1', type: 'api', enabled: true, hardwareUnavailable: false }],
+      activeProvider: 'prov-1',
+    });
+    renderPage();
+
+    // Open runner panel
+    const runBtn = await screen.findByRole('button', { name: 'Run Prompt' });
+    fireEvent.click(runBtn);
+
+    // Profile selector should be available
+    const profileSelect = await screen.findByLabelText('Orchestration profile');
+    expect(profileSelect).toBeInTheDocument();
+    fireEvent.change(profileSelect, { target: { value: 'deep-research' } });
+
+    // Role chips should appear
+    expect(await screen.findByText('o3-mini planner + sonnet coder')).toBeInTheDocument();
+    expect(screen.getByText('architect:')).toBeInTheDocument();
+    expect(screen.getByText('o3-mini')).toBeInTheDocument();
+    expect(screen.getByText('(high)')).toBeInTheDocument();
+
+    // Fill prompt and execute
+    const promptInput = screen.getByLabelText('Prompt');
+    fireEvent.change(promptInput, { target: { value: 'Test run with orchestration' } });
+
+    const executeBtn = screen.getByRole('button', { name: 'Execute' });
+    fireEvent.click(executeBtn);
+
+    await waitFor(() => {
+      expect(api.createRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          providerId: 'prov-1',
+          prompt: 'Test run with orchestration',
+          orchestrationProfileId: 'deep-research',
+        }),
+        expect.anything()
+      );
+    });
+  });
+});
+
+// A refresh used to end in `loadData()`, which flips the page's `loading` flag
+// back on — the whole list is replaced by the skeleton and the browser lands at
+// the top, so the card the user clicked (often several screens down) scrolls out
+// from under them. The card has to update in place instead.
+describe('AIProviders model refresh', () => {
+  const executionModes = [{ id: 'opencode-mtplx', type: 'cli' }, { id: 'opencode-mtplx-tui', type: 'tui' }];
+
+  const mtplxProviders = () => ({
+    activeProvider: null,
+    providers: [
+      {
+        id: 'opencode-mtplx', name: 'OpenCode MTPLX', type: 'cli', command: 'opencode', enabled: true,
+        models: ['mtplx-served'], canRefreshModels: true, executionModes,
+      },
+      {
+        id: 'opencode-mtplx-tui', name: 'OpenCode MTPLX TUI', type: 'tui', command: 'opencode', enabled: true,
+        models: ['mtplx-served'], canRefreshModels: true, executionModes,
+      },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    api.getApps.mockResolvedValue([]);
+    api.getProviderStatuses.mockResolvedValue({ providers: {} });
+    api.getProviderRuntimes.mockResolvedValue({ runtimes: {} });
+    api.getProviderReadiness.mockResolvedValue({ readiness: {} });
+    api.getCodexAccount.mockImplementation(() => new Promise(() => {}));
+    api.getProviders.mockResolvedValue(mtplxProviders());
+    localModels.value = { ctxById: {}, installed: { ollama: null, lmstudio: null } };
+  });
+
+  it('applies the refreshed catalog to the clicked card without reloading the page', async () => {
+    api.refreshProviderModels.mockResolvedValue({
+      id: 'opencode-mtplx', name: 'OpenCode MTPLX', type: 'cli', command: 'opencode', enabled: true,
+      models: ['mtplx-served', 'wang-yang/Ornith-1.0-35B-MTPLX'], canRefreshModels: true,
+    });
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh Models' }));
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('Models refreshed for OpenCode MTPLX'));
+    expect(await screen.findByText(/Models: mtplx-served, wang-yang\/Ornith-1\.0-35B-MTPLX/)).toBeInTheDocument();
+    // One load, from the initial mount — the refresh must not re-fetch the whole
+    // page, which is what unmounted the list and reset the scroll position.
+    expect(api.getProviders).toHaveBeenCalledTimes(1);
+    // The unified card keeps its grouping: replacing the entry wholesale with
+    // the bare record the refresh route returns would drop `executionModes` and
+    // split one card into two.
+    expect(screen.getAllByRole('button', { name: 'Refresh Models' })).toHaveLength(1);
+  });
+
+  it('keeps the stored catalog when the refresh is unsupported', async () => {
+    api.refreshProviderModels.mockResolvedValue(null);
+
+    renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Refresh Models' }));
+
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(screen.getByText(/Models: mtplx-served$/)).toBeInTheDocument();
+  });
+
+  // The root cause under the refresh button, which the other four reload paths
+  // on this page share: `loadData` flipped `loading` on unconditionally, so ANY
+  // reload after a click swapped the whole list for the page skeleton and
+  // returned the user to the top. The skeleton belongs to the first load only.
+  it('reloads after enabling a provider without swapping the list for the skeleton', async () => {
+    api.updateProvider.mockResolvedValue({});
+    // The reload is held OPEN so the assertions run while it is in flight — that
+    // window is the whole bug, and after it resolves the skeleton is gone again
+    // whether or not it ever appeared.
+    let releaseReload;
+    api.getProviders
+      .mockResolvedValueOnce(mtplxProviders())
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseReload = resolve; }));
+
+    renderPage();
+    // The first load DOES show the skeleton — there is nothing else to show, and
+    // this is what keeps the assertion below from passing vacuously.
+    expect(screen.getByLabelText('Loading providers')).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }));
+
+    await waitFor(() => expect(api.getProviders).toHaveBeenCalledTimes(2));
+    expect(screen.queryByLabelText('Loading providers')).toBeNull();
+    // ...and the card the user just clicked is still the thing on screen.
+    expect(screen.getByRole('heading', { name: 'OpenCode MTPLX' })).toBeInTheDocument();
+
+    releaseReload({
+      ...mtplxProviders(),
+      providers: mtplxProviders().providers.map(p => ({ ...p, enabled: false })),
+    });
+    expect(await screen.findByRole('button', { name: 'Enable' })).toBeInTheDocument();
   });
 });

@@ -7,7 +7,8 @@
  *
  * Neither POST route merges a user's PR directly. `/resolve` queues PortOS's
  * existing review-loop follow-up, which owns fetching feedback, fixing the
- * branch, waiting for checks, and merging. `/review` queues the `pr-reviewer`
+ * branch, waiting for checks, and merging — and starts it immediately, because
+ * pressing the button is the approval. `/review` queues the `pr-reviewer`
  * scheduled task narrowed to a single request, so the security-scan → review
  * pipeline that normally sweeps every external PR can be pointed at one.
  */
@@ -15,6 +16,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { asyncHandler, ServerError } from '../../lib/errorHandler.js';
+import { pullRequestProviderOverrideSchema } from '../../lib/cosValidation.js';
 import { claimSafeReviewers, normalizeReviewers, validateRequest } from '../../lib/validation.js';
 import { PR_COMPLETIONS } from '../../lib/prDisposition.js';
 import { isTruthyMeta } from '../../services/agentState.js';
@@ -110,7 +112,11 @@ async function resolveReviewEligibility(app, result) {
     console.error(`❌ app-pull-requests: could not resolve pr-reviewer scope: ${err.message}`);
     return null;
   });
-  return pullRequest => isReviewablePullRequest(scope, pullRequest);
+  const eligible = new Set();
+  await Promise.all((result.pullRequests || []).map(async pullRequest => {
+    if (await isReviewablePullRequest(scope, pullRequest)) eligible.add(pullRequest.number);
+  }));
+  return pullRequest => eligible.has(pullRequest.number);
 }
 
 function actionFor(pullRequest, tasks, appId) {
@@ -181,11 +187,16 @@ router.get('/:id/pull-requests', loadApp, asyncHandler(async (req, res) => {
 }));
 
 // POST /api/apps/:id/pull-requests/:number/resolve — queue the existing review
-// loop against a freshly-read open PR/MR. Re-reading before queueing prevents a
-// closed or replaced request from being attached to an agent by stale UI data.
+// loop against a freshly-read open PR/MR and start it now. Re-reading before
+// queueing prevents a closed or replaced request from being attached to an agent
+// by stale UI data.
 router.post('/:id/pull-requests/:number/resolve', loadApp, asyncHandler(async (req, res) => {
   const app = req.loadedApp;
   const { number } = validateRequest(pullRequestParamsSchema, req.params);
+  // Optional provider/model/effort pin from the tab's "Run with" picker — left
+  // blank, the follow-up resolves the install's active provider exactly as it
+  // always did.
+  const { provider, model, effort } = validateRequest(pullRequestProviderOverrideSchema, req.body || {});
   const { result, tasks } = await listWithActionState(app);
   throwForgeReadError(result);
 
@@ -245,6 +256,12 @@ router.post('/:id/pull-requests/:number/resolve', loadApp, asyncHandler(async (r
     metadata: {
       app: app.id,
       reviewLoopPRTitle: `--- BEGIN UNTRUSTED FORGE PR TITLE ---\n${title}\n--- END UNTRUSTED FORGE PR TITLE ---`,
+      // Read by spawnReviewLoopFollowUp below as the source task's pin — the
+      // same `providerPins` inheritance every other follow-up gets, just seeded
+      // from this request instead of the original task that opened the PR.
+      ...(provider ? { provider } : {}),
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
     },
   };
 
@@ -253,11 +270,20 @@ router.post('/:id/pull-requests/:number/resolve', loadApp, asyncHandler(async (r
     originalTask,
     prUrl: pullRequest.url,
     prBranch: pullRequest.headBranch,
+    // Null for a same-repo head. A FORK PR's head branch has no
+    // `origin/<branch>`, so without this the follow-up is queued and then
+    // blocked at workspace prep — which is every external contribution (#6064).
+    forkHead: pullRequest.forkHead,
     sourceWorkspace: app.repoPath,
     prCompletion: PR_COMPLETIONS.REVIEW_THEN_MERGE,
     ...reviewOptions,
     reviewers,
     optionalReviewers,
+    // This button IS the user's approval — start the agent now instead of leaving
+    // the follow-up as a pending system task the autonomous dequeue only picks up
+    // while CoS auto-run is in `execute` and under its daily budget (which is why
+    // it had to be started by hand from the task page).
+    dispatch: 'immediate',
   });
   if (!task) {
     throw new ServerError('Could not queue the pull-request resolve agent', {
@@ -266,13 +292,23 @@ router.post('/:id/pull-requests/:number/resolve', loadApp, asyncHandler(async (r
     });
   }
 
-  console.log(`🚀 Queued PR resolve agent ${task.id} for app ${app.id} request #${number}`);
+  // `started` false means the task is persisted and queued but nothing is running
+  // it yet (no agent slots, daemon stopped/paused, runner unreachable) — report the
+  // reason rather than letting the UI claim an agent is on it. A duplicate has no
+  // dispatch of its own: whatever is already queued owns the run.
+  const started = task.dispatch?.started === true;
+  const queueReason = task.dispatch?.reason ?? null;
+  console.log(started
+    ? `🚀 Started PR resolve agent for task ${task.id} (app ${app.id} request #${number})`
+    : `⏳ Queued PR resolve task ${task.id} for app ${app.id} request #${number}${queueReason ? ` — ${queueReason}` : ''}`);
   res.status(task.duplicate ? 200 : 202).json({
     appId: app.id,
     appName: app.name,
     pullRequest: { ...pullRequest, agentAction: { taskId: task.id, status: task.status } },
     task: taskResponse(task),
     duplicate: task.duplicate === true,
+    started,
+    queueReason,
   });
 }));
 
@@ -289,6 +325,11 @@ router.post('/:id/pull-requests/:number/resolve', loadApp, asyncHandler(async (r
 router.post('/:id/pull-requests/:number/review', loadApp, asyncHandler(async (req, res) => {
   const app = req.loadedApp;
   const { number } = validateRequest(pullRequestParamsSchema, req.params);
+  // Optional provider/model/effort pin from the tab's "Run with" picker. A
+  // public-review posture (see resolveAgentProviderAndModel) still gates the
+  // provider to its own eligible set — an ineligible pin is dropped with a
+  // warning rather than honored, same as any other pr-reviewer pin.
+  const { provider, model, effort } = validateRequest(pullRequestProviderOverrideSchema, req.body || {});
 
   const target = await listExternalOpenPullRequests(app);
   if (!target.ok) {
@@ -301,7 +342,7 @@ router.post('/:id/pull-requests/:number/review', loadApp, asyncHandler(async (re
   const pullRequest = target.prs.find(candidate => candidate.number === number);
   if (!pullRequest) {
     throw new ServerError(
-      `Pull request #${number} is not reviewable — PR review covers open GitHub pull requests against the default branch that were opened by someone else`,
+      `Pull request #${number} is not reviewable — PR review covers open GitHub pull requests against the default branch from an untrusted contributor`,
       { status: 409, code: 'PULL_REQUEST_NOT_REVIEWABLE' },
     );
   }
@@ -333,7 +374,12 @@ router.post('/:id/pull-requests/:number/review', loadApp, asyncHandler(async (re
     return;
   }
 
-  const request = await triggerOnDemandTask(PR_REVIEWER_TASK_TYPE, app.id, { targetPullRequest: number });
+  const request = await triggerOnDemandTask(PR_REVIEWER_TASK_TYPE, app.id, {
+    targetPullRequest: number,
+    provider,
+    model,
+    effort,
+  });
   if (request?.error) {
     throw new ServerError(request.error, { status: 409, code: 'PR_REVIEWER_UNAVAILABLE' });
   }

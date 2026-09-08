@@ -1,3 +1,4 @@
+import { isPrivateSecurityTask } from '../lib/privateSecurityPolicy.js';
 /**
  * Agent Lifecycle
  *
@@ -26,7 +27,7 @@
  */
 
 import { join } from 'path';
-import { readFile, writeFile } from 'fs/promises';
+import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { cosEvents, emitLog } from './cosEvents.js';
 // The DEFINING module, not a barrel (#3450) — see the note in
@@ -45,7 +46,8 @@ import { spawnAgentViaRunner, getRunnerHealth, classifyRunnerSpawnFailure, RUNNE
 import { MAX_TOTAL_SPAWNS, normalizeReviewers } from '../lib/validation.js';
 import { isInternalTaskId } from '../lib/taskParser.js';
 import { isRetryHeld } from '../lib/taskRetryHold.js';
-import { ensureDir, PATHS, sleep, tryReadFile } from '../lib/fileUtils.js';
+import { PROVIDER_CONFIG_BLOCKED_CATEGORY } from '../lib/taskBlockCategories.js';
+import { ensureDir, PATHS, sleep, tryReadFile, writeFileGuarded } from '../lib/fileUtils.js';
 import { createToolExecution, startExecution, completeExecution, errorExecution } from './toolStateMachine.js';
 import { determineLane, acquire, release } from './executionLanes.js';
 import { analyzeAgentFailure } from './agentErrorAnalysis.js';
@@ -57,12 +59,14 @@ import { buildAgentPrompt, getAppWorkspace, inlinePrLifecycleSection, isClaimFlo
 import { isOllamaClaudeProvider, isClaudeCommand, providerSuppliesGithubToken } from '../lib/providerModels.js';
 import { canTypeSlashCommands } from '../lib/slashdoInvocation.js';
 import { prClaimWasVerified } from '../lib/prDisposition.js';
+import { quotaBurnAgentMetadata } from '../lib/quotaBurnOrigin.js';
 import { composeProviderEnv } from '../lib/cliChildEnv.js';
 import { cliProviderAuthDescriptor } from '../lib/processEnv.js';
 import { PROVIDER_TYPES } from '../lib/aiToolkit/constants.js';
 import { buildCliSpawnConfig, isClaudeCliProvider, isTuiProvider, getClaudeSettingsEnv, spawnDirectly } from './agentCliSpawning.js';
+import { dropUnsupportedOllamaThinking } from './ollamaAgentContext.js';
 import { buildTuiSpawnConfig, spawnTuiAgent } from './agentTuiSpawning.js';
-import { publicReviewProviderBlock, publicReviewPostureForProfile, PUBLIC_REVIEW_NO_TOOL_POSTURE } from '../lib/providerVendors.js';
+import { publicReviewProviderBlock, publicReviewPostureForProfile, supportsTuiPublicReviewActionsProvider, PUBLIC_REVIEW_NO_TOOL_POSTURE } from '../lib/providerVendors.js';
 import { PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE } from '../lib/agentExecutionProfiles.js';
 import { formatPublicReviewInputPrompt } from '../lib/modelAbuseGuard.js';
 import { materializePublicReviewInput, materializePublicReviewPatches, readPublicReviewInputSnapshot, validatePublicReviewModel } from './modelAbuseGuard.js';
@@ -80,13 +84,10 @@ import { v4 as uuidv4 } from '../lib/uuid.js';
 // Imported for use here only; the pass-through re-exports that used to sit
 // below them were retired with the `subAgentSpawner.js` barrel (#3450).
 import { resolveAgentProviderAndModel } from './agentProviderResolution.js';
-import { cloudSwarmThreadCapacity, providerBaseUrl } from './cosLocalEndpointSlots.js';
+import { cloudSwarmThreadCapacity, localEndpointOfProvider, providerBaseUrl } from './cosLocalEndpointSlots.js';
+import { describeLocalPromptBudget, planLocalPromptBudget } from '../lib/localPromptBudget.js';
 import { prepareAgentWorkspace } from './agentWorkspacePrep.js';
-// `releaseRetryHold` is imported STATICALLY here (the TUI/direct-CLI spawners
-// reach for it via `await import()` only because they sit BELOW this module and
-// a top-level import there would race the cycle) — this module already imports
-// `cleanupAgentWorktree` from the same file, so there is no new edge.
-import { cleanupAgentWorktree, releaseRetryHold } from './agentWorktreeCleanup.js';
+import { releaseRetryHold } from './agentWorktreeCleanup.js';
 import { runAgentCompletionCleanup } from './agentCompletionCleanup.js';
 import { dispatchRecoveredTaskOutputHook, finalizeAgent, releaseAgentLane, stampLiExecutionVerdict } from './agentFinalization.js';
 import { extractFinalSummary } from './agentSummaryExtraction.js';
@@ -279,10 +280,15 @@ async function runAgentSpawn(task) {
   // "in review" until the next daemon restart (issue #989). The release is a
   // no-op when the task carries no `metadata.app` or the marker is a real
   // `agent-*` id from a different live agent.
+  // The throwaway worktree this attempt cut (set once prepareAgentWorkspace
+  // returns one), so every setup failure after that point removes it. Without
+  // this each failed spawn left a full checkout behind: the task stayed pending
+  // and every retry cut another.
+  let spawnWorktree = null;
   const cleanupOnError = async (error) => {
     // The spawn-dedup guard is released by withSpawnDedupGuard's finally around
     // this whole body (see spawnAgentForTask) — cleanupOnError only owns the
-    // lane, tool-execution, claim, and app-review marker releases.
+    // lane, tool-execution, claim, app-review marker, and setup-worktree releases.
     release(agentId);
     errorExecution(toolExecution.id, { message: error });
     completeExecution(toolExecution.id, { success: false });
@@ -295,6 +301,14 @@ async function runAgentSpawn(task) {
     await releaseAppReviewMarker(task.metadata?.app).catch(err => {
       emitLog('warn', `Failed to release app review marker for ${task.metadata?.app}: ${err.message}`, { taskId: task.id });
     });
+    if (spawnWorktree) {
+      // No agent ever ran in it, so nothing in it is worth keeping.
+      const { removeWorktree } = await import('./worktreeManager.js');
+      const sourceWorkspace = task.metadata?.app ? await getAppWorkspace(task.metadata.app).catch(() => ROOT_DIR) : ROOT_DIR;
+      await removeWorktree(agentId, sourceWorkspace, spawnWorktree.branchName, { discardDirt: true }).catch((cleanupErr) => {
+        emitLog('warn', `Failed to remove the worktree of failed spawn ${agentId}: ${cleanupErr.message}`, { agentId, taskId: task.id });
+      });
+    }
   };
 
   // Acquire the federation lease BEFORE any spawn setup (issue #1563, addressing
@@ -402,7 +416,7 @@ async function runAgentSpawn(task) {
           metadata: {
             ...task.metadata,
             blockedReason: resolution.error,
-            blockedCategory: 'provider-config',
+            blockedCategory: PROVIDER_CONFIG_BLOCKED_CATEGORY,
             blockedAt: new Date().toISOString()
           }
         }, task.taskType || 'user').catch(() => {});
@@ -417,13 +431,31 @@ async function runAgentSpawn(task) {
       return null;
     }
     const { provider, selectedModel, modelSelection } = resolution;
-    const isTui = isTuiProvider(provider);
+    const privateSecurity = isPrivateSecurityTask(task);
     const executionProfile = task.metadata?.executionProfile;
     const publicReviewPosture = publicReviewPostureForProfile(executionProfile);
     const publicReviewNoTools = publicReviewPosture === PUBLIC_REVIEW_NO_TOOL_POSTURE;
     const publicReviewActions = executionProfile === PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE;
     const publicReview = Boolean(publicReviewPosture);
-    if (publicReview) {
+    const isTui = isTuiProvider(provider);
+    // Stage 3 (`sandboxed-actions`) is the longest-running and least
+    // predictable stage in the pr-reviewer pipeline — it applies a screened
+    // patch and runs the repo's tests — so it is the one an operator actually
+    // wants to attach to and steer. It may run as an interactive session when
+    // its configured provider is a TUI record AND that vendor declares an
+    // attachable recipe (`tuiSpawnArgs`), which keeps every enforcement flag and
+    // drops only the headless output flags.
+    //
+    // Everything else stays headless. The `no-tool` postures (Stage 1's
+    // security scan, Stage 2's eligibility gate) are excluded by design: an
+    // interactive session for a reasoner with no tools buys nothing and widens
+    // the boundary for free. A TUI record whose vendor has no attachable
+    // recipe also stays headless — its ordinary recipe emits `--print`/`exec`
+    // argv that a PTY can neither prompt nor enforce.
+    const publicReviewTui = publicReviewActions && isTui
+      && supportsTuiPublicReviewActionsProvider(provider);
+    const spawnHeadless = !isTui || (publicReview && !publicReviewTui);
+    if (publicReview && !privateSecurity) {
       const scanBlock = publicReviewScanBlock(task);
       if (scanBlock) {
         await updateTask(task.id, {
@@ -465,7 +497,7 @@ async function runAgentSpawn(task) {
     // payload can be edited without the browser: the picker is a convenience,
     // never the enforcement. The helper owns the "no posture requested" case,
     // so an ordinary task (posture `null`) passes straight through (#5830).
-    const postureBlock = publicReviewProviderBlock(provider, publicReviewPosture, { tui: isTui });
+    const postureBlock = publicReviewProviderBlock(provider, publicReviewPosture);
     if (postureBlock) {
       const { reason, category } = postureBlock;
       await updateTask(task.id, {
@@ -481,7 +513,7 @@ async function runAgentSpawn(task) {
       cosEvents.emit('agent:error', { taskId: task.id, error: reason });
       return null;
     }
-    if (publicReviewNoTools) {
+    if (publicReviewNoTools && !privateSecurity) {
       const modelPolicy = await validatePublicReviewModel({ provider, model: selectedModel, posture: PUBLIC_REVIEW_NO_TOOL_POSTURE });
       if (!modelPolicy.ok) {
         const reason = `Public review model is unavailable or not tool-free (${modelPolicy.code})`;
@@ -522,8 +554,11 @@ async function runAgentSpawn(task) {
       return null;
     }
     const { workspacePath, resolvedAppName, worktreeInfo, jiraTicket, jiraBranchName, explicitWorktree } = prep;
+    if (worktreeInfo?.branchName && !worktreeInfo.existingBranch && !worktreeInfo.isPersistentWorktree) {
+      spawnWorktree = { branchName: worktreeInfo.branchName };
+    }
 
-    if (publicReview) {
+    if (publicReview && !privateSecurity) {
       const allowedPullRequestNumbers = publicReviewActions
         ? task.metadata?.pipeline?.eligibility?.eligibleNumbers
         : null;
@@ -608,7 +643,10 @@ async function runAgentSpawn(task) {
 
     // Build the agent prompt. `provider.type` drives the light-vs-full split
     // inside buildAgentPrompt — see its doc comment.
-    const promptResult = await buildAgentPrompt(task, config, workspacePath, worktreeInfo, isTruthyMeta, {
+    const privatePrompt = privateSecurity
+      ? await import('./privateSecurityAssessment.js').then(({ preparePrivateSecurityAssessment }) => preparePrivateSecurityAssessment(task, provider, selectedModel))
+      : null;
+    const promptResult = privateSecurity ? privatePrompt : await buildAgentPrompt(task, config, workspacePath, worktreeInfo, isTruthyMeta, {
       providerType: provider.type,
       providerId: provider.id,
       providerCommand: provider.command,
@@ -621,10 +659,48 @@ async function runAgentSpawn(task) {
       split: splitSystemPrompt
     });
     const basePrompt = typeof promptResult === 'string' ? promptResult : promptResult.userPrompt;
-    const prompt = publicReview
+    const prompt = publicReview && !privateSecurity
       ? `${basePrompt}\n\n${formatPublicReviewInputPrompt(publicReviewPromptData)}`
       : basePrompt;
     const systemPrompt = typeof promptResult === 'string' ? null : promptResult.systemPrompt;
+
+    // What this prompt costs to PREFILL on a model server running on this box
+    // (#6117). A public-review stage inlines the whole screened envelope — ~100K
+    // tokens is ordinary — and a local endpoint spends minutes on that before it
+    // can emit a single line. Nothing else in the dispatch path compares the
+    // assembled prompt against the throughput of the endpoint it is aimed at, so
+    // the run's duration estimate was the review's estimate with none of the
+    // prefill in it, and the card was indistinguishable from a wedged run.
+    //
+    // The dispatch is NEVER refused here: the user chose this provider, and the
+    // window the prompt has to fit is the model's own context window — a
+    // separate condition the provider reports for itself. All we do is raise the
+    // estimate and say so.
+    //
+    // Cloud runs take no async hop at all: `localEndpointOfProvider` answers null
+    // for anything not on this machine, and `planLocalPromptBudget` is skipped.
+    const localEndpoint = localEndpointOfProvider(provider);
+    const localPromptBudget = localEndpoint
+      ? planLocalPromptBudget({
+        prompt,
+        endpoint: localEndpoint,
+        // The learned per-task-type average — the estimate being raised. A
+        // dynamic import for the same reason the workspace snapshot above uses
+        // one: it keeps the task-learning graph out of this hot module's load
+        // path, and a failed read means "nothing learned", not "zero".
+        baseDurationMs: await import('./taskLearning.js')
+          .then((tl) => tl.getTaskDurationEstimate(task.description))
+          .then((estimate) => estimate?.estimatedDurationMs ?? null)
+          .catch(() => null),
+      })
+      : null;
+    if (localPromptBudget?.longPrefill) {
+      emitLog('info', `🐢 Agent ${agentId} ${describeLocalPromptBudget(localPromptBudget)}`, {
+        agentId,
+        taskId: task.id,
+        promptTokens: localPromptBudget.promptTokens,
+      });
+    }
 
     // Create agent directory
     const agentDir = join(AGENTS_DIR, agentId);
@@ -633,11 +709,11 @@ async function runAgentSpawn(task) {
     }
 
     // Save prompt to file
-    await writeFile(join(agentDir, 'prompt.txt'), prompt);
+    await writeFileGuarded(join(agentDir, 'prompt.txt'), prompt);
     let systemPromptFile = null;
     if (systemPrompt) {
       systemPromptFile = join(agentDir, 'system-prompt.md');
-      await writeFile(systemPromptFile, systemPrompt);
+      await writeFileGuarded(systemPromptFile, systemPrompt);
     }
 
     // Create run entry for usage tracking
@@ -649,7 +725,7 @@ async function runAgentSpawn(task) {
       workspacePath,
       appName: resolvedAppName
     });
-    const executionMode = isTui ? (dispatchUseRunner ? 'runner-tui' : 'tui') : dispatchUseRunner ? 'runner' : 'direct';
+    const executionMode = !spawnHeadless ? (dispatchUseRunner ? 'runner-tui' : 'tui') : dispatchUseRunner ? 'runner' : 'direct';
 
     // Register the agent with model info.
     //
@@ -668,6 +744,14 @@ async function runAgentSpawn(task) {
       ? (task.metadata?.app ? await getAppWorkspace(task.metadata.app) : ROOT_DIR)
       : null;
 
+    const ownsPrWorkflow = inlinePrLifecycleSection(task, {
+      providerType: provider.type,
+      providerId: provider.id,
+      providerCommand: provider.command,
+      leanMode,
+      worktreeInfo,
+      isTruthyMetaFn: isTruthyMeta,
+    }) !== null;
     await registerAgent(agentId, task.id, {
       instanceId,
       workspacePath,
@@ -706,6 +790,11 @@ async function runAgentSpawn(task) {
       // slot key: a slot key is null for a cloud provider, and stamping null
       // would re-open the mid-run-edit hole this exists to close.
       providerEndpoint: providerBaseUrl(provider),
+      // What this run's prompt costs to prefill on a LOCAL endpoint, and the
+      // duration estimate raised by it (#6117). `null` for a cloud provider and
+      // for a run with nothing assembled to measure — the card must read that as
+      // "no estimate", never as a small one, so it stays absent rather than 0.
+      localPromptBudget,
       leanMode,
       // Whether THIS run's prompt told the agent to push, open, review, and merge
       // its own PR. Persisted rather than re-derived at cleanup time: the two
@@ -721,14 +810,7 @@ async function runAgentSpawn(task) {
       // every one of them — routing a Creative Director reasoning run into the
       // did-you-open-it net, which then opened a PR for it and filed a HIGH
       // notification blaming the agent for skipping a step it was never given.
-      ownsPrWorkflow: inlinePrLifecycleSection(task, {
-        providerType: provider.type,
-        providerId: provider.id,
-        providerCommand: provider.command,
-        leanMode,
-        worktreeInfo,
-        isTruthyMetaFn: isTruthyMeta,
-      }) !== null,
+      ownsPrWorkflow,
       model: selectedModel,
       // The reasoning-effort override this run was dispatched with (null when the
       // task pinned none). Persisted next to the model because the Resume Agent
@@ -741,6 +823,16 @@ async function runAgentSpawn(task) {
       phase: 'initializing',
       useRunner: dispatchUseRunner,
       executionMode,
+      // The public-review posture this run executes under (null for an ordinary
+      // task). Projected beside `executionMode` because the UI cannot otherwise
+      // explain why the card has no "Open Shell" link: a public-review stage is
+      // forced headless (`spawnHeadless` above) unless it is the sandboxed-
+      // actions stage on a TUI provider whose vendor declares an attachable
+      // recipe, so without this the card is indistinguishable from an agent
+      // whose PTY failed to attach.
+      publicReviewPosture,
+      // Preserve privacy after the task becomes an archived agent.
+      machineLocal: isTruthyMeta(task.metadata?.machineLocal),
       taskAnalysisType: task.metadata?.analysisType || null,
       taskReviewType: task.metadata?.reviewType || null,
       taskApp: task.metadata?.app || null,
@@ -750,6 +842,10 @@ async function runAgentSpawn(task) {
       // the auto-run-gated queue lane. `isTruthyMeta` accepts the boolean set at
       // spawn AND the string `"true"` a COS-TASKS.md round-trip yields.
       taskOnDemand: isTruthyMeta(task.metadata?.onDemand),
+      // WHO asked for that on-demand run. `perpetualRefillPlan` needs it to tell
+      // a human Run (which keeps draining) from an automated origin such as a
+      // quota burn (which is one unit and stops).
+      taskOnDemandOrigin: task.metadata?.onDemandOrigin || null,
       // The single PR a pr-reviewer run was narrowed to. Same hand-picked-projection
       // reason as the keys around it: perpetualRefillPlan must see from the AGENT
       // record that this run was scoped, or its untargeted re-issue silently widens
@@ -764,14 +860,13 @@ async function runAgentSpawn(task) {
       // `taskLiProposal`: the runner listens for `agent:completed` and dispatches
       // the NEXT job in this family's burn plan when the previous one finishes,
       // so it must be able to tell a burn run from any other agent from the
-      // agent record alone.
-      taskQuotaBurnFamily: task.metadata?.quotaBurnFamily || null,
-      // The reset of the short rolling window that refuses first, carried for the
-      // same reason: when this run is REFUSED, the continuation blocks the family
-      // until that window rolls instead of re-dispatching into the same wall
-      // (see quotaBurnDenials.js). A COS-TASKS.md round-trip can hand it back as
-      // a string, so coerce rather than projecting whatever arrived.
-      taskQuotaBurnLimitingResetAt: Number(task.metadata?.quotaBurnLimitingResetAt) || null,
+      // agent record alone. Spread from the ONE block definition
+      // (`lib/quotaBurnOrigin.js`) so every field that reaches disk reaches the
+      // runner's continuation and the denial ledger — naming them here one at a
+      // time is how `quotaBurnStepId` ended up persisted but unprojected (#6406).
+      // Values are coerced on the way through: a COS-TASKS.md round-trip hands
+      // every scalar back as a string.
+      ...quotaBurnAgentMetadata(task.metadata),
       // Same reason as taskLiProposal — a hand-picked projection, so this must be
       // listed explicitly. `declaresNoCommitCriterion` (taskTypeHooks.js) reads it
       // to decide whether a run declared a commit criterion at all,
@@ -878,7 +973,7 @@ async function runAgentSpawn(task) {
     // dynamic `agent.build` config instead of mutating saved provider state.
     const taskTemperature = task.metadata?.temperature === '' ? NaN : Number(task.metadata?.temperature);
     const taskThinking = task.metadata?.thinking;
-    const runProvider = {
+    const requestedProvider = {
       ...provider,
       ...(Number.isFinite(taskTemperature) && taskTemperature >= 0 && taskTemperature <= 2
         ? { temperature: taskTemperature }
@@ -886,9 +981,19 @@ async function runAgentSpawn(task) {
       ...([true, false, 'true', 'false'].includes(taskThinking) ? { thinking: taskThinking } : {}),
       ...(typeof task.metadata?.effort === 'string' ? { effort: task.metadata.effort } : {}),
     };
-    // Per-task reasoning-effort override (task form / schedule config). The
-    // builders no-op it for providers without an effort control.
-    const taskEffort = task.metadata?.effort || null;
+    // Ollama 400s the whole request when a model that never implements thinking
+    // is asked to think, so a non-reasoning local model dispatched at any effort
+    // level dies on its first turn with exit 1 and no output. Resolved here,
+    // once, on the provider EVERY spawn path shares — so the two carriers of the
+    // level (the `--effort` argv and OpenCode's `agent.*.reasoningEffort` config)
+    // drop it together. `taskEffort` is the per-task reasoning-effort override
+    // (task form / schedule config); the builders no-op it for providers without
+    // an effort control.
+    const { provider: runProvider, effort: taskEffort } = await dropUnsupportedOllamaThinking(
+      requestedProvider,
+      selectedModel,
+      task.metadata?.effort || null,
+    );
     // Codex counts the root orchestrator against its per-session thread cap.
     // Lift that cap to root + configured workers for cloud swarms so a six-way
     // claim run can actually fan out six issue agents. Never lift it for a
@@ -896,7 +1001,7 @@ async function runAgentSpawn(task) {
     // their deliberately bounded GPU concurrency posture.
     const maxConcurrentThreads = cloudSwarmThreadCapacity(runProvider, task.metadata?.swarmCount);
     const safetyProfile = publicReview ? executionProfile : null;
-    const cliConfig = isTui
+    const cliConfig = !spawnHeadless
       ? buildTuiSpawnConfig(runProvider, selectedModel, { systemPromptFile, effort: taskEffort, maxConcurrentThreads, safetyProfile })
       : buildCliSpawnConfig(runProvider, selectedModel, cliSettingsEnv, { systemPromptFile, effort: taskEffort, maxConcurrentThreads, safetyProfile });
 
@@ -920,7 +1025,7 @@ async function runAgentSpawn(task) {
     // must NOT run here on the success path; the lane is released by the
     // agent-completion handler when the work finishes.
     handedOff = true;
-    if (isTui) {
+    if (!spawnHeadless) {
       return await spawnTuiAgent({
         agentId,
         task,
@@ -933,10 +1038,11 @@ async function runAgentSpawn(task) {
         agentDir,
         executionId: toolExecution.id,
         laneName,
-        cleanupWorktreeFn: cleanupAgentWorktree,
         isTruthyMetaFn: isTruthyMeta,
         leanMode,
+        ownsPrWorkflow,
         useDurableRunner: dispatchUseRunner,
+        safetyProfile,
       });
     }
     if (dispatchUseRunner) {
@@ -955,8 +1061,8 @@ async function runAgentSpawn(task) {
       agentDir,
       executionId: toolExecution.id,
       laneName,
-      cleanupWorktreeFn: cleanupAgentWorktree,
       isTruthyMetaFn: isTruthyMeta,
+      ownsPrWorkflow,
       safetyProfile,
     });
   } catch (err) {
@@ -968,9 +1074,19 @@ async function runAgentSpawn(task) {
       // handler. The finally still releases the dedup guard.
       throw err;
     }
-    emitLog('error', `Agent spawn setup failed: ${err.message}`, { taskId: task.id, error: err.message });
-    await cleanupOnError(err.message);
-    cosEvents.emit('agent:error', { taskId: task.id, error: err.message });
+    const setupError = isPrivateSecurityTask(task)
+      ? 'Private assessment setup failed. Verify its local model, isolated harness, and source access before retrying.'
+      : err.message;
+    if (isPrivateSecurityTask(task)) {
+      await updateTask(task.id, {
+        status: 'blocked',
+        metadata: { ...task.metadata, blockedCategory: 'private-security-setup-failed',
+          blockedReason: setupError, blockedAt: new Date().toISOString() },
+      }, task.taskType || 'user').catch(() => {});
+    }
+    emitLog('error', `Agent spawn setup failed: ${setupError}`, { taskId: task.id, error: setupError });
+    await cleanupOnError(setupError);
+    cosEvents.emit('agent:error', { taskId: task.id, error: setupError });
     // Preserve the autonomous-job retry contract. Pre-widening, an uncaught
     // throw here propagated to subAgentSpawner's `task:ready` listener,
     // which emitted `job:spawn-failed` so cos.js could clear
@@ -1293,6 +1409,8 @@ async function completeUntrackedAgentFromCosState(agentId, exitCode, success, du
   }
   console.log(`🔄 Completing untracked agent ${agentId} from cos state (post-restart)`);
   const task = cosAgent.taskId ? await getTaskById(cosAgent.taskId).catch(() => null) : null;
+  // Recovery has no immutable source inventory with which to validate a report.
+  if (isPrivateSecurityTask(task) || isPrivateSecurityTask(cosAgent)) success = false;
   await dispatchRecoveredTaskOutputHook({
     agentId,
     task,

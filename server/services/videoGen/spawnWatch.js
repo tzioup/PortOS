@@ -2,10 +2,11 @@
 
 import { spawn } from '../../lib/childProcess.js';
 import { watch as fsWatch } from 'fs';
-import { rm, readFile } from 'fs/promises';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
-import { PATHS } from '../../lib/fileUtils.js';
+import { PATHS, rmGuarded } from '../../lib/fileUtils.js';
 import { spawnDetached } from '../../lib/detachedSpawn.js';
+import { createVideoDiagnosticTail, normalizeVideoFailure } from '../../lib/videoFailure.js';
 import { createLineReader } from '../../lib/streamLines.js';
 import { claimHeavyLocalJob } from '../../lib/heavyJobClaim.js';
 import { prepareLocalMemory, gpuBlockersMessage } from '../localMemory.js';
@@ -20,6 +21,8 @@ import {
   makeVideoGenLineHandler,
   finalizeGeneratedVideo,
   isWatchdogSuccess,
+  isNativeTeardownAbort,
+  verifyPostCompletionOutputs,
   describeSignalDeath,
   planPromptEncodingRetry,
   bufferChildExit,
@@ -32,7 +35,7 @@ import {
   invalidateByovReadyCache,
   pickDeathFingerprint,
 } from './runtimes.js';
-import { sleepDisplay, wakeDisplay } from '../displayPower.js';
+import { isDisplaySleepEnabled, sleepDisplayForVideo, wakeDisplayForVideo } from './displayPower.js';
 import { loadHistory, mutateVideoHistory } from './history.js';
 import { estimateRenderMs } from './eta.js';
 import { videoJobState } from './jobState.js';
@@ -49,6 +52,7 @@ const MUXING_DONE_RE = /\[Decoding video \+ audio \+ muxing\]\s+done in/i;
 
 export async function spawnAndWatchVideo({
   jobId,
+  batch = null,
   speedProfileId = null,
   cleanupTempFiles,
   stepwiseDir,
@@ -71,7 +75,7 @@ export async function spawnAndWatchVideo({
   if (!heavyClaim.ok) {
     videoJobState.jobs.delete(jobId);
     await cleanupTempFiles({ includeUploads: true });
-    await rm(stepwiseDir, { recursive: true, force: true });
+    await rmGuarded(stepwiseDir, { recursive: true, force: true });
     throw new ServerError(heavyClaim.message, { status: 409, code: 'HEAVY_LOCAL_JOB_BUSY', context: { holder: heavyClaim.holder } });
   }
   const releaseHeavyClaim = () => heavyClaim.release()
@@ -104,7 +108,7 @@ export async function spawnAndWatchVideo({
       try { previewWatcher.close(); } catch { /* already closed */ }
       previewWatcher = null;
     }
-    void rm(stepwiseDir, { recursive: true, force: true });
+    void rmGuarded(stepwiseDir, { recursive: true, force: true });
   };
   const processLatestPreview = async () => {
     if (previewClosed) return;
@@ -137,6 +141,14 @@ export async function spawnAndWatchVideo({
     });
   } catch { /* preview is best-effort; the final video remains authoritative */ }
 
+  // Every file this render was asked to write, in the order the runner emits
+  // them. Job-level (a relaunch renders the SAME outputs), and the yardstick the
+  // post-completion teardown recovery below measures a child's result claims
+  // against — so "it printed a path" can never stand in for "it printed OUR path".
+  const expectedOutputPaths = batch
+    ? batch.map((item) => join(PATHS.videos, item.filename))
+    : [outputPath];
+
   // ── one render child, fully wired ──────────────────────────────────────────
   // Everything per-CHILD lives in here — the process handle, the completion watchdog, the
   // line readers, the close handler — so the same job can be relaunched once
@@ -161,6 +173,11 @@ export async function spawnAndWatchVideo({
     // we only killed a post-completion teardown hang) rather than reporting the
     // generic "killed, likely OOM" failure.
     let completionWatchdogFired = false;
+    // Which of `expectedOutputPaths` THIS child reported finished, by exact
+    // path. Minted per child rather than stamped on `job` — `job` outlives a
+    // prompt-encode relaunch, and the dead child's completion claim must never
+    // vouch for its replacement's output (#6501).
+    const completedOutputs = new Set();
     const clearCompletionWatchdog = () => {
       if (completionWatchdog) {
         clearTimeout(completionWatchdog);
@@ -195,7 +212,7 @@ export async function spawnAndWatchVideo({
     // from the Apple menu. `-w` makes caffeinate self-exit when our pid does, so
     // no manual cleanup is needed and a server crash mid-render still releases
     // the assertion. macOS-only — `caffeinate` is a darwin binary.
-    const sleepDisplayForRender = runtimeUsesMlx(model.runtime) && videoGenSettings?.displaySleep !== false;
+    const sleepDisplayForRender = runtimeUsesMlx(model.runtime) && isDisplaySleepEnabled(videoGenSettings);
     let displaySlept = false;
     if (process.platform === 'darwin' && proc.pid) {
       // MLX renders must keep the system awake but let the display sleep: `-d`
@@ -203,7 +220,7 @@ export async function spawnAndWatchVideo({
       // watchdog. Other runtimes keep their existing display-awake behavior.
       const caffeineArgs = sleepDisplayForRender ? ['-is', '-w', String(proc.pid)] : ['-dis', '-w', String(proc.pid)];
       spawn('caffeinate', caffeineArgs, { stdio: 'ignore', detached: false }).on('error', () => {});
-      displaySlept = sleepDisplayForRender && sleepDisplay(videoGenSettings, 'Video generation');
+      displaySlept = sleepDisplayForRender && sleepDisplayForVideo(videoGenSettings, 'Video generation');
     }
     // Guards the ONE terminal run of this child's teardown, across BOTH terminal
     // paths ('error' and 'close'). The caller may have to replay a terminal
@@ -223,9 +240,9 @@ export async function spawnAndWatchVideo({
       const reason = `Failed to spawn ${bin}: ${err.message}`;
       console.log(`❌ Video generation spawn error [${jobId.slice(0, 8)}]: ${reason}`);
       broadcastSse(job, { type: 'error', error: reason });
-      videoGenEvents.emit('failed', { generationId: jobId, error: reason });
+      videoGenEvents.emit('failed', { generationId: jobId, error: reason, failure: normalizeVideoFailure(err, { prompts: [meta?.prompt, meta?.negativePrompt] }) });
       videoJobState.activeProcess = null;
-      if (displaySlept) wakeDisplay(videoGenSettings, 'Video generation');
+      if (displaySlept) wakeDisplayForVideo(videoGenSettings, 'Video generation');
       void releaseHeavyClaim();
       // Spawn failed, so proc.on('close') will never fire — clean up every
       // temp file we own here, including the multipart upload, otherwise
@@ -244,8 +261,9 @@ export async function spawnAndWatchVideo({
     // grow it without limit; the abort banner is the last thing printed before
     // the process dies, so the tail always holds it.
     const stderrTail = [];
+    const diagnostics = createVideoDiagnosticTail();
     const recordStderrTail = (raw) => {
-      stderrTail.push(raw);
+      stderrTail.push(raw.slice(-2048));
       if (stderrTail.length > STDERR_TAIL_LINES) stderrTail.shift();
     };
 
@@ -254,6 +272,41 @@ export async function spawnAndWatchVideo({
     // Returns true for a recognized progress/status/noise line (suppress raw
     // logging), false for an unhandled line worth raw-logging.
     const handleLine = makeVideoGenLineHandler({ job, jobId, pythonNoiseRe: PYTHON_NOISE_RE });
+    const batchResults = [];
+    let outputTail = Promise.resolve();
+    let batchError = null;
+    let receivedOutputs = 0;
+    const stopFailedBatch = (err) => {
+      batchError ||= err;
+      try { proc.kill('SIGTERM'); } catch (killError) {
+        console.error(`❌ Video batch could not stop [${jobId.slice(0, 8)}]: ${killError.message}`);
+      }
+    };
+    const acceptBatchOutput = (parsed) => {
+      const item = batch[receivedOutputs];
+      const itemFilename = item?.filename;
+      const itemPath = itemFilename && join(PATHS.videos, itemFilename);
+      if (!item || parsed.batch_index !== item.index || parsed.seed !== item.seed || parsed.video_path !== itemPath) {
+        stopFailedBatch(new Error('Video batch returned an unexpected output or seed.'));
+        return;
+      }
+      receivedOutputs += 1;
+      completedOutputs.add(itemPath);
+      outputTail = outputTail.then(async () => {
+        const thumbnail = await finalizeGeneratedVideo({
+          job, jobId: item.id, outputPath: itemPath, filename: itemFilename,
+          meta: { ...meta, id: item.id, filename: itemFilename, seed: item.seed, batchIndex: item.index },
+          actualSeed: item.seed, mutateHistory: mutateVideoHistory,
+          // Batch timings include shared startup and cannot train single-render ETAs.
+          startedAtMs: null, terminal: false,
+        });
+        batchResults.push({ filename: itemFilename, seed: item.seed, thumbnail, path: `/data/videos/${itemFilename}` });
+        const message = `Saved ${batchResults.length}/${batch.length} videos`;
+        broadcastSse(job, { type: 'status', message });
+        videoGenEvents.emit('status', { generationId: jobId, message });
+      }).catch(stopFailedBatch);
+      if (receivedOutputs === batch.length) armCompletionWatchdog();
+    };
 
     // Per-stream line readers carry the partial trailing line across chunk
     // boundaries and decode through a StringDecoder, so a marker (or multibyte
@@ -266,8 +319,16 @@ export async function spawnAndWatchVideo({
       // for the result metadata; otherwise raw-log so we can debug failures.
       try {
         const parsed = JSON.parse(line);
+        if (parsed.video_path && batch) {
+          acceptBatchOutput(parsed);
+          return;
+        }
         if (parsed.video_path) {
           job.resultJson = parsed;
+          // Completion evidence only when the child names the exact file THIS
+          // job asked for. An unrelated path still arms the watchdog (the child
+          // is clearly past its render) but proves nothing about our output.
+          if (expectedOutputPaths.includes(parsed.video_path)) completedOutputs.add(parsed.video_path);
           // The result JSON is the strongest "work is done" signal — arm the
           // watchdog so a post-completion teardown hang can't wedge the job.
           armCompletionWatchdog();
@@ -276,7 +337,7 @@ export async function spawnAndWatchVideo({
       } catch { /* not JSON */ }
       // Some runtimes don't print the result JSON but do log the final
       // decode+mux line right before they should exit — treat it the same way.
-      if (MUXING_DONE_RE.test(line)) armCompletionWatchdog();
+      if (!batch && MUXING_DONE_RE.test(line)) armCompletionWatchdog();
       console.log(`🐍-out [${jobId.slice(0, 8)}] ${line}`);
     });
     const stderrReader = createLineReader((raw) => {
@@ -291,10 +352,12 @@ export async function spawnAndWatchVideo({
     }, { splitRe: /[\n\r]+/ });
 
     proc.stdout.on('data', (chunk) => {
+      diagnostics.push('stdout', chunk);
       stdoutReader.push(chunk);
     });
 
     proc.stderr.on('data', (chunk) => {
+      diagnostics.push('stderr', chunk);
       stderrReader.push(chunk);
     });
 
@@ -344,11 +407,42 @@ export async function spawnAndWatchVideo({
         // output file is already on disk and non-empty: the render wrote its
         // result, but the child hung during teardown. A kill with no output on
         // disk still fails loudly below.
-        const watchdogSuccess = isWatchdogSuccess({ completionWatchdogFired, signal, outputPath });
+        await outputTail;
+        if (batchError) throw batchError;
+        const allOutputsFinalized = !batch || batchResults.length === batch.length;
+        const watchdogSuccess = allOutputsFinalized
+          && isWatchdogSuccess({ completionWatchdogFired, signal, outputPath });
+        // Everything below asks the same question twice — did this child die in
+        // a way we have not already forgiven? — so name it once.
+        const unforgivenExit = code !== 0 && !watchdogSuccess;
 
-        if (code !== 0 && !watchdogSuccess) {
+        // A VERIFIED post-completion native teardown abort is also a success
+        // (#6501): the H3 MLX runner wrote and muxed its clip, printed the
+        // emit_result contract naming this job's output, and only then aborted
+        // inside native interpreter teardown. Gated hard — this child's own
+        // result claim, a freshly written non-empty file, and an ffprobe reading
+        // that matches the request. A warm batch recovers only once EVERY output
+        // is accepted and finalized; a partial batch stays failed with the
+        // results it already saved. The synchronous gate runs first so no
+        // ordinary failure pays for a probe.
+        let teardownRecovered = false;
+        if (unforgivenExit && allOutputsFinalized
+          && isNativeTeardownAbort({ runtime: model.runtime, signal, childKilled: proc.killed })) {
+          const verdict = await verifyPostCompletionOutputs({
+            outputPaths: expectedOutputPaths,
+            completedOutputs,
+            startedAtMs: job.renderStartedAtMs,
+            expectedFrames: parsedNumFrames,
+            fps: meta?.fps,
+          });
+          teardownRecovered = verdict.ok;
+          if (!verdict.ok) console.log(`⚠️ teardown abort stays a failure [${jobId.slice(0, 8)}]: ${verdict.reason}`);
+        }
+
+        if (unforgivenExit && !teardownRecovered) {
           job.status = 'error';
           let reason;
+          const failure = diagnostics.failure({ prompts: [meta?.prompt, meta?.negativePrompt] });
           if (missingPyModule) {
             const runtimeInfo = BYOV_RUNTIME_INFO[model.runtime];
             if (runtimeInfo) {
@@ -369,16 +463,35 @@ export async function spawnAndWatchVideo({
               fingerprint: await pickDeathFingerprint({ emitted: job.runtime, runtimeId: model.runtime }),
             });
           } else {
-            reason = `Exit code ${code}`;
+            const diagnostic = failure?.summary || failure?.cause;
+            reason = `Exit code ${code}${diagnostic ? `: ${diagnostic}` : ''}`;
           }
+          if (batch) reason += ` (${batchResults.length}/${batch.length} videos saved to history)`;
           console.log(`❌ Video generation failed [${jobId.slice(0, 8)}]: ${reason}`);
           broadcastSse(job, { type: 'error', error: `Generation failed: ${reason}` });
-          videoGenEvents.emit('failed', { generationId: jobId, error: reason });
+          videoGenEvents.emit('failed', { generationId: jobId, error: reason, failure: missingPyModule ? normalizeVideoFailure(reason) : failure, ...(batch ? { results: batchResults } : {}) });
         } else {
           if (watchdogSuccess) {
             console.log(`⚠️ video child force-killed (completion teardown hang) — output is intact [${jobId.slice(0, 8)}]`);
           }
-          await finalizeGeneratedVideo({ job, jobId, outputPath, filename, meta, actualSeed, mutateHistory: mutateVideoHistory });
+          if (teardownRecovered) {
+            // One concise, scrubbed warning: names the fault and nothing about
+            // this machine or where the file lives. The completion event below
+            // is the only terminal event this job emits.
+            const message = `The renderer aborted during native teardown after finishing — the verified video was kept (${signal})`;
+            console.log(`⚠️ ${message} [${jobId.slice(0, 8)}]`);
+            broadcastSse(job, { type: 'status', message });
+            videoGenEvents.emit('status', { generationId: jobId, message });
+          }
+          if (batch) {
+            if (batchResults.length !== batch.length) throw new Error(`Video batch stopped after ${batchResults.length}/${batch.length} outputs.`);
+            job.status = 'complete';
+            const result = { ...batchResults[0], results: batchResults };
+            broadcastSse(job, { type: 'complete', result });
+            videoGenEvents.emit('completed', { generationId: jobId, ...result });
+          } else {
+            await finalizeGeneratedVideo({ job, jobId, outputPath, filename, meta, actualSeed, mutateHistory: mutateVideoHistory });
+          }
         }
       } catch (err) {
         // Finalize/teardown threw — fail the job loudly instead of crashing the
@@ -387,11 +500,11 @@ export async function spawnAndWatchVideo({
         job.status = 'error';
         console.error(`❌ Video close handler failed [${jobId.slice(0, 8)}]: ${err.message}`);
         broadcastSse(job, { type: 'error', error: `Generation failed: ${err.message}` });
-        videoGenEvents.emit('failed', { generationId: jobId, error: err.message });
+        videoGenEvents.emit('failed', { generationId: jobId, error: err.message, failure: normalizeVideoFailure(err, { prompts: [meta?.prompt, meta?.negativePrompt] }), ...(batch ? { results: batchResults } : {}) });
       } finally {
         // A prompt-encode relaunch returns before this finalizer, deliberately
         // leaving the display asleep while its replacement owns the GPU.
-        if (displaySlept) wakeDisplay(videoGenSettings, 'Video generation');
+        if (displaySlept) wakeDisplayForVideo(videoGenSettings, 'Video generation');
         closeJobAfterDelay(videoJobState.jobs, jobId);
       }
     };
@@ -567,7 +680,7 @@ export async function spawnAndWatchVideo({
     const reason = err.message || 'Video generation failed before the render child was wired';
     console.log(`❌ Video generation setup error [${jobId.slice(0, 8)}]: ${reason}`);
     broadcastSse(job, { type: 'error', error: reason });
-    videoGenEvents.emit('failed', { generationId: jobId, error: reason });
+    videoGenEvents.emit('failed', { generationId: jobId, error: reason, failure: normalizeVideoFailure(err, { prompts: [meta?.prompt, meta?.negativePrompt] }) });
     void cleanupTempFiles({ includeUploads: true, includeUntrackedAudio: true });
     cleanupStepwisePreview();
     closeJobAfterDelay(videoJobState.jobs, jobId);
@@ -586,7 +699,7 @@ export async function spawnAndWatchVideo({
     // has never measured a render on this model — an explicit "no estimate"
     // sentinel the UI must render as "unknown", never as 0 or a guess. Stamped
     // on the job so every progress frame can carry it alongside step progress.
-    const etaEstimate = estimateRenderMs({
+    const etaEstimate = batch ? null : estimateRenderMs({
       history: await loadHistory(),
       modelId,
       width: w,

@@ -3,17 +3,18 @@
  * Re-exports toolkit runner service functions with local overrides
  */
 import { spawn } from '../lib/childProcess.js';
-import { writeFile, readFile } from 'fs/promises';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
-import { atomicWrite, ensureDir, tryReadFile, PATHS } from '../lib/fileUtils.js';
+import { atomicWrite, ensureDir, tryReadFile, writeFileGuarded, PATHS } from '../lib/fileUtils.js';
 import { resolveSpawnCwd } from '../lib/spawnCwd.js';
-import { hasModelFlag, extractBakedModel } from '../lib/providerModels.js';
+import { hasModelFlag, extractBakedModel, isCodexProvider } from '../lib/providerModels.js';
 import { buildCliArgs, prepareCliPrompt } from '../lib/cliProviderArgs.js';
 import { buildCliChildEnv } from '../lib/cliChildEnv.js';
 import { createImmediateFallbackSignalDetector, ERROR_CATEGORIES } from '../lib/aiToolkit/errorDetection.js';
 import { killProcessTree, resolveWindowsExecutable, prepareWindowsSafeSpawn, guardChildStdin, deliverChildStdin } from '../lib/bufferedSpawn.js';
 import { isHostShuttingDown } from '../lib/hostShutdown.js';
-import { ensureOllamaAgentContext } from './ollamaAgentContext.js';
+// `./ollamaAgentContext.js` (and the ollama daemon manager behind it) is imported
+// lazily inside the predicate-gated branch below, NOT here — see that call site.
 import { isOllamaBackedProvider } from './providers.js';
 import {
   setAIToolkitInstance,
@@ -109,7 +110,7 @@ export async function finalizeRunRecord({ runId, output, exitCode, success, erro
   const outputPath = join(runDir, 'output.txt');
   const metadataPath = join(runDir, 'metadata.json');
 
-  await writeFile(outputPath, output).catch(() => {});
+  await writeFileGuarded(outputPath, output).catch(() => {});
 
   const metadataStr = await readFile(metadataPath, 'utf-8').catch(() => '{}');
   let metadata = {};
@@ -244,11 +245,16 @@ export async function resolveRunCwd({ runId, workspacePath, label, startTime = D
  * run tracking sees TUI runs as active.
  */
 export function emitRunStarted({ runId, provider, model }) {
-  runnerConfig.hooks?.onRunStarted?.({
-    runId,
-    provider: provider?.name || provider?.id,
-    model: model ?? provider?.defaultModel,
-  });
+  // Fire-and-forget lifecycle notification — a throwing hook must not take
+  // down the already-registered PTY run (same orphaned-run shape as #5792).
+  safeSettle(
+    () => runnerConfig.hooks?.onRunStarted?.({
+      runId,
+      provider: provider?.name || provider?.id,
+      model: model ?? provider?.defaultModel,
+    }),
+    `Run ${runId} onRunStarted hook`,
+  );
 }
 
 /**
@@ -322,6 +328,10 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
 
   const startTime = Date.now();
   let output = '';
+  // Codex writes its final answer to stdout; stderr is a diagnostic transcript
+  // containing the input prompt. Keep both in logs, but never parse stderr.
+  let assistantOutput = '';
+  const stdoutIsResponse = isCodexProvider(provider);
   let immediateFallbackAnalysis = null;
   let childProcess = null;
   // Set by the wall-clock timeout below so the close handler can classify the
@@ -379,9 +389,12 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
   // hold the daemon at the provider's configured window (or warn) first. See
   // services/ollamaAgentContext.js.
   // Gated on the predicate here (not just inside the helper) so a cloud-provider
-  // run — the overwhelmingly common case — takes no async hop at all.
+  // run — the overwhelmingly common case — takes no async hop at all, and the
+  // import sits INSIDE that gate so it never instantiates the daemon manager's
+  // subtree either. ~160 suites reach runner.js and none of them run ollama.
   const ollamaContext = isOllamaBackedProvider(provider)
-    ? await ensureOllamaAgentContext(provider, { model: provider.defaultModel ?? null })
+    ? await import('./ollamaAgentContext.js')
+      .then(({ ensureOllamaAgentContext }) => ensureOllamaAgentContext(provider, { model: provider.defaultModel ?? null }))
     : null;
   if (ollamaContext?.warning) onData?.(`${ollamaContext.warning}\n`);
 
@@ -408,6 +421,20 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
     env: childEnv
   });
 
+  // Claim the child's 'error' event in the SAME tick as spawn(). Everything
+  // between here and the terminal handlers below — stdin delivery, the
+  // external-run registration, the onRunStarted hook — can throw, and a throw
+  // there leaves a live registered child whose 'error' has no listener; Node
+  // re-throws an unhandled ChildProcess 'error' and kills the server process.
+  // Buffer until the real handler is wired, then replay it exactly once
+  // (same shape as `spawnDirectly` in agentCliSpawning.js).
+  let pendingSpawnError = null;
+  let handleSpawnError = null;
+  childProcess.on('error', (err) => {
+    if (handleSpawnError) handleSpawnError(err);
+    else pendingSpawnError = err;
+  });
+
   // Guard the stdin pipe BEFORE writing: a child that exits before reading it
   // (bad flag, missing CLI) emits EPIPE, and an unlistened stream 'error' out
   // here crashes the server. The 'error'/'close' handlers below settle the run.
@@ -422,8 +449,13 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
   // stopRun/isRunActive/deleteRun account for this host-spawned child process.
   toolkit.services.runner.registerExternalRun(runId, childProcess);
 
-  // Call hooks
-  runnerConfig.hooks?.onRunStarted?.({ runId, provider: provider.name, model: provider.defaultModel });
+  // Call hooks — isolated like every other hook invocation here: a throw would
+  // otherwise reject executeCliRun with the child already spawned and
+  // registered, leaving the run permanently non-terminal.
+  safeSettle(
+    () => runnerConfig.hooks?.onRunStarted?.({ runId, provider: provider.name, model: provider.defaultModel }),
+    `Run ${runId} onRunStarted hook`,
+  );
 
   // Set timeout (default 5 min, guard against undefined which would fire immediately)
   const effectiveTimeout = timeout ?? provider.timeout ?? 300000;
@@ -442,6 +474,7 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
   childProcess.stdout?.on('data', (data) => {
     const text = data.toString();
     output += text;
+    if (stdoutIsResponse) assistantOutput += text;
     onData?.(text);
     abortForImmediateFallbackSignal(text);
   });
@@ -493,7 +526,7 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
       await cleanupVisionFiles().catch((error) => console.error(`❌ Failed to clean CLI vision files: ${error.message}`));
       if (spawnError) console.error(`❌ Run ${runId} spawn error: ${spawnError.message}`);
 
-      await writeFile(outputPath, output);
+      await writeFileGuarded(outputPath, output);
 
       metadata.endTime = new Date().toISOString();
       metadata.duration = Date.now() - startTime;
@@ -545,7 +578,7 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
       } else if (!canceled) {
         safeSettle(() => runnerConfig.hooks?.onRunFailed?.(metadata, metadata.error, output), `Run ${runId} onRunFailed hook`);
       }
-      safeSettle(() => onComplete?.(metadata), `Run ${runId} onComplete`);
+      safeSettle(() => onComplete?.(stdoutIsResponse && metadata.success ? { ...metadata, text: assistantOutput } : metadata), `Run ${runId} onComplete`);
       return metadata;
     } catch (err) {
       const handler = spawnError ? 'error' : 'close';
@@ -573,13 +606,18 @@ export async function executeCliRun({ runId, provider, prompt, workspacePath, sc
     return finalizationPromise;
   };
 
-  childProcess.on('error', (err) => {
+  handleSpawnError = (err) => {
     void finalizeOnce({ exitCode: -1, spawnError: err });
-  });
+  };
 
   childProcess.on('close', (code, signal) => {
     void finalizeOnce({ exitCode: code, signal });
   });
+
+  // A failed spawn emits 'error' and commonly 'close' after it; finalizeOnce
+  // is idempotent, so replaying the buffered error here settles the run and
+  // the later 'close' is a no-op.
+  if (pendingSpawnError) handleSpawnError(pendingSpawnError);
 
   return runId;
 }

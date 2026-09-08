@@ -5,6 +5,8 @@ import { request } from '../lib/testHelper.js';
 // In-memory settings store backing the mocked service.
 let store = {};
 
+vi.mock('../services/userActions.js', () => ({ recordUserAction: vi.fn(async () => ({ id: 'evt' })) }));
+
 vi.mock('../services/settings.js', () => ({
   getSettings: vi.fn(async () => ({ ...store })),
   getSettingsWithStatus: vi.fn(async () => ({ corrupt: false, settings: { ...store } })),
@@ -105,6 +107,36 @@ describe('Settings routes — operator-action actor (#5594)', () => {
   });
 });
 
+describe('Settings routes — untrusted-content policy', () => {
+  beforeEach(() => { store = {}; vi.clearAllMocks(); });
+  it('ships classifier-required defaults and persists source-specific constraints', async () => {
+    const defaults = await request(buildApp()).get('/api/settings');
+    expect(defaults.body.untrustedContent.defaults).toMatchObject({ classifierMode: 'required', minBenignScore: 0.9 });
+    const policy = { defaults: { classifierMode: 'required' }, sources: { signal: { providerId: 'local-api', model: 'example-model', maxInputChars: 5000 }, 'github-issue': { classifierMode: 'optional' } } };
+    const saved = await request(buildApp()).put('/api/settings').send({ untrustedContent: policy });
+    expect(saved.status).toBe(200);
+    expect(store.untrustedContent).toEqual(policy);
+    const read = await request(buildApp()).get('/api/settings');
+    expect(read.body.untrustedContent.sources).toEqual(policy.sources);
+  });
+  it('rejects invalid or weakening policy shapes before replacing the saved settings', async () => {
+    store = { untrustedContent: { defaults: { classifierMode: 'required' } } };
+    const previous = structuredClone(store);
+    for (const patch of [
+      { defaults: { classifierMode: 'off' } },
+      { sources: { signal: { maxInputChars: 999999999 } } },
+      { sources: { email: { providerId: {} } } },
+      { defaults: { minBenignScore: 0.1 } },
+      { sources: { unknown: {} } },
+    ]) {
+      const result = await request(buildApp()).put('/api/settings').send({ untrustedContent: patch });
+      expect(result.status).toBe(400);
+      expect(store).toEqual(previous);
+    }
+    expect(updateSettingsWith).not.toHaveBeenCalled();
+  });
+});
+
 describe('Settings routes — apiAccess slice', () => {
   beforeEach(() => {
     store = {};
@@ -169,10 +201,9 @@ describe('Settings routes — instance feature participation', () => {
       enabled: false,
       setup: expect.objectContaining({ installed: false }),
     }));
-    // GSD remains enabled by default so existing app planning tabs stay
-    // available unless the install explicitly opts out.
-    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'gsd', enabled: true }));
-    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'openclaw', enabled: true }));
+    // GSD and OpenClaw ship disabled by default; the install opts in.
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'gsd', enabled: false }));
+    expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'openclaw', enabled: false }));
     expect(res.body.features).toContainEqual(expect.objectContaining({ id: 'health', enabled: true }));
     // #40 — iMessage and Signal join the comms group, defaulting to enabled
     // with no settings write, exactly like an existing install saw before.
@@ -1024,5 +1055,113 @@ describe('Settings routes — credential inventory', () => {
     expect(res.body.headline).toMatch(/no key at all/i);
     expect(res.body.credentials[0]).toMatchObject({ id: 'huggingface', configured: true, source: 'settings' });
     expect(JSON.stringify(res.body)).not.toMatch(/hf_|sk-|ghp_/);
+  });
+});
+
+describe('Settings routes — hideFirstRunCard (#5640)', () => {
+  beforeEach(() => {
+    store = {};
+    vi.clearAllMocks();
+  });
+
+  it('accepts a boolean durable suppress on the general settings record', async () => {
+    const res = await request(buildApp()).put('/api/settings').send({ hideFirstRunCard: true });
+    expect(res.status).toBe(200);
+    expect(res.body.hideFirstRunCard).toBe(true);
+  });
+
+  it('rejects a non-boolean hideFirstRunCard', async () => {
+    const res = await request(buildApp()).put('/api/settings').send({ hideFirstRunCard: 'yes' });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_ERROR');
+  });
+});
+
+describe('Settings routes — orchestration profiles (#5992)', () => {
+  beforeEach(() => {
+    store = {};
+    vi.clearAllMocks();
+  });
+
+  it('GET /api/settings/orchestration-profiles returns profiles including built-ins', async () => {
+    const res = await request(buildApp()).get('/api/settings/orchestration-profiles');
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body.some(p => p.id === 'heavy-planner')).toBe(true);
+  });
+
+  it('POST /api/settings/orchestration-profiles saves a valid profile', async () => {
+    const payload = {
+      id: 'custom-team',
+      name: 'Custom Team',
+      description: 'Opus + Sonnet',
+      profile: {
+        architect: { provider: 'anthropic', model: 'claude-3-opus', effort: 'max' },
+        implementer: { provider: 'anthropic', model: 'claude-3-5-sonnet', effort: 'low' },
+      },
+    };
+    const res = await request(buildApp()).post('/api/settings/orchestration-profiles').send(payload);
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe('custom-team');
+    expect(store.orchestrationProfiles?.some(p => p.id === 'custom-team')).toBe(true);
+  });
+
+  it('POST rejects an invalid role reasoning effort', async () => {
+    const payload = {
+      id: 'bad-effort',
+      name: 'Bad',
+      profile: {
+        architect: { effort: 'invalid-rung' },
+      },
+    };
+    const res = await request(buildApp()).post('/api/settings/orchestration-profiles').send(payload);
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('PUT /api/settings validates orchestrationProfiles array', async () => {
+    const res = await request(buildApp()).put('/api/settings').send({
+      orchestrationProfiles: [{
+        id: 'valid',
+        name: 'Valid Profile',
+        profile: {
+          architect: { effort: 'high' },
+        },
+      }],
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+
+it('accepts only registered private keys and never returns the submitted secret', async () => {
+  const { getCredentialInventory } = await import('../services/credentialInventory.js');
+  getCredentialInventory.mockResolvedValue({ credentials: [{ id: 'artificial-analysis', configured: true, source: 'settings', editable: true }] });
+  const app = buildApp();
+  const result = await request(app).put('/api/settings/credentials/artificial-analysis').send({ value: 'example-private-key' });
+  expect(result.status).toBe(200);
+  expect(result.body).toMatchObject({ configured: true });
+  expect(JSON.stringify(result.body)).not.toContain('example-private-key');
+  expect(store.secrets.artificialAnalysis.apiKey).toBe('example-private-key');
+  const publicSettings = await request(app).get('/api/settings');
+  expect(JSON.stringify(publicSettings.body)).not.toContain('example-private-key');
+  expect((await request(app).put('/api/settings/credentials/auth').send({ value: 'example' })).status).toBe(400);
+  expect((await request(app).put('/api/settings/credentials/civitai').send({ value: {}, extra: true })).status).toBe(400);
+  await request(app).put('/api/settings/credentials/artificial-analysis').send({ value: '' });
+  expect(store.secrets.artificialAnalysis.apiKey).toBe('');
+});
+
+describe('Settings routes — optional networking preference', () => {
+  beforeEach(() => { store = {}; vi.clearAllMocks(); });
+  it('persists all supported choices and rejects invalid preferences without replacing the saved choice', async () => {
+    for (const networkSetupPreference of ['tailscale', 'tailcat', 'none']) {
+      const saved = await request(buildApp()).put('/api/settings').send({ networkSetupPreference });
+      expect(saved.status).toBe(200);
+      const loaded = await request(buildApp()).get('/api/settings');
+      expect(loaded.body.networkSetupPreference).toBe(networkSetupPreference);
+    }
+    const invalid = await request(buildApp()).put('/api/settings').send({ networkSetupPreference: 'invalid' });
+    expect(invalid.status).toBe(400);
+    expect(store.networkSetupPreference).toBe('none');
   });
 });

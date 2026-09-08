@@ -33,7 +33,6 @@ import {
   ensureDir,
   pathExists,
   expandHome,
-  isValidJSON,
   listDirectoryByExtension,
   safeJSONParse,
   safeJSONLParse,
@@ -127,56 +126,6 @@ async function withUnreadableFile(err, fn) {
 }
 
 describe('fileUtils', () => {
-  describe('isValidJSON', () => {
-    it('should return true for valid JSON object', () => {
-      expect(isValidJSON('{"key": "value"}')).toBe(true);
-    });
-
-    it('should return true for valid JSON array when allowed', () => {
-      expect(isValidJSON('[1, 2, 3]')).toBe(true);
-    });
-
-    it('should return false for JSON array when not allowed', () => {
-      expect(isValidJSON('[1, 2, 3]', { allowArray: false })).toBe(false);
-    });
-
-    it('should return false for empty string', () => {
-      expect(isValidJSON('')).toBe(false);
-    });
-
-    it('should return false for whitespace-only string', () => {
-      expect(isValidJSON('   ')).toBe(false);
-    });
-
-    it('should return false for null', () => {
-      expect(isValidJSON(null)).toBe(false);
-    });
-
-    it('should return false for undefined', () => {
-      expect(isValidJSON(undefined)).toBe(false);
-    });
-
-    it('should return false for string not starting with { or [', () => {
-      expect(isValidJSON('hello')).toBe(false);
-    });
-
-    it('should return false for incomplete object (missing end)', () => {
-      expect(isValidJSON('{"key":')).toBe(false);
-    });
-
-    it('should return false for incomplete array (missing end)', () => {
-      expect(isValidJSON('[1, 2')).toBe(false);
-    });
-
-    it('should handle whitespace around valid JSON', () => {
-      expect(isValidJSON('  {"key": "value"}  ')).toBe(true);
-    });
-
-    it('should handle nested objects', () => {
-      expect(isValidJSON('{"outer": {"inner": "value"}}')).toBe(true);
-    });
-  });
-
   describe('safeJSONParse', () => {
     it('should parse valid JSON object', () => {
       const result = safeJSONParse('{"key": "value"}', {});
@@ -223,6 +172,23 @@ describe('fileUtils', () => {
       expect(result).toEqual({});
     });
 
+    it('should still reject a root array under allowArray: false when defaultValue is not an array', () => {
+      const result = safeJSONParse('["a", "b"]', { fallback: true }, { allowArray: false });
+      expect(result).toEqual({ fallback: true });
+    });
+
+    it('should parse a top-level scalar string', () => {
+      expect(safeJSONParse('"hello"', null)).toBe('hello');
+    });
+
+    it('should parse a top-level scalar number', () => {
+      expect(safeJSONParse('123', null)).toBe(123);
+    });
+
+    it('should parse a top-level scalar boolean', () => {
+      expect(safeJSONParse('true', null)).toBe(true);
+    });
+
     it('should log warning when logError is true', () => {
       const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       safeJSONParse('invalid', {}, { logError: true });
@@ -245,7 +211,6 @@ describe('fileUtils', () => {
     });
 
     it('should handle syntax error in structurally valid JSON', () => {
-      // Passes structural check but fails JSON.parse
       const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const result = safeJSONParse('{"key": undefined}', { fallback: true }, { logError: true });
       expect(result).toEqual({ fallback: true });
@@ -1661,6 +1626,39 @@ describe('createCachedStore', () => {
     await writeFile(file, JSON.stringify({ n: 42 }));
     store.invalidateCache();
     expect((await store.load()).n).toBe(42);
+  });
+
+  // Strict-read regression (#4115). Every consumer (accounts, feeds, schedules,
+  // personalities) mutates through `mutate`, which persists whatever `load`
+  // returned — so a corrupt file that read as the default was rewritten as the
+  // default on the next mutation, deleting every record it held. Corrupt JSON is
+  // the portable "present but unreadable" (same `ok: false` branch as EACCES).
+  describe('strict reads (#4115)', () => {
+    const CORRUPT = '{"accounts": {"a": 1},';
+
+    it('load rejects on a corrupt file instead of fabricating the default', async () => {
+      const file = join(dir, 'x.json');
+      await writeFile(file, CORRUPT);
+      const store = createCachedStore(file, { accounts: {} }, { context: 'accounts' });
+      await expect(store.load()).rejects.toThrow(/Unreadable JSON file/);
+    });
+
+    it('mutate leaves a corrupt file byte-for-byte intact', async () => {
+      const file = join(dir, 'x.json');
+      await writeFile(file, CORRUPT);
+      const store = createCachedStore(file, { accounts: {} });
+      await expect(store.mutate((data) => { data.accounts.b = 2; })).rejects.toThrow(/Unreadable JSON file/);
+      expect(await readFile(file, 'utf-8'), 'the default must never be written over the file we could not read').toBe(CORRUPT);
+    });
+
+    it('recovers once the file is repaired', async () => {
+      const file = join(dir, 'x.json');
+      await writeFile(file, CORRUPT);
+      const store = createCachedStore(file, { accounts: {} });
+      await expect(store.load()).rejects.toThrow(/Unreadable JSON file/);
+      await writeFile(file, JSON.stringify({ accounts: { a: 1 } }));
+      expect((await store.mutate((data) => { data.accounts.b = 2; })).accounts).toEqual({ a: 1, b: 2 });
+    });
   });
 });
 

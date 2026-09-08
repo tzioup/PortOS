@@ -17,24 +17,32 @@ import IMessageTab from '../components/messages/IMessageTab';
 import SignalTab from '../components/messages/SignalTab';
 import BeeperTab from '../components/messages/BeeperTab';
 import ContactsTab from '../components/messages/ContactsTab';
+import { getPageNavTabs } from '../../../server/lib/navManifest.js';
+import { buildPageNavTabs } from '../lib/pageNavTabs.js';
 
-// Exported for the nav-manifest tab-coverage guard (server/lib/navManifest.test.js).
+// Presentation per tab id. The manifest (`tabGroup: 'messages'`) owns
+// id/label/order — this page owns how each tab looks and behaves.
 // `fullBleed: true` — tab owns internal scroll/height; Messages skips padded overflow wrapper.
 // `needsAccounts: true` — tab renders the account list, so it waits for that fetch.
 // `recordParam: true` — tab uses the shared `/messages/:tab/:chatKey` second
 // segment to carry ITS open record in the URL (iMessage a chat key, Beeper a
 // conversation id). Declared here rather than as a hardcoded tab name below, so
 // a third tab that deep-links a record does not have to be remembered twice.
-export const TABS = [
-  { id: 'inbox', label: 'Inbox', icon: Mail, needsAccounts: true },
-  { id: 'drafts', label: 'Drafts', icon: Mail, needsAccounts: true },
-  { id: 'imessage', label: 'iMessage', icon: MessageSquare, fullBleed: true, recordParam: true, feature: 'imessage' },
-  { id: 'signal', label: 'Signal', icon: MessageSquare, feature: 'signal' },
-  { id: 'beeper', label: 'Beeper', icon: MessageCircle, fullBleed: true, recordParam: true, feature: 'beeper' },
-  { id: 'contacts', label: 'Contacts', icon: Users },
-  { id: 'sync', label: 'Sync', icon: RefreshCw, needsAccounts: true },
-  { id: 'config', label: 'Config', icon: Settings, needsAccounts: true },
-];
+// `feature` is NOT declared here: it rides through from the manifest entry via
+// `getPageNavTabs`, so the pill and the sidebar gate on one field.
+// Throws at import time if the manifest and this map drift.
+const TAB_PRESENTATION = {
+  inbox: { icon: Mail, needsAccounts: true },
+  drafts: { icon: Mail, needsAccounts: true },
+  imessage: { icon: MessageSquare, fullBleed: true, recordParam: true },
+  signal: { icon: MessageSquare },
+  beeper: { icon: MessageCircle, fullBleed: true, recordParam: true },
+  contacts: { icon: Users },
+  sync: { icon: RefreshCw, needsAccounts: true },
+  config: { icon: Settings, needsAccounts: true },
+};
+
+export const TABS = buildPageNavTabs(getPageNavTabs('messages'), TAB_PRESENTATION, 'Messages');
 
 const FULL_BLEED_TAB_IDS = new Set(TABS.filter((t) => t.fullBleed).map((t) => t.id));
 const RECORD_PARAM_TAB_IDS = new Set(TABS.filter((t) => t.recordParam).map((t) => t.id));

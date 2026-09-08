@@ -11,10 +11,12 @@
  * so a malformed mutation can never persist.
  */
 
+import { sanitizeShot } from '../../lib/fableLoomShots.js';
 import { randomUUID } from 'crypto';
 import { ServerError } from '../../lib/errorHandler.js';
 import { isStr, trimTo } from '../../lib/storyBible.js';
 import { sanitizeLlmRoutePin } from '../../lib/llmRoutePin.js';
+import { sanitizeCharacterEvolutionList } from '../../lib/characterEvolution.js';
 import { compareNewerWins } from '../../lib/lwwTimestamp.js';
 import { sanitizeSoftDeleteFields } from '../../lib/syncWire.js';
 import {
@@ -90,6 +92,7 @@ const sanitizeVisualCanon = (raw) => {
     .map((item) => ({
       characterId: nullableRef(item.characterId),
       wardrobeId: nullableRef(item.wardrobeId),
+      ...(isSafeImageFilename(item.referenceImage) ? { referenceImage: item.referenceImage } : {}),
       expression: trimTo(item.expression, LOOM_LIMITS.VISUAL_NOTE_MAX),
       continuityNotes: trimTo(item.continuityNotes, LOOM_LIMITS.VISUAL_NOTE_MAX),
     }));
@@ -128,6 +131,7 @@ function sanitizeNode(raw) {
     id: raw.id,
     title: trimTo(raw.title, LOOM_LIMITS.NODE_TITLE_MAX),
     prose: trimTo(raw.prose, LOOM_LIMITS.PROSE_MAX),
+    ...(raw.shot ? { shot: sanitizeShot(raw.shot) } : {}),
     plotPointId: isStr(raw.plotPointId)
       ? raw.plotPointId.trim().slice(0, LOOM_LIMITS.OUTLINE_KEY_MAX)
       : null,
@@ -233,6 +237,13 @@ function sanitizeSeriesPlan(raw, episodes) {
       transcript: trimTo(source.nextSeasonTeaser.transcript, LOOM_LIMITS.DELIVERY_MESSAGE_MAX),
     }
     : null;
+  // The OPTIONAL five-stage character evolution lens (#6440), one per
+  // character, keyed by the canon `chr-` id. Evidence anchors (episodeId /
+  // sceneKey) are PRESERVED as authored even when they no longer resolve —
+  // `fableLoomEvolutionEvidenceRefs` lets a reader derive `stale` on read,
+  // the same way `sanitizeStoryOutline` keeps an unknown `targetKey` so
+  // DANGLING_TRANSITION can report it. Absent on every pre-#6440 plan.
+  const characterEvolutions = sanitizeCharacterEvolutionList(source.characterEvolutions);
   return {
     storyArc: trimTo(source.storyArc, LOOM_LIMITS.STORY_ARC_MAX),
     plotPoints: (Array.isArray(source.plotPoints) ? source.plotPoints : [])
@@ -261,7 +272,36 @@ function sanitizeSeriesPlan(raw, episodes) {
       interEpisodeVoicemails,
       nextSeasonTeaser: teaser,
     } : {}),
+    // Omitted entirely when no lens is authored, so a pre-#6440 plan is
+    // byte-identical after a round trip (same shape rule the delivery plan
+    // above follows) and `preserveLegacyCharacterEvolutions` can tell "this
+    // sender cannot represent the field" from "the author cleared it".
+    ...(characterEvolutions.length ? { characterEvolutions } : {}),
   };
+}
+
+/**
+ * Reference sets a FableLoom evolution lens's evidence anchors resolve
+ * against — every episode id, and every scene an anchor can name across the
+ * loom: expanded teleplay node ids AND authored outline keys. The sync
+ * contract makes those the same string once an outline is expanded, so the
+ * union only widens for a graph-first episode whose outline was never written
+ * — where a live scene must not read as a deleted one.
+ * Hand it to `evolutionEvidenceStatus` so a stage pointing at a deleted
+ * episode or a renamed scene reports `stale` rather than passing as proof.
+ */
+export function fableLoomEvolutionEvidenceRefs(loom) {
+  const episodes = Array.isArray(loom?.episodes) ? loom.episodes : [];
+  const sceneKeys = new Set();
+  for (const episode of episodes) {
+    for (const node of episode?.nodes || []) {
+      if (node?.id) sceneKeys.add(node.id);
+    }
+    for (const scene of episode?.storyOutline?.scenes || []) {
+      if (scene?.key) sceneKeys.add(scene.key);
+    }
+  }
+  return { episodeIds: new Set(episodes.map((episode) => episode.id)), sceneKeys };
 }
 
 export function sanitizeLoom(raw) {
@@ -386,6 +426,7 @@ const editorialContentSignature = (loom) => JSON.stringify({
       id: node.id,
       title: node.title,
       prose: node.prose,
+      shot: node.shot,
       plotPointId: node.plotPointId,
       challengePhase: node.challengePhase,
       imagePrompt: node.imagePrompt,
@@ -633,40 +674,122 @@ export async function deleteLoom(id) {
   emitRecordDeleted('fableLoom', id);
 }
 
+// Episode beat outlines arrived with schema v4, alongside the series delivery
+// plan. A <=v3 sender round-trips the record through an outline-unaware
+// sanitizer, so an absent outline there means "cannot represent" rather than
+// "the author deleted it" — restore the local one whole. A v4 sender knows the
+// outline but not the v5 plot-point/challenge mapping on its scenes, so its
+// outline wins except for those two per-scene fields.
+const preserveLegacyStoryOutline = (episode, localEpisode, senderVersion) => {
+  if (!episode.storyOutline) {
+    return senderVersion < 4 && localEpisode?.storyOutline
+      ? { storyOutline: localEpisode.storyOutline }
+      : {};
+  }
+  if (senderVersion >= 5) return {};
+  const localScenes = new Map((localEpisode?.storyOutline?.scenes || [])
+    .map((scene) => [scene.key, scene]));
+  return {
+    storyOutline: {
+      ...episode.storyOutline,
+      scenes: episode.storyOutline.scenes.map((scene) => ({
+        ...scene,
+        ...(localScenes.has(scene.key) ? {
+          plotPointId: localScenes.get(scene.key).plotPointId,
+          challengePhase: localScenes.get(scene.key).challengePhase,
+        } : {}),
+      })),
+    },
+  };
+};
+
+// The series delivery plan (overnight voicemails, inter-episode voicemails, and
+// the next-season teaser) also arrived with v4. `sanitizeSeriesPlan` omits the
+// three keys entirely when a record predates the feature, so a <=v3 sender that
+// omits them means "cannot represent" and the local plan must survive. A v4+
+// sender that omits them describes a record with genuinely no delivery plan.
+const preserveLegacyDeliveryPlan = (remotePlan, localPlan, senderVersion) => (
+  senderVersion < 4
+    && localPlan
+    && Object.prototype.hasOwnProperty.call(localPlan, 'deliveryOptions')
+    && !Object.prototype.hasOwnProperty.call(remotePlan || {}, 'deliveryOptions')
+    ? {
+      deliveryOptions: localPlan.deliveryOptions,
+      interEpisodeVoicemails: localPlan.interEpisodeVoicemails,
+      nextSeasonTeaser: localPlan.nextSeasonTeaser,
+    }
+    : {}
+);
+
+// The per-character evolution lens (#6440) arrived with v8. `sanitizeSeriesPlan`
+// omits the key entirely when a plan has none, so a <=v7 sender that omits it
+// means "cannot represent" and the local lenses must survive; a v8+ sender that
+// omits it describes a plan whose lenses were genuinely cleared. Same shape as
+// preserveLegacyDeliveryPlan above — without it, one sync from a not-yet-
+// upgraded peer silently drops every authored lens and LWWs the loss back.
+const preserveLegacyCharacterEvolutions = (remotePlan, localPlan, senderVersion) => (
+  senderVersion < 8
+    && localPlan
+    && Object.prototype.hasOwnProperty.call(localPlan, 'characterEvolutions')
+    && !Object.prototype.hasOwnProperty.call(remotePlan || {}, 'characterEvolutions')
+    ? { characterEvolutions: localPlan.characterEvolutions }
+    : {}
+);
+
+// Everything an older sender cannot represent inside `seriesPlan`, in one
+// place: the v4 delivery plan, the v5 plot-point kinds, and the v8 evolution
+// lenses. Returns `remote` BY REFERENCE when there is nothing to restore, so
+// the common merge allocates no copy.
+const preserveLegacySeriesPlan = (remote, local, senderVersion) => {
+  const evolutions = preserveLegacyCharacterEvolutions(remote, local, senderVersion);
+  if (senderVersion >= 5) {
+    return evolutions.characterEvolutions ? { ...remote, ...evolutions } : remote;
+  }
+  const localPlotPoints = new Map((local?.plotPoints || []).map((item) => [item.id, item]));
+  return {
+    ...remote,
+    ...preserveLegacyDeliveryPlan(remote, local, senderVersion),
+    plotPoints: (remote?.plotPoints || []).map((item) => ({
+      ...item,
+      ...(localPlotPoints.has(item.id) ? { kind: localPlotPoints.get(item.id).kind } : {}),
+    })),
+    // Last, so the key lands where `sanitizeSeriesPlan` puts it — this merge
+    // result is persisted without a re-sanitize.
+    ...evolutions,
+  };
+};
+
 // An older peer cannot represent newer scene production fields. When that
 // peer wins whole-record LWW after an unrelated edit, retain the local fields
 // on nodes that still exist instead of letting its unaware sanitizer clear
 // them. A sender at the current schema version's present null remains an
 // intentional clear.
 const preserveLegacyVisualProduction = (remote, local, senderVersion) => {
-  if (!local || senderVersion >= 6) return remote;
+  if (!local || senderVersion >= 8) return remote;
+  const seriesPlan = preserveLegacySeriesPlan(remote.seriesPlan, local.seriesPlan, senderVersion);
+  // A v7 sender's ONLY unrepresentable field is the evolution lens above —
+  // every branch below is gated at <7 or lower. Returning early keeps the
+  // dominant legacy path off the O(episodes x nodes) rebuild it would all skip.
+  if (senderVersion >= 7) {
+    return seriesPlan === remote.seriesPlan ? remote : { ...remote, seriesPlan };
+  }
   const localEpisodes = new Map(local.episodes.map((episode) => [episode.id, episode]));
-  const localPlotPoints = new Map((local.seriesPlan?.plotPoints || []).map((item) => [item.id, item]));
-  const legacyRenderSettings = senderVersion < 5
-    ? local.renderSettings
-    : {
-      ...remote.renderSettings,
-      ...Object.fromEntries(FABLELOOM_RENDER_PREFERENCE_KEYS
-        .filter((key) => Object.prototype.hasOwnProperty.call(local.renderSettings, key))
-        .map((key) => [key, local.renderSettings[key]])),
-    };
   return {
     ...remote,
     ...(senderVersion < 6 ? {
       // v5 peers understand the aspect-ratio format but would strip the
       // provider/model preferences added in v6 during an unrelated update.
-      renderSettings: legacyRenderSettings,
+      renderSettings: senderVersion < 5 ? local.renderSettings : {
+        ...remote.renderSettings,
+        ...Object.fromEntries(FABLELOOM_RENDER_PREFERENCE_KEYS
+          .filter((key) => Object.prototype.hasOwnProperty.call(local.renderSettings, key))
+          .map((key) => [key, local.renderSettings[key]])),
+      },
     } : {}),
     ...(senderVersion < 5 ? {
       productionStatus: local.productionStatus,
     } : {}),
-    seriesPlan: senderVersion < 5 ? {
-      ...remote.seriesPlan,
-      plotPoints: (remote.seriesPlan?.plotPoints || []).map((item) => ({
-        ...item,
-        ...(localPlotPoints.has(item.id) ? { kind: localPlotPoints.get(item.id).kind } : {}),
-      })),
-    } : remote.seriesPlan,
+    seriesPlan,
     ...(senderVersion < 4 ? {
       protagonistCharacterId: local.protagonistCharacterId,
       protagonistWardrobeId: local.protagonistWardrobeId,
@@ -675,26 +798,25 @@ const preserveLegacyVisualProduction = (remote, local, senderVersion) => {
     episodes: remote.episodes.map((episode) => {
       const localEpisode = localEpisodes.get(episode.id);
       const localNodes = new Map((localEpisode?.nodes || []).map((node) => [node.id, node]));
-      const localOutlineScenes = new Map((localEpisode?.storyOutline?.scenes || [])
-        .map((scene) => [scene.key, scene]));
       return {
         ...episode,
-        ...(senderVersion < 5 && episode.storyOutline ? {
-          storyOutline: {
-            ...episode.storyOutline,
-            scenes: episode.storyOutline.scenes.map((scene) => ({
-              ...scene,
-              ...(localOutlineScenes.has(scene.key) ? {
-                plotPointId: localOutlineScenes.get(scene.key).plotPointId,
-                challengePhase: localOutlineScenes.get(scene.key).challengePhase,
-              } : {}),
-            })),
-          },
-        } : {}),
+        ...preserveLegacyStoryOutline(episode, localEpisode, senderVersion),
         nodes: episode.nodes.map((node) => {
           const localNode = localNodes.get(node.id);
           return localNode ? {
             ...node,
+            ...(senderVersion < 7 ? {
+              ...(localNode.shot ? { shot: localNode.shot } : {}),
+              ...(senderVersion >= 3 && node.visualCanon ? {
+                visualCanon: {
+                  ...node.visualCanon,
+                  characterAppearances: node.visualCanon.characterAppearances.map((appearance) => {
+                    const previous = localNode.visualCanon?.characterAppearances.find((item) => item.characterId === appearance.characterId);
+                    return previous?.referenceImage ? { ...appearance, referenceImage: previous.referenceImage } : appearance;
+                  }),
+                },
+              } : {}),
+            } : {}),
             ...(senderVersion < 5 ? {
               plotPointId: localNode.plotPointId,
               challengePhase: localNode.challengePhase,
@@ -726,7 +848,7 @@ export async function mergeLoomsFromSync(
   remoteLooms,
   {
     source = { via: 'sync', peerId: null },
-    senderSchemaVersions = { fableLoom: 6 },
+    senderSchemaVersions = { fableLoom: 8 },
   } = {},
 ) {
   if (!Array.isArray(remoteLooms)) return { applied: false, count: 0 };
@@ -863,6 +985,7 @@ export function deleteEpisode(loomId, episodeId) {
 // --- Nodes & transitions ----------------------------------------------------
 
 const NODE_PATCH_FIELDS = [
+  'shot',
   'title', 'prose', 'plotPointId', 'challengePhase', 'imagePrompt', 'videoPrompt', 'cameraMovement', 'playbackMode',
   'audienceConnection', 'protagonistPresence', 'visualCanon', 'videoHistoryId', 'playbackAssets', 'interactionWindow',
   'isEnding', 'endingLabel', 'pos', 'transitions',

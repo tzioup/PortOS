@@ -1,10 +1,25 @@
+import { providerModeGroups } from '../lib/aiToolkit/internal/providerModes.js';
+import { buildProviderGraphPreview, toManagementPreviewDto } from '../lib/providerGraphPreview.js';
+import {
+  createBinding,
+  createConnection,
+  getManagementGraph,
+  linkBinding,
+  previewBindingLink,
+  refreshConnectionCatalog,
+  removeConnection,
+  unlinkBinding,
+  updateBindingSettings,
+  updateConnectionSettings,
+  updateRouteModelAliases,
+  updateRouteSettings,
+} from '../services/providerGraph.js';
 import { Router } from 'express';
 import { asyncHandler, ServerError } from '../lib/errorHandler.js';
 import { testVision, runVisionTestSuite, checkVisionHealth } from '../services/visionTest.js';
 import { providerSchema, providerActiveSchema, validate } from '../lib/aiToolkit/validation.js';
 import { withRefreshCapability } from '../lib/aiToolkit/internal/modelFetchers.js';
 import { ALLOWED_COMMANDS } from '../cos-runner/allowedCommands.js';
-import { createLineReader } from '../lib/streamLines.js';
 import { onClientDisconnect, openSseStream } from '../lib/sseDownload.js';
 import { createInstallLogger } from '../lib/installLogger.js';
 import {
@@ -13,15 +28,22 @@ import {
   codexLoginStartSchema,
   providerVisionTestSchema,
   providerVisionSuiteSchema,
+  providerBindingCreateSchema,
+  providerBindingLinkSchema,
+  providerBindingUnlinkSchema,
+  providerBindingUpdateSchema,
+  providerConnectionCreateSchema,
+  providerConnectionUpdateSchema,
+  providerRouteModelAliasSchema,
+  providerRouteSettingsUpdateSchema,
 } from '../lib/validation.js';
 import {
-  describeRuntimeInstall,
-  getProviderRuntime,
   getProviderRuntimeStatus,
   getProviderRuntimeStatuses,
-  spawnRuntimeInstaller,
-  stopRuntimeInstaller,
 } from '../services/providerRuntimeInstaller.js';
+import { refreshHarnessModels, usesHarnessCatalog } from '../services/harnesses.js';
+import { providerRuntimeKey } from '../lib/providerPrerequisites.js';
+import { streamHarnessAction } from '../services/harnessActionStream.js';
 import { getProviderReadinessMap, resetProviderReadinessCache, servedModelId } from '../services/providerReadiness.js';
 import { getLlamaServerEndpoint, relaunchLlamaServerWithAlias } from '../services/llamaServerManager.js';
 import { claimHeavyLocalJob } from '../lib/heavyJobClaim.js';
@@ -30,6 +52,7 @@ import { isCodexSubscriptionProvider } from '../lib/codexAccount.js';
 import {
   cancelCodexChatGptLogin,
   peekCodexAccountReadiness,
+  peekCodexModelCatalog,
   codexLogout,
   listCodexModels,
   getCodexAccountReadiness,
@@ -37,7 +60,12 @@ import {
 } from '../services/codexAppServer.js';
 import { runLocalRuntimeSetup, SETUP_ACTIONS } from '../services/localRuntimeSetup.js';
 import { localEndpointPort, localRuntimeForProvider } from '../lib/localProviderRuntime.js';
-import { publicReviewPosturesForProvider, PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE } from '../lib/providerVendors.js';
+import {
+  enforcedPublicReviewPosturesForProvider,
+  publicReviewPosturesForProvider,
+  PUBLIC_REVIEW_NO_TOOL_POSTURE,
+  PUBLIC_REVIEW_ACTIONS_POSTURE,
+} from '../lib/providerVendors.js';
 import { buildTuiShellLaunch } from '../lib/tuiShellLaunch.js';
 import {
   captureSystemCapabilities,
@@ -61,12 +89,6 @@ import {
  * `data/providers.json`, or a config write could choose the exec target.
  */
 const RUNNER_ALLOWED_COMMANDS = [...ALLOWED_COMMANDS].sort();
-
-// One global CLI install at a time — npm's global prefix and the vendor
-// install scripts all write the same bin directory. This is a lightweight
-// re-entrancy guard for a double-click or a second browser tab; its child stays
-// in the route so a client disconnect can terminate it.
-let runtimeInstallInFlight = null;
 
 // Same re-entrancy guard for the local-daemon setup lane. Separate from the CLI
 // one because they install different things, but each is single-flight: two
@@ -119,6 +141,11 @@ const withTuiLaunchCommand = (provider) => {
   return launch ? { ...provider, tuiCommandLine: launch.commandLine } : provider;
 };
 
+// Reuse the harness catalog only for wrappers the managed OpenCode refresh
+// can update; custom binaries and declared backends keep their own catalogs.
+const refreshesOpenCodeCatalog = (provider) =>
+  providerRuntimeKey(provider) === 'opencode' && usesHarnessCatalog(provider);
+
 /**
  * The shape a provider takes on its way OUT to the client: secrets stripped,
  * plus the derived `canRefreshModels` flag the AI Providers page reads to
@@ -147,12 +174,15 @@ const presentProvider = (provider, capabilities = captureSystemCapabilities()) =
   // the maintained public-review recipe, not a client-side guess based on a
   // provider name or a user-writable `args` list.
   // `publicReviewPostures` is the value the schedule UI filters on, so a stage
-  // offers exactly the providers this install can actually enforce. The two
-  // booleans are derived from it and kept for existing consumers.
-  const publicReviewPostures = publicReviewPosturesForProvider(provider, { tui: provider?.type === 'tui' });
+  // offers exactly the providers this install can actually run it on;
+  // `publicReviewEnforcedPostures` is the subset backed by a vendor sandbox
+  // recipe. The two booleans are derived from it and kept for existing consumers.
+  const publicReviewPostures = publicReviewPosturesForProvider(provider);
   return sanitizeProvider({
     ...decorated,
+    canRefreshModels: decorated.canRefreshModels || refreshesOpenCodeCatalog(provider),
     publicReviewPostures,
+    publicReviewEnforcedPostures: enforcedPublicReviewPosturesForProvider(provider),
     publicReviewSupported: publicReviewPostures.includes(PUBLIC_REVIEW_NO_TOOL_POSTURE),
     publicReviewActionsSupported: publicReviewPostures.includes(PUBLIC_REVIEW_ACTIONS_POSTURE),
   });
@@ -164,6 +194,40 @@ const presentProvider = (provider, capabilities = captureSystemCapabilities()) =
  */
 export function createPortOSProviderRoutes(aiToolkit) {
   const router = Router();
+
+  router.get('/fleet-host', asyncHandler(async (req, res) => {
+    const { getFleetLlmHostStatus } = await import('../services/fleetLlmHost.js');
+    res.set('Cache-Control', 'no-store').json(await getFleetLlmHostStatus());
+  }));
+  router.get('/fleet-peer-hosts', asyncHandler(async (req, res) => {
+    const { getFleetPeerHosts } = await import('../services/fleetLlmHost.js');
+    res.set('Cache-Control', 'no-store').json(await getFleetPeerHosts());
+  }));
+  router.post('/fleet-peer-hosts/:peerId/key', asyncHandler(async (req, res) => {
+    const { revealFleetPeerHostKey } = await import('../services/fleetLlmHost.js');
+    res.set('Cache-Control', 'no-store').json(await revealFleetPeerHostKey(req.params.peerId));
+  }));
+  // Explicit reveal; secrets are never included in status, URLs or install logs.
+  router.post('/fleet-host/key', asyncHandler(async (req, res) => {
+    const { revealFleetLlmKey } = await import('../services/fleetLlmHost.js');
+    res.set('Cache-Control', 'no-store').json({ apiKey: await revealFleetLlmKey() });
+  }));
+  router.post('/fleet-host/setup', asyncHandler(async (req, res) => {
+    const { configureFleetLlmHost } = await import('../services/fleetLlmHost.js');
+    if (runtimeSetupInFlight) throw new ServerError('Another model setup is running.', { status: 409, code: 'SETUP_BUSY' });
+    runtimeSetupInFlight = true;
+    const { send, safeEnd } = openSseStream(res);
+    let clientGone = false;
+    onClientDisconnect(req, res, () => { clientGone = true; });
+    const result = await configureFleetLlmHost({
+      emit: (message) => send({ type: 'log', message }),
+      isCancelled: () => clientGone,
+    }).catch((err) => ({ success: false, error: err.message }))
+      .finally(() => { runtimeSetupInFlight = false; resetProviderReadinessCache(); });
+    send(result.success ? { type: 'complete', message: 'Host configured. Check model readiness below.' } : { type: 'error', message: result.error });
+    safeEnd();
+  }));
+
   const providerService = aiToolkit.services.providers;
   const providerStatusService = aiToolkit.services.providerStatus;
 
@@ -187,18 +251,31 @@ export function createPortOSProviderRoutes(aiToolkit) {
   router.get('/', asyncHandler(async (req, res) => {
     const data = await providerService.getAllProviders();
     const prerequisites = getProviderPrerequisiteMap(data.providers);
+    const modeGroups = new Map(providerModeGroups(data.providers).flatMap(group =>
+      group.map(provider => [provider.id, group.map(({ id, type }) => ({ id, type }))])));
     const capabilities = await detectSystemCapabilities();
     // Cache-only: this list must stay a synchronous read that spawns nothing.
     // `null` here means NOT PROBED, and the dedicated `/codex/account` fetch is
     // what fills it — a card renders "unknown", never "signed out", until then.
     const codexAccount = peekCodexAccountReadiness();
+    // Same cache-only contract, for the CoS/model pickers (#6306): the signed-in
+    // account's real catalog when one has been fetched, otherwise the three-state
+    // shape that tells the client to keep showing its shipped list. Rendering a
+    // picker must never be what starts `codex app-server`.
+    const codexModelCatalog = peekCodexModelCatalog();
     res.json({
       activeProvider: data.activeProvider,
       providers: data.providers.map((provider) => ({
         ...presentProvider(provider, capabilities),
+        executionModes: modeGroups.get(provider.id),
         prerequisitesMet: prerequisites[provider.id]?.met ?? true,
         missingPrerequisites: prerequisites[provider.id]?.missing ?? [],
-        ...(isCodexSubscriptionProvider(provider) ? { codexAccount } : {}),
+        // NON-blocking notices — today only 'this install's own ~/.codex/config.toml
+        // re-points Codex model routing'. Kept OUT of `missingPrerequisites` so a
+        // legitimate user choice never buckets a card as NEEDS SETUP; the card
+        // renders it as a badge and caveats the subscription quota with it.
+        prerequisiteAdvisories: prerequisites[provider.id]?.advisories ?? [],
+        ...(isCodexSubscriptionProvider(provider) ? { codexAccount, codexModelCatalog } : {}),
       })),
       runnerAllowedCommands: RUNNER_ALLOWED_COMMANDS
     });
@@ -222,6 +299,176 @@ export function createPortOSProviderRoutes(aiToolkit) {
       throw new ServerError('Provider not found', { status: 404 });
     }
     res.json(presentProvider(provider, await detectSystemCapabilities()));
+  }));
+
+  /**
+   * READ-ONLY preview of the provider connection graph (#6366) — what an
+   * import WOULD create from the records this install already runs, and which
+   * records it would leave isolated, with reasons.
+   *
+   * Nothing is persisted, no provider is written, and no AI provider is
+   * contacted: this is a pure projection of `providers.json` and must stay one,
+   * because it is meant to be safe to open from a configuration screen. The
+   * flat `GET /api/providers` shape is untouched and remains the execution
+   * contract; `activeProvider` here is the same executable provider id string.
+   *
+   * A client talking to a server without this endpoint gets a 404 and falls
+   * back to the flat list — an explicit unsupported answer, not a guess.
+   */
+  router.get('/management/preview', asyncHandler(async (_req, res) => {
+    const data = await providerService.getAllProviders();
+    res.set('Cache-Control', 'no-store').json(toManagementPreviewDto(buildProviderGraphPreview(data)));
+  }));
+
+  /**
+   * The DURABLE provider connection graph (#6367) — the same shape as the
+   * preview above, but read from ai_connections / ai_harness_bindings /
+   * ai_route_bindings rather than derived on every request.
+   *
+   * Sanitized identically: credential PRESENCE only, no projection snapshots,
+   * no raw provider records. An install whose database is unavailable gets an
+   * explicit 503 `PROVIDER_GRAPH_UNAVAILABLE` rather than a silent empty graph,
+   * so a client can fall back to the flat list on a known answer instead of
+   * guessing from a failed request.
+   */
+  router.get('/management', asyncHandler(async (_req, res) => {
+    res.set('Cache-Control', 'no-store').json(await getManagementGraph());
+  }));
+
+  /**
+   * Add a NEW backend to the graph (#6369) — mock flow 3 in the decision
+   * record: a distinct remote endpoint with its own credentials, created as its
+   * own identity even when its model names match a backend already configured.
+   *
+   * Creation only. Nothing is probed, no model list is fetched, no route is
+   * minted and `activeProvider` does not move: a connection with no binding is
+   * a legitimate row the user then attaches a harness to.
+   */
+  router.post('/connections', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerConnectionCreateSchema, req.body ?? {});
+    res.status(201).json(await createConnection(input));
+  }));
+
+  /**
+   * Add a harness to an existing backend (#6369) — mock flow 2: the same
+   * daemon, driven by a second program, as an INDEPENDENT binding with its own
+   * executable route ids.
+   *
+   * The route records are minted from the harness's command recipe
+   * (`PROVIDER_HARNESSES[].recipe`), which is what this endpoint waited on: the
+   * registry could classify an existing record but not describe how to spawn a
+   * fresh one.
+   *
+   * Every minted route arrives DISABLED with no model pins. Creating a route is
+   * a management act; executing one is a separate grant on `PATCH
+   * /api/providers/:id`, and nothing here launches, probes or generates.
+   */
+  router.post('/bindings', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerBindingCreateSchema, req.body ?? {});
+    res.status(201).json(await createBinding(input));
+  }));
+
+  /**
+   * What linking this binding into another connection WOULD change: which
+   * executable route ids move, how the two backends differ, and which variant
+   * key the binding would occupy. Read-only — POST because the body carries the
+   * revisions being reviewed, not because anything is written.
+   */
+  router.post('/bindings/:id/link/preview', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerBindingLinkSchema, req.body ?? {});
+    res.json(await previewBindingLink({ bindingId: req.params.id, ...input }));
+  }));
+
+  // Apply a reviewed link. Every named revision is re-checked inside the graph
+  // transaction; a stale one is a 409 that requires a fresh preview.
+  router.post('/bindings/:id/link', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerBindingLinkSchema, req.body ?? {});
+    res.json(await linkBinding({ bindingId: req.params.id, ...input }));
+  }));
+
+  // Give this binding its own copy of the connection it shares. Route ids,
+  // activeProvider, task pins and fallback references are all retained.
+  router.post('/bindings/:id/unlink', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerBindingUnlinkSchema, req.body ?? {});
+    res.json(await unlinkBinding({ bindingId: req.params.id, ...input }));
+  }));
+
+  // Remove a connection no binding uses. Refused with a 409 while one still
+  // does — the graph never silently orphans a binding to tidy a row away.
+  router.delete('/connections/:id', asyncHandler(async (req, res) => {
+    res.json(await removeConnection(req.params.id));
+  }));
+
+  /**
+   * Edit one SHARED backend (#6369) — its label, transports and credentials —
+   * and materialize the result into every executable route on it.
+   *
+   * This is the edit the graph exists for: an endpoint or key changed once
+   * rather than retyped per harness. `expectedRevision` is required and
+   * re-checked inside the serialized pass, so an edit made against a row that
+   * has since moved is a 409 instead of a silent overwrite.
+   */
+  router.patch('/connections/:id', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerConnectionUpdateSchema, req.body ?? {});
+    res.json(await updateConnectionSettings({ connectionId: req.params.id, ...input }));
+  }));
+
+  /**
+   * Refresh a connection's SHARED model catalog once for every harness on it.
+   *
+   * An explicit discovery request and nothing more: it lists models, it never
+   * generates, and a failed probe keeps the catalog the connection already had
+   * rather than reporting an empty backend.
+   */
+  router.post('/connections/:id/refresh-models', asyncHandler(async (req, res) => {
+    res.json(await refreshConnectionCatalog(req.params.id));
+  }));
+
+  /**
+   * Edit one harness binding's management state: its label and the subset of
+   * the shared catalog it offers. Never its routes' enablement or consent —
+   * those stay on `PATCH /api/providers/:id`, where granting them is explicit.
+   */
+  router.patch('/bindings/:id', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerBindingUpdateSchema, req.body ?? {});
+    res.json(await updateBindingSettings({ bindingId: req.params.id, ...input }));
+  }));
+
+  /**
+   * Edit ONE route's mode overrides (#6369) — args, timeout, effort, model pins.
+   *
+   * The per-mode counterpart to the shared-backend edit above, so a whole
+   * backend is configurable from one screen instead of a connection plus three
+   * route editors. Route-owned only: an endpoint, a credential and the `enabled`
+   * flag are all unreachable here by construction, and `PATCH
+   * /api/providers/:id` remains the place execution consent is granted.
+   *
+   * `expectedRevision` is the route's `settingsRevision` from
+   * `GET /api/providers/management` — a fingerprint of the values on disk, so an
+   * edit made in the route editor while this panel was open is a 409 too.
+   */
+  router.patch('/routes/:providerId', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerRouteSettingsUpdateSchema, req.body ?? {});
+    res.json(await updateRouteSettings({ providerId: req.params.providerId, ...input }));
+  }));
+
+  /**
+   * Correct ONE route's canonical→executable model aliases by hand (#6369).
+   *
+   * A refresh records only the aliases it can VERIFY — a stored model string
+   * round-trips through the harness's own adapter or it stays an unresolved
+   * alias rather than being rewritten — so a spelling the adapter cannot
+   * reproduce reaches no shared catalog and no model menu. This is where a
+   * human supplies it.
+   *
+   * `null` for a key removes that override and is the ONLY thing that does: a
+   * refresh rewrites what it observed in a separate column, so a correction
+   * survives it and an alias for a model the route no longer lists is kept and
+   * reported stale rather than dropped.
+   */
+  router.patch('/routes/:providerId/model-aliases', asyncHandler(async (req, res) => {
+    const input = validateRequest(providerRouteModelAliasSchema, req.body ?? {});
+    res.json(await updateRouteModelAliases({ providerId: req.params.providerId, ...input }));
   }));
 
   router.get('/samples', asyncHandler(async (req, res) => {
@@ -325,142 +572,11 @@ export function createPortOSProviderRoutes(aiToolkit) {
     res.json({ readiness: await codexLogout() });
   }));
 
-  /**
-   * Install one provider runtime, streaming the installer's output as SSE.
-   *
-   * Installing a global CLI mutates host state, so this stays a POST even
-   * though the response is SSE-encoded. The client reads it with fetch rather
-   * than EventSource: EventSource would auto-reconnect after a dropped stream
-   * and could launch another non-idempotent install.
-   *
-   * The request names a runtime *id* only. The command, package, and URL all
-   * come from the installer's fixed table, so no request input ever reaches a
-   * shell word.
-   */
-  const streamRuntimeInstall = async (req, res, runtimeId) => {
-    // Table lookup only (no I/O), so an unknown id is a plain 400 instead of a
-    // stream that only says "no" once the modal is up. The real probe waits
-    // until the disconnect handler is registered below.
-    const row = getProviderRuntime(runtimeId);
-    if (!row) {
-      throw new ServerError('Unknown provider runtime', { status: 400, code: 'UNKNOWN_RUNTIME', context: { runtime: String(runtimeId || '') } });
-    }
-
-    const { send, safeEnd } = openSseStream(res);
-    const installLog = createInstallLogger({ installer: row.label, target: `${row.command} on PortOS's PATH` });
-    const emit = (event) => { installLog.onEvent(event); send(event); };
-    let child = null;
-    let finished = false;
-    let clientGone = false;
-    let reservation = null;
-
-    // Register before the availability probe. If the modal closes while the
-    // probe is resolving, do not start an installer nobody can observe.
-    onClientDisconnect(req, res, () => {
-      clientGone = true;
-      installLog.cancel();
-      if (finished) return;
-      if (child) stopRuntimeInstaller(child);
-      if (reservation && runtimeInstallInFlight === reservation) runtimeInstallInFlight = null;
-      safeEnd();
-    });
-
-    // Un-cached: the user may have just installed this CLI in a terminal, and a
-    // stale "not installed" would run a redundant install.
-    const runtime = await getProviderRuntimeStatus(row.id, { fresh: true });
-    if (clientGone) return safeEnd();
-    if (runtime.installed) {
-      send({ type: 'log', message: `${runtime.label} is already available to PortOS.` });
-      send({ type: 'complete', message: 'Already installed — nothing to do.' });
-      return safeEnd();
-    }
-    if (!runtime.installable) {
-      send({ type: 'error', message: runtime.blockedReason || `PortOS cannot install ${runtime.label} on this host.` });
-      return safeEnd();
-    }
-    if (runtimeInstallInFlight) {
-      send({ type: 'error', message: 'Another runtime install is already running. Wait for it to finish or restart PortOS.' });
-      return safeEnd();
-    }
-
-    // Reserve synchronously before spawning so two requests that finish their
-    // status probe together cannot launch competing installs into the same bin
-    // directory.
-    reservation = {};
-    runtimeInstallInFlight = reservation;
-    if (clientGone) {
-      runtimeInstallInFlight = null;
-      return safeEnd();
-    }
-
-    send({ type: 'stage', stage: 'install', message: `Installing ${runtime.label}.` });
-    emit({ type: 'log', message: `Running ${describeRuntimeInstall(runtime.id)}.` });
-    installLog.start();
-    // `spawn` can throw synchronously (a rejected argv shape, an OS-level spawn
-    // refusal). Two things must happen here that letting it bubble would not do:
-    // release the reservation — or every later install answers "another install
-    // is already running" until PortOS restarts — and report the failure as a
-    // terminal SSE frame, since the headers are already flushed and the error
-    // middleware can no longer send JSON to this response.
-    try {
-      child = spawnRuntimeInstaller(runtime.id);
-    } catch (err) {
-      finished = true;
-      if (runtimeInstallInFlight === reservation) runtimeInstallInFlight = null;
-      emit({ type: 'error', message: `${runtime.label} installer failed to start: ${err.message}` });
-      return safeEnd();
-    }
-    runtimeInstallInFlight = child;
-
-    const onLine = (line) => {
-      const text = line.trimEnd();
-      if (text) emit({ type: 'log', message: text });
-    };
-    // npm runs with `--no-progress`, which suppresses its usual redraws. Keep
-    // the default newline-only reader as a defensive second layer: a lifecycle
-    // child (or a vendor install script's own progress bar) that still writes
-    // bare carriage returns cannot turn every redraw into a browser log frame
-    // and a full modal re-render.
-    const stdoutReader = createLineReader(onLine);
-    const stderrReader = createLineReader(onLine);
-    child.stdout.on('data', stdoutReader.push);
-    child.stderr.on('data', stderrReader.push);
-    child.on('error', (err) => {
-      if (finished) return;
-      finished = true;
-      if (runtimeInstallInFlight === child) runtimeInstallInFlight = null;
-      emit({ type: 'error', message: `${runtime.label} installer failed to start: ${err.message}` });
-      safeEnd();
-    });
-    // The post-install PATH check is deliberately stronger than the installer's
-    // exit code. A successful write whose bin directory is absent from PM2's
-    // PATH would otherwise recreate the same opaque agent-start failure.
-    child.on('close', async (code) => {
-      if (finished) return;
-      try {
-        stdoutReader.flush();
-        stderrReader.flush();
-        finished = true;
-        if (runtimeInstallInFlight === child) runtimeInstallInFlight = null;
-        // `fresh` is load-bearing: the pre-install probe cached "not installed"
-        // seconds ago, and re-reading it would fail a CLI that now works.
-        const installed = code === 0 && (await getProviderRuntimeStatus(runtime.id, { fresh: true })).installed;
-        if (installed) {
-          emit({ type: 'complete', message: `${runtime.label} is installed and available to PortOS.` });
-        } else if (code === 0) {
-          emit({ type: 'error', message: `The installer finished, but PortOS still cannot run \`${runtime.command}\`. npm wrote it to a bin directory that is not on this machine's PATH — run \`npm prefix -g\` in a terminal, add that directory (plus \`/bin\` off Windows) to your PATH, then restart PortOS.` });
-        } else {
-          emit({ type: 'error', message: `${runtime.label} installer exited with code ${code}.` });
-        }
-        safeEnd();
-      } catch (err) {
-        // Child-process completion runs outside Express's request lifecycle.
-        console.error(`❌ ${runtime.label} install completion check failed: ${err.message}`);
-        emit({ type: 'error', message: `${runtime.label} install completion check failed: ${err.message}` });
-        safeEnd();
-      }
-    });
-  };
+  // Install-only: the update and remove lanes of the shared runner are reached
+  // from `/api/harnesses`, which is where the Harnesses page drives them. See
+  // `services/harnessActionStream.js` for the stream contract.
+  const streamRuntimeInstall = (req, res, runtimeId) =>
+    streamHarnessAction(req, res, { runtime: runtimeId, action: 'install' });
 
   /**
    * Install and/or start the LOCAL DAEMON one provider points at, streaming
@@ -780,7 +896,18 @@ export function createPortOSProviderRoutes(aiToolkit) {
   // provider record receives the same secret redaction as every other provider
   // response. The toolkit returns its raw persisted record here.
   router.post('/:id/refresh-models', asyncHandler(async (req, res) => {
-    const provider = await providerService.refreshProviderModels(req.params.id);
+    const stored = await providerService.getProviderById(req.params.id);
+    if (!stored) throw new ServerError('Provider not found', { status: 404 });
+    let provider;
+    if (refreshesOpenCodeCatalog(stored)) {
+      const result = await refreshHarnessModels('opencode');
+      if (!result.ok || !result.updated.includes(stored.id)) {
+        throw new ServerError(result.reason || 'No models matched this provider’s namespace; its catalog was preserved.', { status: 502 });
+      }
+      provider = await providerService.getProviderById(stored.id);
+    } else {
+      provider = await providerService.refreshProviderModels(req.params.id);
+    }
     if (!provider) throw new ServerError('Provider not found', { status: 404 });
     res.json(presentProvider(provider, await detectSystemCapabilities()));
   }));

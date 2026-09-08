@@ -24,9 +24,9 @@ and the current-vs-proposed boundary.
 - `GET /api/api-docs/asyncapi.json` — AsyncAPI 3 for the Socket.IO transport.
 - `GET /api/api-docs/tools.min.json` — the minimized semantic tool resource: only the operations annotated `x-portos-tool`, flattened to provider-neutral tool records with an HTTP binding. Sized for an agent to read whole, unlike the full internal document.
 
-Inferred entries are explicitly marked `generated` until a runtime-backed payload contract exists; detailed entries are marked `modeled`. Regenerate the checked-in HTTP route manifest with `npm run generate:api-docs`. Socket.IO events are derived from source on first use and cached for the server process, so event declarations have no checked-in manifest or regeneration step.
+Inferred entries are explicitly marked `generated` until a runtime-backed payload contract exists; detailed entries are marked `modeled`. Both inventories are derived from source on first use and cached for the server process — HTTP routes by `server/lib/apiRouteGraph.js`, Socket.IO events by `server/lib/socketEventInventory.js` — so neither route nor event declarations have a checked-in manifest or a regeneration step.
 
-When adding an HTTP route, keep its request Zod schema in a reusable server library and register the detailed documentation in `server/lib/apiOperationContracts.js`; the route and OpenAPI should consume the same schema object. Add an `x-portos-tool` annotation to that contract entry to also publish the operation as an agent-callable tool in `tools.min.json`, and declare the codes its error responses really throw in `x-portos-error-codes` — the HTTP status alone does not identify the code, since `errorHandler` prefers an explicit `err.code` over the status map. Socket payload schemas follow the same pattern in `server/lib/socketEventContracts.js`. The HTTP generator and live Socket.IO source inventory guarantee coverage, while these small registries make richer contracts incremental without maintaining a second handwritten list of paths or events.
+When adding an HTTP route, keep its request Zod schema in a reusable server library and register the detailed documentation in `server/lib/apiOperationContracts.js`; the route and OpenAPI should consume the same schema object. Add an `x-portos-tool` annotation to that contract entry to also publish the operation as an agent-callable tool in `tools.min.json`, and declare the codes its error responses really throw in `x-portos-error-codes` — the HTTP status alone does not identify the code, since `errorHandler` prefers an explicit `err.code` over the status map. Socket payload schemas follow the same pattern in `server/lib/socketEventContracts.js`. The live HTTP and Socket.IO source inventories guarantee coverage, while these small registries make richer contracts incremental without maintaining a second handwritten list of paths or events.
 
 Building a native companion client? See [COMPANION_APP_API.md](./COMPANION_APP_API.md) — the stable, pre-auth-discoverable contract (discovery/identity, HTTP Basic auth, instance management, palette actions, daily-log, POST progress, and the iCloud-sync precedent) that the PortDeck app consumes.
 
@@ -124,6 +124,16 @@ own wire contract in [FEDERATED_MEDIA_PROVIDERS.md](./FEDERATED_MEDIA_PROVIDERS.
 | GET | `/providers/codex/models?fresh=1` | Which models this ChatGPT subscription may run, from the app-server's own `model/list` rather than a hard-coded table. Answers `{ models, fetchedAt, error }`. The sentinels are load-bearing: `models: null` = NEVER FETCHED, `[]` = fetched and the plan genuinely has none, and a failed read returns the LAST-KNOWN-GOOD list alongside `error` — so one timeout can never empty the picker. Lazy like `/codex/account`; `fresh=1` skips the 10m TTL after a plan change or a sign-in. |
 | GET | `/providers/opencode/installation` | **Legacy alias**, kept so a stale client bundle still renders: `{ installed, npmAvailable }` for the `opencode` runtime. New code uses `/providers/runtimes`. |
 | POST | `/providers/opencode/install` | **Legacy alias** for `/providers/runtimes/install?runtime=opencode`. |
+
+### Harnesses
+
+The coding-agent CLIs/TUIs PortOS drives (`opencode`, `claude`, `codex`, `agy`, `grok`, `kimi`, `cursor-agent`), managed as things in their own right rather than as a footnote on a provider card. Backs **Models → Harnesses**. Every response carries booleans, versions, and labels — never a resolved filesystem path, which would disclose the host account name.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/harnesses?fresh=1` | Every harness with its installed version, the latest published version (npm-backed rows only), whether an update is available, which lifecycle actions it supports, and the provider records riding on it. `version`/`latestVersion` are `null` for NOT KNOWN, never `0.0.0` — `updateAvailable` is set only on a definite "installed < latest", so an offline host shows no false staleness badge. `fresh=1` bypasses both the 60s runtime-status TTL and the 6h registry cache. |
+| POST | `/harnesses/action?runtime=<id>&action=install\|update\|uninstall` | Run one lifecycle action, streaming the child's output as SSE. `action` defaults to `install`. Update prefers the vendor's OWN updater (`opencode upgrade`, `claude update`) — the only path that refreshes the copy actually on PATH when the user installed it from Homebrew or a vendor script. Remove is offered only for npm-installed rows, and reports an error rather than success if the binary is still runnable afterwards. One action at a time process-wide (npm's global prefix is one directory); closing the stream cancels the child. Both values are table keys — nothing from the request reaches a shell word. |
+| POST | `/harnesses/models/refresh?runtime=<id>` | Re-read a harness's own model catalog (`opencode models`, `agy models`, `grok models`) and write it to every provider that draws from that catalog — i.e. a wrapper with no local-runtime marker and no `gatewayBacked`, since a gateway- or Ollama-backed wrapper serves ids the harness never lists. Answers `{ ok, models, updated }`. A probe that runs but parses to nothing is a **409**, not an empty write: a signed-out CLI must not blank every picker. |
 
 ### AI Runs
 
@@ -252,11 +262,11 @@ Context tools remain read-only. Semantic reads and writes are independent, defau
 |--------|----------|-------------|
 | GET | `/cos/schedule` | Get full task schedule status |
 | GET | `/cos/upcoming` | Get upcoming scheduled tasks preview |
-| GET | `/cos/schedule/interval-types` | Get available interval types and descriptions |
+| GET | `/cos/schedule/interval-types` | Get the two cadence types (`on-demand`, `cron`) and their descriptions, plus the `perpetual` flag description |
 | GET | `/cos/schedule/due` | List all tasks due to run |
 | GET | `/cos/schedule/due/:appId` | List tasks due for specific app |
 | GET | `/cos/schedule/task/:taskType` | Get interval and schedule settings for a task type |
-| PUT | `/cos/schedule/task/:taskType` | Update schedule settings for a task type |
+| PUT | `/cos/schedule/task/:taskType` | Update schedule settings for a task type (`type`: `on-demand` \| `cron`; `cronExpression`: 5-field or null; `perpetual`: boolean drain flag, orthogonal to `type`) |
 | POST | `/cos/schedule/trigger` | Trigger an on-demand task run |
 | GET | `/cos/schedule/on-demand` | List pending on-demand task requests |
 | DELETE | `/cos/schedule/on-demand/:requestId` | Clear a pending on-demand request |
@@ -641,7 +651,7 @@ Every mounted API prefix (see `server/index.js` for the authoritative list). Dom
 | `/api/messages` | Messages (email) integration |
 | `/api/digital-twin/social-accounts`, `/api/digital-twin/identity`, `/api/digital-twin/autobiography` | Digital-twin sub-domains |
 | `/api/meatspace` | MeatSpace (health, POST, genome) |
-| `/api/lmstudio`, `/api/local-llm` | Local LLM backends and the local runtime servers PortOS can start/stop (Ollama, LM Studio, `llama-server`, MTPLX, Slotstream — the last three as PM2 processes; `POST /api/local-llm/save-startup` is `pm2 save`), plus MTPLX's checkpoint catalog — `GET /api/local-llm/mtplx/models/search`, `POST .../models/pull` (byte progress on the `mtplx:download` socket event), `POST .../models/remove`. Slotstream lifecycle is `GET /api/local-llm/slotstream/status`, `POST .../start` (never downloads weights), `POST .../stop`, `POST .../install`. |
+| `/api/lmstudio`, `/api/local-llm` | Local LLM backends and the local runtime servers PortOS can start/stop (Ollama, LM Studio, `llama-server`, MTPLX, Slotstream — the last three as PM2 processes; `POST /api/local-llm/save-startup` is `pm2 save`), plus MTPLX's checkpoint catalog — `GET /api/local-llm/mtplx/models/search`, `POST .../models/pull` (byte progress on the `mtplx:download` socket event), `POST .../models/remove`. Slotstream lifecycle is `GET /api/local-llm/slotstream/status` (which also carries the curated checkpoint catalog), `POST .../start` (never downloads weights), `POST .../stop`, `POST .../install`, and `POST /api/local-llm/slotstream/models/download` — the separate, explicit action that fetches a checkpoint, with byte progress on the `slotstream:download` socket event. |
 | `/api/code-review` | Code review runs |
 | `/api/voice`, `/api/voice/public` | Voice assistant |
 | `/api/api-docs` | Generated HTTP/event catalogs, OpenAPI 3.0.3 documents, AsyncAPI 3 document, and the minimized semantic tool resource |
@@ -678,7 +688,7 @@ Every mounted API prefix (see `server/index.js` for the authoritative list). Dom
 | `/api/openclaw` | OpenClaw operator chat |
 | `/api/rounds` | Rounds (music + Morse training) |
 | `/api/ask` | Ask (LLM Q&A) |
-| `/api/quota-burn` | Quota-burn plan, catalog, and runs |
+| `/api/quota-burn` | Quota-burn plan (ordered scheduled-task references + per-invocation overrides), its live status, the app/provider catalog its pickers read, manual runs, and re-arm. The referenced work itself is read from — and only ever edited through — `/api/cos/schedule` and `/api/cos/jobs`. |
 | `/api/timeline` | Human-activity timeline (day + events) |
 | `/api/games` | Game projects |
 | `/api/sprites` | Sprite catalog / export |
@@ -709,6 +719,7 @@ Every mounted API prefix (see `server/index.js` for the authoritative list). Dom
 | `/api/browser` | Managed Chromium |
 | `/api/creative-commission` | Creative commissions |
 | `/api/midi-runtime` | MIDI runtime |
+| `/api/harnesses` | Coding-agent CLI/TUI harness lifecycle |
 
 ## WebSocket Events
 
@@ -858,6 +869,7 @@ curl -X POST http://localhost:5555/api/apps \
 curl -X POST http://localhost:5555/api/runs \
   -H "Content-Type: application/json" \
   -d '{
+    "providerId": "claude-code",
     "prompt": "List all files in the current directory",
     "workspacePath": "/path/to/workspace"
   }'

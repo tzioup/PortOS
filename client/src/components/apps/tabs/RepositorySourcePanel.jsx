@@ -9,10 +9,19 @@ import {
   Server,
 } from 'lucide-react';
 import * as api from '../../../services/api';
+import {
+  countText,
+  describeForkUnsyncable,
+  primaryRepositorySource,
+  repositoryForkDiverged,
+  repositoryForkNeedsSync,
+  repositoryForkPushable,
+} from '../../../lib/managedAppSources';
 import BrailleSpinner from '../../BrailleSpinner';
 import Modal from '../../ui/Modal';
 import toast from '../../ui/Toast';
 import AppOperationBanner from '../AppOperationBanner';
+import GitRecoveryAction from './GitRecoveryAction';
 import { useAppOperation } from '../../../hooks/useAppOperation';
 
 const statusTone = {
@@ -34,7 +43,10 @@ function sourceStatus(source) {
   if (source.forkVsUpstream?.state === 'diverged') {
     return { tone: 'error', label: 'Fork diverged' };
   }
-  const forkBehind = source.forkVsUpstream?.behind || 0;
+  // A fork PortOS may fast-forward is actionable drift; one it can only read is
+  // context, not a call to action, so it must not colour the badge as if a
+  // button here would clear it.
+  const forkBehind = repositoryForkNeedsSync(source) ? source.forkVsUpstream.behind : 0;
   const localBehind = source.localVsOrigin?.behind || 0;
   if (forkBehind > 0 && localBehind > 0) {
     return { tone: 'attention', label: 'Fork and checkout behind' };
@@ -57,8 +69,6 @@ function sourceStatus(source) {
   return { tone: 'current', label: 'Current' };
 }
 
-const countText = (count, noun) => `${count} ${noun}${count === 1 ? '' : 's'}`;
-
 function RepositoryCard({ source }) {
   const status = sourceStatus(source);
   const isPrimary = source.id === 'primary';
@@ -66,6 +76,7 @@ function RepositoryCard({ source }) {
   const upstreamName = source.upstream?.fullName || 'canonical upstream';
   const local = source.localVsOrigin;
   const fork = source.forkVsUpstream;
+  const unsyncable = describeForkUnsyncable(source);
 
   return (
     <section className="rounded-xl border border-port-border bg-port-bg/50 p-4" data-testid={`repository-source-${source.id}`}>
@@ -119,6 +130,7 @@ function RepositoryCard({ source }) {
               Fork is {countText(fork.behind, 'commit')} behind and {countText(fork.ahead, 'commit')} ahead of {upstreamName}.
             </p>
           )}
+          {unsyncable && <p className="text-xs text-gray-500">{unsyncable}</p>}
           {source.remoteError && (
             <p className="flex items-start gap-1.5 text-xs text-port-warning">
               <AlertTriangle size={13} className="mt-0.5 shrink-0" />
@@ -139,7 +151,7 @@ function RepositoryCard({ source }) {
   );
 }
 
-export default function RepositorySourcePanel({ appId, appName, onUpdated, refreshKey = 0 }) {
+export default function RepositorySourcePanel({ appId, appName, onUpdated, refreshKey = 0, hasLocalChanges = false }) {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -171,11 +183,13 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
     isOperating,
     operationType,
     error: operationError,
+    errorCode: operationErrorCode,
     completed: operationCompleted,
+    restarting,
     startUpdate,
   } = useAppOperation({ appId, onComplete: handleOperationComplete });
   const updating = isOperating && operationType === 'update';
-  const operationBusy = isOperating;
+  const operationBusy = isOperating || restarting;
 
   useEffect(() => {
     if (updating) setUpdateRequested(true);
@@ -196,18 +210,17 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
   }, [load, refreshKey]);
 
   const sources = status?.sources || [];
-  const primary = sources.find((source) => source.id === 'primary') || sources[0] || null;
+  const primary = primaryRepositorySource(sources);
   const companions = sources.filter((source) => source !== primary);
-  const forkDiverged = primary?.forkVsUpstream?.state === 'diverged';
-  const forkNeedsSync = primary?.origin?.isFork
-    && (primary.forkVsUpstream?.behind || 0) > 0
-    && !forkDiverged;
+  const forkDiverged = repositoryForkDiverged(primary);
+  const forkNeedsSync = repositoryForkNeedsSync(primary);
   const remoteUnknown = sources.some((source) => (
     !source.remoteFresh
     || (source.origin?.hasOrigin && source.origin.isUpstream == null)
     || (source.origin?.isFork && source.forkVsUpstream?.available === false)
   ));
   const canUpdate = sources.every((source) => source.present) && status?.updatePullsAll;
+  const needsRecovery = hasLocalChanges || sources.some(source => source.clean === false || source.localVsOrigin?.state === 'diverged');
   const shouldOfferUpdate = status?.updateAvailable || remoteUnknown;
   const primaryLabel = forkNeedsSync
     ? 'Sync fork & update app'
@@ -234,10 +247,24 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
   };
 
   const handleManagedUpdate = () => {
+    if (needsRecovery) {
+      setUpdateIntent(null);
+      return;
+    }
     const intent = updateIntent;
     setUpdateIntent(null);
     setUpdateRequested(true);
     startUpdate(appId, appName, { syncFork: intent?.syncFork === true });
+  };
+
+  // Retry a refused PortOS self-update with the acknowledgement its refusal
+  // code named (server/services/updatePreflight.js). The refusal happened
+  // before any operation actually started, so — unlike a real update
+  // failure — it's safe to clear the "reload before trying again" latch and
+  // let the user retry immediately (#5984).
+  const handleAcknowledgeAndRetry = (ackOptions) => {
+    setUpdateRequested(false);
+    startUpdate(appId, appName, ackOptions);
   };
 
   return (
@@ -262,7 +289,7 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
         </button>
       </div>
 
-      {(isOperating || operationError || operationCompleted) && (
+      {(isOperating || restarting || operationError || operationCompleted) && (
         <div className="mt-4">
           <AppOperationBanner
             appName={appName}
@@ -271,7 +298,30 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
             error={operationError}
             completed={operationCompleted}
             completedMessage={operationType === 'update' ? 'Reload this page before starting another update.' : undefined}
+            restarting={restarting}
           />
+          {/* Refusals PortOS's shared update preflight raises (server/services/updatePreflight.js)
+              carry an explicit acknowledgement the user can opt into and retry with. */}
+          {operationErrorCode === 'FORK_SYNC_REQUIRED' && (
+            <button
+              onClick={() => handleAcknowledgeAndRetry({ acknowledgeFork: true })}
+              disabled={isOperating || syncingFork}
+              className="mt-2 flex min-h-[40px] items-center gap-1.5 rounded-lg border border-port-border px-3 py-2 text-sm text-gray-300 hover:border-port-accent hover:text-white disabled:opacity-50"
+            >
+              <Download size={15} />
+              Update from fork as-is
+            </button>
+          )}
+          {operationErrorCode === 'PERSISTENT_MIND_IMAGES_IN_FLIGHT' && (
+            <button
+              onClick={() => handleAcknowledgeAndRetry({ acknowledgePersistentMindImageBackup: true })}
+              disabled={isOperating || syncingFork}
+              className="mt-2 flex min-h-[40px] items-center gap-1.5 rounded-lg border border-port-border px-3 py-2 text-sm text-gray-300 hover:border-port-accent hover:text-white disabled:opacity-50"
+            >
+              <Download size={15} />
+              Update anyway (back up first)
+            </button>
+          )}
         </div>
       )}
 
@@ -299,7 +349,7 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
               {updateSummary}
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {primary?.origin?.isFork && (
+              {repositoryForkPushable(primary) && (
                 <button
                   onClick={handleSyncOnly}
                   disabled={syncingFork || operationBusy || updateRequested || forkDiverged}
@@ -312,7 +362,8 @@ export default function RepositorySourcePanel({ appId, appName, onUpdated, refre
                   {forkDiverged ? 'Fork needs reconciliation' : syncingFork ? 'Syncing fork...' : 'Sync fork'}
                 </button>
               )}
-              {shouldOfferUpdate && (
+              {needsRecovery && <GitRecoveryAction key={appId} appId={appId} appName={appName} disabled={syncingFork || operationBusy || updateRequested} />}
+              {shouldOfferUpdate && !needsRecovery && (
                 <button
                   onClick={() => setUpdateIntent({ syncFork: forkNeedsSync })}
                   disabled={!canUpdate || syncingFork || operationBusy || updateRequested}

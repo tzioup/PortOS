@@ -1,5 +1,5 @@
 import ProviderModelSelector from '../ProviderModelSelector';
-import { filterSelectableModels } from '../../utils/providers';
+import { filterSelectableModels, providerModelList } from '../../utils/providers';
 import { providerPinPatch } from './constants';
 
 /**
@@ -27,6 +27,7 @@ import { providerPinPatch } from './constants';
  * @param {string}   props.label          Provider-select label (also its aria-label when compact).
  * @param {string}   [props.inheritLabel] What a blank pin resolves to, e.g. `Inherit (claude-code)`.
  * @param {boolean}  [props.disabled]
+ * @param {boolean}  [props.loading]     Provider list not settled yet — see ProviderModelSelector.
  * @param {boolean}  [props.compact]      Hide labels for inline/table use.
  * @param {'row'|'stacked'} [props.layout]
  */
@@ -38,14 +39,16 @@ export default function AppProviderPin({
   label,
   inheritLabel = 'Use default provider',
   disabled = false,
+  loading = false,
   compact = false,
-  layout = 'row'
+  layout = 'row',
+  selectionPolicy
 }) {
   const selectedProviderId = providerId || '';
   const selectedModel = model || '';
   const selectedProvider = providers?.find(p => p.id === selectedProviderId);
   const availableModels = selectedProvider
-    ? filterSelectableModels(selectedProvider.models || [selectedProvider.defaultModel])
+    ? filterSelectableModels(providerModelList(selectedProvider))
     : [];
   // Keep a pinned model visible even when it isn't in the provider's fetched list
   // (a stale or hand-typed model must not render as a blanked select).
@@ -67,8 +70,10 @@ export default function AppProviderPin({
       emptyModelOption="Default model"
       alwaysShowModel
       disabled={disabled}
+      loading={loading}
       compact={compact}
       layout={layout}
+      selectionPolicy={selectionPolicy}
     />
   );
 }

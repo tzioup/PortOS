@@ -6,7 +6,7 @@ import { atomicWrite, ensureDir, readJSONFile, PATHS } from '../lib/fileUtils.js
 import { createFileWriteQueue } from '../lib/fileWriteQueue.js';
 import { isPlainObject } from '../lib/objects.js';
 import { emitLog } from './cosEvents.js';
-import { INTERVAL_TYPES } from './taskScheduleConstants.js';
+import { LEGACY_INTERVAL_TYPES, normalizeIntervalConfig } from './taskScheduleConstants.js';
 import {
   DEFAULT_TASK_INTERVALS,
   createPrReviewerDefaultStages,
@@ -85,7 +85,7 @@ function migrateScheduleV1toV2(schedule) {
         const existing = migrated.tasks[unifiedType];
         const isExistingDefault = existing.type === DEFAULT_TASK_INTERVALS[unifiedType]?.type;
         const isNewDifferent = config.type !== (taskType === 'security-audit'
-          ? INTERVAL_TYPES.WEEKLY : DEFAULT_TASK_INTERVALS[unifiedType]?.type);
+          ? LEGACY_INTERVAL_TYPES.WEEKLY : DEFAULT_TASK_INTERVALS[unifiedType]?.type);
         if (isExistingDefault || isNewDifferent) {
           migrated.tasks[unifiedType] = { ...existing, ...config };
         }
@@ -239,6 +239,11 @@ async function readSchedule() {
     }
     if (enforceManagedAgentOptions(taskType, config)) needsSave = true;
     if (enforceBranchReconcileBatch(taskType, config)) needsSave = true;
+    // Collapse a retired cadence type (rotation/daily/weekly/once/custom/
+    // perpetual) onto the two-variant model + orthogonal `perpetual` flag, so an
+    // un-migrated schedule file — or one written by an older peer — is valid in
+    // memory and rewritten on the next save.
+    if (normalizeIntervalConfig(config)) needsSave = true;
     // Stamp a creation timestamp the first time we see a task so the cron
     // catch-up bound (shouldRunTask) never replays a slot that predates the
     // task. Backfilling to "now" is conservative: it only suppresses catch-up
@@ -285,7 +290,7 @@ async function readSchedule() {
       // Self-heal a mis-flagged customization: a prompt marked promptCustomized
       // that nonetheless matches a shipped default was never user-edited — it
       // was flagged by an earlier legacy migration that ran before this task
-      // carried a PREVIOUS_DEFAULT_PROMPTS entry (the basic self-improvement
+      // carried a retired-default history entry (the basic self-improvement
       // prompts that hardcoded the app name as "PortOS", and both
       // pre-unification generations — `[Self-Improvement] …` and
       // `[App Improvement: …]` — that the schedule unification replaced without

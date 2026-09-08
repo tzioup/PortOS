@@ -1,3 +1,4 @@
+import LoomShotPlanner from './LoomShotPlanner';
 import { useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, CircleAlert, Loader2, Save, Sparkles, Trash2 } from 'lucide-react';
 import ProviderModelSelector from '../ProviderModelSelector';
@@ -213,7 +214,7 @@ function OutlineBeat({
                       {possibleTargets.map((target) => <option key={target.key} value={target.key}>{target.title || target.key}</option>)}
                     </select>
                   </div>
-                  <button type="button" onClick={() => onRemovePath(transitionIndex)} className="mt-2 p-1 text-port-text-muted hover:text-port-error" aria-label={`Remove path ${transitionIndex + 1} from ${scene.title || scene.key}`}>
+                  <button type="button" onClick={() => onRemovePath(transitionIndex)} className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center mt-2 p-1 text-port-text-muted hover:text-port-error" aria-label={`Remove path ${transitionIndex + 1} from ${scene.title || scene.key}`}>
                     <Trash2 size={14} />
                   </button>
                 </div>
@@ -240,6 +241,7 @@ export default function LoomEpisodeOutlinePlanner({
   const [dirty, setDirty] = useState(false);
   const [validation, setValidation] = useState(null);
   const [review, setReview] = useState(null);
+  const [shotPlanning, setShotPlanning] = useState(false);
   const [expandedKey, setExpandedKey] = useState(null);
   const [route, setRoute] = useState({ providerId: '', model: '', effort: '' });
   const generateRun = useFableLoomAiRun();
@@ -268,7 +270,7 @@ export default function LoomEpisodeOutlinePlanner({
   const outlineStatus = validation?.stats
     ? (validation.stats.errorCount ? 'invalid' : 'valid')
     : outline?.validation?.status || 'draft';
-  const busy = disabled || providersLoading || generateRun.run?.phase === 'running' || reviewRun.run?.phase === 'running';
+  const busy = shotPlanning || disabled || providersLoading || generateRun.run?.phase === 'running' || reviewRun.run?.phase === 'running';
   const hasScenes = episode.nodes.length > 0;
   const activeValidation = validation || outline?.validation;
   const activeValidationIssues = asArray(activeValidation?.issues);
@@ -373,11 +375,12 @@ export default function LoomEpisodeOutlinePlanner({
         layout="stacked"
         disabled={busy || generating || saving || validating || reviewing || expanding}
         modelDisabled={busy || generating || saving || validating || reviewing || expanding}
+        loading={providersLoading}
         emptyProviderOption="Default (outline stage or active provider)"
         emptyModelOption="Default model"
         alwaysShowModel={!!route.providerId}
       />
-      {selectedProvider ? <p className="text-xs text-port-text-muted">Uses {selectedProvider.name}{effectiveModelFor(selectedProvider, route.model) ? ` (${effectiveModelFor(selectedProvider, route.model)})` : ''} for outline actions.</p> : null}
+      {selectedProvider ? <p className="text-xs text-port-text-muted">Uses {selectedProvider.name}{effectiveModelFor(selectedProvider, route.model) ? ` (${effectiveModelFor(selectedProvider, route.model)})` : ''}{route.effort ? ` at ${route.effort} effort` : ''} for outline and expansion actions.</p> : null}
 
       {!outline ? (
         <button
@@ -439,7 +442,7 @@ export default function LoomEpisodeOutlinePlanner({
           {onExpand ? (
             <button
               type="button"
-              onClick={onExpand}
+              onClick={() => onExpand(routeBody)}
               disabled={busy || dirty || !canExpand || saving || generating || validating || reviewing || expanding}
               className="flex w-full items-center justify-center gap-2 rounded bg-port-accent px-3 py-2 text-sm text-white disabled:opacity-50"
             >
@@ -467,6 +470,7 @@ export default function LoomEpisodeOutlinePlanner({
           ) : null}
         </>
       )}
+      <LoomShotPlanner onRunningChange={setShotPlanning} key={episode.id} loom={loom} episode={episode} route={routeBody} guidance={guidance} disabled={busy || dirty || generating || saving || validating || reviewing || expanding} onLoomUpdate={(next) => { onLoomUpdate(next); setOutline(cloneOutline(next.episodes.find((item) => item.id === episode.id)?.storyOutline)); setValidation(null); }} />
       <LoomAiRunStatus run={generateRun.run} />
       <LoomAiRunStatus run={reviewRun.run} />
     </section>

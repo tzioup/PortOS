@@ -269,11 +269,16 @@ describe('weaveEpisode', () => {
     expect(checked.validation.issues).toEqual([]);
     expect(checked.outline.validation.status).toBe('valid');
 
-    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'expand-run' });
+    const expandedDraft = generatedGraphFromOutline();
+    expandedDraft.nodes[0].title = 'A reworded title';
+    expandedDraft.nodes[0].transitions[0].intent = 'A reworded label';
+    runStagedLLM.mockResolvedValueOnce({ content: expandedDraft, runId: 'expand-run' });
     const expanded = await weaveEpisode(loomId, episodeId, {
       guidance: 'Write the full teleplay now.', replace: false, expandFromOutline: true,
     });
     expect(expanded.runId).toBe('expand-run');
+    expect(expanded.loom.episodes[0].nodes[0].title).toBe(drafted.outline.scenes[0].title);
+    expect(expanded.loom.episodes[0].nodes[0].transitions[0].intent).toBe(drafted.outline.scenes[0].transitions[0].intent);
     expect(expanded.loom.episodes[0].nodes).toHaveLength(4);
     expect(expanded.loom.episodes[0].storyOutline.scenes.map((scene) => scene.key))
       .toEqual(expanded.loom.episodes[0].nodes.map((node) => node.id));
@@ -411,10 +416,61 @@ describe('weaveEpisode', () => {
 });
 
 describe('episode outline AI review', () => {
+  it('withholds author context and blocks an unmotivated opening before the full review', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'A puzzle appears, but no personal goal is shown.', risks: ['Establish what the protagonist wants before the clue.'] }, runId: 'cold-review' });
+    const result = await reviewEpisodeOutline(loomId, episodeId, { planningGate: true, providerId: 'writer', model: 'small', effort: 'low' });
+    expect(result.analysis.risks).toEqual(['Establish what the protagonist wants before the clue.']);
+    expect(runStagedLLM).toHaveBeenCalledTimes(1);
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).toContain('COLD OPENING REVIEW ONLY');
+    expect(prompt).toContain('(withheld for first-time-viewer review)');
+    expect(prompt).not.toContain('CURRENT EPISODE ONLY');
+    expect(prompt).not.toContain('Series arc:');
+  });
+
+  it('cold-reads complete dramatic groups after camera cuts are split', async () => {
+    const { loomId, episodeId } = await setup();
+    await mutateLoom(loomId, (loom) => {
+      const ep = loom.episodes[0];
+      ep.nodes = Array.from({ length: 9 }, (_, index) => ({ id: `shot-${index}`, title: `Shot ${index}`, prose: `Action ${index}`, playbackMode: 'cut', isEnding: index === 8, shot: { dramaticSceneId: index < 4 ? 'opening' : index < 6 ? 'interruption' : index < 8 ? 'consequence' : 'later', durationSeconds: 8 }, transitions: index < 8 ? [{ targetNodeId: `shot-${index + 1}`, intent: 'continue' }] : [] }));
+      ep.startNodeId = 'shot-0';
+      ep.storyOutline = { startKey: 'shot-0', scenes: ep.nodes.map((node) => ({ key: node.id, title: node.title, summary: node.prose, playbackMode: 'cut', isEnding: node.isEnding, transitions: node.transitions.map((t) => ({ targetKey: t.targetNodeId, intent: t.intent })) })) };
+      return loom;
+    });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Opening reviewed.', risks: ['Clarify the consequence.'] } });
+    await reviewEpisodeOutline(loomId, episodeId);
+    const opening = JSON.parse(runStagedLLM.mock.calls[0][1].outlineDigest);
+    expect(opening.map((beat) => beat.key)).toEqual(Array.from({ length: 8 }, (_, index) => `shot-${index}`));
+  });
+
+  it('does not treat a missing opening verdict as approval', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Looks fine.' }, runId: 'incomplete-review' });
+    await expect(reviewEpisodeOutline(loomId, episodeId, {})).rejects.toThrow('explicit comprehension verdict');
+  });
+
+  it('requires an explicit full review verdict before the planning gate can pass', async () => {
+    const { loomId, episodeId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline() });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The opening is clear.', risks: [] } });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Looks fine.' } });
+    await expect(reviewEpisodeOutline(loomId, episodeId, { planningGate: true })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Looks fine.', risks: 'No problems' } });
+    await expect(reviewSeriesPlan(loomId, { planningOnly: true })).rejects.toMatchObject({ code: 'AI_RESPONSE_INVALID' });
+  });
+
   it('returns deterministic findings alongside editorial analysis', async () => {
     const { loomId, episodeId } = await setup();
     runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
     await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'A courier wants to get home; a closed gate threatens that goal.', risks: [] }, runId: 'cold-read' });
     runStagedLLM.mockResolvedValueOnce({
       content: { summary: 'The turn lands.', strengths: ['The endings diverge.'], risks: ['The handoff needs a sharper hook.'], recommendations: ['Make the final beat reveal the next threat.'] },
       runId: 'outline-review-run',
@@ -1012,20 +1068,196 @@ describe('reformatEpisodeScenes', () => {
   });
 });
 
+// A synthetic authored cast used by the canon-digest boundary tests: the
+// causal Ghost/Wound/Lie/Want/Need chain the renderer used to drop entirely
+// (#6416). Obviously-fake placeholder content only.
+const authoredCanonUniverse = (over = {}) => ({
+  characters: [{
+    id: 'character-example',
+    name: 'Mara',
+    role: 'protagonist',
+    description: 'silver-eyed courier',
+    lie: 'Asking for help is how couriers get killed.',
+    want: 'Run the deep line alone and clear the debt.',
+    need: 'Let the harbour crew carry half the run.',
+    motivations: 'Clear the debt before the season closes.',
+    relationships: 'Owes the harbourmaster more than money.',
+    arcType: 'positive',
+  }],
+  places: [{ name: 'The Hollow' }],
+  objects: [],
+  ...over,
+});
+
 describe('buildCanonDigest', () => {
   it('renders linked-universe canon via the shared renderer and returns empty for unlinked looms', async () => {
     getUniverseMock.mockResolvedValue({
-      characters: [{ name: 'Mara', description: 'silver-eyed courier' }],
+      characters: [{ id: 'character-example', name: 'Mara', description: 'silver-eyed courier' }],
       places: [{ name: 'The Hollow' }],
       objects: [],
     });
-    const digest = await buildCanonDigest({ universeId: 'uni-1' });
+    const digest = await buildCanonDigest({ universeId: 'uni-1', protagonistCharacterId: 'character-example' });
+    expect(digest).toContain('Verified Universe protagonist: id=character-example; name=Mara.');
     expect(digest).toContain('characters:');
     expect(digest).toContain('- Mara');
     expect(digest).toContain('places:');
     expect(digest).not.toContain('objects:');
 
     expect(await buildCanonDigest({ universeId: null })).toBe('');
+  });
+
+  it('carries the authored belief, goal and internal alternative the old digest dropped', async () => {
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    const digest = await buildCanonDigest({ universeId: 'uni-1', protagonistCharacterId: 'character-example' });
+    expect(digest).toContain('lie=Asking for help is how couriers get killed.');
+    expect(digest).toContain('want=Run the deep line alone and clear the debt.');
+    expect(digest).toContain('need=Let the harbour crew carry half the run.');
+    expect(digest).toContain('relationships=Owes the harbourmaster more than money.');
+  });
+
+  it('keeps a bound protagonist past the per-kind cast cap', async () => {
+    const crowd = Array.from({ length: 60 }, (_, index) => ({
+      id: `extra-${index}`, name: `Extra ${index}`, description: 'a face on the dock',
+    }));
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse({
+      characters: [...crowd, ...authoredCanonUniverse().characters],
+    }));
+    const digest = await buildCanonDigest({ universeId: 'uni-1', protagonistCharacterId: 'character-example' });
+    expect(digest).toContain('- Mara [protagonist]');
+    expect(digest).toContain('lie=Asking for help is how couriers get killed.');
+    // The model is told the roster is incomplete rather than being left to
+    // assume it saw the whole ensemble.
+    expect(digest).toContain('not shown — prompt budget reached');
+  });
+
+  it('withholds a reveal-gated character\'s psychology from the generation digest', async () => {
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse({
+      characters: [{
+        id: 'character-masked', name: 'The Auditor', role: 'antagonist', spoiler: true,
+        surfaceDescriptor: 'a clerk with a ledger',
+        lie: 'The ledger is the only honest thing left.',
+        ghost: 'Signed off on the collapse.',
+      }],
+    }));
+    const digest = await buildCanonDigest({ universeId: 'uni-1' });
+    expect(digest).toContain('The Auditor: (reveal-gated');
+    expect(digest).not.toContain('Signed off on the collapse.');
+    expect(digest).not.toContain('The ledger is the only honest thing left.');
+  });
+});
+
+describe('authored psychology at the FableLoom prompt boundary (#6416)', () => {
+  it('reaches the outline and expansion stage variables', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    await updateLoom(loomId, { protagonistCharacterId: 'character-example' });
+
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    const outlineVars = runStagedLLM.mock.calls[0][1];
+    expect(outlineVars.canonDigest).toContain('lie=Asking for help is how couriers get killed.');
+    expect(outlineVars.canonDigest).toContain('want=Run the deep line alone and clear the debt.');
+    expect(outlineVars.canonDigest).toContain('need=Let the harbour crew carry half the run.');
+
+    await validateEpisodeOutline(loomId, episodeId);
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraphFromOutline(), runId: 'expand-run' });
+    await weaveEpisode(loomId, episodeId, { expandFromOutline: true });
+    expect(runStagedLLM.mock.calls[0][1].canonDigest).toContain('need=Let the harbour crew carry half the run.');
+  });
+
+  it('still withholds every canon fact from the first-time-viewer cold read', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    await updateLoom(loomId, { protagonistCharacterId: 'character-example' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'No personal goal is shown.', risks: ['Show what she wants.'] }, runId: 'cold-review' });
+
+    await reviewEpisodeOutline(loomId, episodeId, {});
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).toContain('(withheld for first-time-viewer review)');
+    expect(prompt).not.toContain('Asking for help is how couriers get killed.');
+    expect(prompt).not.toContain('character engines');
+  });
+
+  it('never renders canon into a reader-facing play turn', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(authoredCanonUniverse());
+    await updateLoom(loomId, { protagonistCharacterId: 'character-example', participationMode: 'protagonist' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'weave-run' });
+    const woven = await weaveEpisode(loomId, episodeId, {});
+    const startNode = woven.loom.episodes[0].nodes.find((node) => node.id === woven.loom.episodes[0].startNodeId);
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { action: 'stay', narration: 'You wait.' }, runId: 'play-run' });
+
+    await playTurn(loomId, episodeId, { nodeId: startNode.id, message: 'look around' });
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).not.toContain('Asking for help is how couriers get killed.');
+    expect(prompt).not.toContain('character engines');
+  });
+});
+
+describe('descriptive canon reveal gate at the FableLoom prompt boundary (#6426)', () => {
+  // A spoiler character whose concealed origin lives in `background` — the
+  // field the descriptive block used to publish while the psychology block
+  // masked the same character. Obviously-fake placeholder content only.
+  const maskedCanonUniverse = () => authoredCanonUniverse({
+    characters: [{
+      id: 'character-masked',
+      name: 'The Auditor',
+      role: 'antagonist',
+      spoiler: true,
+      surfaceDescriptor: 'a clerk with a ledger',
+      background: 'LEAK-background signed off on the collapse',
+      personality: 'LEAK-personality outwardly meek, actually the signatory',
+      lie: 'LEAK-lie the ledger is the only honest thing left',
+    }],
+  });
+
+  it('keeps the concealed background out of the generation digest while still naming the character', async () => {
+    getUniverseMock.mockResolvedValue(maskedCanonUniverse());
+    const digest = await buildCanonDigest({ universeId: 'uni-1' });
+    expect(digest).toContain('- The Auditor [antagonist]: a clerk with a ledger — (reveal-gated');
+    expect(digest).not.toMatch(/LEAK-/);
+  });
+
+  it('never reaches the reader-facing play turn', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(maskedCanonUniverse());
+    await updateLoom(loomId, { participationMode: 'protagonist' });
+    runStagedLLM.mockResolvedValueOnce({ content: generatedGraph(), runId: 'weave-run' });
+    const woven = await weaveEpisode(loomId, episodeId, {});
+    const startNode = woven.loom.episodes[0].nodes.find((node) => node.id === woven.loom.episodes[0].startNodeId);
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { action: 'stay', narration: 'You wait.' }, runId: 'play-run' });
+
+    await playTurn(loomId, episodeId, { nodeId: startNode.id, message: 'look around' });
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).not.toMatch(/LEAK-/);
+    // Not even the masked identity line: a play turn renders no canon at all,
+    // so piping any digest in here — gated or not — fails this.
+    expect(prompt).not.toContain('The Auditor');
+    expect(prompt).not.toContain('character engines');
+  });
+
+  it('never reaches the first-time-viewer cold read', async () => {
+    const { loomId, episodeId } = await setup();
+    getUniverseMock.mockResolvedValue(maskedCanonUniverse());
+    runStagedLLM.mockResolvedValueOnce({ content: generatedOutline(), runId: 'outline-run' });
+    await generateEpisodeOutline(loomId, episodeId, {});
+    runStagedLLM.mockClear();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'No personal goal is shown.', risks: ['Show what she wants.'] }, runId: 'cold-review' });
+
+    await reviewEpisodeOutline(loomId, episodeId, {});
+
+    const prompt = JSON.stringify(runStagedLLM.mock.calls[0]);
+    expect(prompt).toContain('(withheld for first-time-viewer review)');
+    expect(prompt).not.toMatch(/LEAK-/);
   });
 });
 
@@ -1123,20 +1355,114 @@ describe('series plan AI', () => {
     }), expect.objectContaining({ providerOverride: 'writer' }));
   });
 
+  it('sends no evolution block, and a byte-identical plan digest, when no lens is authored', async () => {
+    // The epic's non-negotiable: with the lens unset the review must be exactly
+    // the pre-#6443 review. The gated section renders nothing only if the
+    // variable is '' — and `seriesPlanDigest` must not have grown a field.
+    const { loomId } = await setup();
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'Strong spine.', risks: [] }, runId: 'run-a' });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    const variables = runStagedLLM.mock.calls[0][1];
+    expect(variables.characterEvolutions).toBe('');
+    expect(JSON.parse(variables.seriesPlanJson)).not.toHaveProperty('characterEvolutions');
+  });
+
+  it('feeds the authored lens to the plan review and never presents a dead anchor as proof', async () => {
+    const { loomId, episodeId } = await setup();
+    await updateLoom(loomId, {
+      seriesPlan: {
+        characterEvolutions: [
+          {
+            characterName: 'Mara',
+            evolution: {
+              outcome: 'full-change',
+              stages: [
+                { stageId: 'control-strategy-failing', testedBelief: 'Only leverage keeps her safe.' },
+                { stageId: 'final-proof', characterChoice: 'She hands the ledger back.', evidence: { episodeId } },
+              ],
+            },
+          },
+          {
+            characterName: 'Joss',
+            evolution: {
+              outcome: 'tragic-refusal',
+              stages: [{ stageId: 'cost-tested', causalConsequence: 'He keeps the ledger.', evidence: { episodeId: 'ep-deleted-0000' } }],
+            },
+          },
+        ],
+      },
+    });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The proof lands.', risks: [] }, runId: 'run-b' });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    const block = runStagedLLM.mock.calls[0][1].characterEvolutions;
+    expect(block).toContain('- Mara');
+    expect(block).toContain('declared outcome: full-change');
+    expect(block).toContain('declared outcome: tragic-refusal');
+    // Mara's anchor names a live episode; Joss's names a deleted one. Resolving
+    // against the loom is what keeps the dead pointer from reading as proof.
+    expect(block).toContain(`episode ${episodeId} [anchored]`);
+    expect(block).toContain('episode ep-deleted-0000 [stale]');
+  });
+
+  it('accepts an empty risks array from a lens-satisfied plan under the planning gate', async () => {
+    // `editorialAutopilot.runPlanning()` loops while `risks` is non-empty, so a
+    // lens the plan satisfies has to be able to END that loop — the verdict
+    // contract must not read "no evolution risk" as a missing verdict.
+    const { loomId } = await setup();
+    await updateLoom(loomId, {
+      seriesPlan: {
+        characterEvolutions: [{
+          characterName: 'Mara',
+          evolution: { outcome: 'flat-testing', stages: [{ stageId: 'final-proof', characterChoice: 'She holds the line.' }] },
+        }],
+      },
+    });
+    runStagedLLM.mockResolvedValueOnce({
+      content: {
+        summary: 'Every authored stage pays off.',
+        strengths: ['The refusal costs her the crew.'],
+        risks: [],
+        recommendations: [],
+      },
+    });
+    const result = await reviewSeriesPlan(loomId, { planningOnly: true });
+    expect(result.analysis.risks).toEqual([]);
+  });
+
+  it('passes complete challenge outcomes and arc endings to review without duplicate plan context', async () => {
+    const { loomId, episodeId } = await setup();
+    const storyArc = `${'An established turn. '.repeat(340)}The final reconciliation.`;
+    const description = `${'A planted clue. '.repeat(60)}FAILURE: Lose the original. RECOVERY: Keep the proof.`;
+    await updateLoom(loomId, { seriesPlan: { storyArc, plotPoints: [{ title: 'The lock', kind: 'challenge', description, episodeId }], sideQuests: [] } });
+    runStagedLLM.mockResolvedValueOnce({ content: { summary: 'The complete contract is visible.', risks: [], recommendations: [] } });
+    await reviewSeriesPlan(loomId, { planningOnly: true });
+    const variables = runStagedLLM.mock.calls[0][1];
+    const plan = JSON.parse(variables.seriesPlanJson);
+    expect(plan.storyArc).toBe(storyArc);
+    expect(plan.plotPoints[0].description).toBe(description);
+    expect(variables.storyContext).not.toContain(storyArc);
+    expect(variables.storyContext).toContain('PRE-OUTLINE REVIEW');
+  });
+
   it('applies sparse series-plan feedback and preserves omitted collections', async () => {
     const { loomId, episodeId } = await setup();
+    await addNode(loomId, episodeId, { title: 'Keep this scene', prose: 'The gate opens.' });
+    const before = await getLoom(loomId);
     await updateLoom(loomId, { seriesPlan: {
       storyArc: 'Old arc',
       plotPoints: [{ id: 'plot-1', title: 'Turn', description: 'Old', episodeId }],
       sideQuests: [],
     } });
     runStagedLLM.mockResolvedValueOnce({
-      content: { storyArc: 'New arc', changes: ['Raised the stakes'] },
+      content: { storyArc: 'New arc', episodeSynopsisEdits: [{ id: episodeId, synopsis: 'The new consequence.', title: 'Do not replace', nodes: [] }, { id: 'unknown', synopsis: 'Ignored' }], changes: ['Raised the stakes'] },
       runId: 'run-feedback',
     });
     const result = await feedbackSeriesPlan(loomId, { feedback: 'Raise the stakes.' });
     expect(result.loom.seriesPlan.storyArc).toBe('New arc');
     expect(result.loom.seriesPlan.plotPoints).toHaveLength(1);
+    expect(result.loom.episodes[0]).toMatchObject({ id: episodeId, title: 'Pilot', synopsis: 'The new consequence.' });
+    expect(result.loom.episodes).toHaveLength(1);
+    expect(result.loom.episodes[0].nodes).toEqual(before.episodes[0].nodes);
     expect(result.changes).toEqual(['Raised the stakes']);
   });
 
@@ -1168,6 +1494,24 @@ describe('series plan AI', () => {
     expect(runStagedLLM).toHaveBeenCalledWith('fableloom-weave-episode', expect.objectContaining({
       storyContext: expect.stringContaining('Plot point 1 id=plot-relevant kind=beat [planned for Episode 1: Pilot]: Episode turn'),
     }), expect.anything());
+  });
+
+  it('rejects a later episode payoff before expanding the current episode', async () => {
+    const { loomId, episodeId } = await setup();
+    const withSecond = await addEpisode(loomId, { title: 'Second' });
+    await updateLoom(loomId, { seriesPlan: { storyArc: 'Two distinct acts.', plotPoints: [
+      { id: 'plot-later', kind: 'challenge', title: 'Later revelation', description: 'Reserved for the second act.', episodeId: withSecond.episodes[1].id },
+    ], sideQuests: [] } });
+    const outline = generatedChallengeOutline();
+    outline.scenes.forEach((scene) => { scene.plotPointId = 'plot-later'; });
+    runStagedLLM.mockResolvedValueOnce({ content: outline });
+    const draft = await generateEpisodeOutline(loomId, episodeId);
+    expect(draft.validation.issues).toContainEqual(expect.objectContaining({ code: 'WRONG_EPISODE_PLOT_POINT', severity: 'error' }));
+    expect(runStagedLLM.mock.calls[0][1].storyContext).toContain('CURRENT EPISODE ONLY');
+    expect(runStagedLLM.mock.calls[0][1].storyContext).not.toContain('PLAYABLE CHALLENGE CONTRACT');
+    expect((await validateEpisodeOutline(loomId, episodeId)).outline.validation.status).toBe('invalid');
+    await expect(weaveEpisode(loomId, episodeId, { expandFromOutline: true })).rejects.toThrow();
+    expect(runStagedLLM).toHaveBeenCalledTimes(1);
   });
 
   it('expands explicitly-authored challenges into a multi-scene interactive contract', async () => {

@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import useFieldDraft from '../../../../hooks/useFieldDraft';
 import { RotateCcw, AlertCircle } from 'lucide-react';
 import CronInput from '../../../CronInput';
-import { AGENT_OPTIONS, BRANCHES_PER_AGENT_DEFAULT, BRANCHES_PER_AGENT_OPTIONS, BRANCHES_PER_AGENT_TASK_TYPES, DEFAULT_REVIEW_STOP_MODE, IMPLICIT_PR_COMPLETION, PR_AUTHOR_FILTER_OPTIONS, PR_COMPLETION_OPTIONS, pinnedPrCompletion, prCompletionOption, ISSUE_AUTHOR_FILTER_OPTIONS, ISSUE_AUTHOR_FILTER_TASK_TYPES, SWARM_COUNT_OPTIONS, SWARM_TASK_TYPES } from '../../constants';
+import { AGENT_OPTIONS, BRANCHES_PER_AGENT_DEFAULT, BRANCHES_PER_AGENT_OPTIONS, BRANCHES_PER_AGENT_TASK_TYPES, DEFAULT_REVIEW_STOP_MODE, REVIEWER_OVERRIDE_KEYS as REVIEW_CONFIG_KEYS, IMPLICIT_PR_COMPLETION, PR_AUTHOR_FILTER_OPTIONS, PR_COMPLETION_OPTIONS, pinnedPrCompletion, prCompletionOption, ISSUE_AUTHOR_FILTER_OPTIONS, ISSUE_AUTHOR_FILTER_TASK_TYPES, SWARM_COUNT_OPTIONS, SWARM_TASK_TYPES } from '../../constants';
 import ReviewerPicker from '../../ReviewerPicker';
 import Banner from '../../../ui/Banner';
 import InfoTooltip from '../../../ui/InfoTooltip';
@@ -13,34 +13,28 @@ import useReviewerModelOptions from '../../../../hooks/useReviewerModelOptions';
 import { reviewerModelsFromDefaults, reviewerEffortsFromDefaults } from '../../../../lib/reviewerModels';
 import ToggleSwitch from '../../../ToggleSwitch';
 import useTaskModelPins from '../../../../hooks/useTaskModelPins';
-import { effectiveModelFor } from '../../../../utils/providers';
+import { effectiveModelFor, selectableProviders } from '../../../../utils/providers';
 import EffortSelect from '../../EffortSelect';
 import PromptEditor from './PromptEditor';
 import RunTaskButton from './RunTaskButton';
 import TaskDataInputs from '../../TaskDataInputs';
-import { INTERVAL_DESCRIPTIONS, toggleMetadataField, pipelineStages, IMPROVEMENT_DISABLED_TITLE, SAVING_TITLE, fileIssuesEffective, managedAgentOptionsFor, toggleFileIssuesMetadata } from './scheduleConstants';
+import { INTERVAL_DESCRIPTIONS, PERPETUAL_DESCRIPTION, toggleMetadataField, pipelineStages, IMPROVEMENT_DISABLED_TITLE, SAVING_TITLE, fileIssuesEffective, managedAgentOptionsFor, toggleFileIssuesMetadata } from './scheduleConstants';
 
 // Shown for the unpinned ('' → inherit) choice: the task type is global, so the
 // policy is whatever each target app configured, and PortOS's own self-improvement
 // runs (no app) land on the server-side fallback.
 const PR_COMPLETION_INHERIT_HINT = `Uses the target app's "After opening PR" default (Apps → Edit App), or "${prCompletionOption(IMPLICIT_PR_COMPLETION)?.label}" when it has none.`;
 
-// These fields are the task-local reviewer-loop override. Removing them lets
-// the picker and server resolver fall back to the install-wide Code Review
-// Defaults without changing the task's PR policy or other agent options.
-const REVIEW_CONFIG_KEYS = [
-  'reviewer',
-  'reviewers',
-  'usernames',
-  'optionalReviewers',
-  'reviewerMaxRounds',
-  'reviewerModels',
-  'reviewerEfforts',
-  'reviewStopMode',
-  'reviewerApplies',
-];
+// The task-local reviewer-loop override is REVIEWER_OVERRIDE_KEYS (imported as
+// REVIEW_CONFIG_KEYS above). Removing those keys lets the picker and the server
+// resolver fall back to the install-wide Code Review Defaults without changing
+// the task's PR policy or other agent options.
+//
+// Deliberately the WIDE roster, not `hasReviewerOverride`'s list-bearing subset:
+// the reset clears the two run flags too, so gating its visibility on the subset
+// would leave a stop-mode-only override on screen with no control that removes it.
 
-export default function GlobalConfigControls({ taskType, config, onUpdate, onTrigger, onReset, category: _category, providers, activeProviderId, apps, updating, setUpdating, allTaskTypes, improvementDisabled, dataInputCatalog }) {
+export default function GlobalConfigControls({ taskType, config, onUpdate, onTrigger, category: _category, providers, providersLoaded = true, activeProviderId, apps, updating, setUpdating, allTaskTypes, improvementDisabled, dataInputCatalog }) {
   const reviewDefaults = useCodeReviewDefaults();
   // Resolved model lists for the reviewer table's Model column (the picker itself
   // never fetches — see its `modelOptions` prop).
@@ -88,6 +82,7 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
     provider: selectedProvider,
     defaultProviderLabel,
     availableModels,
+    toolFree,
     changeProvider: handleProviderChange,
     changeModel: handleModelChange,
     changeEffort: handleEffortChange,
@@ -107,19 +102,10 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
 
   const handleTypeChange = async (newType) => {
     if (newType === 'cron') {
+      // Open the editor rather than saving: the cadence isn't chosen until an
+      // expression is committed (handleCronSave writes both fields together).
       setCronEditing(true);
       setSelectedType('cron');
-      return;
-    }
-    if (newType === 'perpetual') {
-      // Don't null recheckCron — switching to perpetual keeps any prior cadence.
-      setCronEditing(false);
-      setUpdating(true);
-      setSelectedType('perpetual');
-      await onUpdate(taskType, { type: 'perpetual' }).catch(() => {
-        setSelectedType(config.type);
-      });
-      setUpdating(false);
       return;
     }
     setCronEditing(false);
@@ -128,6 +114,16 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
     await onUpdate(taskType, { type: newType, cronExpression: null }).catch(() => {
       setSelectedType(config.type);
     });
+    setUpdating(false);
+  };
+
+  // Perpetual is orthogonal to the cadence — toggling it never touches `type`,
+  // so a Scheduled task keeps its expression and an On-Demand one stays manual.
+  // No local optimistic state to roll back, so this awaits bare like
+  // handleToggleEnabled rather than attaching its own rejection handler.
+  const handlePerpetualToggle = async () => {
+    setUpdating(true);
+    await onUpdate(taskType, { perpetual: !config.perpetual });
     setUpdating(false);
   };
 
@@ -142,11 +138,7 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
 
   const handleRecheckCronSave = async (expr) => {
     setUpdating(true);
-    // Switching to perpetual together with its recheck cadence in one PUT so a
-    // freshly-picked perpetual type lands with the cadence already set.
-    await onUpdate(taskType, { type: 'perpetual', recheckCron: expr }).catch(() => {
-      setSelectedType(config.type);
-    });
+    await onUpdate(taskType, { recheckCron: expr }).catch(() => {});
     setRecheckEditing(false);
     setUpdating(false);
   };
@@ -156,16 +148,6 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
   const handleToggleEnabled = async () => {
     setUpdating(true);
     await onUpdate(taskType, { enabled: isPaused });
-    setUpdating(false);
-  };
-
-  const handlePrAuthorFilterChange = async (value) => {
-    setUpdating(true);
-    // Send the full merged taskMetadata — updateTaskInterval replaces the
-    // object wholesale, and loadSchedule re-merges defaults on read.
-    await onUpdate(taskType, {
-      taskMetadata: { ...(config.taskMetadata || {}), prAuthorFilter: value }
-    });
     setUpdating(false);
   };
 
@@ -233,9 +215,18 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
   // Reviewers only run under review-then-merge, so the picker hides for the two
   // policies that never reach them — but an unpinned ('') task may still inherit
   // review-then-merge from its app, so that keeps it.
-  const reviewersApply = config.taskMetadata?.openPR
-    ? prCompletion === '' || prCompletion === 'review-then-merge'
-    : !!config.taskMetadata?.reviewLoop;
+  //
+  // A claimFlow task is unconditional: its PROMPT opens and merges its own PR and
+  // runs the reviewers itself, so the resolved list is operative no matter what
+  // `openPR` / `reviewLoop` say (both are false in the shipped claim metadata).
+  // Without this the picker — and the "Use system Code Review Defaults" reset
+  // beside it — never render for claim-work, leaving a reviewer override that
+  // every claim obeys with no control anywhere that can clear it.
+  const reviewersApply = config.taskMetadata?.claimFlow
+    ? true
+    : config.taskMetadata?.openPR
+      ? prCompletion === '' || prCompletion === 'review-then-merge'
+      : !!config.taskMetadata?.reviewLoop;
 
   // `selectedProvider` / `availableModels` come from useTaskModelPins above — it
   // resolves the pin against the active provider, lists Antigravity's BASE models
@@ -289,13 +280,8 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
           disabled={updating}
           className="w-full bg-port-card border border-port-border rounded px-3 py-2 text-white text-sm"
         >
-          <option value="rotation">Rotation (runs in task queue)</option>
-          <option value="daily">Daily (once per day)</option>
-          <option value="weekly">Weekly (once per week)</option>
-          <option value="once">Once (run once then stop)</option>
           <option value="on-demand">On Demand (manual trigger only)</option>
-          <option value="cron">Cron (custom schedule)</option>
-          <option value="perpetual">Perpetual (drain until done, then recheck)</option>
+          <option value="cron">Scheduled (cron)</option>
         </select>
         {(selectedType === 'cron' && (cronEditing || config.type === 'cron')) ? (
           <CronInput
@@ -309,7 +295,31 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
         )}
       </FormField>
 
-      {selectedType === 'perpetual' && (
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm text-gray-400">Perpetual</span>
+          <InfoTooltip label="What does Perpetual do?">
+            {PERPETUAL_DESCRIPTION}. It applies to either cadence: an On-Demand
+            perpetual task drains whenever it isn&apos;t parked, and a Scheduled
+            one starts its drain on the cron slot and rechecks on the same schedule.
+          </InfoTooltip>
+        </div>
+        <ToggleSwitch
+          enabled={!!config.perpetual}
+          onChange={handlePerpetualToggle}
+          disabled={updating}
+          ariaLabel={config.perpetual ? 'Disable perpetual drain' : 'Enable perpetual drain'}
+        />
+      </div>
+
+      {config.perpetual && selectedType === 'cron' && (
+        <p className="text-xs text-gray-500">
+          Each cron slot starts a drain that runs back-to-back while actionable work remains;
+          once it parks, the same schedule gates the next attempt.
+        </p>
+      )}
+
+      {config.perpetual && selectedType === 'on-demand' && (
         <div>
           <span className="text-sm text-gray-400 block mb-2">Recheck Cadence</span>
           {(recheckEditing || config.recheckCron) ? (
@@ -335,9 +345,9 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
           </p>
           {(() => {
             // claim-issue/claim-work park PER-APP, so prefer the per-app aggregate
-            // (config.perpetual) over the global status.reason — which always reads
-            // 'perpetual-drain' for app-scoped tasks even when every app is parked.
-            const p = config.perpetual;
+            // (config.perpetualStatus) over the global status.reason — which always
+            // reads 'perpetual-drain' for app-scoped tasks even when every app is parked.
+            const p = config.perpetualStatus;
             if (p && (p.trackedAppCount > 0 || p.globalParked)) {
               const allParked = p.globalParked || (p.trackedAppCount > 0 && p.parkedAppCount === p.trackedAppCount);
               if (allParked) {
@@ -373,22 +383,26 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
             <select
               value={selectedProviderId}
               onChange={(e) => handleProviderChange(e.target.value)}
-              disabled={updating}
+              disabled={updating || !providersLoaded}
               className="w-full bg-port-card border border-port-border rounded px-3 py-2 text-white text-sm"
             >
-              <option value="">{defaultProviderLabel}</option>
-              {providers?.map(provider => (
-                <option key={provider.id} value={provider.id}>{provider.name}</option>
+              {/* Mid-fetch the list is empty, so "Default (active provider)" would
+                  be this select's only option — a slow control that reads broken. */}
+              <option value="">{providersLoaded ? defaultProviderLabel : 'Loading providers…'}</option>
+              {selectableProviders(providers || [], { selectedId: selectedProviderId, allowed: toolFree ? (provider) => provider.type === 'api' : undefined }).map(provider => (
+                <option key={provider.id} value={provider.id} disabled={toolFree && provider.type !== 'api'}>{provider.name}{toolFree && provider.type !== 'api' ? ' (API provider required)' : ''}</option>
               ))}
             </select>
-            <p className="text-xs text-gray-500 mt-1">Leave as default to use the currently active provider</p>
+            <p className="text-xs text-gray-500 mt-1">{toolFree
+              ? <>Uses a text API with no tools. Default follows <a href="/models/llms/abuse" className="text-port-accent underline">Abuse Guard source settings</a>; a saved CLI provider must be cleared or replaced.</>
+              : 'Leave as default to use the currently active provider'}</p>
           </FormField>
 
           <FormField label="Model (optional)" labelClassName="text-sm text-gray-400 block mb-2">
             <select
               value={selectedModel}
               onChange={(e) => handleModelChange(e.target.value)}
-              disabled={updating}
+              disabled={updating || !providersLoaded}
               className="w-full bg-port-card border border-port-border rounded px-3 py-2 text-white text-sm"
             >
               {/* `availableModels` already carries a pin the provider no longer
@@ -417,12 +431,11 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
 
       {taskType === 'pr-watcher' && (
         <div>
-          <label htmlFor={`pr-author-filter-${taskType}`} className="text-sm text-gray-400 block mb-2">PR Author Filter</label>
+          <label htmlFor={`pr-author-filter-${taskType}`} className="text-sm text-gray-400 block mb-2">PR Remediation Scope</label>
           <select
             id={`pr-author-filter-${taskType}`}
-            value={config.taskMetadata?.prAuthorFilter || 'any'}
-            onChange={(e) => handlePrAuthorFilterChange(e.target.value)}
-            disabled={updating}
+            value="trusted"
+            disabled
             className="w-full bg-port-card border border-port-border rounded px-3 py-2 text-white text-sm"
           >
             {PR_AUTHOR_FILTER_OPTIONS.map(opt => (
@@ -430,7 +443,7 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
             ))}
           </select>
           <p className="text-xs text-gray-500 mt-1">
-            {PR_AUTHOR_FILTER_OPTIONS.find(o => o.value === (config.taskMetadata?.prAuthorFilter || 'any'))?.description}
+            {PR_AUTHOR_FILTER_OPTIONS.find(o => o.value === 'trusted')?.description}
             {' '}Edit the prompt below to control what the agent does for each opened PR (it can use <code>{'{prData}'}</code>, <code>{'{repoFullName}'}</code>, <code>{'{defaultBranch}'}</code>).
           </p>
         </div>
@@ -654,13 +667,38 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
               reviewerApplies={config.taskMetadata?.reviewerApplies !== undefined
                 ? (config.taskMetadata?.reviewerApplies === true || config.taskMetadata?.reviewerApplies === 'true')
                 : reviewDefaults.reviewerApplies}
+              // The same fallback the props above were seeded from. The picker
+              // omits whatever still equals it, so touching one control no
+              // longer freezes the rest into a permanent task override (#6208).
+              defaults={{
+                reviewers: reviewDefaults.reviewers,
+                usernames: reviewDefaults.usernames,
+                optionalReviewers: reviewDefaults.optionalReviewers,
+                reviewerMaxRounds: reviewDefaults.reviewerMaxRounds,
+                reviewerModels: seededPins.models,
+                reviewerEfforts: seededPins.efforts,
+                stopMode: reviewDefaults.stopMode,
+                reviewerApplies: reviewDefaults.reviewerApplies,
+              }}
               disabled={updating}
-              onChange={({ reviewers, usernames, optionalReviewers, reviewerMaxRounds, reviewerModels, reviewerEfforts, stopMode, reviewerApplies }) => {
+              onChange={(patch) => {
+                // The picker emits only what differs from `defaults` above, so
+                // rebuild the reviewer slice from scratch: strip every override
+                // key (a key that reverted to the default must be DELETED, not
+                // left pinning its old value), then re-apply what arrived.
                 // Drop the legacy single `reviewer` key so storage converges on `reviewers`.
                 const { reviewer: _reviewer, ...rest } = config.taskMetadata || {};
-                onUpdate(taskType, {
-                  taskMetadata: { ...rest, reviewers, usernames, optionalReviewers, reviewerMaxRounds, reviewerModels, reviewerEfforts, reviewStopMode: stopMode, reviewerApplies }
-                });
+                for (const key of REVIEW_CONFIG_KEYS) delete rest[key];
+                const taskMetadata = { ...rest };
+                if (patch.reviewers !== undefined) taskMetadata.reviewers = patch.reviewers;
+                if (patch.usernames !== undefined) taskMetadata.usernames = patch.usernames;
+                if (patch.optionalReviewers !== undefined) taskMetadata.optionalReviewers = patch.optionalReviewers;
+                if (patch.reviewerMaxRounds !== undefined) taskMetadata.reviewerMaxRounds = patch.reviewerMaxRounds;
+                if (patch.reviewerModels !== undefined) taskMetadata.reviewerModels = patch.reviewerModels;
+                if (patch.reviewerEfforts !== undefined) taskMetadata.reviewerEfforts = patch.reviewerEfforts;
+                if (patch.stopMode !== undefined) taskMetadata.reviewStopMode = patch.stopMode;
+                if (patch.reviewerApplies !== undefined) taskMetadata.reviewerApplies = patch.reviewerApplies;
+                onUpdate(taskType, { taskMetadata });
               }}
             />
           </div>
@@ -706,6 +744,7 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
             apps={apps}
             onTrigger={onTrigger}
             installWide={config.installWide}
+            programmatic={config.programmatic}
             // `updating` covers an in-flight pin write here, same race the card gates on.
             disabledReason={improvementDisabled ? IMPROVEMENT_DISABLED_TITLE : (updating ? SAVING_TITLE : '')}
           />
@@ -713,16 +752,6 @@ export default function GlobalConfigControls({ taskType, config, onUpdate, onTri
           <div className="text-xs text-port-warning/80" title={invocationDescription}>
             {config.invocation?.label || 'Automation-only'} — runs from its parent automation
           </div>
-        )}
-        {config.type === 'once' && status.reason === 'once-completed' && (
-          <button
-            onClick={() => onReset(taskType)}
-            className="flex items-center gap-1 px-3 py-1.5 text-sm bg-port-warning/20 hover:bg-port-warning/30 text-port-warning rounded transition-colors"
-            title="Reset execution history to run this task again"
-          >
-            <RotateCcw size={14} />
-            Reset
-          </button>
         )}
       </div>
 

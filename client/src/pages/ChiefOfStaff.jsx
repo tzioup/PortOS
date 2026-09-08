@@ -5,7 +5,10 @@ import { useLocalStorageBool } from '../hooks/useLocalStorageBool';
 import { useAutoRefetch } from '../hooks/useAutoRefetch';
 import { useValidTab } from '../hooks/useValidTab';
 import * as api from '../services/api';
+import { isRiggedAvatarStyle, riggedRecordForStyle, useAvatarCapabilities } from '../hooks/useAvatarCapabilities';
 import { coalesce } from '../utils/coalesce';
+import { sameJsonShape } from '../lib/sameJsonShape';
+import { WEBGL_AVATAR_STYLE_IDS } from '../lib/avatarStyles';
 import { Play, Pause, Square, Clock, CheckCircle, AlertCircle, Cpu, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, Brain, PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import toast from '../components/ui/Toast';
 import BrailleSpinner from '../components/BrailleSpinner';
@@ -57,25 +60,44 @@ const ConfigTab = lazy(() => import('../components/cos/tabs/ConfigTab'));
 const BriefingTab = lazy(() => import('../components/cos/tabs/BriefingTab'));
 
 // Three.js-based avatars lazy-loaded so the R3F stack isn't bundled unless the
-// user's chosen avatar style actually needs it.
-const LAZY_AVATARS = {
+// user's chosen avatar style actually needs it. `core` is a plain 2D canvas
+// (no three.js) but stays lazy so the default SVG path loads nothing extra.
+// Every registry id (`lib/avatarStyles.js`) EXCEPT `svg`/`ascii` renders through
+// a lazily-loaded component here — those two fall through to the inline
+// `CoSCharacter` default below. `ChiefOfStaff.avatarStyles.test.jsx` fails if a
+// registry id is missing from this map (or from the inline-rendered pair).
+export const INLINE_RENDERED_AVATAR_STYLES = new Set(['svg', 'ascii']);
+
+export const LAZY_AVATARS = {
   cyber:    lazy(() => import('../components/cos/CyberCoSAvatar')),
   sigil:    lazy(() => import('../components/cos/SigilCoSAvatar')),
   esoteric: lazy(() => import('../components/cos/EsotericCoSAvatar')),
   nexus:    lazy(() => import('../components/cos/NexusCoSAvatar')),
   muse:     lazy(() => import('../components/cos/MuseCoSAvatar')),
+  core:     lazy(() => import('../components/cos/CoreCoSAvatar')),
   // Bundled CC0 Kenney Mini Characters — animated rigged GLB avatars.
   miniMaleC:   lazy(() => import('../components/cos/MiniCharMaleC')),
   miniFemaleD: lazy(() => import('../components/cos/MiniCharFemaleD')),
 };
 
-const CANVAS_AVATAR_STYLES = new Set([
-  'cyber', 'sigil', 'esoteric', 'nexus', 'muse',
-  'miniMaleC', 'miniFemaleD',
-]);
+// A verified animated record renders through the same mini-character stage —
+// the variant URL resolves to the record's GLB via /api/avatar, and playback
+// falls back to a present clip per its coverage. Lazy like every other 3D
+// avatar so three.js stays out of the main chunk until it is picked.
+const LazyRiggedAvatar = lazy(() => import('../components/cos/MiniCharacterCoSAvatar'));
+
+// `CANVAS_AVATAR_STYLES` means "needs the WebGL/three.js stage" — derives
+// directly from the registry's `webgl` flag (`lib/avatarStyles.js`).
+const CANVAS_AVATAR_STYLES = WEBGL_AVATAR_STYLE_IDS;
 
 // Shared brand gradient for the "CoS" wordmark headings (clipped to text).
 const COS_TITLE_GRADIENT = 'linear-gradient(135deg, #6366f1, #8b5cf6, #06b6d4)';
+
+// How long the avatar keeps "speaking" after an event that gives it something to
+// say. Exported so tests drain the timer by this value rather than a literal —
+// a hardcoded drain that no longer covers the timer lets a state update escape
+// act() again.
+export const SPEAKING_MS = 2000;
 
 function TabLoadFallback({ label }) {
   return <div className="flex items-center justify-center py-12"><BrailleSpinner text={`Loading ${label}`} /></div>;
@@ -95,6 +117,9 @@ export default function ChiefOfStaff() {
   // Which provider an unpinned task actually runs on — the Schedule tab names it
   // on the "Default" option and resolves model/effort choices against it.
   const [activeProviderId, setActiveProviderId] = useState(null);
+  // `[]` is ambiguous — "not fetched yet" vs "fetched, none configured". The
+  // pickers below need the difference; see ProviderModelSelector's `loading`.
+  const [providersLoaded, setProvidersLoaded] = useState(false);
   const [apps, setApps] = useState([]);
   const [loading, setLoading] = useState(true);
   const [agentState, setAgentState] = useState('sleeping');
@@ -123,6 +148,9 @@ export default function ChiefOfStaff() {
   // overwrite a fresher optimistic mutation or fetchQueue result.
   const queueSeqRef = useRef(0);
   const socket = useSocket();
+
+  // Verified animated records for the avatar selector and rigged playback (#5894).
+  const { records: riggedAvatars } = useAvatarCapabilities();
 
   // Derive avatar style from server config, with optional dynamic override
   const configAvatarStyle = status?.config?.avatarStyle || 'svg';
@@ -155,6 +183,31 @@ export default function ChiefOfStaff() {
     setHealth(resolved);
     setHealthLoaded(true);
     return resolved;
+  }, []);
+
+  // The single write path for the provider list, mirroring `applyHealth` above:
+  // stamping the settle flag anywhere else could set `providers` without it.
+  // `sameJsonShape` keeps the array identity stable when the payload is
+  // unchanged — which it is on essentially every 30s poll — so the early commit
+  // that fixes first-paint latency doesn't cost a full-tree re-render each tick
+  // (`providers` is an unmemoized prop down through every schedule card).
+  const applyProviders = useCallback((data) => {
+    setProviders(prev => (sameJsonShape(prev, data.providers || []) ? prev : data.providers || []));
+    setActiveProviderId(data.activeProvider || null);
+    setProvidersLoaded(true);
+    return data;
+  }, []);
+
+  // Same self-committing-read fix as `applyProviders`, for the same reason: apps
+  // feeds the Schedule/Tasks/Agents app pickers, so bundling it into
+  // `secondaryRead`'s Promise.all held it hostage to `getCosActionableInsights`
+  // (a server-side health check) and left those pickers showing an empty list
+  // for seconds. `sameJsonShape` keeps the array identity stable on an unchanged
+  // 30s poll payload so this doesn't cost a full-tree re-render each tick.
+  const applyApps = useCallback((data) => {
+    const filtered = (Array.isArray(data) ? data : []).filter(a => a.id !== 'portos-autofixer');
+    setApps(prev => (sameJsonShape(prev, filtered) ? prev : filtered));
+    return filtered;
   }, []);
 
   // Derive agent state from system status
@@ -190,10 +243,19 @@ export default function ChiefOfStaff() {
       applyHealth(data, { merge: true });
       return data;
     });
+    // `/providers` is a cache-only read that returns in milliseconds, but bundling
+    // it into the Promise.all below held it until the SLOWEST sibling settled —
+    // and `getCosActionableInsights` runs a server-side PM2/memory health check.
+    // That left the Schedule tab's provider pickers empty for seconds, rendering
+    // a lone "Default (active provider)" option that reads as broken. Same fix as
+    // `healthRead`: commit on its own settle.
+    const providersRead = api.getProviders()
+      .catch(() => ({ providers: [] }))
+      .then(applyProviders);
+    // Same rationale as providersRead above: apps commits on its own settle
+    // instead of waiting on the slower siblings in secondaryRead.
+    const appsRead = api.getApps().catch(() => []).then(applyApps);
     const secondaryRead = Promise.all([
-      healthRead,
-      api.getProviders().catch(() => ({ providers: [] })),
-      api.getApps().catch(() => []),
       api.getCosLearningSummary().catch(() => null),
       // `silent: true` keeps transient poll blips quiet, matching the banner's
       // retired 60s poll; `.catch(() => null)` → preserve last-good below.
@@ -224,7 +286,10 @@ export default function ChiefOfStaff() {
     const runningAgent = agentsData.find(a => a.status === 'running');
     setActiveAgentMeta(runningAgent?.metadata || null);
 
-    const [, providersData, appsData, learningSummaryData, insightsData] = await secondaryRead;
+    const [learningSummaryData, insightsData] = await secondaryRead;
+    // All three self-committing reads are barriers, not values: `mergedHealth`
+    // below reads what `healthRead` wrote, so it must not run before they settle.
+    await Promise.all([healthRead, providersRead, appsRead]);
     // `getCosHealth` above reads the *pre-check* persisted health, while the
     // getCosActionableInsights call in this same batch triggers a fresh server
     // health check (cos.runHealthCheck) that emits `cos:health:check` — the
@@ -233,10 +298,6 @@ export default function ChiefOfStaff() {
     // failed); everything below derives from what it returned, never from the
     // raw read, so the bubble can't name an older issue than the tile shows.
     const mergedHealth = healthRef.current;
-    setProviders(providersData.providers || []);
-    setActiveProviderId(providersData.activeProvider || null);
-    // Filter out PortOS Autofixer (it's part of PortOS project)
-    setApps(appsData.filter(a => a.id !== 'portos-autofixer'));
     setLearningSummary(learningSummaryData);
     // Apply a real insights payload (including a legitimately-empty []); a null
     // from a failed/transient fetch preserves the last-good array so the banner
@@ -357,7 +418,7 @@ export default function ChiefOfStaff() {
       const shortDesc = taskDesc ? taskDesc.substring(0, 60) + (taskDesc.length > 60 ? '...' : '') : 'Working on task...';
       setStatusMessage(`Running: ${shortDesc}`);
       setSpeaking(true);
-      setTimeout(() => setSpeaking(false), 2000);
+      setTimeout(() => setSpeaking(false), SPEAKING_MS);
       // Track active agent metadata for dynamic avatar resolution
       if (data?.metadata) setActiveAgentMeta(data.metadata);
       // Initialize empty output buffer for new agent
@@ -392,7 +453,7 @@ export default function ChiefOfStaff() {
       const success = data?.result?.success;
       setStatusMessage(success ? "Task completed successfully" : "Task failed - checking errors...");
       setSpeaking(true);
-      setTimeout(() => setSpeaking(false), 2000);
+      setTimeout(() => setSpeaking(false), SPEAKING_MS);
       // Clear active agent metadata so avatar reverts to default
       setActiveAgentMeta(null);
       // Clean up live output buffer for completed agent to prevent memory growth
@@ -415,7 +476,7 @@ export default function ChiefOfStaff() {
         setAgentState('investigating');
         setStatusMessage(summarizeHealthIssues(data.issues));
         setSpeaking(true);
-        setTimeout(() => setSpeaking(false), 2000);
+        setTimeout(() => setSpeaking(false), SPEAKING_MS);
       }
     };
     socket.on('cos:health:check', handleHealthCheck);
@@ -474,7 +535,7 @@ export default function ChiefOfStaff() {
       setAgentState('thinking');
       setStatusMessage("Starting daemon - scanning for tasks...");
       setSpeaking(true);
-      setTimeout(() => setSpeaking(false), 2000);
+      setTimeout(() => setSpeaking(false), SPEAKING_MS);
       fetchData();
     }
   };
@@ -530,7 +591,7 @@ export default function ChiefOfStaff() {
       setAgentState('thinking');
       setStatusMessage("Evaluating tasks...");
       setSpeaking(true);
-      setTimeout(() => setSpeaking(false), 2000);
+      setTimeout(() => setSpeaking(false), SPEAKING_MS);
     } catch (err) {
       toast.error(err.message);
     }
@@ -679,7 +740,7 @@ export default function ChiefOfStaff() {
     el.scrollBy({ left: direction === 'left' ? -scrollAmount : scrollAmount, behavior: 'smooth' });
   }, []);
 
-  const hasCanvasAvatar = CANVAS_AVATAR_STYLES.has(avatarStyle);
+  const hasCanvasAvatar = CANVAS_AVATAR_STYLES.has(avatarStyle) || isRiggedAvatarStyle(avatarStyle);
 
   // Learning tile behaviour shared by the compact (sidebar/mobile) and mini
   // (ascii stats bar) renderings — only the icon scale and the empty-state
@@ -748,6 +809,7 @@ export default function ChiefOfStaff() {
         value={learningRate ?? 'No data'}
         icon={<Brain className="w-4 h-4" />}
         compact
+        className="hidden lg:flex"
       />
       {status?.running ? (
         <>
@@ -803,6 +865,18 @@ export default function ChiefOfStaff() {
   );
 
   const renderAvatar = (background = false) => {
+    // A rigged record plays on the mini-character stage: the variant URL
+    // resolves to its animated GLB, and its coverage drives the fallback to
+    // a present clip. A record deleted after being picked 404s its HEAD
+    // probe, so the stage shows the missing-model hint instead of a canvas.
+    if (isRiggedAvatarStyle(avatarStyle)) {
+      const record = riggedRecordForStyle(riggedAvatars, avatarStyle);
+      return (
+        <Suspense fallback={<div className="flex items-center justify-center h-full"><BrailleSpinner /></div>}>
+          <LazyRiggedAvatar state={agentState} speaking={speaking} background={background} variant={avatarStyle} coverage={record?.coverage || null} />
+        </Suspense>
+      );
+    }
     const LazyAvatar = LAZY_AVATARS[avatarStyle];
     if (LazyAvatar) {
       return (
@@ -842,7 +916,7 @@ export default function ChiefOfStaff() {
       {desktopPanelCollapsed && (
         <button
           onClick={toggleDesktopPanel}
-          className="hidden lg:flex absolute left-0 top-2 z-20 p-1.5 text-port-text-muted hover:text-port-text transition-colors rounded-r-md hover:bg-port-border/80 bg-port-card/60 border border-l-0 border-port-accent-2/20"
+          className="min-h-[44px] min-w-[44px] items-center justify-center hidden lg:flex absolute left-0 top-2 z-20 p-1.5 text-port-text-muted hover:text-port-text transition-colors rounded-r-md hover:bg-port-border/80 bg-port-card/60 border border-l-0 border-port-accent-2/20"
           aria-label="Expand CoS panel"
           title="Expand CoS panel"
         >
@@ -857,10 +931,10 @@ export default function ChiefOfStaff() {
           {desktopPanelCollapsed ? (
             <div className="hidden lg:block overflow-hidden min-w-0" />
           ) : (
-            <div className="hidden lg:block relative">
+            <div className="hidden lg:block relative min-w-0 w-full max-w-full lg:w-[320px] lg:max-w-[320px]">
               <button
                 onClick={toggleDesktopPanel}
-                className="absolute top-2 right-2 z-10 p-1.5 text-gray-500 hover:text-white transition-colors rounded-md hover:bg-white/5"
+                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center absolute top-2 right-2 z-10 p-1.5 text-gray-500 hover:text-white transition-colors rounded-md hover:bg-white/5"
                 aria-label="Collapse CoS panel"
                 title="Collapse CoS panel"
               >
@@ -937,11 +1011,11 @@ export default function ChiefOfStaff() {
           </div>
         </>
       ) : (
-        <div className="relative flex flex-col border-b lg:border-b-0 lg:border-r border-port-accent-2/20 bg-gradient-to-b from-port-card/80 to-port-card/40 shrink-0 w-full max-w-full overflow-x-hidden lg:h-full lg:overflow-y-auto scrollbar-hide">
+        <div className="relative flex flex-col border-b lg:border-b-0 lg:border-r border-port-accent-2/20 bg-gradient-to-b from-port-card/80 to-port-card/40 shrink-0 w-full max-w-full min-w-0 lg:w-[320px] lg:max-w-[320px] overflow-x-hidden lg:h-full lg:overflow-y-auto scrollbar-hide">
           {/* Desktop Collapse Button */}
           <button
             onClick={toggleDesktopPanel}
-            className="hidden lg:flex absolute top-2 right-2 z-20 p-1.5 text-gray-500 hover:text-white transition-colors rounded-md hover:bg-white/5"
+            className="min-h-[44px] min-w-[44px] items-center justify-center hidden lg:flex absolute top-2 right-2 z-20 p-1.5 text-gray-500 hover:text-white transition-colors rounded-md hover:bg-white/5"
             aria-label="Collapse CoS panel"
             title="Collapse CoS panel"
           >
@@ -978,7 +1052,7 @@ export default function ChiefOfStaff() {
           {/* Collapsible Content */}
           <div
             id="cos-agent-panel"
-            className={`${agentPanelCollapsed ? 'hidden' : 'flex'} lg:flex min-w-0 relative overflow-hidden ${hasCanvasAvatar ? 'flex-none min-h-[180px] sm:min-h-[190px] md:min-h-[190px] lg:min-h-dvh-cap lg:[--dvh-cap:460px] lg:[--dvh-inset:1rem] xl:[--dvh-cap:620px]' : 'flex-1'}`}
+            className={`${agentPanelCollapsed ? 'hidden' : 'flex'} lg:flex min-w-0 w-full max-w-full relative overflow-hidden ${hasCanvasAvatar ? 'flex-none min-h-[180px] sm:min-h-[190px] md:min-h-[190px] lg:min-h-dvh-cap lg:[--dvh-cap:460px] lg:[--dvh-inset:1rem] xl:[--dvh-cap:620px]' : 'flex-1'}`}
           >
             {/* Background Effects */}
             <div
@@ -1004,7 +1078,13 @@ export default function ChiefOfStaff() {
             )}
 
             {/* Avatar UI overlays the full-width canvas stage for 3D styles. */}
-            <div className={`${hasCanvasAvatar ? 'absolute inset-y-0 left-0 w-[46%] lg:relative lg:inset-auto lg:w-full lg:flex-none lg:min-h-full p-2 sm:p-3 lg:px-4 lg:py-6' : 'relative flex-1 min-w-0 lg:flex-none lg:min-h-full p-2 lg:px-4 lg:py-6'} min-w-0 flex flex-col items-center z-10`}>
+            <div
+              className={`${
+                hasCanvasAvatar
+                  ? 'absolute inset-y-0 left-0 w-[46%] p-2 sm:p-3'
+                  : 'relative flex-1 w-full p-2'
+              } min-w-0 lg:relative lg:inset-auto lg:w-full lg:max-w-full lg:flex-none lg:min-h-full lg:px-4 lg:py-6 flex flex-col items-center z-10`}
+            >
               <div className="hidden lg:block text-sm font-semibold tracking-widest uppercase text-port-text-muted mb-1 font-mono">
                 Digital Assistant
               </div>
@@ -1030,12 +1110,12 @@ export default function ChiefOfStaff() {
               </div>
 
               {/* Desktop Stats Grid - integrated into CoS sidebar (matches mobile compressed layout) */}
-              <div className="hidden lg:grid grid-cols-2 gap-1.5 w-full mt-3 relative z-10">
+              <div className="hidden lg:grid grid-cols-2 gap-1.5 w-full min-w-0 mt-3 relative z-10">
                 {statsGridCards}
               </div>
 
               {status?.running && (
-                <div className="hidden lg:flex flex-1 min-h-0 w-full flex-col">
+                <div className="hidden lg:flex flex-1 min-h-0 w-full min-w-0 flex-col">
                   <EventLog logs={eventLogs} />
                 </div>
               )}
@@ -1133,12 +1213,12 @@ export default function ChiefOfStaff() {
         {activeTab === 'tasks' && (
           <div role="tabpanel" id="tabpanel-tasks" aria-labelledby="tab-tasks">
             <ActionableInsightsBanner insights={insights} onTaskUnblocked={handleTaskUnblocked} onRefresh={fetchData} />
-            <TasksTab tasks={tasks} agents={agents} onRefresh={fetchData} onTaskAdded={handleUserTaskAdded} onTaskUnblocked={handleTaskUnblocked} providers={providers} apps={apps} />
+            <TasksTab tasks={tasks} agents={agents} onRefresh={fetchData} onTaskAdded={handleUserTaskAdded} onTaskUnblocked={handleTaskUnblocked} providers={providers} providersLoaded={providersLoaded} apps={apps} />
           </div>
         )}
         {activeTab === 'agents' && (
           <div role="tabpanel" id="tabpanel-agents" aria-labelledby="tab-agents">
-            <AgentsTab agents={agents} onRefresh={fetchData} liveOutputs={liveOutputs} providers={providers} apps={apps} />
+            <AgentsTab agents={agents} onRefresh={fetchData} liveOutputs={liveOutputs} providers={providers} providersLoaded={providersLoaded} apps={apps} />
           </div>
         )}
         {activeTab === 'jobs' && (
@@ -1172,14 +1252,14 @@ export default function ChiefOfStaff() {
         {activeTab === 'schedule' && (
           <div role="tabpanel" id="tabpanel-schedule" aria-labelledby="tab-schedule">
             <Suspense fallback={<TabLoadFallback label="schedule" />}>
-              <ScheduleTab apps={apps} providers={providers} activeProviderId={activeProviderId} />
+              <ScheduleTab apps={apps} providers={providers} activeProviderId={activeProviderId} providersLoaded={providersLoaded} daemonRunning={status?.running} />
             </Suspense>
           </div>
         )}
         {activeTab === 'workflow' && (
           <div role="tabpanel" id="tabpanel-workflow" aria-labelledby="tab-workflow">
             <Suspense fallback={<TabLoadFallback label="workflow" />}>
-              <WorkflowTab apps={apps} providers={providers} />
+              <WorkflowTab apps={apps} providers={providers} providersLoaded={providersLoaded} />
             </Suspense>
           </div>
         )}
@@ -1228,7 +1308,7 @@ export default function ChiefOfStaff() {
         {activeTab === 'config' && (
           <div role="tabpanel" id="tabpanel-config" aria-labelledby="tab-config">
             <Suspense fallback={<TabLoadFallback label="configuration" />}>
-              <ConfigTab config={status?.config} onUpdate={fetchData} onEvaluate={handleForceEvaluate} avatarStyle={configAvatarStyle} setAvatarStyle={setAvatarStyle} />
+              <ConfigTab config={status?.config} onUpdate={fetchData} onEvaluate={handleForceEvaluate} avatarStyle={configAvatarStyle} setAvatarStyle={setAvatarStyle} riggedAvatars={riggedAvatars} />
             </Suspense>
           </div>
         )}

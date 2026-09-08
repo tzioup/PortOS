@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  agentActivityAgentParamsSchema,
   processSchema,
   appSchema,
   appUpdateSchema,
@@ -315,6 +316,26 @@ describe('validation.js', () => {
 
     it('rejects an unknown reviewer enum value', () => {
       expect(codeReviewSettingsSchema.safeParse({ reviewers: ['bogus'] }).success).toBe(false)
+    })
+
+    // The goal-fidelity gate (#5994) is its own block, not another
+    // `<reviewer>*` scalar: it is a different review, on a model the user picks
+    // independently of the quality chain.
+    it('accepts the goal-fidelity block and rejects a backend it cannot call server-side', () => {
+      const ok = codeReviewSettingsSchema.safeParse({
+        goalFidelity: { enabled: true, backend: 'ollama', model: 'qwen3:8b', effort: 'low' },
+      })
+      expect(ok.success).toBe(true)
+      expect(ok.data.goalFidelity).toEqual({ enabled: true, backend: 'ollama', model: 'qwen3:8b', effort: 'low' })
+
+      // A CLI reviewer is invoked by the follow-up agent from a prompt and has no
+      // server-side entry point, so the completion gate could never run it.
+      expect(codeReviewSettingsSchema.safeParse({ goalFidelity: { backend: 'codex' } }).success).toBe(false)
+      expect(codeReviewSettingsSchema.safeParse({ goalFidelity: { unknownField: 1 } }).success).toBe(false)
+      // An empty select is an absent pin, not a stored empty string.
+      const cleared = codeReviewSettingsSchema.safeParse({ goalFidelity: { enabled: false, backend: '', effort: '' } })
+      expect(cleared.success).toBe(true)
+      expect(cleared.data.goalFidelity).toEqual({ enabled: false })
     })
 
     it('rejects an unknown stopMode', () => {
@@ -1134,11 +1155,11 @@ describe('validation.js', () => {
   });
 
   describe('normalizeReviewers', () => {
-    it('defaults to [copilot] when absent/empty', () => {
-      expect(normalizeReviewers(undefined)).toEqual(['copilot']);
-      expect(normalizeReviewers({})).toEqual(['copilot']);
-      expect(normalizeReviewers({ reviewers: [] })).toEqual(['copilot']);
-      expect(normalizeReviewers({ reviewers: ['bogus'] })).toEqual(['copilot']);
+    it('defaults to no reviewers when absent/empty', () => {
+      expect(normalizeReviewers(undefined)).toEqual([]);
+      expect(normalizeReviewers({})).toEqual([]);
+      expect(normalizeReviewers({ reviewers: [] })).toEqual([]);
+      expect(normalizeReviewers({ reviewers: ['bogus'] })).toEqual([]);
     });
 
     it('prefers reviewers, falls back to legacy reviewer, preserves order + dedupes', () => {
@@ -1154,12 +1175,12 @@ describe('validation.js', () => {
       expect(normalizeReviewers({ reviewer: 'lmstudio' })).toEqual(['lmstudio']);
     });
 
-    it('uses the fallback when metadata is empty and falls back to copilot when the fallback is invalid', () => {
+    it('uses the fallback when metadata is empty and drops an invalid fallback', () => {
       // Settings-derived defaults flow through when the task didn't pin reviewers.
       expect(normalizeReviewers({}, ['antigravity', 'codex'])).toEqual(['antigravity', 'codex']);
       expect(normalizeReviewers({}, ['gemini', 'codex'])).toEqual(['antigravity', 'codex']);
-      // An all-bogus fallback collapses to the hardcoded copilot, never an empty list.
-      expect(normalizeReviewers({}, ['bogus', null])).toEqual(['copilot']);
+      // An all-bogus fallback collapses to the empty install default.
+      expect(normalizeReviewers({}, ['bogus', null])).toEqual([]);
       // Explicit task metadata still wins over the fallback.
       expect(normalizeReviewers({ reviewers: ['claude'] }, ['antigravity'])).toEqual(['claude']);
     });
@@ -1197,13 +1218,13 @@ describe('validation.js', () => {
   describe('resolveKeyedReviewers', () => {
     it('keeps an explicitly empty list empty only when usernames carry the review', () => {
       expect(resolveKeyedReviewers([], true)).toEqual([]);
-      // No usernames → falls back to the copilot default (can never be empty).
-      expect(resolveKeyedReviewers([], false)).toEqual(['copilot']);
+      // No usernames → follows the empty install default.
+      expect(resolveKeyedReviewers([], false)).toEqual([]);
     });
 
-    it('normalizes a populated list and defaults absent/legacy input to copilot', () => {
+    it('normalizes a populated list and defaults absent/legacy input to the install default', () => {
       expect(resolveKeyedReviewers(['codex', 'gemini'], true)).toEqual(['codex', 'antigravity']);
-      expect(resolveKeyedReviewers(undefined, true)).toEqual(['copilot']);
+      expect(resolveKeyedReviewers(undefined, true)).toEqual([]);
     });
   });
 
@@ -1224,9 +1245,9 @@ describe('validation.js', () => {
       expect(buildReviewersCsv(['copilot', 'codex'], ['@Bot'])).toBe('copilot,codex,@Bot');
     });
 
-    it('falls back to the copilot default when the keyed list is empty', () => {
-      expect(buildReviewersCsv([], [])).toBe('copilot');
-      expect(buildReviewersCsv([], ['Bot'])).toBe('copilot,@Bot');
+    it('keeps the keyed list empty when no reviewers are configured', () => {
+      expect(buildReviewersCsv([], [])).toBe('');
+      expect(buildReviewersCsv([], ['Bot'])).toBe('@Bot');
     });
 
     it('normalizes/strips bogus usernames', () => {
@@ -1558,11 +1579,27 @@ describe('validation.js', () => {
         .toBe('--review-with ollama[qwen2.5:7b]~opt~max=1');
     });
 
-    it('never brackets copilot, a @username, or lmstudio (no slashdo slug takes one)', () => {
-      // lmstudio's model rides in the /api/code-review/local request body instead.
+    it('never brackets copilot or a @username, and drops a PortOS-only reviewer entirely', () => {
+      // lmstudio has no slashdo slug at all: emitting it would abort the command
+      // (unknown --review-with value), so it is dropped from the flag rather than
+      // bracketed. Its model rides in the /api/code-review/local request body.
       expect(buildReviewWithArgs(['copilot', 'lmstudio'], { usernames: ['Bot'], reviewerModels: {
         copilot: 'x', lmstudio: 'local-a', '@Bot': 'y',
-      } })).toBe('--review-with copilot,lmstudio,@Bot');
+      } })).toBe('--review-with copilot,@Bot');
+    });
+
+    it('still emits the copilot flag when a PortOS-only reviewer rides alongside it', () => {
+      // Suppression hands `--review-with` to the host's saved slashdo defaults.
+      // That is right for a bare default copilot (#2507) and wrong here: the user
+      // chose this pair, and only lmstudio's slug is unemittable.
+      expect(buildReviewWithArgs(['lmstudio', 'copilot'])).toBe('--review-with copilot');
+    });
+
+    it('emits no flag at all when every configured reviewer is PortOS-only', () => {
+      // `--review-with` with an empty value is as fatal to slashdo as an unknown
+      // slug; the surrounding prompt still names the reviewers and the Local
+      // Reviewer Procedure that runs them.
+      expect(buildReviewWithArgs(['mtplx', 'opencode'])).toBe('');
     });
 
     it('does not let a stray copilot pin force the suppressed lone-default flag on', () => {
@@ -1922,6 +1959,39 @@ describe('validation.js', () => {
       }).success).toBe(false);
       expect(writersRoomCharacterUpdateSchema.safeParse({
         identityPack: { assets: [{ role: 'arbitrary', imageRef: 'ref.png' }] },
+      }).success).toBe(false);
+    });
+  });
+
+  describe('writersRoomCharacterUpdateSchema — psychology & sliders (#6417)', () => {
+    it('accepts a partial psychology profile, an explicit clear, and a rated axis', () => {
+      expect(writersRoomCharacterUpdateSchema.safeParse({
+        psychology: {
+          theoryOfControl: 'If I stay useful, nobody leaves.',
+          assessment: 'assessed',
+          drives: { connection: { desire: 'To be kept' } },
+        },
+        sliders: { proactivity: 8 },
+      }).success).toBe(true);
+      // Present-but-empty is the clear path the store relies on.
+      expect(writersRoomCharacterUpdateSchema.safeParse({
+        psychology: null,
+        sliders: { proactivity: null, likability: null, competence: null },
+      }).success).toBe(true);
+    });
+
+    it('rejects an unknown drive axis, an out-of-range slider, and a stray key', () => {
+      expect(writersRoomCharacterUpdateSchema.safeParse({
+        psychology: { drives: { ambition: { desire: 'more' } } },
+      }).success).toBe(false);
+      expect(writersRoomCharacterUpdateSchema.safeParse({
+        sliders: { proactivity: 11 },
+      }).success).toBe(false);
+      expect(writersRoomCharacterUpdateSchema.safeParse({
+        sliders: { proactivity: 4.5 },
+      }).success).toBe(false);
+      expect(writersRoomCharacterUpdateSchema.safeParse({
+        psychology: { theoryOfControl: 'ok', freudianSlip: 'nope' },
       }).success).toBe(false);
     });
   });
@@ -2294,6 +2364,19 @@ describe('ad-hoc route schemas (#2521)', () => {
       expect(typeof eidoverseWorldConfigPatchSchema?.safeParse).toBe('function');
       expect(eidoverseWorldConfigPatchSchema.safeParse({ cosEnabled: true }).success).toBe(true);
       expect(eidoverseWorldConfigPatchSchema.safeParse({ notAField: 1 }).success).toBe(false);
+    });
+  });
+
+  // The activity log builds a file path out of this id, so the schema — not the
+  // URL layer — is what has to refuse a non-segment (#5714).
+  describe('agentActivityAgentParamsSchema', () => {
+    it('accepts a bare filename segment', () => {
+      expect(agentActivityAgentParamsSchema.safeParse({ agentId: 'agent_a-1.v2' }).success).toBe(true);
+    });
+    it('refuses a dot segment or a path separator', () => {
+      for (const agentId of ['.', '..', '../etc', 'a/b', 'a\\b', 'a b', '']) {
+        expect(agentActivityAgentParamsSchema.safeParse({ agentId }).success).toBe(false);
+      }
     });
   });
 });

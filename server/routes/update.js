@@ -3,80 +3,14 @@ import { z } from 'zod';
 import { asyncHandler, ServerError } from '../lib/errorHandler.js';
 import { validateRequest } from '../lib/validation.js';
 import { UPSTREAM_FULL_NAME } from '../lib/gitRemote.js';
-import { persistentMindImageWorkGuard } from '../lib/persistentMind.js';
 import * as updateChecker from '../services/updateChecker.js';
-import { executeUpdate } from '../services/updateExecutor.js';
-import { getActiveAgentIds, spawningTasks } from '../services/agentState.js';
-import { readPersistentMindStateForSafetyCheck, withStateLock } from '../services/cosState.js';
-import { filterLiveAgentIds } from '../services/cosAgentLifecycle.js';
+import { startPortosSelfUpdate } from '../services/portosSelfUpdate.js';
+import {
+  countActiveCosAgents,
+  getPersistentMindImageWorkGuard,
+} from '../services/updatePreflight.js';
 
 const router = Router();
-
-// Count CoS agents a PortOS restart (update.sh → pm2 restart) would disrupt:
-// live processes (direct + runner spawns) PLUS any task mid-spawn. During a
-// spawn the task sits in `spawningTasks` while its child process is created and
-// only THEN registered in the process maps (`withSpawnDedupGuard` holds the set
-// across the whole launch) — so an agent that has already spawned a process but
-// not yet registered it is invisible to getActiveAgentIds() alone. Summing both
-// includes every distinct in-flight task in the count (a live agent plus two
-// spawning tasks reads as 3, not 1). It can transiently over-report by 1 during
-// the sub-second overlap where a single launching agent sits in BOTH sets, but
-// the guard only needs `> 0` and the count is a near-exact upper bound shown in
-// an advisory notice — an occasional +1 mid-launch is preferable to dropping
-// the spawning tasks entirely.
-//
-// This still can't close the window where a NEW spawn begins AFTER a caller
-// reads this but before update.sh's pm2 restart. The route's post-lock re-check
-// below narrows it; fully closing it needs every CoS spawn engine to consult
-// updateInProgress (tracked in #4124) — the orphan reaper bounds the residual.
-//
-// The map ids are filtered through PortOS's own durable records first
-// (`filterLiveAgentIds`). Neither map is self-cleaning, and `syncRunnerAgents`
-// adopts whatever the CoS Runner still advertises — so a TUI the runner failed
-// to kill stayed "active" until the next PortOS restart, permanently blocking
-// the one action that would have cleared it. A restart cannot sever a run this
-// process has already finalized, so a finalized id must not gate the update.
-async function countActiveCosAgents() {
-  const live = await filterLiveAgentIds(getActiveAgentIds());
-  return live.length + spawningTasks.size;
-}
-
-// The 409 the update flow raises when a restart would sever a live/spawning
-// agent — shared by the fast-fail pre-check and the post-lock re-check.
-function agentsActiveError(n) {
-  return new ServerError(
-    `${n} CoS agent${n === 1 ? ' is' : 's are'} running — updating would restart PortOS and ` +
-    `sever ${n === 1 ? 'it' : 'them'}. Pause or wait for the agent${n === 1 ? '' : 's'} to finish, then update.`,
-    { status: 409, code: 'AGENTS_ACTIVE' }
-  );
-}
-
-const persistentMindImageWorkError = (guard) => {
-  const work = [
-    guard.queuedImageMessages > 0
-      ? `${guard.queuedImageMessages} queued image message${guard.queuedImageMessages === 1 ? '' : 's'}`
-      : null,
-    guard.activeImageMessage ? 'one active image turn' : null,
-  ].filter(Boolean).join(' and ');
-  return new ServerError(
-    `Persistent Mind has ${work}. Drain the image-bearing work, or create a backup and retry ` +
-    'with acknowledgePersistentMindImageBackup: true. Older source readers cannot preserve image references.',
-    { status: 409, code: 'PERSISTENT_MIND_IMAGES_IN_FLIGHT' },
-  );
-};
-
-async function getPersistentMindImageWorkGuard() {
-  const snapshot = await readPersistentMindStateForSafetyCheck();
-  if (!snapshot.trusted) {
-    return { safe: false, trusted: false, queuedImageMessages: 0, activeImageMessage: false };
-  }
-  return persistentMindImageWorkGuard(snapshot.persistentMind);
-}
-
-const persistentMindStateUntrustedError = () => new ServerError(
-  'Persistent Mind state could not be validated. Restore data/cos/state.json from backup before updating.',
-  { status: 409, code: 'PERSISTENT_MIND_STATE_UNTRUSTED' },
-);
 
 const ignoreSchema = z.object({
   version: z.string().min(1, 'version is required')
@@ -110,9 +44,12 @@ router.get('/status', asyncHandler(async (req, res) => {
   res.json({ ...status, activeCosAgents, persistentMindImages });
 }));
 
-// POST /api/update/check — triggers manual check
+// POST /api/update/check — triggers manual check. `manual: true` bypasses the
+// unattended scheduler's gh backoff — a user who explicitly asked for a check
+// must get a real attempt, not a silent rejection from a cooldown the
+// background poller armed on its own.
 router.post('/check', asyncHandler(async (req, res) => {
-  const result = await updateChecker.checkForUpdate();
+  const result = await updateChecker.checkForUpdate({ manual: true });
   res.json(result);
 }));
 
@@ -189,143 +126,18 @@ router.post('/sync-fork', asyncHandler(async (req, res) => {
 router.post('/execute', asyncHandler(async (req, res) => {
   const { acknowledgeFork, acknowledgePersistentMindImageBackup, reconcile } = validateRequest(executeSchema, req.body || {});
 
-  // Never restart PortOS out from under a live CoS agent. Both a normal update
-  // and a reconcile run update.sh, which pm2-restarts THIS server process and
-  // severs any in-flight agent (each agent's PTY/child process is a child of it).
-  // countActiveCosAgents() reflects exactly what a restart would kill (see its
-  // definition above). Fast-fail here so it covers reconcile, normal update, and
-  // both fork variants (all funnel through /execute) before doing the git/fork
-  // work below; a second re-check after the lock closes the window an agent
-  // could start in during that work.
-  const preCheck = await countActiveCosAgents();
-  if (preCheck > 0) throw agentsActiveError(preCheck);
-  const preImageCheck = await getPersistentMindImageWorkGuard();
-  if (!preImageCheck.trusted) throw persistentMindStateUntrustedError();
-  if (!preImageCheck.safe && !acknowledgePersistentMindImageBackup) {
-    throw persistentMindImageWorkError(preImageCheck);
-  }
-
-  const status = await updateChecker.getUpdateStatus();
-
-  // Two distinct entry points:
-  //   - Normal update: requires a known, newer release tag to update TO.
-  //   - Reconcile (issue #1779): finishes a bare `git pull` by running update.sh
-  //     even with no newer release. It must be gated on the install ACTUALLY
-  //     being out of sync — branch on `reconcile` first so a cached release tag
-  //     can't let `reconcile: true` force update.sh on an in-sync install (or
-  //     target a stale release). update.sh pulls main regardless of the tag, so
-  //     the tag here is purely for logging; prefer the current version.
-  let tag;
-  if (reconcile) {
-    if (!status.installState) {
-      // installState is best-effort (.catch(() => null) in getUpdateStatus); a
-      // transient git/fs hiccup shouldn't read as "already in sync".
-      throw new ServerError('Could not determine install state — try again', { status: 503, code: 'INSTALL_STATE_UNAVAILABLE' });
-    }
-    if (!status.installState.outOfSync) {
-      throw new ServerError('Install is already in sync — nothing to reconcile', { status: 400, code: 'ALREADY_IN_SYNC' });
-    }
-    tag = `v${status.currentVersion}`;
-  } else {
-    if (!status.latestRelease?.tag) {
-      throw new ServerError('No release available to update to', { status: 400, code: 'NO_RELEASE' });
-    }
-    tag = status.latestRelease.tag;
-  }
-
-  // Validate tag is a well-formed semver release (e.g. "v1.27.0" or "v1.27.0-rc.1") to prevent option injection
-  if (!/^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?$/.test(tag)) {
-    throw new ServerError('Invalid release tag format', { status: 400, code: 'INVALID_TAG' });
-  }
-
-  // Fork gate: update.sh pulls from origin, so running from an unsynced fork
-  // would silently no-op (or pull a stale version). Require either a recent
-  // fork sync of the upstream branch or an explicit acknowledgement that the
-  // user knows they're updating from their own origin.
-  const remote = status.remoteInfo;
-  if (remote?.isFork && !acknowledgeFork) {
-    // Reuse the freshness boolean the service already computed so the route
-    // and `status.forkSyncFresh` agree by construction (no duplicate math).
-    if (!status.forkSyncFresh) {
-      throw new ServerError(
-        `Running from a fork (${remote.fullName}). Sync your fork from ${status.upstream.fullName} ` +
-        `first, or re-submit with acknowledgeFork: true to update from your fork's origin as-is.`,
-        { status: 412, code: 'FORK_SYNC_REQUIRED' }
-      );
-    }
-  }
-
-  // Atomic check-and-set: rejects if already in progress, preventing concurrent updates
-  const acquired = await updateChecker.setUpdateInProgress(true);
-  if (!acquired) {
-    throw new ServerError('Update already in progress', { status: 409, code: 'UPDATE_IN_PROGRESS' });
-  }
-
-  // Re-check after acquiring the lock: an agent (e.g. a scheduled/autopilot
-  // spawn) may have started live during the git/fork awaits between the
-  // fast-fail pre-check and here. If so, release the lock and reject rather than
-  // restart out from under it. A spawn that begins AFTER this, during update.sh
-  // itself, is closed from the spawn side: the lock we just acquired flips
-  // `updateChecker.isUpdateInProgress()`, which subAgentSpawner's `task:ready`
-  // listener and `spawnAgentForTask` both check, holding the task as `pending`
-  // until after the restart (issue #4124).
-  const postLock = await countActiveCosAgents();
-  if (postLock > 0) {
-    await updateChecker.setUpdateInProgress(false);
-    throw agentsActiveError(postLock);
-  }
-  const postLockImageCheck = await withStateLock(() => getPersistentMindImageWorkGuard()).catch(async (error) => {
-    await updateChecker.setUpdateInProgress(false);
-    throw error;
-  });
-  if (!postLockImageCheck.trusted || (!postLockImageCheck.safe && !acknowledgePersistentMindImageBackup)) {
-    await updateChecker.setUpdateInProgress(false);
-    if (!postLockImageCheck.trusted) throw persistentMindStateUntrustedError();
-    throw persistentMindImageWorkError(postLockImageCheck);
-  }
-
-  const io = req.app.get('io');
-
-  // Start update in background, stream progress via socket
-  const emit = (step, stepStatus, message) => {
-    if (io) {
-      io.emit('portos:update:step', { step, status: stepStatus, message, timestamp: Date.now() });
-    }
-  };
-
-  // Don't await — respond immediately, progress streams via socket.
-  // The update script runs `git pull --rebase` to get the latest code,
-  // so the actual post-update version may differ from `tag` if new commits
-  // landed after the release. The script writes the true version to
-  // data/update-complete.json, which the server reads on boot.
-  //
-  // For a reconcile, hand the updater the workspaces whose installed deps are
-  // stale (per installState's receipt check) so it force-reinstalls exactly
-  // those — a bare `git pull` (possibly already restarted) leaves the scripts'
-  // commit-diff dependency detection empty. 'root' maps to update.sh's '.' token.
-  const forceCleanWorkspaces = reconcile
-    ? (status.installState.staleDeps?.workspaces || [])
-        .filter(w => w.stale)
-        .map(w => (w.name === 'root' ? '.' : w.name))
-    : undefined;
-  executeUpdate(tag, emit, { forceCleanWorkspaces }).then(result => {
-    // Note: this .then() may never fire if the update script's PM2 restart
-    // kills this server process first. The client handles this by polling
-    // /api/system/health after receiving the 'restart' step.
-    if (io) {
-      if (result.success) {
-        io.emit('portos:update:complete', { success: true, newVersion: result.version || tag.replace(/^v/, ''), versionKnown: !!result.version });
-      } else {
-        io.emit('portos:update:error', { message: result.errorMessage ?? 'Update failed', step: result.failedStep ?? 'unknown' });
-      }
-    }
-  }).catch(err => {
-    if (io) {
-      io.emit('portos:update:error', { message: err.message, step: 'unknown' });
-    }
+  // Every refusal, the update lock, and the fire-and-forget launch live in
+  // `portosSelfUpdate` — shared with App Management's Git tab so both entry
+  // points into update.sh behave identically (#5984, and the Git tab hang the
+  // shared launcher was extracted to fix).
+  const { started, tag } = await startPortosSelfUpdate({
+    io: req.app.get('io'),
+    acknowledgeFork,
+    acknowledgePersistentMindImageBackup,
+    mode: reconcile ? 'reconcile' : 'release',
   });
 
-  res.json({ started: true, tag });
+  res.json({ started, tag });
 }));
 
 export default router;

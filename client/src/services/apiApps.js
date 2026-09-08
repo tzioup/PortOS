@@ -33,6 +33,19 @@ export const getAppWorkItems = (id, { issueAuthorFilter } = {}, options) => {
   const qs = issueAuthorFilter ? `?issueAuthorFilter=${encodeURIComponent(issueAuthorFilter)}` : '';
   return request(`/apps/${id}/work-items${qs}`, { silent: true, ...options });
 };
+// The reviewers a `/do:next` claim will ACTUALLY run for this app, resolved
+// server-side through the claim-work task metadata layered OVER the install-wide
+// Code Review Defaults: `{ source, reviewers, usernames, optionalReviewers,
+// reviewerMaxRounds, reviewerModels, reviewerEfforts, csv }`. `source` is
+// 'task-override' when the claim-work override supplied any part of the list,
+// else 'defaults'. Note the fallback is per FIELD — a task pinning only
+// `reviewers` still takes its models and usernames from the defaults — so
+// 'task-override' means "an override is in play", not "the defaults were
+// ignored". Seed a claim surface from THIS, not from getCodeReviewDefaults —
+// the latter can't see the override and so shows reviewers the run won't use.
+// Read-only; callers own their fallback, so default to silent.
+export const getAppClaimReviewers = (id, options) =>
+  request(`/apps/${id}/claim-reviewers`, { silent: true, ...options });
 // Every OPEN issue on the forge this app's git origin points at (GitHub via gh,
 // GitLab via glab): { forge, fullName, issues: [{ number, title, body, labels,
 // assignees, author, url, createdAt, updatedAt }], reason, transient }. Backs the
@@ -48,9 +61,13 @@ export const getAppPullRequests = (id, options) =>
   request(`/apps/${id}/pull-requests`, { silent: true, ...options });
 // Queue the shared review-loop follow-up for one freshly verified open PR/MR.
 // The server, not the browser, owns the forge URL/branch and duplicate guard.
-export const resolveAppPullRequest = (id, number, options = {}) =>
+// `settings` is the same provider/model/effort pin `createSlashdoTask` takes —
+// the Pull Requests tab's "Run with" picker — left blank to resolve the
+// install's active provider.
+export const resolveAppPullRequest = (id, number, settings = {}, options = {}) =>
   request(`/apps/${id}/pull-requests/${encodeURIComponent(number)}/resolve`, {
     method: 'POST',
+    body: JSON.stringify(settings),
     silent: true,
     ...options,
   });
@@ -58,10 +75,13 @@ export const resolveAppPullRequest = (id, number, options = {}) =>
 // letting it pick from the app's whole external open set. The server owns the
 // eligibility check (open, GitHub, opened by someone else) and the duplicate
 // guard, so a refusal comes back as an explained error rather than a run that
-// silently reviews nothing.
-export const reviewAppPullRequest = (id, number, options = {}) =>
+// silently reviews nothing. `settings` is the same provider/model/effort pin as
+// `resolveAppPullRequest` — the server still gates the resolved provider to the
+// pr-reviewer posture's eligible set.
+export const reviewAppPullRequest = (id, number, settings = {}, options = {}) =>
   request(`/apps/${id}/pull-requests/${encodeURIComponent(number)}/review`, {
     method: 'POST',
+    body: JSON.stringify(settings),
     silent: true,
     ...options,
   });

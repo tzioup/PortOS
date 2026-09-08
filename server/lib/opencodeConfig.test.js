@@ -8,6 +8,16 @@ import {
   toBareModelIds,
 } from './opencodeConfig.js';
 import { LOCAL_RUNTIMES } from './localProviderRuntime.js';
+import { PUBLIC_REVIEW_GATE_EXECUTION_PROFILE } from './agentExecutionProfiles.js';
+
+// Spelled out rather than imported from the module under test: these three
+// permissions ARE the contract (OpenCode's own defaults deny them because no
+// unattended run can answer the gate they open), so an assertion that reads
+// them back out of the source would prove nothing. Named once so a fourth gate
+// is one edit — every assertion below compares the WHOLE permission object, so
+// adding one to the source without adding it here fails loudly.
+const GATES = { question: 'deny', plan_enter: 'deny', plan_exit: 'deny' };
+const gated = (wildcard) => ({ '*': wildcard, ...GATES });
 
 describe('toBareModelIds', () => {
   it('strips the ollama/ namespace, drops empties, and dedupes', () => {
@@ -41,7 +51,7 @@ describe('toBareModelIds', () => {
 describe('buildOpencodeConfig', () => {
   it('returns base config without a models map when no model provided', () => {
     const cfg = buildOpencodeConfig(null);
-    expect(cfg.permission).toBe('allow');
+    expect(cfg.permission).toEqual(gated('allow'));
     expect(cfg.provider.ollama).toMatchObject({
       npm: '@ai-sdk/openai-compatible',
       name: 'Ollama (local)',
@@ -84,7 +94,7 @@ describe('buildOpencodeConfig', () => {
       },
     };
     const cfg = buildOpencodeConfig('qwen2.5:7b', base);
-    expect(cfg.permission).toBe('ask');
+    expect(cfg.permission).toEqual(gated('ask'));
     expect(cfg.provider.ollama.options.baseURL).toBe('http://gpu-box:11434/v1');
     // hand-maintained model kept, runtime model added
     expect(cfg.provider.ollama.models['kept:70b']).toBeDefined();
@@ -146,7 +156,7 @@ describe('buildOpencodeConfigContent', () => {
 
   it('serializes the base config (no models) for null model', () => {
     const parsed = JSON.parse(buildOpencodeConfigContent(null));
-    expect(parsed.permission).toBe('allow');
+    expect(parsed.permission).toEqual(gated('allow'));
     expect(parsed.provider.ollama.models).toBeUndefined();
   });
 });
@@ -156,11 +166,45 @@ describe('buildOpencodeEnvVars', () => {
     expect(buildOpencodeEnvVars({ command: 'claude' }, 'claude-opus-4')).toEqual({});
   });
 
-  it('returns empty object for OpenCode providers without ollamaBacked', () => {
+  // `OPENCODE_CONFIG_CONTENT` REPLACES the user's own ~/.config/opencode, so a
+  // hand-made plain `opencode` record that declares nothing must keep getting
+  // nothing — synthesizing a config would drop every provider it defines.
+  it('injects nothing for a namespace-less provider that stores no config', () => {
     expect(buildOpencodeEnvVars(
       { command: 'opencode', ollamaBacked: false },
       'anthropic/claude-sonnet',
     )).toEqual({});
+  });
+
+  // A namespace-less record that DOES ship a config is the harness's own catalog
+  // (the seeded OpenCode Zen wrappers): nothing to declare and no key to inject,
+  // but it still needs the `small_model` pin so OpenCode's own side work stays
+  // on the dispatched model instead of its built-in default.
+  it('declares no provider entry for a namespace-less OpenCode provider', () => {
+    const result = buildOpencodeEnvVars(
+      {
+        command: 'opencode',
+        envVars: { OPENCODE_CONFIG_CONTENT: '{"permission":"allow"}' },
+      },
+      'opencode/big-pickle',
+    );
+    const cfg = JSON.parse(result.OPENCODE_CONFIG_CONTENT);
+    expect(cfg).toEqual({ permission: gated('allow'), small_model: 'opencode/big-pickle' });
+    expect(cfg.provider).toBeUndefined();
+    // No gateway key env var rides along — OpenCode authenticates Zen itself.
+    expect(Object.keys(result)).toEqual(['OPENCODE_CONFIG_CONTENT']);
+  });
+
+  it('preserves a stored config and its small_model pin for a namespace-less provider', () => {
+    const stored = JSON.stringify({ permission: 'ask', small_model: 'opencode/mimo-v2.5-free' });
+    const result = buildOpencodeEnvVars(
+      { command: 'opencode', envVars: { OPENCODE_CONFIG_CONTENT: stored } },
+      'opencode/big-pickle',
+    );
+    expect(JSON.parse(result.OPENCODE_CONFIG_CONTENT)).toEqual({
+      permission: gated('ask'),
+      small_model: 'opencode/mimo-v2.5-free',
+    });
   });
 
   it('declares the run model (bare) under provider.ollama.models', () => {
@@ -348,18 +392,39 @@ describe('buildOpencodeEnvVars', () => {
 // every generation control silently discarded (#4765). Walk LOCAL_RUNTIMES so a
 // seventh runtime cannot land with the same hole.
 describe('every OpenCode-reachable local runtime forwards generation controls', () => {
-  // LM Studio is skipped deliberately — nothing spawns OpenCode against it, so
+  // Slotstream is skipped deliberately — nothing spawns OpenCode against it, so
   // it has no provider entry (and no base URL) in opencodeConfig's table.
   const opencodeRuntimes = Object.keys(LOCAL_RUNTIMES).filter((id) => opencodeLocalBaseUrl(id));
 
   it('actually walks the runtimes (a degenerate filter would pass vacuously)', () => {
-    expect(opencodeRuntimes).toEqual(expect.arrayContaining(['vllm', 'sglang']));
+    expect(opencodeRuntimes).toEqual(expect.arrayContaining(['vllm', 'sglang', 'lmstudio']));
     expect(opencodeRuntimes.length).toBeGreaterThanOrEqual(5);
   });
 
   it.each(opencodeRuntimes)('%s', (id) => {
     expect(buildAgentGeneration({ temperature: 0.7, topP: 0.9, effort: 'high' }, id))
       .toMatchObject({ temperature: 0.7, topP: 0.9, reasoningEffort: 'high' });
+  });
+});
+
+describe('LM Studio OpenCode config', () => {
+  it('declares the lmstudio namespace at the local server', () => {
+    const result = buildOpencodeEnvVars(
+      { command: 'opencode', lmstudioBacked: true, models: ['qwen3-coder-30b'] },
+      'qwen3-coder-30b',
+    );
+    const config = JSON.parse(result.OPENCODE_CONFIG_CONTENT);
+    expect(config.provider.lmstudio.options.baseURL).toBe('http://localhost:1234/v1');
+    expect(config.provider.lmstudio.models['qwen3-coder-30b']).toEqual({ name: 'qwen3-coder-30b', tool_call: true });
+  });
+
+  it('forwards sampling but never a thinking toggle — reasoning is a load-time choice', () => {
+    // LM Studio's OpenAI-compatible endpoint documents no per-request reasoning
+    // field: the instance is loaded with (or without) it in the app. A toggle
+    // here would pin a value nothing reads, so THINKING_STYLE.lmstudio is null —
+    // which must still leave temperature/topP/effort forwarding, the #4765 hole.
+    expect(buildAgentGeneration({ temperature: 0.7, topP: 0.9, thinking: true, effort: 'high' }, 'lmstudio'))
+      .toEqual({ temperature: 0.7, topP: 0.9, reasoningEffort: 'high' });
   });
 });
 
@@ -429,5 +494,131 @@ describe('small-model pin', () => {
         .OPENCODE_CONFIG_CONTENT,
     );
     expect(config.small_model).toBe('ollama/qwen3');
+  });
+});
+
+describe('interactive-gate denials', () => {
+  // OpenCode resolves a permission with findLast over the config's entries, and
+  // the root block is merged after the vendor's own agent defaults — so the
+  // blanket allow PortOS writes used to override OpenCode's built-in
+  // question/plan_enter/plan_exit denials and hand an unattended local model a
+  // `question` tool it then stalled the whole run on.
+  it('denies every interactive gate under the blanket allow, wildcard first', () => {
+    const permission = buildOpencodeConfig('qwen3', null, 'ollama').permission;
+    // Order is load-bearing: OpenCode resolves a permission by findLast over
+    // the config's entries, so a denial after the wildcard is what wins.
+    expect(Object.keys(permission)[0]).toBe('*');
+    expect(permission).toEqual(gated('allow'));
+  });
+
+  it('overrides a stored config that allows a gate outright', () => {
+    const stored = JSON.stringify({ permission: { '*': 'allow', question: 'allow' } });
+    const config = JSON.parse(buildOpencodeEnvVars(
+      { command: 'opencode', ollamaBacked: true, models: ['qwen3'], envVars: { OPENCODE_CONFIG_CONTENT: stored } },
+      'qwen3',
+    ).OPENCODE_CONFIG_CONTENT);
+    expect(config.permission.question).toBe('deny');
+    expect(config.permission['*']).toBe('allow');
+  });
+
+  // OpenCode resolves with findLast and a '*' KEY matches every permission, so
+  // the last rule wins outright. Overwriting a gate key in place would keep its
+  // original position — a stored config listing 'question' BEFORE the wildcard
+  // would emit { question: 'deny', '*': 'allow' } and the trailing wildcard
+  // would allow it right back. The denials have to be re-appended, not merged.
+  it('re-appends a gate the stored block listed before its wildcard', () => {
+    const stored = JSON.stringify({ permission: { question: 'allow', '*': 'allow' } });
+    const config = JSON.parse(buildOpencodeEnvVars(
+      { command: 'opencode', ollamaBacked: true, models: ['qwen3'], envVars: { OPENCODE_CONFIG_CONTENT: stored } },
+      'qwen3',
+    ).OPENCODE_CONFIG_CONTENT);
+    const keys = Object.keys(config.permission);
+    expect(keys.indexOf('question')).toBeGreaterThan(keys.indexOf('*'));
+    expect(config.permission).toEqual(gated('allow'));
+  });
+
+  it('keeps the rest of a stored permission block', () => {
+    const stored = JSON.stringify({ permission: { '*': 'allow', bash: 'ask' } });
+    const config = JSON.parse(buildOpencodeEnvVars(
+      { command: 'opencode', ollamaBacked: true, models: ['qwen3'], envVars: { OPENCODE_CONFIG_CONTENT: stored } },
+      'qwen3',
+    ).OPENCODE_CONFIG_CONTENT);
+    expect(config.permission.bash).toBe('ask');
+    expect(config.permission.question).toBe('deny');
+  });
+});
+
+describe('hardenOpencodeConfigForNoTool', () => {
+  // OpenCode has no read-only argv flag — this IS the vendor's enforced recipe
+  // for the pr-reviewer eligibility gate, so it has to override a user's stored
+  // config rather than merely default around it.
+  const harden = (provider, model) => JSON.parse(
+    buildOpencodeEnvVars(provider, model, { safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE })
+      .OPENCODE_CONFIG_CONTENT,
+  );
+
+  it('overrides a stored allow-everything posture', () => {
+    const stored = JSON.stringify({
+      permission: 'allow',
+      mcp: { fetch: { type: 'local', command: ['mcp-fetch'] } },
+      plugin: ['some-plugin'],
+      agent: { build: { temperature: 0.2, tools: { bash: true } } },
+    });
+    const config = harden(
+      { command: 'opencode', ollamaBacked: true, temperature: 0.2, models: ['gemma3:27b'], envVars: { OPENCODE_CONFIG_CONTENT: stored } },
+      'gemma3:27b',
+    );
+
+    // The string shorthand denies EVERY permission category, including any
+    // OpenCode adds later; naming three would leave a new one at its default.
+    expect(config.permission).toBe('deny');
+    expect(config.tools).toEqual({ '*': false });
+    // Per-agent settings override the root block, and OpenCode's built-in
+    // `build`/`plan` agents carry tool maps of their own.
+    expect(config.agent.build.tools).toEqual({ '*': false });
+    expect(config.agent.build.permission).toEqual({ edit: 'deny', bash: 'deny', webfetch: 'deny' });
+    // Generation settings are configuration, not posture — they survive.
+    expect(config.agent.build.temperature).toBe(0.2);
+    // The agent the spawner actually selects is hardened even when the stored
+    // config never mentioned it.
+    expect(config.agent.plan.tools['*']).toBe(false);
+    expect(config.provider.ollama.models['gemma3:27b'].tool_call).toBe(false);
+    expect(config.mcp).toEqual({});
+    expect(config.plugin).toEqual([]);
+    expect(config.share).toBe('disabled');
+    expect(config.autoupdate).toBe(false);
+  });
+
+  // The stage's effort control writes to `agent.build` (OpenCode's default
+  // agent), but this profile runs `--agent plan` — so an uncopied level would
+  // silently leave the gate on the backend default.
+  it('carries the stage generation settings onto the agent it actually runs', () => {
+    const config = harden(
+      { command: 'opencode', ollamaBacked: true, temperature: 0.3, effort: 'high', models: ['gemma3:27b'] },
+      'gemma3:27b',
+    );
+    expect(config.agent.plan.reasoningEffort).toBe('high');
+    expect(config.agent.plan.temperature).toBe(0.3);
+  });
+
+  it('lets a user-declared plan agent keep its own generation settings', () => {
+    const stored = JSON.stringify({ agent: { plan: { reasoningEffort: 'low' } } });
+    const config = harden(
+      {
+        command: 'opencode',
+        ollamaBacked: true,
+        effort: 'high',
+        models: ['gemma3:27b'],
+        envVars: { OPENCODE_CONFIG_CONTENT: stored },
+      },
+      'gemma3:27b',
+    );
+    expect(config.agent.plan.reasoningEffort).toBe('low');
+  });
+
+  it('leaves the endpoint and the auxiliary-model pin intact', () => {
+    const config = harden({ command: 'opencode', ollamaBacked: true, models: ['gemma3:27b'] }, 'gemma3:27b');
+    expect(config.provider.ollama.options.baseURL).toBe('http://localhost:11434/v1');
+    expect(config.small_model).toBe('ollama/gemma3:27b');
   });
 });

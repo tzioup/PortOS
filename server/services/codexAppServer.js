@@ -110,6 +110,14 @@ const activeTurns = new Map();
  * account has no models".
  */
 let modelsCache = null;
+/**
+ * `{ code, message }` from the LAST `model/list` attempt, or `null` when the most
+ * recent attempt succeeded (or none has run). Cached beside — never inside —
+ * `modelsCache`, so a failed read stays distinguishable from a never-fetched
+ * one while the last-known-good list survives: a picker reading the peek can
+ * then say WHY it is showing the shipped list instead of the account's.
+ */
+let modelsError = null;
 /** `{ until, category, message }` while the TEXT transport is benched. */
 let textTransportBench = null;
 /** The empty scratch directory generic text turns run in. Created lazily. */
@@ -222,6 +230,7 @@ const handleNotification = (method, params) => {
   // completely as one PortOS started.
   if (params?.success !== false) {
     modelsCache = null;
+    modelsError = null;
     clearCodexTextTransportBench();
   }
   const loginId = typeof params?.loginId === 'string' ? params.loginId : null;
@@ -610,6 +619,7 @@ export async function codexLogout() {
   settleLogin('ended by sign-out');
   readinessCache = null;
   modelsCache = null;
+  modelsError = null;
   // Signing out invalidates whatever the bench was waiting on, and signing back
   // in must not inherit the previous account's cooldown.
   clearCodexTextTransportBench();
@@ -729,13 +739,15 @@ export async function listCodexModels({ fresh = false } = {}) {
       throw new Error(`model/list did not finish paginating within ${MODEL_LIST_MAX_PAGES} pages`);
     }
     modelsCache = { at: Date.now(), models };
+    modelsError = null;
     return { models, fetchedAt: modelsCache.at, error: null };
   } catch (err) {
     console.error(`❌ Codex model/list failed: ${err.message}`);
+    modelsError = { code: err.code || CODEX_ERROR_CODES.protocol, message: err.message };
     return {
       models: modelsCache ? modelsCache.models : null,
       fetchedAt: modelsCache ? modelsCache.at : null,
-      error: { code: err.code || CODEX_ERROR_CODES.protocol, message: err.message },
+      error: modelsError,
     };
   }
 }
@@ -743,6 +755,26 @@ export async function listCodexModels({ fresh = false } = {}) {
 /** The cached catalog without spawning anything. `null` = never fetched. */
 export function peekCodexModels() {
   return modelsCache ? { models: modelsCache.models, fetchedAt: modelsCache.at } : null;
+}
+
+/**
+ * The cached catalog as the three-state shape a picker needs, without spawning
+ * anything. `models: null` = NEVER FETCHED, `[]` = fetched and genuinely empty,
+ * and a populated array is this account's real catalog; `error` is set when the
+ * last attempt failed, in which case `models` is the last-known-good list (or
+ * `null` if there never was one). A caller must fall back to its shipped list
+ * for every state except a successful read — that is the whole point of keeping
+ * the three apart.
+ *
+ * CACHE-ONLY, like `peekCodexAccountReadiness`: this is what the providers list
+ * may call on a render path, where spawning `codex app-server` is forbidden.
+ */
+export function peekCodexModelCatalog() {
+  return {
+    models: modelsCache ? modelsCache.models : null,
+    fetchedAt: modelsCache ? modelsCache.at : null,
+    error: modelsError,
+  };
 }
 
 /** The catalog entry for `modelId`, or `null` when the catalog is unknown. */
@@ -754,6 +786,64 @@ const cachedModelEntry = (modelId) => {
 /** The one shape a caller's Stop takes, wherever in a turn it is noticed. */
 const turnCancelledError = () =>
   codexError(CODEX_TURN_ERROR_CODES.turnInterrupted, 'The Codex turn was cancelled.', { status: 499 });
+
+/**
+ * Best-effort: tell the app-server to stop working a turn PortOS has abandoned,
+ * so a cancelled request does not keep burning subscription quota.
+ *
+ * Sent on the connection that OWNS the thread, and only while it is still alive
+ * — routing it through `call` would reconnect, spawning a whole new app-server
+ * to interrupt a thread that only existed in the dead one. Fire and forget: the
+ * caller is already gone, and nothing downstream waits on the acknowledgement.
+ */
+const interruptCodexTurn = (owner, threadId, turnId) => {
+  if (!turnId || !owner || owner.closed) return;
+  sendRequest(owner, CODEX_TURN_RPC.turnInterrupt, { threadId, turnId })
+    .catch((err) => console.error(`❌ Codex turn interrupt failed: ${err.message}`));
+};
+
+/**
+ * Await `request`, but give up the moment the caller's Stop lands.
+ *
+ * Without this a Stop raised WHILE an RPC is in flight is invisible until that
+ * RPC answers or hits its own deadline — up to 15s on `thread/start` and the
+ * whole 5-minute turn deadline on `turn/start` against a stalled app-server.
+ *
+ * `Promise.race` settles on the first, but the LOSER keeps running: a raced-away
+ * `sendRequest` still answers (or times out) later. That matters for
+ * `turn/start` — a turn the app-server accepted after the caller walked away
+ * would otherwise generate with nothing telling it to stop, which is worse for
+ * quota than the wait this removes. `onAbandoned` is that compensating path; it
+ * runs outside any request lifecycle, so it is guarded here rather than trusted
+ * to bubble.
+ */
+const raceCodexAbort = (request, signal, onAbandoned = null) => {
+  if (!signal) return request;
+  let abandoned = false;
+  let onAbort = null;
+  const cancelled = new Promise((_, reject) => {
+    onAbort = () => { abandoned = true; reject(turnCancelledError()); };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+  // The race hands the caller whichever settles first, so the loser's rejection
+  // would otherwise be an UNHANDLED one — a process-level crash under Node's
+  // default policy. Both sides are parked before they can reject.
+  cancelled.catch(() => {});
+  const watched = request.then((result) => {
+    if (!abandoned) return result;
+    // The Stop already won: this response arrived for a caller that is gone.
+    if (onAbandoned) {
+      try { onAbandoned(result); } catch (err) {
+        console.error(`❌ Codex abandoned-response cleanup failed: ${err.message}`);
+      }
+    }
+    return result;
+  });
+  watched.catch(() => {});
+  return Promise.race([watched, cancelled])
+    .finally(() => signal.removeEventListener('abort', onAbort));
+};
 
 /**
  * Run ONE bounded text turn against the ChatGPT subscription.
@@ -816,11 +906,14 @@ export async function runCodexTextTurn({
   if (signal?.aborted) {
     throw turnCancelledError();
   }
-  const started = await sendRequest(owner, CODEX_TURN_RPC.threadStart, {
+  // Raced against the signal: a Stop pressed during the handshake must not wait
+  // out `REQUEST_TIMEOUT_MS`. No compensation is needed here — the thread is
+  // ephemeral and no turn exists yet, so nothing is left running to interrupt.
+  const started = await raceCodexAbort(sendRequest(owner, CODEX_TURN_RPC.threadStart, {
     ...CODEX_TEXT_THREAD_CONFIG,
     cwd,
     ...(model ? { model } : {}),
-  }, REQUEST_TIMEOUT_MS);
+  }, REQUEST_TIMEOUT_MS), signal);
   const threadId = typeof started?.thread?.id === 'string' ? started.thread.id : null;
   if (!threadId) {
     throw codexError(CODEX_ERROR_CODES.protocol, 'Codex started a thread with no id.');
@@ -864,7 +957,14 @@ export async function runCodexTextTurn({
     // and Stop does not have to wait out a `turn/start` response that would
     // only be thrown away. The `finally` below still runs the shared cleanup.
     if (signal?.aborted) await finished;
-    const response = await sendRequest(owner, CODEX_TURN_RPC.turnStart, {
+    // Raced the same way, but this one CAN leave a live turn behind: the
+    // app-server may accept the turn just after the Stop won. `onAbandoned`
+    // interrupts it with the id that late response carries, which the `finally`
+    // below cannot do because `acc.turnId` was never set. The `activeTurns`
+    // guard is what tells the two apart — the `finally` has already deleted the
+    // entry by the time an abandoned response lands, whereas a response the
+    // normal path is still reading finds the thread registered.
+    const response = await raceCodexAbort(sendRequest(owner, CODEX_TURN_RPC.turnStart, {
       threadId,
       input: [{ type: 'text', text: prompt }],
       sandboxPolicy: { ...CODEX_TEXT_TURN_SANDBOX },
@@ -872,7 +972,10 @@ export async function runCodexTextTurn({
       ...(model ? { model } : {}),
       ...(resolvedEffort ? { effort: resolvedEffort } : {}),
       ...(responseSchema ? { outputSchema: responseSchema } : {}),
-    }, timeoutMs);
+    }, timeoutMs), signal, (late) => {
+      if (activeTurns.has(threadId)) return;
+      interruptCodexTurn(owner, threadId, typeof late?.turn?.id === 'string' ? late.turn.id : null);
+    });
     const turnId = typeof response?.turn?.id === 'string' ? response.turn.id : null;
     if (turnId) acc.turnId = turnId;
     // A turn that completed before its own response was read leaves the
@@ -895,16 +998,10 @@ export async function runCodexTextTurn({
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onAbort);
+    // Delete BEFORE the interrupt: this is the flag a late `turn/start`
+    // response reads to decide whether the turn it carries still has an owner.
     activeTurns.delete(threadId);
-    // Best-effort: tell the app-server to stop working a turn PortOS has
-    // abandoned, so a cancelled request does not keep burning subscription
-    // quota. Sent to the connection that OWNS the thread, and only while it is
-    // still alive — routing it through `call` would reconnect, spawning a whole
-    // new app-server to interrupt a thread that only existed in the dead one.
-    if (acc.status === 'inProgress' && acc.turnId && !owner.closed) {
-      sendRequest(owner, CODEX_TURN_RPC.turnInterrupt, { threadId, turnId: acc.turnId })
-        .catch((err) => console.error(`❌ Codex turn interrupt failed: ${err.message}`));
-    }
+    if (acc.status === 'inProgress') interruptCodexTurn(owner, threadId, acc.turnId);
   }
 }
 
@@ -923,6 +1020,7 @@ export async function stopCodexAppServer() {
   settleLogin(null);
   readinessCache = null;
   modelsCache = null;
+  modelsError = null;
 
   // The child goes down BEFORE any await. `teardown` decides whether to fail
   // live turns by comparing `connection` to the dying target, so `connection`
@@ -949,6 +1047,17 @@ export async function stopCodexAppServer() {
   }
 }
 
+/**
+ * Test-only: how many turns are still registered.
+ *
+ * A leaked entry is invisible from the outside — it neither fails a turn nor
+ * throws — but it strands the accumulator and misroutes every later event for
+ * that thread id, so the cancellation paths assert against it directly.
+ */
+export function __codexActiveTurnCount() {
+  return activeTurns.size;
+}
+
 /** Test-only: drop every module-level handle so a suite starts clean. */
 export function __resetCodexAppServer() {
   if (pendingLogin) clearTimeout(pendingLogin.timer);
@@ -959,6 +1068,7 @@ export function __resetCodexAppServer() {
   connectingTarget = null;
   activeTurns.clear();
   modelsCache = null;
+  modelsError = null;
   textTransportBench = null;
   textTurnCwd = null;
   creatingTextTurnCwd = null;

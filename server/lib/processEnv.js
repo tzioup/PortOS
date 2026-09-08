@@ -65,13 +65,22 @@ const CLI_PROVIDER_AUTH_RULES = Object.freeze({
   cursor: { keys: ['CURSOR_API_KEY'], prefixes: [] },
 });
 
-const LOCAL_PROVIDER_MARKERS = ['ollamaBacked', 'mtplxBacked', 'llamaBacked', 'vllmBacked', 'sglangBacked'];
+const LOCAL_PROVIDER_MARKERS = ['ollamaBacked', 'lmstudioBacked', 'mtplxBacked', 'llamaBacked', 'vllmBacked', 'sglangBacked'];
 
 /**
  * Build the non-secret provider metadata needed to classify ambient CLI auth
  * in another process. Provider envVars are deliberately excluded: those may
  * contain credentials and are already carried separately when explicitly
  * configured.
+ *
+ * The result is stamped `authOnly` because it is a PARTIAL view — an identity,
+ * not a provider record. Its consumer (the CoS runner) hands it to
+ * `buildCliChildEnv`, which feeds `provider` to two different contracts:
+ * `buildSafeCliBaseEnv`, which wants exactly this identity, and
+ * `composeProviderEnv`, which otherwise treats it as authoritative and
+ * regenerates every per-provider env layer from it. Regenerating from a partial
+ * view over an already-composed delta produces a WORSE value that still wins by
+ * layer order — see the `authOnly` short-circuit in `cliChildEnv.js`.
  */
 export function cliProviderAuthDescriptor(provider) {
   if (!provider || typeof provider !== 'object') return null;
@@ -81,7 +90,7 @@ export function cliProviderAuthDescriptor(provider) {
   for (const marker of LOCAL_PROVIDER_MARKERS) {
     if (provider[marker] === true) descriptor[marker] = true;
   }
-  return Object.keys(descriptor).length ? descriptor : null;
+  return Object.keys(descriptor).length ? { ...descriptor, authOnly: true } : null;
 }
 
 function cliProviderAuthRule(provider) {

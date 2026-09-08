@@ -1,13 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router';
-import { RefreshCw, Play, PauseCircle, Settings, ChevronDown, ChevronRight, Sparkles } from 'lucide-react';
+import { RefreshCw, Play, PauseCircle, Settings, ChevronDown, ChevronRight, Sparkles, AlertTriangle } from 'lucide-react';
 import toast from '../../ui/Toast';
 import BrailleSpinner from '../../BrailleSpinner';
 import CronInput from '../../CronInput';
 import ToggleSwitch from '../../ToggleSwitch';
 import AppProviderPin from '../../cos/AppProviderPin';
 import * as api from '../../../services/api';
-import { AGENT_OPTIONS, hasProviderPin, toggleAppMetadataOverride, agentOptionButtonClass } from '../../cos/constants';
+import { AGENT_OPTIONS, hasProviderPin, providerPinDivergesFromSchedule, toggleAppMetadataOverride, agentOptionButtonClass } from '../../cos/constants';
 import { isCronExpression, describeCron } from '../../../utils/cronHelpers';
 import { PROVIDER_TYPES, providerDisplayName } from '../../../utils/providers';
 import CustomTasksSection from './CustomTasksSection';
@@ -16,12 +16,8 @@ const RUNNABLE_PROVIDER_TYPES = Object.values(PROVIDER_TYPES);
 
 const INTERVAL_OPTIONS = [
   { value: null, label: 'Inherit Global' },
-  { value: 'rotation', label: 'Rotation' },
-  { value: 'daily', label: 'Daily' },
-  { value: 'weekly', label: 'Weekly' },
-  { value: 'once', label: 'Once' },
-  { value: 'on-demand', label: 'On-demand' },
-  { value: 'cron', label: 'Cron' }
+  { value: 'on-demand', label: 'On Demand' },
+  { value: 'cron', label: 'Scheduled' }
 ];
 
 export default function AutomationTab({ appId, appName }) {
@@ -213,10 +209,13 @@ export default function AutomationTab({ appId, appName }) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
           <div>
-            <h3 className="text-lg font-semibold text-white">Task Type Overrides</h3>
-            <p className="text-sm text-gray-500">Per-app automation preferences for CoS task scheduling</p>
+            <h3 className="text-lg font-semibold text-white">Scheduled Task Options</h3>
+            <p className="text-sm text-gray-500">
+              Each toggle turns that CoS scheduled task on or off for this app. The controls beside it are optional —
+              leave one on <em>Inherit</em> and it follows the global schedule defaults.
+            </p>
           </div>
-          <ToggleSwitch enabled={allEnabled} onChange={handleToggleAll} size="sm" activeColor="bg-port-success" ariaLabel={allEnabled ? 'Disable all automations' : 'Enable all automations'} />
+          <ToggleSwitch enabled={allEnabled} onChange={handleToggleAll} size="sm" activeColor="bg-port-success" ariaLabel={allEnabled ? 'Disable every scheduled task for this app' : 'Enable every scheduled task for this app'} />
         </div>
         <button
           onClick={fetchData}
@@ -252,20 +251,52 @@ export default function AutomationTab({ appId, appName }) {
             const effectiveProviderName = override.providerId
               ? providerDisplayName(providers, override.providerId)
               : taskProviderName;
+            // Surfaced collapsed (not just inside Configure): an app-level pin
+            // silently wins over the Schedule pin at spawn (#4783), so a task
+            // schedule showing one provider while this app's override names a
+            // DIFFERENT one is exactly the "why did it run somewhere else"
+            // confusion a user hits with only the Schedule page open.
+            const providerDivergesFromSchedule = providerPinDivergesFromSchedule(override, globalConfig);
 
             return (
               <div key={taskType} className="bg-port-card border border-port-border rounded-lg p-3 space-y-2">
                 {/* Row 1: name + toggle + configure + run now */}
                 <div className="flex items-center gap-3">
-                  <ToggleSwitch enabled={isEnabled} onChange={() => handleToggle(taskType, isEnabled)} size="sm" activeColor="bg-port-success" />
+                  {/* Labelled "Enabled", not "Run" — the row already has a Run
+                      (trigger now) button, and this switch is the on/off state
+                      that gates both the schedule and that button. */}
+                  <span
+                    className="flex items-center gap-1.5 shrink-0"
+                    title={isEnabled
+                      ? `${taskType} runs for this app on the schedule below. Turn off to stop scheduling it.`
+                      : `${taskType} does not run for this app. Turn on to schedule it.`}
+                  >
+                    <span className="text-[10px] uppercase tracking-wide text-gray-500">Enabled</span>
+                    <ToggleSwitch
+                      enabled={isEnabled}
+                      onChange={() => handleToggle(taskType, isEnabled)}
+                      size="sm"
+                      activeColor="bg-port-success"
+                      ariaLabel={`${taskType} enabled for this app: ${isEnabled ? 'on' : 'off'}`}
+                    />
+                  </span>
                   <div className="flex-1 min-w-0">
                     <span className="text-white font-mono text-xs">{taskType}</span>
+                    {providerDivergesFromSchedule && (
+                      <span
+                        className="inline-flex items-center gap-1 ml-2 text-port-warning"
+                        title={`Runs on ${effectiveProviderName} — the schedule's default is ${taskProviderName}, but this app's provider override wins`}
+                      >
+                        <AlertTriangle size={11} />
+                        <span className="text-[10px] uppercase tracking-wide">Provider override</span>
+                      </span>
+                    )}
                     <div className="text-xs text-gray-500">{effectiveLabel}{intervalSuffix}</div>
                   </div>
                   <button
                     onClick={() => setExpandedTaskType(prev => prev === taskType ? null : taskType)}
                     aria-expanded={isExpanded}
-                    aria-label={`${isExpanded ? 'Hide' : 'Show'} provider and model overrides for ${taskType}`}
+                    aria-label={`${isExpanded ? 'Hide' : 'Show'} provider and model options for ${taskType}`}
                     className="px-2 py-1 bg-port-border/60 text-gray-300 hover:bg-port-border rounded text-xs inline-flex items-center gap-1 shrink-0"
                   >
                     {isExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}

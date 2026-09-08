@@ -28,6 +28,7 @@ import TrainingPanel from '../components/loraTraining/TrainingPanel';
 import CaptionModelPicker from '../components/loraTraining/CaptionModelPicker';
 import ImportGalleryDialog from '../components/loraTraining/ImportGalleryDialog';
 import UniverseCharacterPicker from '../components/loraTraining/UniverseCharacterPicker';
+import { escapeRegExp } from '../lib/textUtils.js';
 import {
   getLoraDataset,
   getLoraDatasetVariationAxes,
@@ -61,7 +62,7 @@ const captionHasTriggerWord = (caption, triggerWord) => {
   const text = (caption || '').trim();
   if (!text) return false;
   if (!word) return true;
-  const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escaped = escapeRegExp(word);
   return new RegExp(`(?:^|[^a-z0-9_])${escaped}(?:[^a-z0-9_]|$)`, 'i').test(text);
 };
 // Mirror of server/lib/loraDataset.js analyzeCaptionInvariants — flags the
@@ -76,7 +77,7 @@ const captionBody = (caption, triggerWord) => {
   const word = (triggerWord || '').trim();
   let body = (caption || '').trim();
   if (word) {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = escapeRegExp(word);
     body = body.replace(new RegExp(`^${escaped}(?=[\\s,]|$)\\s*,?\\s*`, 'i'), '');
   }
   return body;

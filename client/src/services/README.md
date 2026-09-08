@@ -45,13 +45,15 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `apiCommands.js` | CLI command dispatch. |
 | `apiDashboard.js` | Dashboard state. |
 | `apiDatabase.js` | Database introspection. |
-| `apiLocalLlm.js` | Local LLM backends (Ollama / LM Studio): status (incl. installed models), catalog, model install/delete, the managed Prompt Guard model-abuse classifier lifecycle, backend install (Homebrew/script), switch/migrate, playground test/compare, and measured per-model assessments (run + persisted results + intent ranking + the server-side "measure everything" sweep). Also the PM2-managed runtime servers (llama.cpp, MTPLX, Slotstream) and MTPLX's checkpoint catalog — `searchMtplxModels` / `pullMtplxModel` / `removeMtplxModel`, so weights are managed in-app rather than from a terminal. |
+| `apiLocalLlm.js` | Local LLM backends (Ollama / LM Studio): status (incl. installed models), catalog, model install/delete, the managed Prompt Guard model-abuse classifier lifecycle, backend install (Homebrew/script), switch/migrate, playground test/compare, and measured per-model assessments (run + persisted results + intent ranking + the server-side "measure everything" sweep). Also the PM2-managed runtime servers (llama.cpp, MTPLX, Slotstream) and their checkpoint catalogs — `searchMtplxModels` / `pullMtplxModel` / `removeMtplxModel` and `downloadSlotstreamModel` / `cancelSlotstreamModelDownload`, so weights are managed in-app rather than from a terminal. |
 | `apiGit.js` | Git operations. |
 | `apiGithub.js` | GitHub repo metadata. |
 | `apiHistory.js` | Historical logs / runs. |
 | `apiLogs.js` | PM2 system logs: fetch a process's recent log tail (process list comes from `apiCommands.getProcessesList`). |
 | `apiPorts.js` | Port scan/detect wrappers (no current UI callers; module kept for the catalog). |
-| `apiProviders.js` | AI provider configuration, plus provider-runtime (CLI) install readiness for the per-card Install buttons, and the Codex / ChatGPT-subscription account calls (`getCodexAccount`, `startCodexLogin`, `cancelCodexLogin`, `codexLogout`) — sign-in STATE only, never a token. |
+| `apiHarnesses.js` | Coding-agent harness (CLI/TUI) inventory for Models → Harnesses: installed vs latest version, the providers riding on each, and the model-catalog refresh. Install/update/remove is an SSE stream driven by `RuntimeInstallModal`, not a call here. |
+| `apiModelComparison.js` | Sourced model comparison catalog, provider discovery and validated observation import. |
+| `apiProviders.js` | AI provider configuration, plus provider-runtime (CLI) install readiness for the per-card Install buttons, and the Codex / ChatGPT-subscription account calls (`getCodexAccount`, `startCodexLogin`, `cancelCodexLogin`, `codexLogout`) — sign-in STATE only, never a token. Also the connection-graph management calls, including `createProviderConnection` / `createProviderBinding`, which add a backend and mint its (disabled) executable routes. |
 | `apiPrompts.js` | Prompt Manager: stage templates, variables, and job-skill templates (providers list reuses `apiProviders.getProviders`). |
 | `apiReferenceRepos.js` | Per-app reference-repo registry. |
 | `apiReview.js` | Review hub. |
@@ -63,7 +65,7 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `apiSchedules.js` | Automation schedules. |
 | `apiQuotaBurn.js` | Quota Burn plan + live status, the job-type catalog its config form renders, and manual runs (`getQuotaBurn`/`getQuotaBurnCatalog`/`saveQuotaBurn`/`runQuotaBurn`), plus `rearmQuotaBurn` to put spent `run once` steps back into the rotation. |
 | `apiRapidReader.js` | Rapid Reader's optional author-hosted Accelerando loader and machine-local shelf API. |
-| `apiSystem.js` | System info (CPU/memory/ports/alerts/active processing and local hardware capabilities) + D&D-style character sheet getter, plus the usage cost report and explicit historical reconciliation (`getUsage`, `getProviderUsage`, `getUsageBackfillStatus`/`startUsageBackfill`, `updateSubscriptionCosts` for the subscription-vs-API savings comparison, `updateUsageFleetBilling` to exclude an API-billed federated instance from Across Instances totals). Also `getCredentialInventory` (`GET /settings/credentials`) — presence and source of each PortOS credential, never a value. |
+| `apiSystem.js` | System info (CPU/memory/ports/alerts/active processing and local hardware capabilities) + D&D-style character sheet getter, plus the usage cost report and explicit historical reconciliation (`getUsage`, `getProviderUsage`, `getUsageBackfillStatus`/`startUsageBackfill`, `updateSubscriptionCosts` for the subscription-vs-API savings comparison, `updateUsageFleetBilling` to exclude an API-billed federated instance from Across Instances totals). Also `saveCredential` (write-only integration key save/clear) and `getCredentialInventory` (`GET /settings/credentials`) — presence and source of each PortOS credential, never a value. |
 | `apiAuth.js` | Optional login password — status, login, set/clear password. |
 | `apiLoops.js` | Scheduled loops. |
 
@@ -81,7 +83,7 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `apiMeatspace.js` | MeatSpace health, genome, POST, memory-practice, and atomic POST training-run APIs. |
 | `apiMortalLoom.js` | Mortality tracking. |
 | `apiMoodBoard.js` | Mood boards (inspiration canvas + items). |
-| `apiTribe.js` | Tribe people (relationship rings + contacts). |
+| `apiTribe.js` | Tribe people (relationship rings + contacts), plus `getTribeDuplicateIdentifiers()` (`GET /tribe/duplicate-identifiers`): a non-blocking report of emails/phones shared by more than one person. |
 | `apiTimeline.js` | Human-activity timeline: `/timeline/day`. |
 | `apiCalendar.js` | Calendar events. |
 | `apiMessages.js` | Messages / notifications + iMessage manager (#2413). |
@@ -107,10 +109,11 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `apiFableLoom.js` | FableLoom branching narratives — loom/episode/scene-node/transition CRUD, deterministic graph validation, AI authoring lanes, and the bounded editorial/playthrough autopilot lifecycle. |
 | `apiGames.js` | Game studio records, managed-app binding, reusable sprite/music bindings, deterministic asset-bundle compilation/integrity preflight, and AI feedback history. |
 | `apiMusicVideo.js` | Music Video projects + scene board + audio analysis. |
+| `apiContinuousVideo.js` | Continuous-video episode generation: client-side-callable lint preview of a scene draft, queue-episode submit, and the SSE progress-events URL. |
 | `apiSprites.js` | Sprite Manager records, asset library, production-set import (#2895), reference workflow: create/generate/lock (#2896), directional walk and per-track generation/approval, animation-type definition CRUD (#3153), trim/postprocess, and per-run source-frame listing for the Loop Trimmer's re-derive (#2980), and animation render-provider readiness (#4876). |
 | `apiShell.js` | Shell sessions over HTTP: hand a photo (plus a message) to the agent TUI running in a session. Keystrokes/output stay on the `shell:*` socket protocol. |
 | `apiThreejsModels.js` | Procedural Three.js model workspaces: gallery-image generation, refinement, source export, deletion, and the subject-family checklist options. |
-| `apiImageTo3d.js` | Image-to-3D (`/3d`): selectable targets (TRELLIS.2) with host availability/install status, and per-image model records — create/list/get/generate/delete + GLB asset URL and the full-resolution OBJ download URL. |
+| `apiImageTo3d.js` | Image-to-3D (`/3d`): selectable targets (TRELLIS.2) with host availability/install status, and per-image model records — create/list/get/generate/delete + GLB asset URL, the full-resolution OBJ download URL, and the AR Quick Look USDZ upload/download pair. |
 | `apiPipeline.js` | Pipeline (issues + stages + canon). |
 | `apiUniverseBuilder.js` | Universe Builder (generate + edit + commit). |
 | `apiAuthors.js` | Author personas (name, writing style, bio, headshot description/style). |
@@ -150,3 +153,5 @@ toasts on throw). **Custom catch ⇒ `silent: true`** — otherwise toasts fire 
 | `uiInteract.js` | Execute voice `ui_click` / `ui_fill` / `ui_select` against live DOM. |
 | `domIndex.js` | DOM indexer for voice accessibility mode. |
 | `staleBuildToast.jsx` | Sticky toast shown when server's build id differs from client's. |
+| `apiRigging.js` | Character rigging. `getRiggingReadiness()` (`GET /rigging/readiness`): whether this install's Blender runtime is provisioned, the resolved interpreter, the module version, the install command when it is not, and the auto-skin threshold defaults. `rigImageTo3dModel(id, body)` (`POST /rigging/models/:id`): auto-skin a rendered mesh behind the measured weight-coverage gate, resolving with the updated model record. `listRiggingClips()` (`GET /rigging/clips`): the locally-held animation clip library plus CoS-state coverage. `retargetImageTo3dModel(id, body)` (`POST /rigging/models/:id/retarget`): apply a clip to a published rig in `diagnostic` (measure only) or `write` mode, resolving with the updated model record. |
+| `apiAvatar.js` | Avatar surfaces. `getRiggedAvatars()` (`GET /avatar/rigged`): the install's verified animated records, each with its `?variant=` spelling, serving URL, retargeted clip name, and server-computed CoS-state coverage. |

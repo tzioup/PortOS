@@ -6,6 +6,12 @@ import { execFileSync } from 'child_process';
 import { resolve } from 'path';
 
 import { resolveBundleNodeEnv } from './vite.buildEnv.js';
+import { CHUNK_GROUPS } from './vite.chunkGroups.js';
+import {
+  EIDOVERSE_HOST_PATH_PREFIX,
+  EIDOVERSE_ROOT_EXACT_PATHS,
+  EIDOVERSE_ROOT_PREFIX_PATHS,
+} from '../server/lib/eidoverseProxyRoutes.js';
 
 const ANALYZE_BUNDLE = process.env.ANALYZE === 'true';
 const CONFIG_DIR = import.meta.dirname;
@@ -87,6 +93,43 @@ function buildStamp() {
 const CERT_PATH = resolve(CONFIG_DIR, '..', 'data', 'certs', 'cert.pem');
 const API_SCHEME = existsSync(CERT_PATH) ? 'https' : 'http';
 
+// Dev proxies for the same-origin Eidoverse iframe. Root routes only forward
+// while the API host is active; `/node_modules/` + `/shared/` keep a Referer
+// bypass so Vite's own dependency graph is not stolen.
+function eidoverseDevProxies(target) {
+  const entries = {
+    [`^${EIDOVERSE_HOST_PATH_PREFIX}(?:/|$)`]: {
+      target,
+      changeOrigin: true,
+      ws: true,
+      secure: false,
+    },
+  };
+  for (const exact of EIDOVERSE_ROOT_EXACT_PATHS) {
+    entries[`^${exact}$`] = {
+      target,
+      changeOrigin: true,
+      ws: exact === '/ws',
+      secure: false,
+    };
+  }
+  for (const prefix of EIDOVERSE_ROOT_PREFIX_PATHS) {
+    entries[`^${prefix}`] = {
+      target,
+      changeOrigin: true,
+      secure: false,
+      bypass(req) {
+        if (prefix !== '/node_modules/' && prefix !== '/shared/') return undefined;
+        const referer = String(req.headers.referer || '');
+        if (!referer.includes(EIDOVERSE_HOST_PATH_PREFIX)) return req.url;
+        return undefined;
+      },
+    };
+  }
+  return entries;
+}
+
+
 export default defineConfig(({ command, mode }) => {
   // Pin the build's NODE_ENV before Vite reads it. resolveConfig() only defaults
   // it to 'production' when it is UNSET, and PortOS reaches this build from
@@ -160,7 +203,8 @@ export default defineConfig(({ command, mode }) => {
           changeOrigin: true,
           ws: true,
           secure: false
-        }
+        },
+        ...eidoverseDevProxies(API_TARGET),
       }
     },
     build: {
@@ -171,29 +215,11 @@ export default defineConfig(({ command, mode }) => {
           // id matches `test` into a named chunk. This replaces the legacy
           // `rollupOptions.output.manualChunks` function (still accepted via
           // rolldown's compat layer, but slated to drop in a future Vite). The
-          // groups below reproduce the same four vendor chunks as before.
-          // Note: use `[\\/]` (not `/`) for the path separator so the regexes
-          // also match on Windows.
+          // groups themselves are declared as package names in
+          // `vite.chunkGroups.js`, so a group naming an uninstalled package fails
+          // a test instead of silently grouping nothing.
           codeSplitting: {
-            groups: [
-              // Core React dependencies
-              { name: 'vendor-react', test: /[\\/]node_modules[\\/](react|react-dom|react-router)[\\/]/ },
-              // Socket dependencies
-              { name: 'vendor-realtime', test: /[\\/]node_modules[\\/]socket\.io-client[\\/]/ },
-              // Drag and drop library (only used in CoS)
-              { name: 'vendor-dnd', test: /[\\/]node_modules[\\/]@dnd-kit[\\/]/ },
-              // Icon library (largest dependency)
-              { name: 'vendor-icons', test: /[\\/]node_modules[\\/]lucide-react[\\/]/ },
-              // 3D stack — only pulled into lazy 3D pages (CyberCity, avatars,
-              // BrainGraph). Naming it gives the ~1 MB chunk a stable identity
-              // instead of an opaque `OrbitControls-*.js` and guarantees a single
-              // shared chunk across all 3D consumers.
-              { name: 'vendor-three', test: /[\\/]node_modules[\\/](three|@react-three|three-fenestra)[\\/]/ },
-              // Charting (recharts) — lazy chart pages only
-              { name: 'vendor-charts', test: /[\\/]node_modules[\\/](recharts|d3-[^\\/]+|victory-[^\\/]+)[\\/]/ },
-              // Terminal emulator (xterm) — Shell page only
-              { name: 'vendor-term', test: /[\\/]node_modules[\\/]@xterm[\\/]/ },
-            ]
+            groups: CHUNK_GROUPS.map(({ name, test }) => ({ name, test }))
           }
         }
       },

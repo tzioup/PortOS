@@ -3,11 +3,13 @@ import * as api from '../../services/api';
 import toast from '../ui/Toast';
 
 const normalizeCapabilities = (value) => ({
-  schemaVersion: 5,
+  schemaVersion: 8,
   createTasks: value?.createTasks === true,
   manageMind: value?.manageMind === true,
   manageEidoverse: value?.manageEidoverse === true,
+  visitEidoversePeers: value?.visitEidoversePeers === true,
   callUser: value?.callUser === true,
+  adjustLocalContext: value?.adjustLocalContext === true,
   readPortos: value?.readPortos === true,
   writePortos: value?.writePortos === true,
   taskModelAllowlist: Array.isArray(value?.taskModelAllowlist)
@@ -34,6 +36,11 @@ const OPTIONS = [
     hint: 'Queues typed tasks through isolated worktrees, capacity, budget, review, CI, and landing-policy gates.',
   },
   {
+    key: 'visitEidoversePeers',
+    label: 'Allow guest travel and chat with federated worlds',
+    hint: 'Lets the mind visit enabled registered peers and exchange live chat with their humans and agents. Messages cross instances; private records and secrets must stay local.',
+  },
+  {
     key: 'manageEidoverse',
     label: 'Allow private Eidoverse world management',
     hint: 'Lets the mind project PortOS resources, apply bounded world-building and role operations, and speak as the persistent CoS identity. This does not grant generic PortOS record writes.',
@@ -42,6 +49,11 @@ const OPTIONS = [
     key: 'manageMind',
     label: 'Allow mind to clean up its mindspace',
     hint: 'Lets the mind archive only its own memories, forget older trajectory history, or rebuild derived context. Cleanup remains bounded and auditable.',
+  },
+  {
+    key: 'adjustLocalContext',
+    label: 'Allow mind to adjust local model context (numCtx)',
+    hint: 'Lets the mind raise or lower its own local API provider context window within RAM/GPU safety clamps. Cloud providers stay out of reach; oversized requests are refused so PortOS is not OOMed.',
   },
   {
     key: 'callUser',
@@ -65,7 +77,7 @@ export default function PersistentMindTaskAccessControls({
 
   useEffect(() => {
     if (!saving) setDraft(normalizeCapabilities(capabilities));
-  }, [capabilities?.schemaVersion, capabilities?.createTasks, capabilities?.manageMind, capabilities?.manageEidoverse, capabilities?.callUser, capabilities?.readPortos, capabilities?.writePortos, capabilities?.taskModelAllowlist, capabilities?.taskModelAllowlistInvalid, capabilities?.allowedAppIds?.join('\0'), saving]);
+  }, [capabilities?.schemaVersion, capabilities?.createTasks, capabilities?.manageMind, capabilities?.manageEidoverse, capabilities?.visitEidoversePeers, capabilities?.callUser, capabilities?.adjustLocalContext, capabilities?.readPortos, capabilities?.writePortos, capabilities?.taskModelAllowlist, capabilities?.taskModelAllowlistInvalid, capabilities?.allowedAppIds?.join('\0'), saving]);
 
   const save = async (key, enabled) => {
     const previous = draft;

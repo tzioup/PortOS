@@ -121,11 +121,20 @@ excluded on both privacy and payload grounds.
 - Peer rows are as fresh as the last 60s sync cycle, so each row states when its
   digest was captured rather than implying it is live.
 - `usage` is the first snapshot category that is **always dirty** — `saveUsage`
-  rewrites `usage.json` on every AI run — so it transfers the whole digest map
-  where every other category rests on a rarely-moving checksum. The payload is
-  bounded here (120-day wire rollup, all-time `byProvider`/`byModel` dropped,
-  no per-provider rows on fleet output); replacing the whole-payload transfer
-  with a `capturedAt` manifest + per-slot fetch is filed as **#5759**.
+  rewrites `usage.json` on every AI run — where every other category rests on a
+  rarely-moving checksum. The payload is bounded (120-day wire rollup, all-time
+  `byProvider`/`byModel` dropped, no per-provider rows on fleet output), and
+  since **#5759** the transfer is per-slot rather than whole-map: the category
+  serves a **manifest** at `/api/sync/usage/manifest` — `{ instances: {
+  <instanceId>: capturedAt }, tombstones }` — and that manifest, not the
+  payload, is what the category's checksum hashes. A puller diffs the remote
+  manifest against what it already holds and fetches only the advanced slots
+  via `/api/sync/usage/snapshot?slots=…`, so one machine burning tokens moves
+  one digest instead of N. Both legs degrade: a source peer too old to serve a
+  manifest 404s it and the puller falls back to the whole snapshot, and a
+  snapshot request with no `slots` serves everything — receivers merge per slot
+  under LWW either way, so a full payload is always applied idempotently. See
+  `server/lib/syncManifest.js` for the wire contract.
 - **The per-peer toggle governs the INBOUND direction.** Snapshot sync is
   pull-only, and `/api/sync/:category/snapshot` carries no per-peer category
   authorization for *any* category — the receiver-side gap that per-record pulls
@@ -163,3 +172,54 @@ excluded on both privacy and payload grounds.
   far smaller depth budget than native `JSON.stringify` — so a digest deep
   enough to pass `atomicWrite` but blow that recursion would otherwise 500 the
   snapshot endpoint for every peer, permanently and across restarts.
+
+## Amendment (2026-09-03): subscription-quota readings ride the same category
+
+A subscription is **one account across every federated instance**, but each
+install can only read the quota panel of its own local CLI. So every
+subscription card on the Usage page was a partial view of a shared allowance,
+captioned with the CLI's own wording — "Local sessions only — does not include
+other devices or claude.ai." That caption was accurate and useless: the
+federation already carries this user's other devices.
+
+**Each instance's last quota reading now rides the `usage` category alongside
+its usage digest**, and the cards are unified before they render
+([`server/lib/fleetQuotas.js`](../../server/lib/fleetQuotas.js)).
+
+- **Two merge rules, because the halves mean different things.** `limits` (the
+  meters) are account-wide — every machine reads the same server-side allowance,
+  just at a different moment — so the FRESHEST reading per limit key wins;
+  summing them would multiply one allowance by the number of machines that
+  looked at it. `activity` (requests/sessions) is per-machine, which is exactly
+  what the provider's caption is about, so those SUM. `metrics[]` is left local:
+  its values are prose (`"3 renders · 24h"`), not addends.
+- **A card this machine could not read is filled from a peer that could** — a
+  logged-out CLI or a scrape still in flight stops reporting a failure once
+  another instance has read the same account.
+- **Only families this install has enabled get a card.** A peer running a
+  provider we don't is that machine's business; a meter for a plan the viewer
+  can't spend would be noise.
+- **API-billed instances are excluded.** The existing per-row Subscriptions
+  toggle already marks fleet members that pay API rates rather than riding the
+  viewer's plans; those meter a different account, so folding their readings in
+  would be a wrong number rather than a fuller one.
+- **A single-machine install is unchanged, caption included.** With nothing to
+  combine, claiming otherwise would be worse than the wording this replaces —
+  so the local note says only that no other instance has reported yet.
+
+Mechanically, the readings live in an in-memory stale-while-revalidate cache
+(a reading costs a 10-20s CLI/TUI spawn), which cannot be federated: it dies
+with the process, and this category's checksum is invalidated by FILE
+fingerprints. So `services/providerQuotaShare.js` persists them to
+`data/provider-quotas.json` — added to `USAGE_CHECKSUM_PATHS`, and folded into
+the entry's `capturedAt` so a quota refresh with no new AI runs still advances
+the slot a peer pulls. The write is skipped when a card's *claim* is unchanged
+(comparing whole cards would rewrite the file on every page poll, since some
+adapters stamp the clock on read).
+
+Nothing here reads a provider: the AI Provider Usage Policy still holds, because
+this only records and forwards what a user-triggered reading already produced.
+Privacy is unchanged in kind — a quota card carries provider ids, percentages,
+reset times and the publishing instance's name; no prompts, no transcripts, no
+PII. The peer payload is rebuilt to the wire shape on arrival for the same
+recursion-depth reason the usage digest is.

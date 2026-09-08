@@ -103,6 +103,7 @@ import {
   Clapperboard,
   PersonStanding,
   Box,
+  Blocks,
   Boxes,
   Gamepad2,
   Waypoints,
@@ -159,7 +160,6 @@ function ThemeModeToggle({ className = '' }) {
     </button>
   );
 }
-import * as api from '../services/api';
 
 // `NAV_COMMANDS` owns every structural field shared with the sidebar. This map
 // intentionally contains presentation only: giving a manifest path an icon is
@@ -230,6 +230,7 @@ export const NAV_PRESENTATION = {
   '/catalog': { icon: Sparkles },
   '/creative-commission': { icon: CalendarClock },
   '/creative-director': { icon: Clapperboard },
+  '/video': { icon: Clapperboard },
   '/pipeline/editorial-checks': { icon: ListChecks },
   '/fableloom': { icon: Waypoints },
   '/game': { icon: Gamepad2 },
@@ -285,9 +286,11 @@ export const NAV_PRESENTATION = {
   '/meatspace/settings': { icon: Settings },
   '/models/3d': { icon: Boxes },
   '/models/embeddings': { icon: Braces },
+  '/models/harnesses': { icon: Blocks },
   '/models/llms': { icon: Cpu },
   '/models/loras': { icon: Sparkles },
   '/models/media': { icon: HardDrive },
+  '/models/comparison': { icon: Gauge },
   '/models/performance': { icon: Gauge },
   '/local-llm/playground': { icon: FlaskConical },
   '/models/status': { icon: Activity },
@@ -304,6 +307,7 @@ export const NAV_PRESENTATION = {
   '/settings/general': { icon: Settings },
   '/settings/mortalloom': { icon: Activity },
   '/openclaw': { icon: MessagesSquare },
+  '/settings/orchestration': { icon: Cpu },
   '/prompts': { icon: FileText },
   '/ai': { icon: Bot },
   '/settings/security': { icon: Lock },
@@ -551,7 +555,8 @@ const EXACT_FULL_WIDTH_PATHS = [
   // OpenClaw lives under the Settings nav group; it's a full-bleed
   // chat surface (sidebar + message pane) that owns its own internal
   // scroll, so it needs the bare full-width main like the other
-  // Settings pages (/ai, /prompts, /settings/*).
+  // Full-width Settings pages (/prompts, /settings/*) and the Models Providers
+  // page at /ai.
   '/openclaw',
   '/prompts',
   '/review',
@@ -583,6 +588,7 @@ const FULL_WIDTH_PATH_PREFIXES = [
   // so they need the bare full-width main — same as when they lived
   // under the /media tabs.
   '/creative-director',
+  '/video',
   '/brain',
   '/digital-twin',
   '/feature-agents',
@@ -754,25 +760,20 @@ export default function Layout() {
   const pipelineSeries = useSidebarSeries();
   const universes = useSidebarUniverses();
 
-  // Fetch the palette nav manifest once on mount so manifest-only paths
-  // (e.g. /wiki/log, /goals/tree) can be resolved in the Pinned/Recent sections
-  // even though they are not sidebar leaves.
-  const [manifestNav, setManifestNav] = useState([]);
-  useEffect(() => {
-    api.getPaletteManifest({ silent: true })
-      .then((data) => setManifestNav(Array.isArray(data?.nav) ? data.nav : []))
-      .catch((err) => console.warn(`⚠️ Layout: palette manifest fetch failed: ${err?.message || err}`));
-  }, []);
-
-  // Manifest-only paths still honour the feature gate, so a row pinned before the
-  // user disabled its feature stops resolving into Pinned/Recent too.
+  // Manifest-only paths (e.g. /wiki/log, /goals/tree) have no sidebar leaf, so
+  // they resolve out of the statically imported manifest that already backs
+  // `commandByPath`. Reading the bundle instead of re-fetching `/palette/manifest`
+  // is what lets a Pinned/Recent row for one of those paths render on the FIRST
+  // paint rather than popping in once a request lands (and keeps it rendering on
+  // an install where that request fails). They still honour the feature gate, so
+  // a row pinned before the user disabled its feature stops resolving too.
   const manifestEntryByPath = useMemo(() => {
     const map = new Map();
-    filterNavByFeatures(manifestNav, isFeatureEnabled).forEach((c) => {
-      if (c?.path && !map.has(c.path)) map.set(c.path, { path: c.path, label: c.label, icon: Navigation });
+    filterNavByFeatures([...commandByPath.values()], isFeatureEnabled).forEach((c) => {
+      map.set(c.path, { path: c.path, label: c.label, icon: Navigation });
     });
     return map;
-  }, [manifestNav, isFeatureEnabled]);
+  }, [isFeatureEnabled]);
 
   useEffect(() => {
     safeWriteStorage(SIDEBAR_KEY, String(collapsed));
@@ -877,11 +878,11 @@ export default function Layout() {
     (path) => {
       const direct = navEntryByPath.get(path) || manifestEntryByPath.get(path);
       if (direct) return direct;
-      const current = migrateLegacyNavPath(path, manifestNav);
+      const current = migrateLegacyNavPath(path, NAV_COMMANDS);
       if (current === path) return null;
       return navEntryByPath.get(current) || manifestEntryByPath.get(current) || null;
     },
-    [navEntryByPath, manifestEntryByPath, manifestNav],
+    [navEntryByPath, manifestEntryByPath],
   );
 
   const { pinned, recent, pin, unpin, isPinned } = useNavWorkingSet(resolveNavEntry);
@@ -1205,6 +1206,7 @@ export default function Layout() {
       {/* Sidebar */}
       <aside
         className={`
+          port-app-sidebar
           fixed inset-y-0 left-0 z-50 h-dvh-screen print:hidden
           flex flex-col bg-port-card border-r border-port-border
           transition-all duration-300 ease-in-out
@@ -1237,7 +1239,7 @@ export default function Layout() {
             <button
               type="button"
               onClick={() => setCollapsed(true)}
-              className="hidden lg:flex p-1 text-gray-500 hover:text-white transition-colors"
+              className="min-h-[44px] min-w-[44px] items-center justify-center hidden lg:flex p-1 text-gray-500 hover:text-white transition-colors"
               title="Collapse sidebar"
               aria-label="Collapse sidebar"
             >
@@ -1407,7 +1409,7 @@ export default function Layout() {
       {/* Main area — print drops the sidebar offset so printed pages aren't shifted right */}
       <div className={`flex-1 flex flex-col min-w-0 max-w-full transition-all duration-300 print:ml-0 ${collapsed ? 'lg:ml-16' : 'lg:ml-64'}`}>
         {/* Mobile header */}
-        <header className="lg:hidden flex items-center justify-between px-2 py-1.5 border-b border-port-border bg-port-card print:hidden">
+        <header className="port-app-topbar lg:hidden flex items-center justify-between px-2 py-1.5 border-b border-port-border bg-port-card print:hidden">
           <button
             onClick={() => setMobileOpen(true)}
             className="inline-flex items-center justify-center min-w-[44px] min-h-[44px] -ml-1 rounded-lg text-gray-400 hover:text-white"

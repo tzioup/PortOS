@@ -11,15 +11,20 @@
 import { createHash } from 'node:crypto';
 import { execGh, ensureForgeReachable } from './github.js';
 import { getSelfLogin } from './prWatcher.js';
+import { createGithubActorTrust } from './forgeActorTrust.js';
 import { getOriginInfo } from '../lib/gitRemote.js';
 import { githubApiHost, githubRepoSpec } from '../lib/workTracker.js';
 import { mapWithConcurrency } from '../lib/mapWithConcurrency.js';
 import {
   MODEL_ABUSE_GUARD,
   MODEL_ABUSE_GUARD_MAX_INPUT_CHARS,
+  LINKED_ISSUE_MAX_COUNT,
+  linkedIssueIntentContent,
+  linkedIssueIntentFingerprint,
   modelAbuseContentFingerprint,
+  normalizeLinkedIssues,
 } from '../lib/modelAbuseGuard.js';
-import { runModelAbuseScan } from './modelAbuseGuard.js';
+import { screenUntrustedContent } from './untrustedContent.js';
 import { safeJSONParse } from '../lib/fileUtils.js';
 
 export const SECURITY_SCAN_MAX_OPEN_PRS = 200;
@@ -57,18 +62,30 @@ export function extractLinkedIssueNumbers(pr, repoFullName) {
   ])].sort((a, b) => a - b).slice(0, MAX_LINKED_ISSUES);
 }
 
+/**
+ * Resolve the issue facts that admit a PR, plus the intent evidence a reviewer
+ * needs to answer "does this diff do what the issue asked?". Only OPEN linked
+ * issues contribute intent — a closed issue is not a live requirement, and the
+ * pre-action recheck recomputes the fingerprint from the same open set.
+ */
 async function resolveEligibilityFacts(pr, repoFullName, hostname) {
   const linkedIssueNumbers = extractLinkedIssueNumbers(pr, repoFullName);
   if (linkedIssueNumbers.length === 0) {
     return {
-      linkedIssueNumbers: [],
-      openLinkedIssueNumbers: [],
-      openerAssignedIssueNumbers: [],
-      issueLookupComplete: true,
+      facts: {
+        linkedIssueNumbers: [],
+        openLinkedIssueNumbers: [],
+        openerAssignedIssueNumbers: [],
+        issueLookupComplete: true,
+        intentFingerprint: null,
+      },
+      linkedIssues: [],
+      inputComplete: true,
     };
   }
   const openLinkedIssueNumbers = [];
   const openerAssignedIssueNumbers = [];
+  const openIssues = [];
   let issueLookupComplete = true;
   for (const issueNumber of linkedIssueNumbers) {
     const raw = await execGh([
@@ -82,6 +99,7 @@ async function resolveEligibilityFacts(pr, repoFullName, hostname) {
     const isIssue = !issue.pull_request;
     if (isIssue && String(issue.state).toLowerCase() === 'open') {
       openLinkedIssueNumbers.push(issueNumber);
+      openIssues.push({ number: issueNumber, title: issue.title, body: issue.body });
       const assignedLogins = Array.isArray(issue.assignees)
         ? issue.assignees.map((assignee) => String(assignee?.login || '').toLowerCase()).filter(Boolean)
         : [];
@@ -90,11 +108,17 @@ async function resolveEligibilityFacts(pr, repoFullName, hostname) {
       }
     }
   }
+  const linkedIssues = normalizeLinkedIssues(openIssues);
   return {
-    linkedIssueNumbers,
-    openLinkedIssueNumbers,
-    openerAssignedIssueNumbers,
-    issueLookupComplete,
+    facts: {
+      linkedIssueNumbers,
+      openLinkedIssueNumbers,
+      openerAssignedIssueNumbers,
+      issueLookupComplete,
+      intentFingerprint: linkedIssueIntentFingerprint(linkedIssues),
+    },
+    linkedIssues,
+    inputComplete: openIssues.length <= LINKED_ISSUE_MAX_COUNT && !linkedIssues.some(issue => issue.truncated),
   };
 }
 
@@ -132,6 +156,7 @@ export async function resolvePrReviewerTargetScope(app) {
     hostname: githubApiHost(origin.host),
     defaultBranch: defaultBranch.trim(),
     selfLogin,
+    actorTrust: await createGithubActorTrust({ runGh: execGh, host: githubApiHost(origin.host), repoFullName: origin.fullName, currentUser: selfLogin }),
   };
 }
 
@@ -141,19 +166,20 @@ export async function resolvePrReviewerTargetScope(app) {
  * against the default branch, opened by someone other than the signed-in
  * account — so a UI gated on this and the route's authoritative check agree.
  */
-export function isReviewablePullRequest(scope, pullRequest) {
+export async function isReviewablePullRequest(scope, pullRequest) {
   const author = pullRequest?.author;
   return scope?.ok === true
     && pullRequest?.baseBranch === scope.defaultBranch
     && typeof author === 'string'
     && author.length > 0
-    && author.toLowerCase() !== String(scope.selfLogin).toLowerCase();
+    && author.toLowerCase() !== String(scope.selfLogin).toLowerCase()
+    && !(await scope.actorTrust?.isTrusted(author));
 }
 
 export async function listExternalOpenPullRequests(app) {
   const scope = await resolvePrReviewerTargetScope(app);
   if (!scope.ok) return scope;
-  const { repoSpec, repoFullName, hostname, defaultBranch, selfLogin } = scope;
+  const { repoSpec, repoFullName, hostname, defaultBranch, actorTrust } = scope;
 
   const raw = await execGh([
     'pr', 'list', '--repo', repoSpec,
@@ -186,11 +212,12 @@ export async function listExternalOpenPullRequests(app) {
     return failure('security-scan-pr-list-unreadable');
   }
 
-  const externalPrs = listedPrs.filter((pr) => String(pr.authorLogin).toLowerCase() !== String(selfLogin).toLowerCase());
-  const prs = await mapWithConcurrency(externalPrs, ELIGIBILITY_LOOKUP_CONCURRENCY, async (pr) => ({
-    ...pr,
-    eligibilityFacts: await resolveEligibilityFacts(pr, repoFullName, hostname),
-  }));
+  const trusted = await mapWithConcurrency(listedPrs, ELIGIBILITY_LOOKUP_CONCURRENCY, pr => actorTrust.isTrusted(pr.authorLogin));
+  const externalPrs = listedPrs.filter((_, index) => !trusted[index]);
+  const prs = await mapWithConcurrency(externalPrs, ELIGIBILITY_LOOKUP_CONCURRENCY, async (pr) => {
+    const { facts, linkedIssues, inputComplete } = await resolveEligibilityFacts(pr, repoFullName, hostname);
+    return { ...pr, eligibilityFacts: facts, linkedIssues, inputComplete };
+  });
 
   return {
     ok: true,
@@ -255,7 +282,7 @@ const reportFor = (pr, diff, verdict) => ({
   securityFindings: Array.isArray(verdict.findings) ? verdict.findings : [],
   guardId: verdict.guardId || MODEL_ABUSE_GUARD.id,
   guardModel: verdict.model || MODEL_ABUSE_GUARD.name,
-  guardRevision: verdict.revision || MODEL_ABUSE_GUARD.revision,
+  guardRevision: verdict.revision ?? null,
   layers: verdict.layers || null,
   chunkCount: Number.isInteger(verdict.chunkCount) ? verdict.chunkCount : null,
   minBenignScore: Number.isFinite(verdict.minBenignScore) ? verdict.minBenignScore : null,
@@ -267,7 +294,7 @@ const reportFor = (pr, diff, verdict) => ({
  * or malformed verdict fails closed; reports collected before that point remain
  * generic and are useful to the human-facing status view only.
  */
-export async function runPrReviewerSecurityScan({ app, timeoutMs, target = null } = {}) {
+export async function runPrReviewerSecurityScan({ app, target = null } = {}) {
   const resolvedTarget = target || await listExternalOpenPullRequests(app);
   if (!resolvedTarget.ok) return resolvedTarget;
   const scanKey = securityScanFingerprint(resolvedTarget);
@@ -276,7 +303,12 @@ export async function runPrReviewerSecurityScan({ app, timeoutMs, target = null 
   const reviewedPrs = [];
   const reviewInputs = [];
   let hasFindings = false;
+  // Named by the verdicts, not the module constant: a scan that ran only the
+  // deterministic layer must not be recorded as classified by Prompt Guard.
+  let guardModel = MODEL_ABUSE_GUARD.name;
+  let guardRevision = MODEL_ABUSE_GUARD.revision;
   for (const pr of resolvedTarget.prs) {
+    if (pr.inputComplete === false || pr.linkedIssues?.some(issue => issue.truncated)) return failure('security-scan-linked-issue-too-large', { reviewedPrs, scanKey });
     const diff = await execGh(['pr', 'diff', String(pr.number), '--repo', resolvedTarget.repoSpec]).catch(() => null);
     if (diff === null) return failure('security-scan-diff-unavailable', { reviewedPrs, scanKey });
     if (typeof diff !== 'string' || diff.length > SECURITY_SCAN_MAX_DIFF_CHARS) {
@@ -284,12 +316,25 @@ export async function runPrReviewerSecurityScan({ app, timeoutMs, target = null 
     }
     if (!diff.trim()) return failure('security-scan-empty-diff', { reviewedPrs, scanKey });
 
-    const content = contentFor(pr, diff);
+    // The linked issue's own text is contributor-authored public content, and it
+    // is about to be quoted to a downstream reviewer as the requirement the diff
+    // is judged against. It crosses the boundary in the same pass as the PR — an
+    // injected issue body flags the PR rather than reaching a reviewer as the
+    // thing it is supposed to trust. The verdict is one status for the whole
+    // PR, so a second classifier subprocess per PR would buy nothing: findings
+    // are deliberately generic either way. Freshness stays anchored on both
+    // halves separately — the diff by `contentFingerprint`, the issue text by
+    // `eligibilityFacts.intentFingerprint`.
+    const intentContent = linkedIssueIntentContent(pr.linkedIssues);
+    const content = intentContent ? `${contentFor(pr, diff)}\n\n${intentContent}` : contentFor(pr, diff);
     if (content.length > SECURITY_SCAN_MAX_DIFF_CHARS) {
       return failure('security-scan-input-too-large', { reviewedPrs, scanKey });
     }
-    const verdict = await runModelAbuseScan({ content, timeoutMs });
+    const screened = await screenUntrustedContent({ content, source: 'github-pr' });
+    const verdict = screened.screening || screened;
     if (!verdict.ok) return failure(verdict.code || 'security-scan-verdict-unavailable', { reviewedPrs, scanKey });
+    guardModel = verdict.model || guardModel;
+    guardRevision = verdict.revision ?? null;
 
     const report = reportFor(pr, diff, verdict);
     reviewedPrs.push(report);
@@ -306,6 +351,7 @@ export async function runPrReviewerSecurityScan({ app, timeoutMs, target = null 
       headSha: pr.headRefOid,
       baseRefName: resolvedTarget.defaultBranch,
       eligibilityFacts: pr.eligibilityFacts,
+      linkedIssues: pr.linkedIssues || [],
       behindBy: null,
       files: [],
       additions: 0,
@@ -319,8 +365,8 @@ export async function runPrReviewerSecurityScan({ app, timeoutMs, target = null 
     passed: !hasFindings,
     code: hasFindings ? 'security-scan-findings' : 'security-scan-passed',
     guardId: MODEL_ABUSE_GUARD.id,
-    guardModel: MODEL_ABUSE_GUARD.name,
-    guardRevision: MODEL_ABUSE_GUARD.revision,
+    guardModel,
+    guardRevision,
     repoFullName: resolvedTarget.repoFullName,
     defaultBranch: resolvedTarget.defaultBranch,
     scanKey,

@@ -16,27 +16,34 @@ import {
   ScrollText,
   MessageCircle
 } from 'lucide-react';
-import { normalizeReviewerSlug } from '../../lib/reviewerPins';
+import { normalizeReviewerSlug, REVIEWER_VALUES } from '../../lib/reviewerPins';
+import { AVATAR_STYLE_LABELS } from '../../lib/avatarStyles';
 import { inPlaceClipName } from '../../utils/animationClips';
+import { getPageNavTabs } from '../../../../server/lib/navManifest.js';
+import { buildPageNavTabs } from '../../lib/pageNavTabs.js';
 
-export const TABS = [
-  { id: 'briefing', label: 'Briefing', icon: Newspaper },
-  { id: 'tasks', label: 'Tasks', icon: FileText },
-  { id: 'agents', label: 'Agents', icon: Cpu },
-  { id: 'jobs', label: 'System Tasks', icon: Bot },
-  { id: 'runs', label: 'Runs', icon: Play },
-  { id: 'run-events', label: 'Run Events', icon: ScrollText },
-  { id: 'schedule', label: 'Schedule', icon: Clock },
-  { id: 'workflow', label: 'Timeline', icon: ChartGantt },
-  { id: 'digest', label: 'Digest', icon: Calendar },
-  { id: 'gsd', label: 'GSD', icon: Compass },
-  { id: 'productivity', label: 'Productivity', icon: BarChart2 },
-  { id: 'learning', label: 'Learning', icon: GraduationCap },
-  { id: 'memory', label: 'Memory', icon: Brain },
-  { id: 'mind', label: 'Mind', icon: MessageCircle },
-  { id: 'health', label: 'Health', icon: Activity },
-  { id: 'config', label: 'Config', icon: Settings }
-];
+// Icon per tab id. The manifest (`tabGroup: 'cos'`) owns id/label/order — this
+// file owns only how each tab looks. Throws at import time on drift.
+const TAB_PRESENTATION = {
+  briefing: { icon: Newspaper },
+  tasks: { icon: FileText },
+  agents: { icon: Cpu },
+  jobs: { icon: Bot },
+  runs: { icon: Play },
+  'run-events': { icon: ScrollText },
+  schedule: { icon: Clock },
+  workflow: { icon: ChartGantt },
+  digest: { icon: Calendar },
+  gsd: { icon: Compass },
+  productivity: { icon: BarChart2 },
+  learning: { icon: GraduationCap },
+  memory: { icon: Brain },
+  mind: { icon: MessageCircle },
+  health: { icon: Activity },
+  config: { icon: Settings },
+};
+
+export const TABS = buildPageNavTabs(getPageNavTabs('cos'), TAB_PRESENTATION, 'CoS');
 
 // Intentional category-color enum (#1909/#1924 caution), NOT off-token theme
 // inconsistency: 9 files (CoSCharacter, CyberCoSAvatar, EsotericCoSAvatar,
@@ -276,23 +283,41 @@ export function pinnedPrCompletion(metadata) {
   return metadata?.reviewLoop === true || metadata?.reviewLoop === 'true' ? 'review-then-merge' : '';
 }
 
-// Reviewer choices for the Review Loop. `copilot` requests a GitHub Copilot
-// review via the native reviewer API; CLI reviewers (claude/antigravity/codex/grok/cursor)
-// instruct the follow-up agent to invoke the named CLI; local-LLM reviewers
-// (lmstudio/ollama) route the diff through PortOS's `POST /api/code-review/local`
-// endpoint, which runs the model configured on the Models → Code Reviewers
-// page. Keep in sync with the `REVIEWER_VALUES` enum in
-// `server/lib/validation.js`.
-export const REVIEWER_OPTIONS = [
-  { value: 'copilot', label: 'Copilot', description: 'GitHub Copilot (GitHub-only)' },
-  { value: 'claude', label: 'Claude', description: 'Claude CLI reviews the PR diff (optional model on Models → Code Reviewers; supports an Ollama-backed Claude for local-only setups)' },
-  { value: 'antigravity', label: 'Antigravity', description: 'Antigravity CLI (agy) reviews the PR diff' },
-  { value: 'codex', label: 'Codex', description: 'Codex CLI reviews the PR diff (optional model tier on Models → Code Reviewers)' },
-  { value: 'grok', label: 'Grok', description: 'Grok Build CLI (grok) reviews the PR diff' },
-  { value: 'cursor', label: 'Cursor Agent', description: 'Cursor Agent CLI (cursor-agent) reviews the PR diff' },
-  { value: 'lmstudio', label: 'LM Studio', description: 'Local LM Studio model reviews the diff (set model on AI Providers)' },
-  { value: 'ollama', label: 'Ollama', description: 'Local Ollama model reviews the diff (set model on AI Providers)' }
-];
+// UI copy for each reviewer in the Review Loop picker. `copilot` requests a
+// GitHub Copilot review via the native reviewer API; CLI reviewers
+// (claude/antigravity/codex/grok/cursor/opencode/kimi) instruct the follow-up agent
+// to invoke the named CLI; local-LLM reviewers (lmstudio/ollama/mtplx) route the
+// diff through
+// PortOS's `POST /api/code-review/local` endpoint, which runs the model
+// configured on the Models → Code Reviewers page.
+//
+// Copy only — the ROSTER is `REVIEWER_VALUES` in `client/src/lib/reviewerPins.js`,
+// which the server suite pins against the server's own enum.
+const REVIEWER_COPY = {
+  pi: { label: 'Pi', description: 'Pi Coding Agent CLI reviews the supplied diff without tools' },
+  copilot: { label: 'Copilot', description: 'GitHub Copilot (GitHub-only)' },
+  claude: { label: 'Claude', description: 'Claude CLI reviews the PR diff (optional model on Models → Code Reviewers; supports an Ollama-backed Claude for local-only setups)' },
+  antigravity: { label: 'Antigravity', description: 'Antigravity CLI (agy) reviews the PR diff' },
+  codex: { label: 'Codex', description: 'Codex CLI reviews the PR diff (optional model tier on Models → Code Reviewers)' },
+  grok: { label: 'Grok', description: 'Grok Build CLI (grok) reviews the PR diff' },
+  cursor: { label: 'Cursor Agent', description: 'Cursor Agent CLI (cursor-agent) reviews the PR diff' },
+  opencode: { label: 'OpenCode', description: 'OpenCode CLI reviews the PR diff (optional provider/model on Models → Code Reviewers)' },
+  kimi: { label: 'Kimi', description: 'Kimi CLI reviews the PR diff (optional model on Models → Code Reviewers)' },
+  lmstudio: { label: 'LM Studio', description: 'Local LM Studio model reviews the diff (set model on AI Providers)' },
+  ollama: { label: 'Ollama', description: 'Local Ollama model reviews the diff (set model on AI Providers)' },
+  mtplx: { label: 'MTPLX', description: 'Local MTPLX model reviews the diff (set model on AI Providers)' }
+};
+
+// Derived from the roster rather than mirroring it, so a reviewer added
+// server-side surfaces as a loud module-load failure here instead of a silently
+// missing dropdown row — and so the picker can never offer a slug the server's
+// enum rejects.
+export const REVIEWER_OPTIONS = REVIEWER_VALUES.map((value) => {
+  const copy = REVIEWER_COPY[value];
+  if (!copy) throw new Error(`❌ REVIEWER_COPY is missing UI copy for reviewer '${value}'`);
+  return { value, ...copy };
+});
+
 // The display label for a reviewer token — the one place UI copy turns a
 // reviewer slug into prose, so a roster addition renders everywhere without a
 // literal edit. Resolves the `gemini` alias; an `@username` (or any token with no
@@ -300,13 +325,28 @@ export const REVIEWER_OPTIONS = [
 export const reviewerLabel = (value) =>
   REVIEWER_OPTIONS.find(o => o.value === normalizeReviewerSlug(value))?.label || value;
 
-// The per-reviewer PIN vocabularies (which reviewers take a model or an effort,
-// and the values each accepts) live in `client/src/lib/reviewerPins.js` and are
-// re-exported here so existing imports keep working. They are NOT defined in this
-// file because the server suite pins them against the server's own ladders, and
-// this module's `lucide-react` icon import isn't installed in that workspace —
-// see the leaf module's header for the full rationale.
+// The whole reviewer vocabulary — the roster, its aliases and defaults, the
+// review-username pattern and cap, the max-rounds ceiling, the stop-mode list,
+// and the per-reviewer pin vocabularies — lives in `client/src/lib/reviewerPins.js`
+// and is re-exported here so existing imports keep working. It is NOT defined in
+// this file because the server suite pins the mirror against the server's own
+// constants, and this module's `lucide-react` icon import isn't installed in that
+// workspace — see the leaf module's header for the full rationale.
 export {
+  REVIEWER_VALUES,
+  REVIEWER_ALIASES,
+  DEFAULT_REVIEWER,
+  DEFAULT_REVIEWERS,
+  MAX_REVIEW_USERNAMES,
+  cleanReviewUsername,
+  normalizeReviewUsernames,
+  MAX_REVIEWER_MAX_ROUNDS,
+  REVIEW_STOP_MODES,
+  DEFAULT_REVIEW_STOP_MODE,
+  REVIEWER_OVERRIDE_KEYS,
+  REVIEWER_LIST_OVERRIDE_KEYS,
+  hasReviewerOverride,
+  normalizeReviewers,
   MODEL_CAPABLE_CLI_REVIEWERS,
   LOCAL_LLM_REVIEWERS,
   MODEL_SELECTABLE_REVIEWERS,
@@ -318,14 +358,10 @@ export {
   sanitizeReviewerModelInput
 } from '../../lib/reviewerPins';
 
-// pr-watcher author gate (taskMetadata.prAuthorFilter). Mirrors
-// PR_AUTHOR_FILTERS in server/lib/validation.js. 'self' = PRs opened by the
-// gh-authenticated operator (or their automation); 'others' = external
-// contributors; 'any' = react to every opened PR.
+// pr-watcher owns trusted remediation. Legacy filter values remain accepted
+// server-side for compatibility; every dispatch enforces collaborator trust.
 export const PR_AUTHOR_FILTER_OPTIONS = [
-  { value: 'any', label: 'Any author', description: 'React to every PR opened on the default branch' },
-  { value: 'self', label: 'Opened by me', description: 'Only PRs opened by the gh-authenticated user (or their automation)' },
-  { value: 'others', label: 'Opened by others', description: 'Only PRs opened by someone other than the gh-authenticated user' }
+  { value: 'trusted', label: 'Owner and write collaborators', description: 'Verified repository collaborators and the signed-in operator; external PRs use PR Reviewer' }
 ];
 
 // claim-issue author gate (taskMetadata.issueAuthorFilter). Mirrors
@@ -373,79 +409,6 @@ export const BRANCHES_PER_AGENT_OPTIONS = [1, 2, 3, 4, 5, 6].map((value) => ({
   description: `Give each branch-reconcile coordinator up to ${value} prioritized branch${value === 1 ? '' : 'es'} per run`
 }));
 
-export const DEFAULT_REVIEWER = 'copilot';
-export const DEFAULT_REVIEWERS = ['copilot'];
-
-// Arbitrary GitHub reviewer usernames (e.g. `@CodeReviewbot`) requested as PR
-// reviewers to gate merging, appended to slashdo's `--review-with` after the
-// keyed reviewers. Client mirror of server/lib/cosValidation.js
-// `normalizeReviewUsernames` + MAX_REVIEW_USERNAMES — keep the pattern/cap in
-// sync so the picker rejects the same tokens the server would drop. Stored
-// WITHOUT the leading `@` (added back only for display / the flag string).
-export const MAX_REVIEW_USERNAMES = 20;
-const REVIEW_USERNAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\/[A-Za-z0-9._-]{1,100})?$/;
-
-// Validate a single raw username entry (strip `@`, trim). Returns the clean
-// token or null if it isn't a shell-safe GitHub username/team slug.
-export function cleanReviewUsername(raw) {
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim().replace(/^@+/, '');
-  return trimmed && REVIEW_USERNAME_RE.test(trimmed) ? trimmed : null;
-}
-
-// Normalize a raw list: drop invalid tokens, case-insensitively dedupe while
-// preserving order, cap at MAX_REVIEW_USERNAMES. Returns clean usernames sans `@`.
-export function normalizeReviewUsernames(list) {
-  if (!Array.isArray(list)) return [];
-  const seen = new Set();
-  const out = [];
-  for (const raw of list) {
-    const clean = cleanReviewUsername(raw);
-    if (!clean) continue;
-    const key = clean.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(clean);
-    if (out.length >= MAX_REVIEW_USERNAMES) break;
-  }
-  return out;
-}
-
-// Upper bound on a per-reviewer `~max=<n>` round cap. Client mirror of
-// MAX_REVIEWER_MAX_ROUNDS in `server/lib/cosValidation.js` — a value above it is
-// dropped server-side, so the input must not offer one. `0` is valid and means
-// "loop until clean" (slashdo's unlimited mode, bounded by its own guardrail);
-// blank/absent means "no cap requested" and keeps slashdo's built-in default.
-export const MAX_REVIEWER_MAX_ROUNDS = 10;
-
-// Stop-mode for the multi-reviewer loop (slashdo `--review-stop-on-*`).
-// Keep in sync with REVIEW_STOP_MODES in `server/lib/validation.js`.
-export const REVIEW_STOP_MODES = [
-  { value: 'all', label: 'Run all', description: 'Run every reviewer in order before merging (default)' },
-  { value: 'on-findings', label: 'Stop on first fix', description: 'Stop after the first reviewer that landed a fix' },
-  { value: 'on-clean', label: 'Stop on first clean', description: 'Stop after the first reviewer that reports zero findings' }
-];
-export const DEFAULT_REVIEW_STOP_MODE = 'all';
-
-// Resolve metadata to an ordered, deduped reviewer list (client mirror of the
-// server's normalizeReviewers): prefers `reviewers`, falls back to legacy
-// single `reviewer`, defaults to `['copilot']`.
-const REVIEWER_VALUES = REVIEWER_OPTIONS.map(o => o.value);
-const REVIEWER_ALIASES = { gemini: 'antigravity', 'cursor-agent': 'cursor' };
-export function normalizeReviewers(meta) {
-  const raw = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
-  const source = Array.isArray(raw.reviewers)
-    ? raw.reviewers
-    : (typeof raw.reviewer === 'string' && raw.reviewer ? [raw.reviewer] : []);
-  const seen = new Set();
-  const out = [];
-  for (const r of source) {
-    const normalized = REVIEWER_ALIASES[r] || r;
-    if (REVIEWER_VALUES.includes(normalized) && !seen.has(normalized)) { seen.add(normalized); out.push(normalized); }
-  }
-  return out.length ? out : [...DEFAULT_REVIEWERS];
-}
-
 // Returns the Tailwind className string for an agent option toggle button.
 // effective: whether the option is on (global + override resolved)
 // hasOverride: whether there's an explicit per-app override set
@@ -474,6 +437,18 @@ export function providerPinPatch(providerId, model) {
 // inheriting the task's Schedule pin).
 export function hasProviderPin(override) {
   return !!(override?.providerId || override?.model);
+}
+
+// Whether an app's per-task provider pin NAMES A DIFFERENT PROVIDER than the
+// task's own Schedule pin. The app pin always wins at spawn (#4783), so this is
+// the "silently overrides what the Schedule page shows" case worth flagging —
+// not merely "an override exists" (hasProviderPin above): an app pin that
+// happens to match the schedule, or a schedule with no pin of its own, isn't a
+// surprise. Both sides must actually name a provider; an unset schedule pin
+// (any override "diverges" from nothing) or an unset app pin (nothing to
+// diverge) are not divergence.
+export function providerPinDivergesFromSchedule(override, globalConfig) {
+  return !!(override?.providerId && globalConfig?.providerId && override.providerId !== globalConfig.providerId);
 }
 
 // Compute new taskMetadata after toggling a field in a per-app override.
@@ -577,18 +552,7 @@ export const getDomainBudget = (config, domainId) => {
 };
 
 // Avatar style labels for display
-export const AVATAR_STYLE_LABELS = {
-  svg: 'Digital (SVG)',
-  cyber: 'Cyberpunk (3D)',
-  sigil: 'Arcane Sigil (3D)',
-  esoteric: 'Esoteric (3D)',
-  nexus: 'Neural Nexus (3D)',
-  muse: 'Cyber Muse (3D)',
-  // Bundled CC0 Kenney Mini Characters — animated rigged GLB avatars.
-  miniMaleC: 'Mini Character — Male (3D)',
-  miniFemaleD: 'Mini Character — Female (3D)',
-  ascii: 'Minimalist (ASCII)'
-};
+export { AVATAR_STYLE_LABELS };
 
 // Dynamic avatar rules - maps task context to avatar styles
 // Priority order: provider > analysisType > taskType > priority > fallback

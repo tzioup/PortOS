@@ -8,11 +8,10 @@ import {
   DEFAULT_I2V_REFERENCE_MODE, isDefaultI2vReferenceMode, normalizeI2vReferenceMode,
   runtimeSupportsI2vReferenceMode, resolveI2vReferenceStrength,
 } from '../lib/videoReferenceModes';
-import { randomSeed } from '../lib/genUtils';
 import {
   resolutionOptionsForModel, defaultResolutionForModel, snapAspectToImage,
 } from '../lib/videoGenResolutions';
-import { VIDEO_TILING_ENUM_SET } from '../lib/videoTilingOptions';
+import { normalizeVideoTiling } from '../lib/videoTilingOptions';
 import {
   MAX_CHUNKS,
   videoModelMemoryGb, isModelAllowedForMode,
@@ -24,6 +23,7 @@ import {
   DEFAULT_DRAFT_DECODE_ID, draftDecodeOptionsForModel,
   resolveDraftDecodeForModel, draftDecodeFromRecord,
 } from '../lib/videoGenParams.js';
+import { videoStreamingModeFromRecord } from '../lib/videoStreamingMode.js';
 import { useVideoGenFieldState } from './useVideoGenFieldState.js';
 import { useVideoGenSubmitFlow } from './useVideoGenSubmitFlow.js';
 import { useVideoGenValidation } from './useVideoGenValidation.js';
@@ -53,12 +53,14 @@ const editableRemixModel = (models, defaultModelId) => {
  * that clear now-irrelevant inputs, the derived model/keyframe/IC gates, and
  * `buildGeneratePayload()` — the single client-side source of truth for the
  * shape `server/routes/videoGen.js` validates. `VideoGen.jsx` keeps the
- * fetching (status/models/history/gallery), the SSE run pipeline, the batch
- * queue, and the rendering.
+ * fetching (status/model-context/history/gallery), the SSE run pipeline, the
+ * batch queue, and the rendering.
  *
  * The caller supplies the fetched context the form has to react to:
- *   - `models` / `status` — from `getVideoGenStatus()`; drive the model
- *     dropdown, the default-model seed, and the mode-compatibility fallback.
+ *   - `models` / `modelContext` — from `getVideoGenModelContext()`; drive the
+ *     model dropdown, the default-model seed, and the mode-compatibility
+ *     fallback. Deliberately NOT `getVideoGenStatus()`: that route shells out
+ *     to python, and the picker must not wait on the interpreter probe.
  *   - `availableLoras` — the installed LoRA library, for name resolution.
  *   - `grokEnabled` — the Settings → Image Gen toggle that reveals the
  *     Local/Grok backend switch.
@@ -68,8 +70,17 @@ const editableRemixModel = (models, defaultModelId) => {
  *     `buildGeneratePayload()` emit the text-to-video-only shape the federated
  *     wire accepts — kept here rather than in the page so there stays exactly
  *     one builder for what `server/routes/videoGen.js` validates.
+ *   - `displaySleepEnabled` — the page's effective choice (settings default,
+ *     overridable per render) for whether a local MLX render should sleep the
+ *     display. `buildGeneratePayload()` only attaches it when the SELECTED
+ *     MODEL actually has the mitigation (`currentModel.sleepsDisplayDuringRender`),
+ *     so the page doesn't need its own copy of that gate to build the payload —
+ *     only to decide whether to show the control at all.
  */
-export function useVideoGenForm({ models, status, availableLoras, grokEnabled, remoteSubmissionFields = null }) {
+export function useVideoGenForm({
+  models, modelContext, availableLoras, grokEnabled, falEnabled = false, reactorEnabled = false,
+  remoteSubmissionFields = null, displaySleepEnabled = false,
+}) {
   const [searchParams, setSearchParams] = useSearchParams();
   const incomingSourceImage = searchParams.get('sourceImageFile');
   const incomingAudioFilename = searchParams.get('audioFilename');
@@ -90,6 +101,12 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     extendFromVideoId, setExtendFromVideoId,
     fps, setFps,
     grokDuration, setGrokDuration,
+    falDuration, setFalDuration,
+    falModelId, setFalModelId,
+    reactorClipId, setReactorClipId,
+    reactorSeconds, setReactorSeconds,
+    reactorSeed, setReactorSeed,
+    reactorAspect, setReactorAspect,
     guidanceScale, setGuidanceScale,
     height, setHeight,
     i2vReferenceMode, setI2vReferenceMode,
@@ -112,12 +129,14 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     prompt, setPrompt,
     remixModelFallback, setRemixModelFallback,
     remixSourceModel, setRemixSourceModel,
+    batchSize, setBatchSize,
     seed, setSeed,
     selectedLoras, setSelectedLoras,
     selectedUniverse, setSelectedUniverse,
     sizeManuallySetRef,
     speedProfileId, setSpeedProfileId,
     draftDecode, setDraftDecode,
+    streamingMode, setStreamingMode,
     staleModelToastRef,
     steps, setSteps,
     stylePreset, setStylePreset,
@@ -163,11 +182,11 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
       });
     return () => { cancelled = true; };
   }, [incomingAudioFilename, setSearchParams]);
-  // Seed the model dropdown from the server's default once /status lands,
-  // without clobbering a Remix/deep-link/user pick that already set it.
+  // Seed the model dropdown from the server's default once the model context
+  // lands, without clobbering a Remix/deep-link/user pick that already set it.
   useEffect(() => {
-    if (status?.defaultModel) setModelId((prev) => prev || status.defaultModel);
-  }, [status?.defaultModel]);
+    if (modelContext?.defaultModel) setModelId((prev) => prev || modelContext.defaultModel);
+  }, [modelContext?.defaultModel]);
 
   // Re-sync when ImageGen pipes a new image via ?sourceImageFile=...
   useEffect(() => {
@@ -240,7 +259,8 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     // VIDEO_TILING_OPTIONS so a hand-edited URL or stale link can't push the
     // <select> into an invalid state and 400 the next POST.
     const urlTiling = get('tiling');
-    if (urlTiling && VIDEO_TILING_ENUM_SET.has(urlTiling)) setTiling(urlTiling);
+    const normalizedUrlTiling = normalizeVideoTiling(urlTiling);
+    if (normalizedUrlTiling) setTiling(normalizedUrlTiling);
     // disableAudio is a boolean; accept the common encodings a hand-edited URL
     // might carry ('1' from our own Remix builder, 'true' from a manual share).
     // Anything else (absent, '0', 'false', garbage) means "default off".
@@ -370,7 +390,8 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
   //     server would 400 on submit; we proactively swap to a compatible model.
   // a2v fallback preference: highest-memory model that fits this machine
   // (leaving headroom for the OS + text encoder) > the largest if none fit.
-  // Other modes: status.defaultModel (if compatible) > first compatible model.
+  // Other modes: the context's defaultModel (if compatible) > first
+  // compatible model.
   useEffect(() => {
     if (!modelId || models.length === 0) return;
     const current = models.find((m) => m.id === modelId);
@@ -385,13 +406,13 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
       // so the user can at least try, and the install banner / OOM surfaces
       // the real constraint instead of a silent dropdown change.
       const reserveGb = 16;
-      // typeof === 'number' (not `status?.systemMemoryGb ? ...`) so a server
-      // legitimately reporting a tiny number (0 GB after rounding on a
-      // sub-GB box) flows through the `fits` check and lands on the
-      // smallest model. The truthiness shortcut would collapse 0 with
-      // "absent" and pick the LARGEST model on a tiny machine.
-      const budget = typeof status?.systemMemoryGb === 'number'
-        ? Math.max(0, status.systemMemoryGb - reserveGb)
+      // typeof === 'number' (not `modelContext?.systemMemoryGb ? ...`) so a
+      // server legitimately reporting a tiny number (0 GB after rounding on a
+      // sub-GB box) flows through the `fits` check and lands on the smallest
+      // model. The truthiness shortcut would collapse 0 with "absent" and pick
+      // the LARGEST model on a tiny machine.
+      const budget = typeof modelContext?.systemMemoryGb === 'number'
+        ? Math.max(0, modelContext.systemMemoryGb - reserveGb)
         : Number.POSITIVE_INFINITY;
       const sortedDesc = [...visibleModels].sort(
         (a, b) => videoModelMemoryGb(b) - videoModelMemoryGb(a),
@@ -399,18 +420,18 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
       const fits = sortedDesc.find((m) => videoModelMemoryGb(m) <= budget);
       fallback = (fits || sortedDesc[sortedDesc.length - 1])?.id || '';
     } else {
-      const defaultModel = models.find((m) => m.id === status?.defaultModel);
+      const defaultModel = models.find((m) => m.id === modelContext?.defaultModel);
       if (defaultModel && isModelAllowedForMode(defaultModel, mode)) {
         fallback = defaultModel.id;
       } else {
-        fallback = visibleModels[0]?.id || status?.defaultModel || models[0]?.id || '';
+        fallback = visibleModels[0]?.id || modelContext?.defaultModel || models[0]?.id || '';
       }
     }
     if (!fallback || fallback === modelId) return;
     // Toast only for the stale-id case (model removed from catalog). The
     // mode-incompatibility swap is expected behavior after a mode change —
     // no need to surface it. Name the destination model so users on a2v
-    // don't think they landed on `status.defaultModel` (they may not have —
+    // don't think they landed on `modelContext.defaultModel` (they may not have —
     // a2v picks the largest-fits model, which is often a dgrauet entry).
     if (!current && staleModelToastRef.current !== modelId) {
       staleModelToastRef.current = modelId;
@@ -418,7 +439,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
       toast(`Original model "${modelId}" is no longer available — switched to "${fallbackName}"`);
     }
     applyModelSelection(fallback);
-  }, [modelId, models, status?.defaultModel, status?.systemMemoryGb, mode, visibleModels, applyModelSelection]);
+  }, [modelId, models, modelContext?.defaultModel, modelContext?.systemMemoryGb, mode, visibleModels, applyModelSelection]);
 
   const currentModel = models.find((m) => m.id === modelId);
 
@@ -435,9 +456,9 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     setNumFrames(frames);
   }, [audioDurationSec, currentModel, fps, mode]);
 
-  // A source model can reach this hook either through a URL handoff before
-  // /status has populated `models`, or from the in-page gallery after it has.
-  // Resolve both cases here. The fallback is deliberately limited to models
+  // A source model can reach this hook either through a URL handoff before the
+  // model context has populated `models`, or from the in-page gallery after it
+  // has. Resolve both cases here. The fallback is deliberately limited to models
   // that can run a text remix and expose all restored prompt/sampler controls;
   // if no such model is installed we leave the source selected rather than
   // silently changing a faithful re-render.
@@ -445,7 +466,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     if (!remixSourceModel || models.length === 0) return;
     const source = models.find((model) => model.id === remixSourceModel.id);
     if (source && !remixSourceModel.preserveConditioning && !hasEditableRemixControls(source)) {
-      const target = editableRemixModel(models, status?.defaultModel);
+      const target = editableRemixModel(models, modelContext?.defaultModel);
       if (target) {
         setModelId(target.id);
         setRemixModelFallback({
@@ -459,7 +480,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
       setRemixModelFallback(null);
     }
     setRemixSourceModel(null);
-  }, [remixSourceModel, models, status?.defaultModel]);
+  }, [remixSourceModel, models, modelContext?.defaultModel]);
 
   // Until the user deliberately chooses a size, model changes carry their own
   // native default canvas. This is material for H3: the shared 768x512 default
@@ -528,6 +549,27 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     [availableLoras, loraFamily],
   );
 
+  // `applyRemix` resolves each restored LoRA's DISPLAY NAME out of the installed
+  // library at apply time, falling back to the raw filename. The cross-page
+  // Remix handoff (#6290) can apply before that library has landed — the page
+  // fetches the LoRA list and the history list as independent mount effects with
+  // no ordering — so re-resolve once it arrives, or the picker sits on
+  // `lora-example-v7.safetensors` for the session. Filename and scale (what the
+  // payload is built from) are untouched; only the label is filled in.
+  useEffect(() => {
+    if (!availableLoras.length) return;
+    setSelectedLoras((prev) => {
+      let changed = false;
+      const next = prev.map((selected) => {
+        const name = availableLoras.find((l) => l.filename === selected.filename)?.name;
+        if (!name || name === selected.name) return selected;
+        changed = true;
+        return { ...selected, name };
+      });
+      return changed ? next : prev;
+    });
+  }, [availableLoras]);
+
   // Installed video LoRAs bucketed by family, regardless of the selected model.
   // One pass instead of one filter per family, and the source for the
   // "why is the picker gone" hint below.
@@ -583,7 +625,16 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
   // lane reads only prompt/dims/source-image/duration, so its image_to_video
   // always anchors and the promise has to collapse to the default there.
   const isGrok = grokEnabled && backend === 'grok';
-  const referenceModeApplies = mode === 'image' && !isGrok;
+  // fal.ai's queue REST API is usability-gated on a configured API key
+  // (`falEnabled`, mirrored from the server's isVideoModeUsable check), not a
+  // toggle — same short-circuit shape as grok: only prompt/dims/source-image
+  // and a duration reach the provider.
+  const isFal = falEnabled && backend === 'fal';
+  // reactor.inc fast-h3 is likewise usability-gated on a configured API key
+  // (`reactorEnabled`) — same short-circuit shape as fal, plus native
+  // clip-to-clip chaining via continue_from_clip_id.
+  const isReactor = reactorEnabled && backend === 'reactor';
+  const referenceModeApplies = mode === 'image' && !isGrok && !isFal && !isReactor;
   // The strength the render will actually use, for the slider readout — an
   // untouched slider under Inspire still resolves to the contract's low default
   // rather than the pipeline's 1.0, and the panel must say so.
@@ -634,7 +685,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
   const handleResolutionChange = (w, h) => {
     setWidth(w); setHeight(h); sizeManuallySetRef.current = true;
   };
-  const handleRandomSeed = () => setSeed(randomSeed());
+  const handleRandomSeed = () => setSeed('');
   // Switching model drops the sampler overrides — steps/guidanceScale are
   // per-model defaults, and carrying one model's numbers onto another is
   // usually wrong.
@@ -712,7 +763,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     keyframesActive,
     mode,
     numFrames,
-    pixelBudget: status?.fflfLtx2PixelBudget,
+    pixelBudget: modelContext?.fflfLtx2PixelBudget,
     sourceImageFile,
     sourceImageUpload,
     width,
@@ -867,7 +918,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
   // clip survives the switch and reappears if the user flips back.
   const handleBackendChange = (id) => {
     setBackend(id);
-    if (id === 'grok' && mode !== 'text' && mode !== 'image') {
+    if ((id === 'grok' || id === 'fal' || id === 'reactor') && mode !== 'text' && mode !== 'image') {
       handleModeChange((sourceImageFile || sourceImageUpload) ? 'image' : 'text');
     }
   };
@@ -1012,7 +1063,8 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     // tiling must match the VIDEO_TILING_OPTIONS enum. Legacy sidecars sometimes
     // store a boolean here — silently ignore unknown values so the <select>
     // stays valid and the next POST doesn't 400.
-    if (typeof item.tiling === 'string' && VIDEO_TILING_ENUM_SET.has(item.tiling)) setTiling(item.tiling);
+    const tiling = normalizeVideoTiling(item.tiling);
+    if (tiling) setTiling(tiling);
     // ALWAYS set explicitly, like steps/guidanceScale above: history stamps the
     // strength only when it applied, so a missing field means "the model default"
     // and has to clear a leftover value rather than steer a render the user asked
@@ -1032,6 +1084,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     setTextEncoderId(textEncoderIdFromRecord(item.textEncoderId));
     setSpeedProfileId(speedProfileIdFromRecord(item.speedProfileId));
     setDraftDecode(draftDecodeFromRecord(item.draftDecode));
+    setStreamingMode(videoStreamingModeFromRecord(item.streamingMode));
     // disableAudio: always set explicitly (true/false) so the toggle reliably
     // matches the remixed render. Skipping the false branch would leave the
     // toggle stuck ON when the user remixes a clip that had audio enabled.
@@ -1138,7 +1191,8 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     if (p.fps) setFps(p.fps);
     if (p.steps != null) setSteps(String(p.steps));
     if (p.guidanceScale != null) setGuidanceScale(String(p.guidanceScale));
-    if (p.seed != null) setSeed(String(p.seed));
+    setBatchSize(p.batchSize ?? 1);
+    setSeed(p.seed == null ? '' : String(p.seed));
     if (p.tiling) setTiling(p.tiling);
     // Conditioning promise + strength. Both are echoed only when they applied, so
     // absence means "the defaults" and must CLEAR whatever the form last held —
@@ -1150,6 +1204,7 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     setTextEncoderId(textEncoderIdFromRecord(p.textEncoderId));
     setSpeedProfileId(speedProfileIdFromRecord(p.speedProfileId));
     setDraftDecode(draftDecodeFromRecord(p.draftDecode));
+    setStreamingMode(videoStreamingModeFromRecord(p.streamingMode));
     if (typeof p.disableAudio === 'boolean') setDisableAudio(p.disableAudio);
     if (p.mode === 'grok') {
       // Grok job: 'grok' is the queue discriminator, not a semantic video
@@ -1157,6 +1212,20 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
       setBackend('grok');
       setMode(p.videoMode === 'image' ? 'image' : 'text');
       if (p.duration) setGrokDuration(p.duration);
+    } else if (p.mode === 'fal') {
+      // fal.ai job: same discriminator shape as grok above.
+      setBackend('fal');
+      setMode(p.videoMode === 'image' ? 'image' : 'text');
+      if (p.duration) setFalDuration(p.duration);
+      if (p.modelId) setFalModelId(p.modelId);
+    } else if (p.mode === 'reactor') {
+      // reactor.inc job: same discriminator shape as grok/fal above.
+      setBackend('reactor');
+      setMode(p.videoMode === 'image' ? 'image' : 'text');
+      if (p.continueFromClipId) setReactorClipId(p.continueFromClipId);
+      if (p.seconds) setReactorSeconds(p.seconds);
+      if (p.seed !== undefined && p.seed !== null) setReactorSeed(p.seed);
+      if (p.aspect) setReactorAspect(p.aspect);
     } else if (p.mode) setMode(p.mode);
     if (p.chunks && p.chunks > 1) setChunks(p.chunks);
     // 0 is a real restored value ("last frame only"), so this can't gate on
@@ -1229,11 +1298,13 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
   // Snapshot the current validated state into a wire payload. The submit flow
   // stays pure so all three backend contracts can be tested independently.
   const submissionState = {
-    isGrok, grokDuration, remoteSubmissionFields,
+    isGrok, grokDuration, isFal, falDuration, falModelId,
+    isReactor, reactorClipId, reactorSeconds, reactorSeed, reactorAspect, remoteSubmissionFields,
+    displaySleepEnabled,
     prompt, negativePrompt, stylePreset, selectedUniverse,
     width, height, mode, sourceImageFile, sourceImageUpload,
-    numFrames, fps, steps, guidanceScale, seed,
-    currentModel, models, modelId, tiling, textEncoderId, speedProfileId, draftDecode,
+    numFrames, fps, steps, guidanceScale, seed, batchSize,
+    currentModel, models, modelId, tiling, textEncoderId, speedProfileId, draftDecode, streamingMode,
     disableAudio, noMusic, imageStrength, i2vReferenceMode,
     keyframesActive, keyframes, loraFamily, selectedLoras,
     lastImageFile, lastImageUpload, extendFromVideoId, audioFile,
@@ -1245,8 +1316,14 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
 
   return {
     // Backend + mode
-    backend, isGrok, handleBackendChange,
+    backend, isGrok, isFal, isReactor, handleBackendChange,
     grokDuration, setGrokDuration,
+    falDuration, setFalDuration,
+    falModelId, setFalModelId,
+    reactorClipId, setReactorClipId,
+    reactorSeconds, setReactorSeconds,
+    reactorSeed, setReactorSeed,
+    reactorAspect, setReactorAspect,
     mode, handleModeChange,
     // Prompt + style
     prompt, setPrompt,
@@ -1274,11 +1351,13 @@ export function useVideoGenForm({ models, status, availableLoras, grokEnabled, r
     imageStrength, setImageStrength,
     i2vReferenceMode, setI2vReferenceMode,
     referenceModeSupported, effectiveImageStrength,
+    batchSize, setBatchSize,
     seed, setSeed, handleRandomSeed,
     tiling, setTiling,
     textEncoderId, setTextEncoderId, textEncoderOptions,
     speedProfileId, setSpeedProfileId,
     draftDecode, setDraftDecode, draftDecodeOptions,
+    streamingMode, setStreamingMode,
     disableAudio, setDisableAudio,
     noMusic, setNoMusic,
     // Frames

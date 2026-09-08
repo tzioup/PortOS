@@ -21,15 +21,17 @@ import { join } from 'path';
 import { getActiveProvider } from './providers.js';
 import { isInternalTaskId } from '../lib/taskParser.js';
 import { isAutoApprovableInvestigation } from '../lib/investigationTasks.js';
-import { INTERVAL_TYPES, isReconcileDrainTaskType } from './taskScheduleConstants.js';
 import { isRetryHeld, isStaleRetryHold } from '../lib/taskRetryHold.js';
 import { isAppOnCooldown, markAppReviewCooldown, bindAppReviewAgent, clearStaleActiveAgents } from './appActivity.js';
 import { getActiveApps } from './apps.js';
+import { logCosScheduleUpdate } from './userActionScheduleLog.js';
 import { getPerformanceSummary, checkAndRehabilitateSkippedTasks, getLearningInsights } from './taskLearning.js';
 import { schedule as scheduleEvent, cancel as cancelEvent } from './eventScheduler.js';
 import { generateProactiveTasks as generateMissionTasks } from './missions.js';
 import { recordJobExecution } from './autonomousJobs.js';
 import { safeJSONParse, sleep, isTopLevelEntryName } from '../lib/fileUtils.js';
+import { onDemandRequestMetadata } from '../lib/quotaBurnOrigin.js';
+import { ON_DEMAND_ORIGINS } from './taskScheduleConstants.js';
 import { ServerError } from '../lib/errorHandler.js';
 import { addNotification, NOTIFICATION_TYPES } from './notifications.js';
 import { todayInTimezone } from '../lib/timezone.js';
@@ -39,6 +41,8 @@ import { normalizeDomainBudgets, remainingActionBudget } from '../lib/domainBudg
 import { mergePersistentMindCapabilities } from '../lib/persistentMindCapabilities.js';
 import { mergePersistentMindProfile, normalizePersistentMindProfile } from '../lib/persistentMindProfile.js';
 import { mergePersistentMindPrompt } from '../lib/persistentMindPrompt.js';
+import { mergePersistentMindPlaybook } from '../lib/persistentMindPlaybook.js';
+import { mergePersistentMindThinkingPresets } from '../lib/persistentMindThinkingPresets.js';
 import { getDomainBudgetStatus } from './domainUsage.js';
 import { pendingCosActionReservations } from './cosAdmissionReservations.js';
 // Dependency-free leaf holding the shared agent maps + the runner-mode flag,
@@ -46,7 +50,7 @@ import { pendingCosActionReservations } from './cosAdmissionReservations.js';
 import { useRunner } from './agentState.js';
 
 // Shared state management (extracted to avoid circular deps)
-import { loadState, saveState, withStateLock, ensureDirectories, isImprovementEnabled, canQueueImprovementTasks, SCRIPTS_DIR, isDaemonRunning, setDaemonRunning } from './cosState.js';
+import { loadState, saveState, withStateLock, loadConfig, saveConfig, withConfigLock, ensureDirectories, isImprovementEnabled, canQueueImprovementTasks, SCRIPTS_DIR, isDaemonRunning, setDaemonRunning } from './cosState.js';
 
 // Events and logging (canonical source: cosEvents.js)
 import { cosEvents, emitLog } from './cosEvents.js';
@@ -132,6 +136,7 @@ import {
   generateManagedAppImprovementTaskForType,
   recordDeferredPerpetualDispatch,
   applyOnDemandConsent,
+  drainProgrammaticOnDemandRequests,
   emitOnDemandEmpty,
   blockIfExceedsMaxSpawns,
   selectDryRunAutoApproved,
@@ -172,7 +177,11 @@ import {
   registerPersistentMindTurnAdapter,
   unregisterPersistentMindTurnAdapter,
 } from './persistentMindSupervisor.js';
-import { createPersistentMindTurnAdapter } from './persistentMindAdapter.js';
+// `./persistentMindAdapter.js` is imported lazily where the daemon registers the
+// adapter, NOT here. It pulls in the whole CoS tool registry — and through it the
+// voice tool surface, ask service and image-gen backends — a graph the daemon only
+// executes once it is actually running, but that a static edge instantiated in
+// every suite importing cos.js for an unrelated helper.
 
 export {
   getPersistentMindState,
@@ -227,22 +236,26 @@ export { getConfig } from './cosState.js';
  */
 export async function updateConfig(updates) {
   let persistentMindWakeCadenceChanged = false;
-  const config = await withStateLock(async () => {
-    const state = await loadState();
+  // Config has its own file and its own tail (#6182) — a settings write no
+  // longer serializes behind the runtime-record writes in state.json.
+  const config = await withConfigLock(async () => {
+    const current = await loadConfig();
     // domainAutonomy is a partial-friendly map: a PATCH that names only one
     // domain must merge over the others rather than replace the whole object.
     // Capture the prior map BEFORE the spread clobbers it, then normalize the
     // merge so an unknown/invalid stored value resolves to the `execute` default.
-    const priorDomainAutonomy = state.config.domainAutonomy;
+    const priorDomainAutonomy = current.domainAutonomy;
     // Same for domainBudgets — a PATCH naming one domain (or one cap on one
     // domain) must merge field-by-field over the rest, not replace the map.
-    const priorDomainBudgets = state.config.domainBudgets;
-    const priorPersistentMindCapabilities = state.config.persistentMindCapabilities;
-    const priorPersistentMindProfile = state.config.persistentMindProfile;
-    const priorPersistentMindPrompt = state.config.persistentMindPrompt;
-    state.config = { ...state.config, ...updates };
+    const priorDomainBudgets = current.domainBudgets;
+    const priorPersistentMindCapabilities = current.persistentMindCapabilities;
+    const priorPersistentMindProfile = current.persistentMindProfile;
+    const priorPersistentMindPrompt = current.persistentMindPrompt;
+    const priorPersistentMindPlaybook = current.persistentMindPlaybook;
+    const priorPersistentMindThinkingPresets = current.persistentMindThinkingPresets;
+    const next = { ...current, ...updates };
     if (updates.domainAutonomy !== undefined) {
-      state.config.domainAutonomy = normalizeDomainAutonomy({
+      next.domainAutonomy = normalizeDomainAutonomy({
         ...priorDomainAutonomy,
         ...updates.domainAutonomy
       });
@@ -252,7 +265,7 @@ export async function updateConfig(updates) {
       for (const [id, caps] of Object.entries(updates.domainBudgets)) {
         mergedBudgets[id] = { ...(priorDomainBudgets?.[id] || {}), ...caps };
       }
-      state.config.domainBudgets = normalizeDomainBudgets(mergedBudgets);
+      next.domainBudgets = normalizeDomainBudgets(mergedBudgets);
     }
     if (updates.persistentMindProfile !== undefined) {
       const nextPersistentMindProfile = mergePersistentMindProfile(
@@ -261,22 +274,52 @@ export async function updateConfig(updates) {
       );
       persistentMindWakeCadenceChanged = nextPersistentMindProfile.wakeIntervalMinutes
         !== normalizePersistentMindProfile(priorPersistentMindProfile).wakeIntervalMinutes;
-      state.config.persistentMindProfile = nextPersistentMindProfile;
+      next.persistentMindProfile = nextPersistentMindProfile;
     }
     if (updates.persistentMindCapabilities !== undefined) {
-      state.config.persistentMindCapabilities = mergePersistentMindCapabilities(
+      next.persistentMindCapabilities = mergePersistentMindCapabilities(
         priorPersistentMindCapabilities,
         updates.persistentMindCapabilities,
       );
     }
+    if (updates.persistentMindThinkingPresets !== undefined) {
+      next.persistentMindThinkingPresets = mergePersistentMindThinkingPresets(
+        priorPersistentMindThinkingPresets,
+        updates.persistentMindThinkingPresets,
+      );
+    }
+    if (updates.persistentMindCapabilities?.thinkingPresetAllowlist !== undefined) {
+      const { approvePersistentMindThinkingPresets } = await import('./persistentMindThinkingRequests.js');
+      next.persistentMindCapabilities.thinkingPresetGrants = await approvePersistentMindThinkingPresets(
+        next, next.persistentMindCapabilities.thinkingPresetAllowlist,
+      );
+    }
     if (updates.persistentMindPrompt !== undefined) {
-      state.config.persistentMindPrompt = mergePersistentMindPrompt(
+      next.persistentMindPrompt = mergePersistentMindPrompt(
         priorPersistentMindPrompt,
         updates.persistentMindPrompt,
       );
     }
-    await saveState(state);
-    return state.config;
+    if (updates.persistentMindPlaybook !== undefined) {
+      next.persistentMindPlaybook = mergePersistentMindPlaybook(
+        priorPersistentMindPlaybook,
+        updates.persistentMindPlaybook,
+      );
+    }
+    return saveConfig(next);
+  });
+  if (updates.persistentMindCapabilities !== undefined || updates.persistentMindThinkingPresets !== undefined) {
+    const { cancelPersistentMindThinkingRequest } = await import('./persistentMindThinkingRequests.js');
+    await cancelPersistentMindThinkingRequest({ ifRevoked: true });
+  }
+  const improveKeys = ['improvementEnabled', 'selfImprovementEnabled', 'appImprovementEnabled'];
+  const improvePatch = Object.fromEntries(
+    improveKeys.filter((key) => Object.prototype.hasOwnProperty.call(updates, key)).map((key) => [key, updates[key]]),
+  );
+  await logCosScheduleUpdate({
+    target: 'cos-config',
+    patch: improvePatch,
+    source: { service: 'cos', fn: 'updateConfig' },
   });
   cosEvents.emit('config:changed', config);
   if (persistentMindWakeCadenceChanged) {
@@ -503,6 +546,7 @@ async function runStart() {
   emitLog('info', 'Running initial task evaluation...');
   await evaluateTasks({ initialStartup: true });
   await runHealthCheck();
+  const { createPersistentMindTurnAdapter } = await import('./persistentMindAdapter.js');
   await registerPersistentMindTurnAdapter(createPersistentMindTurnAdapter());
   await initializePersistentMindSupervisor();
 
@@ -963,10 +1007,19 @@ async function spawnDequeuePriority0OnDemand(ctx) {
   // (avoids a second load).
   ctx.taskSchedule = taskSchedule;
 
+  // Programmatic handlers first, and outside the slot-bounded loop below: they
+  // spawn nothing, so a full spawn budget must not hold a user's Run Now.
+  const handledProgrammatically = await drainProgrammaticOnDemandRequests({
+    taskScheduleMod, requests: onDemandRequests, schedule: taskSchedule, state
+  });
+
   // Track apps already marked review-started this cycle so multiple on-demand
   // requests for the same app don't each rewrite its activity record.
   const reviewStartedApps = new Set();
   for (const request of onDemandRequests) {
+    // Already handled above (and its request cleared) — `onDemandRequests` is a
+    // snapshot taken before that drain.
+    if (handledProgrammatically.has(request.id)) continue;
     if (capacity.spawned >= capacity.availableSlots) break;
 
     if (!isImprovementEnabled(state)) {
@@ -1017,7 +1070,14 @@ async function spawnDequeuePriority0OnDemand(ctx) {
       task = await generateManagedAppImprovementTaskForType(request.taskType, targetApp, state, {
         skipPreconditions: true,
         deferPerpetualDispatch: true,
-        targetPullRequest: request.targetPullRequest ?? null
+        targetPullRequest: request.targetPullRequest ?? null,
+        providerOverride: request.providerOverride ?? null,
+        // Mirrors the sibling engine in cosTaskGenerator.js#spawnPriority0OnDemand
+        // — either may drain any given request, so a quota-burn step's run
+        // parameters have to reach the generator from both or the mode a
+        // migrated issues-only step pinned depends on which engine got there
+        // first.
+        runOverrides: request.burn?.overrides?.params ?? null
       });
       if (task) {
         await bindAppReviewAgent(targetApp.id, `on-demand-${Date.now()}`);
@@ -1043,7 +1103,10 @@ async function spawnDequeuePriority0OnDemand(ctx) {
       // continues in the same user-initiated lane instead of the auto-run-gated
       // queue path (see perpetualRefillPlan). Stamped before addTask so the
       // blocked-revive branch below inherits it via `task.metadata` too.
-      task.metadata = { ...(task.metadata || {}), onDemand: true };
+      // `onDemandRequestMetadata` also carries the request's ORIGIN, which
+      // `perpetualRefillPlan` reads to decide whether the completed run may
+      // continue its drain — and a quota burn's provenance when it is one.
+      task.metadata = { ...(task.metadata || {}), ...onDemandRequestMetadata(request) };
       // Forward `ignoreTaskId` so a completion-triggered re-issue is dedup-safe:
       // the perpetual drain regenerates an identical first-line for the same app,
       // and `agent:completed` fires before the completing task's updateTask
@@ -1463,16 +1526,21 @@ function agentScheduledType(agent) {
     || null;
 }
 
+/**
+ * The on-demand origins whose completed perpetual run may re-issue itself: a
+ * human Run, and the drain re-issuing itself through the same lane. Everything
+ * else — a quota burn today, whatever is added tomorrow — stops after one unit.
+ */
+const DRAINABLE_ON_DEMAND_ORIGINS = new Set([ON_DEMAND_ORIGINS.USER, ON_DEMAND_ORIGINS.REFILL]);
+
 export function isPerpetualRefillCandidate(agent, schedule) {
   const analysisType = agentScheduledType(agent);
   if (!analysisType) return false;
   const taskDef = schedule?.tasks?.[analysisType];
-  const isPerpetual = taskDef?.type === INTERVAL_TYPES.PERPETUAL;
-  const isOnDemandReconcile = taskDef?.type === INTERVAL_TYPES.ON_DEMAND
-    && isReconcileDrainTaskType(analysisType);
-  // Reconciliation keeps its drain semantics even though its fresh-install
-  // interval is on-demand; all other on-demand tasks remain single-run actions.
-  return Boolean(taskDef?.enabled) && (isPerpetual || isOnDemandReconcile);
+  // `perpetual` is the single drain signal, orthogonal to the cadence type: an
+  // on-demand or cron task carrying the flag re-queues on completion, and one
+  // without it stays a single-run action.
+  return Boolean(taskDef?.enabled) && taskDef?.perpetual === true;
 }
 
 /**
@@ -1509,6 +1577,16 @@ export function perpetualRefillPlan(agent, schedule) {
   // silently promote that click into a sweep of every open contributor PR.
   if (agent?.metadata?.taskTargetPullRequest) return { lane: 'skip' };
   if (agent?.metadata?.taskOnDemand) {
+    // Which ORIGINS may keep draining in this lane, as an allowlist rather than
+    // a growing list of exclusions — so an automated origin added later fails
+    // CLOSED. A QUOTA BURN invokes exactly ONE unit of its referenced task: the
+    // burn has its own continuation (quotaBurnRunner#onBurnAgentCompleted) behind
+    // the window/reserve/cap ladder, and refilling here as well would walk the
+    // whole backlog outside every one of those gates, on the very subscription
+    // the plan was rationing. An unrecorded origin is a human Run — that is what
+    // a task queued before the field existed is.
+    const origin = agent?.metadata?.taskOnDemandOrigin || ON_DEMAND_ORIGINS.USER;
+    if (!DRAINABLE_ON_DEMAND_ORIGINS.has(origin)) return { lane: 'skip' };
     return { lane: 'onDemand', taskType: agentScheduledType(agent), appId: agent?.metadata?.taskApp || null };
   }
   return { lane: 'queue' };
@@ -1585,7 +1663,12 @@ async function refillPerpetualForCompletedAgent(agent) {
   // regenerates an identical first-line per app) is rejected as a duplicate of
   // the completing task and the drain stalls until the next scheduler tick.
   const cosTaskData = await getCosTasks();
-  await queueEligibleImprovementTasks(state, cosTaskData, { ignoreTaskId: agent?.taskId, wakeAfterRecord: false });
+  await queueEligibleImprovementTasks(state, cosTaskData, {
+    ignoreTaskId: agent?.taskId,
+    wakeAfterRecord: false,
+    // Continue only this completed drain: its cron slot already initiated it.
+    perpetualContinuation: { taskType: agentScheduledType(agent), appId: agent?.metadata?.taskApp || null }
+  });
   // NOTE: the caller (the agent:completed handler) runs dequeueNextTask AFTER
   // this resolves, so the freshly-queued perpetual task is on the queue before
   // slots are filled. Do not dequeue here — that would re-introduce the ordering

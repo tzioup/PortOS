@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { existsSync } from 'node:fs';
 
 const listModels = vi.fn();
 const getModelCapabilities = vi.fn();
@@ -7,8 +8,74 @@ const getHfToken = vi.fn();
 vi.mock('./localLlm.js', () => ({ listModels }));
 vi.mock('./ollamaManager.js', () => ({ getModelCapabilities }));
 vi.mock('./hfToken.js', () => ({ getHfToken }));
+// No cached Prompt Guard weights → the classifier layer is "not installed".
+vi.mock('../lib/hfCache.js', () => ({ findCachedRepoFiles: vi.fn().mockResolvedValue(null), getHfCacheRoot: () => '/nonexistent/example-hf-cache' }));
+vi.mock('node:fs', async (importOriginal) => ({ ...await importOriginal(), existsSync: vi.fn().mockReturnValue(false) }));
+vi.mock('../lib/pythonSetup.js', () => ({ detectVenvBasePythonSync: vi.fn().mockReturnValue(null), createVenv: vi.fn(), installPackages: vi.fn() }));
 
-const { installModelAbuseGuard, validatePublicReviewModel } = await import('./modelAbuseGuard.js');
+const {
+  DETERMINISTIC_ONLY_GUARD_MODEL,
+  installModelAbuseGuard,
+  normalizeEligibilityFacts,
+  runModelAbuseScan,
+  validatePublicReviewModel,
+} = await import('./modelAbuseGuard.js');
+
+describe('runModelAbuseScan without the optional classifier installed', () => {
+  beforeEach(() => {
+    getHfToken.mockResolvedValue(null);
+    existsSync.mockReturnValue(false);
+  });
+
+  it('blocks missing setup by default and refuses malformed or weakened policy', async () => {
+    await expect(runModelAbuseScan({ content: 'Fix the import dialog.' })).resolves.toMatchObject({
+      ok: false, passed: false, code: 'security-guard-not-ready',
+    });
+    for (const policy of [{ classifierMode: 'disabled' }, { minBenignScore: 0.5 }, { minBenignScore: '0.99' }]) {
+      await expect(runModelAbuseScan({ content: 'Fix the import dialog.', ...policy })).resolves.toMatchObject({
+        ok: false, passed: false, code: 'security-guard-policy-invalid',
+      });
+    }
+  });
+
+  it('never silently skips an incomplete installation under optional policy', async () => {
+    existsSync.mockImplementation((path) => path.endsWith('venv-prompt-guard'));
+    await expect(runModelAbuseScan({ content: 'Fix the import dialog.', classifierMode: 'optional' })).resolves.toMatchObject({
+      ok: false, passed: false, code: 'security-guard-not-ready',
+      layers: { classifier: 'incomplete' },
+    });
+  });
+
+  it('allows explicitly optional clean content and says the classifier did not run', async () => {
+    await expect(runModelAbuseScan({ content: 'docs: fix a typo in the socket-ui skill', classifierMode: 'optional' })).resolves.toMatchObject({
+      ok: true,
+      passed: true,
+      safe: true,
+      code: 'security-guard-passed',
+      model: DETERMINISTIC_ONLY_GUARD_MODEL,
+      findings: [],
+      layers: { deterministic: 'passed', classifier: 'not-installed', verdict: 'validated' },
+    });
+  });
+
+  it('still blocks hidden or model-directed content before any classifier question arises', async () => {
+    const verdict = await runModelAbuseScan({ content: 'Fix typo\u200B\u200B in README' });
+    expect(verdict).toMatchObject({
+      ok: true,
+      passed: false,
+      safe: false,
+      code: 'security-guard-deterministic-findings',
+      layers: { deterministic: 'blocked', classifier: 'not-run' },
+    });
+    expect(verdict.findings.map((f) => f.category)).toEqual(['hidden-unicode']);
+  });
+
+  it('carries the maintainer-targeted waiver only as an explicit boolean', () => {
+    expect(normalizeEligibilityFacts({ issueLookupComplete: true, maintainerTargeted: true }).maintainerTargeted).toBe(true);
+    expect(normalizeEligibilityFacts({ issueLookupComplete: true, maintainerTargeted: 'yes' }).maintainerTargeted).toBe(false);
+    expect(normalizeEligibilityFacts(null).maintainerTargeted).toBe(false);
+  });
+});
 
 const LOCAL_CLAUDE = {
   id: 'claude-ollama',
@@ -55,7 +122,7 @@ describe('validatePublicReviewModel', () => {
       model: 'safe-model',
     })).resolves.toMatchObject({ ok: false, code: 'public-review-provider-unsupported' });
     await expect(validatePublicReviewModel({
-      provider: LOCAL_CLAUDE,
+      provider: { ...LOCAL_CLAUDE, type: 'api' },
       model: 'safe-model',
       posture: 'sandboxed-actions',
     })).resolves.toMatchObject({ ok: false, code: 'public-review-actions-provider-unsupported' });

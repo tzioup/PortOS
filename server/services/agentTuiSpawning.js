@@ -15,18 +15,18 @@ import { updateAgent } from './cosAgentLifecycle.js';
 import { createOutputSpooler } from './agentTuiSpawning/outputSpooler.js';
 import { resolveErrorAnalysis } from './agentTuiSpawning/finalizeHelpers.js';
 import { finalizeAgent, releaseAgentLane } from './agentFinalization.js';
+import { runSpawnerCompletionCleanup } from './agentCompletionCleanup.js';
 import { activeAgents, userTerminatedAgents, pausedAgents, consumePausedAgentExit, registerSpawnedAgent, unregisterSpawnedAgent } from './agentState.js';
 import { PATHS, watchForFile } from '../lib/fileUtils.js';
 import { resolveAgentCliCwd } from '../lib/spawnCwd.js';
 import { doneSentinelName, doneSentinelPath as resolveDoneSentinelPath, parseSentinelPayload } from '../lib/agentSentinel.js';
 import { shouldAbandonForHostShutdown, HOST_SHUTDOWN_REASON } from '../lib/hostShutdown.js';
 import { SENTINEL_COMPLETION_MARKER } from '../lib/agentOutputMarkers.js';
-import { PR_CREATION, prClaimWasVerified, resolvePrCompletion, resolvePrCreation } from '../lib/prDisposition.js';
-import { canTypeSlashCommands, agentOwnsPrWorkflow } from '../lib/slashdoInvocation.js';
-import { PROVIDER_TYPES } from '../lib/aiToolkit/constants.js';
-import { normalizeReviewers } from '../lib/validation.js';
+import { prClaimWasVerified, leavesPrForHuman } from '../lib/prDisposition.js';
+import { resolvePrOwnership } from '../lib/slashdoInvocation.js';
+import { mergeGateOwed, resolveMergeGateVerdict, buildMergeGateReprompt } from '../lib/mergeGateContract.js';
+import { probePrForBranch } from './prProbe.js';
 import * as git from './git.js';
-import { resolveReviewLoopOptions } from './codeReview.js';
 import { spawnTuiSessionViaRunner, classifyRunnerSpawnFailure, RUNNER_SPAWN_REFUSED, RUNNER_SPAWN_AMBIGUOUS } from './cosRunnerClient.js';
 import { resolveInteractiveShell } from '../lib/interactiveShellResolver.js';
 import { formatShellCommandLine } from '../lib/shellCd.js';
@@ -43,6 +43,10 @@ import {
   countPasteMarkers,
   createSelfClearingSignalGate,
   createOomNudgeGate,
+  createRetryStallGate,
+  createToolPermissionGate,
+  TOOL_PERMISSION_DECLINE_MAX,
+  TOOL_PERMISSION_NUDGE_TEXT,
   OOM_NUDGE_MAX_ATTEMPTS,
   OOM_NUDGE_TEXT,
   createMcpBootTracker,
@@ -64,11 +68,12 @@ import {
   extractVerifiablePromptPrefix,
   isPasteConfirmed,
   SUBMIT_KEY,
+  detectMissingTuiBinary,
 } from '../lib/tuiHandshake.js';
-import { injectTuiModelAndEffort } from '../lib/providerVendors.js';
-import { isPublicReviewNoToolProfile } from '../lib/agentExecutionProfiles.js';
+import { buildVendorSpawnConfig, injectTuiModelAndEffort, supportsTuiPublicReviewPosture } from '../lib/providerVendors.js';
+import { isPublicReviewRestrictedProfile, publicReviewPostureForProfile } from '../lib/agentExecutionProfiles.js';
 import { agentGuardEnv } from '../lib/agentGuard/index.js';
-import { composeProviderEnv } from '../lib/cliChildEnv.js';
+import { buildCliChildEnv, composeProviderEnv } from '../lib/cliChildEnv.js';
 import { cliProviderAuthDescriptor } from '../lib/processEnv.js';
 import { ensureOllamaAgentContext } from './ollamaAgentContext.js';
 import { isOllamaBackedProvider } from './providers.js';
@@ -91,10 +96,37 @@ const PROVIDER_SIGNAL_POLL_MS = 5000;
 // The filename is per agent instance — see doneSentinelName in ../lib/agentSentinel.js.
 
 /**
- * Thin wrapper around `shellService.createShellSession` for the agent TUI
- * path. Centralizes the agent-side defaults (kind, label, initialCommand)
- * and pairs the returned session id with its underlying pty process so
- * callers don't have to make a second `getSessionProcess` call inline.
+ * What kind of PTY a TUI run gets. Resolved ONCE per run and threaded, rather
+ * than re-derived wherever it matters: two consumers wire the prompt handshake
+ * BEFORE the spawn happens, and a predicate that silently disagreed with the
+ * branch actually taken fails by never delivering the prompt — no error, on a
+ * live run.
+ *
+ *   'runner'      — the CoS Runner owns the PTY, in another process.
+ *   'direct'      — this process pty.spawns the provider binary itself.
+ *   'login-shell' — an interactive login shell with the CLI typed into it.
+ *
+ * A public-content stage is `direct` because a login shell would run the
+ * operator's rc file inside its allowlisted environment (#6159). It is never
+ * `runner`: the runner builds its own child env, which would drop that
+ * allowlist, so `agentLifecycle.js` forces those stages direct-only and
+ * `createAgentTuiSession` fails closed if one arrives anyway.
+ *
+ * This is a separate axis from `isPublicReviewRestrictedProfile` itself, which
+ * answers a different question (is the env COMPLETE or a delta?) — the runner
+ * case is the proof they are not the same axis.
+ */
+export function resolveTuiLaunchShape({ useDurableRunner = false, safetyProfile = null } = {}) {
+  if (useDurableRunner) return 'runner';
+  return isPublicReviewRestrictedProfile(safetyProfile) ? 'direct' : 'login-shell';
+}
+
+/**
+ * Open the agent TUI's PTY and pair the returned session id with its underlying
+ * pty process, so callers don't have to make a second `getSessionProcess` call
+ * inline. Centralizes the agent-side defaults (kind, label, initialCommand).
+ *
+ * Which of the three PTY shapes it opens is `resolveTuiLaunchShape`'s call.
  *
  * Returns `{ sessionId, ptyProcess, pid }`. When the shell service fails
  * to create the session, `sessionId` is null and the caller is expected
@@ -110,12 +142,49 @@ export async function createAgentTuiSession({
   forgeTokenEnv = {},
   doneSentinelPath = null,
   useDurableRunner = false,
+  safetyProfile = null,
   onData,
   onExit,
   onInitialCommandSent,
 }) {
-  const env = { ...composeProviderEnv({ before: forgeTokenEnv, provider, model }), ...agentGuardEnv() };
-  if (useDurableRunner) {
+  const restricted = isPublicReviewRestrictedProfile(safetyProfile);
+  // A public-content stage's PTY starts from the SAME environment its headless
+  // sibling gets — no forge credential, no SSH config, no cloud key, no
+  // arbitrary provider var — so it calls the very builder the headless path
+  // uses rather than re-deriving the profile→allowlist mapping here.
+  //
+  // The two branches produce DIFFERENT KINDS of value, which is why they route
+  // to different spawn entry points below. `buildCliChildEnv` returns a COMPLETE
+  // environment, so a restricted stage goes to `spawnCommandSession`, which
+  // unions nothing underneath it — and which is also what removes the login
+  // shell, so the operator's rc file can no longer run between this allowlist
+  // and the provider and re-export whatever it likes (#6159). The ordinary
+  // branch is a DELTA: `createShellSession` unions it onto `buildSafeEnv`.
+  const env = restricted
+    ? buildCliChildEnv({ before: forgeTokenEnv, provider, model, cwd, guard: true, safetyProfile })
+    : { ...composeProviderEnv({ before: forgeTokenEnv, provider, model }), ...agentGuardEnv() };
+  // How this session identifies itself in the Shell UI and the session registry.
+  // Identical for all three spawn shapes below — an attached human sees the same
+  // tab whichever one opened the PTY.
+  const sessionOptions = {
+    cwd,
+    kind: 'agent-tui',
+    agentId,
+    label: `${provider.name} ${agentId}`,
+    command: tuiConfig.commandLine,
+  };
+  const launchShape = resolveTuiLaunchShape({ useDurableRunner, safetyProfile });
+  let sessionId;
+  if (launchShape === 'runner') {
+    // The CoS runner is a shared long-lived process and builds its own child
+    // env from ITS ambient environment (`/spawn-tui` → `buildCliChildEnv`
+    // without a profile), so a public-content stage routed through it would
+    // silently lose the allowlist resolved above. `agentLifecycle.js` forces
+    // every such stage direct-only (`dispatchUseRunner`); fail closed here so
+    // that stays true by construction rather than by remembering it.
+    if (restricted) {
+      throw new Error(`Public-content stage cannot spawn via the CoS runner (profile '${safetyProfile}')`);
+    }
     // The runner launches the TUI command directly (there is no intermediate
     // login-shell readiness probe), so output can arrive before the spawn HTTP
     // response. Open the readiness gate before handing off to avoid discarding
@@ -133,55 +202,70 @@ export async function createAgentTuiSession({
       onData,
       onExit,
     });
-    shellService.registerExternalSession(session.sessionId, session.ptyProcess, {
-      cwd,
-      kind: 'agent-tui',
-      agentId,
-      label: `${provider.name} ${agentId}`,
-      command: tuiConfig.commandLine,
-    });
+    shellService.registerExternalSession(session.sessionId, session.ptyProcess, sessionOptions);
+    // The runner owns this PTY, so it already returns the pty/pid pair the tail
+    // below would otherwise have to look up locally.
     return session;
   }
 
-  // This shell exists only to host the CoS TUI. `exitWithCommand` makes it
-  // follow the TUI's lifetime and preserve the TUI exit status; otherwise the
-  // login shell returns to its prompt when the provider exits and the spawner
-  // cannot observe completion until the wall-clock backstop fires. The wrapper
-  // is dialect-specific, so shell.js renders it once it knows which shell the
-  // session got (see lib/shellExit.js).
-  const sessionId = shellService.createShellSession(null, {
-    cwd,
-    initialCommand: tuiConfig.commandLine,
-    exitWithCommand: true,
-    kind: 'agent-tui',
-    agentId,
-    label: `${provider.name} ${agentId}`,
-    command: tuiConfig.commandLine,
-    // Wait until the shell can actually RUN commands before injecting the CLI
-    // command — a fixed delay races a heavy interactive shell and the launched
-    // TUI can fall straight back to a half-loaded prompt (see shell.js
-    // waitForPromptReady, which proves readiness with a round-trip probe).
-    waitForPromptReady: true,
-    // Fires when the CLI command is actually injected. We start observing
-    // claude's input-readiness only after this so the readiness probe's own
-    // shell activity can't prematurely open the paste gate.
-    onInitialCommandSent,
-    // A DELTA, not a full env — buildSafeEnv inside createShellSession supplies
-    // the base and shell.js does the PWD pin. composeProviderEnv owns the layer
-    // order (forgeTokenEnv before provider.envVars so an explicit provider
-    // GH_TOKEN still wins; the OpenCode declared-models map after it, overriding
-    // the static config). forgeTokenEnv has to be threaded in explicitly because
-    // buildSafeEnv strips GH_TOKEN from the inherited env (resolveForgeTokenEnv).
+  if (launchShape === 'direct') {
+    // Launch the vendor recipe AS the PTY — no hosting shell, so no rc file runs
+    // between the allowlist above and the provider (#6159). `env` is already the
+    // COMPLETE environment, which is what `spawnCommandSession` takes.
     //
-    // agentGuardEnv() is spread last so the pm2 shim wins over any provider PATH.
-    // It reads PATH from process.env rather than the composed env — correct here
-    // and NOT what buildCliChildEnv's `guard` does, because this is an overlay
-    // whose real base env is assembled downstream. Only AI agent sessions get
-    // the shim; the user's own Shell page does not.
-    env,
-    onData,
-    onExit,
-  });
+    // `spawnCommandSession` resolves the executable before it spawns and throws
+    // `Command executable unavailable: …` when it cannot — which the caller's
+    // catch maps to `command-not-found`. That pre-flight has to live in the
+    // launcher: a PTY has no shell to print "command not found", so handleData's
+    // output-driven probe can never fire on this path.
+    //
+    // No shell readiness probe fires `onInitialCommandSent` here, so open the
+    // paste gate before the spawn — exactly as the runner branch above does —
+    // or the TUI's first bracketed-paste/input-ready bytes are discarded.
+    onInitialCommandSent?.();
+    sessionId = shellService.spawnCommandSession(tuiConfig.command, tuiConfig.args, {
+      ...sessionOptions,
+      env,
+      onData,
+      onExit,
+    });
+  } else {
+    // This shell exists only to host the CoS TUI. `exitWithCommand` makes it
+    // follow the TUI's lifetime and preserve the TUI exit status; otherwise the
+    // login shell returns to its prompt when the provider exits and the spawner
+    // cannot observe completion until the wall-clock backstop fires. The wrapper
+    // is dialect-specific, so shell.js renders it once it knows which shell the
+    // session got (see lib/shellExit.js).
+    sessionId = shellService.createShellSession(null, {
+      ...sessionOptions,
+      initialCommand: tuiConfig.commandLine,
+      exitWithCommand: true,
+      // Wait until the shell can actually RUN commands before injecting the CLI
+      // command — a fixed delay races a heavy interactive shell and the launched
+      // TUI can fall straight back to a half-loaded prompt (see shell.js
+      // waitForPromptReady, which proves readiness with a round-trip probe).
+      waitForPromptReady: true,
+      // Fires when the CLI command is actually injected. We start observing
+      // claude's input-readiness only after this so the readiness probe's own
+      // shell activity can't prematurely open the paste gate.
+      onInitialCommandSent,
+      // A DELTA, not a full env — buildSafeEnv inside createShellSession supplies
+      // the base and shell.js does the PWD pin. composeProviderEnv owns the layer
+      // order (forgeTokenEnv before provider.envVars so an explicit provider
+      // GH_TOKEN still wins; the OpenCode declared-models map after it, overriding
+      // the static config). forgeTokenEnv has to be threaded in explicitly because
+      // buildSafeEnv strips GH_TOKEN from the inherited env (resolveForgeTokenEnv).
+      //
+      // agentGuardEnv() is spread last so the pm2 shim wins over any provider PATH.
+      // It reads PATH from process.env rather than the composed env — correct here
+      // and NOT what buildCliChildEnv's `guard` does, because this is an overlay
+      // whose real base env is assembled downstream. Only AI agent sessions get
+      // the shim; the user's own Shell page does not.
+      env,
+      onData,
+      onExit,
+    });
+  }
 
   if (!sessionId) {
     return { sessionId: null, ptyProcess: null, pid: null };
@@ -198,12 +282,37 @@ export function buildTuiSpawnConfig(provider, model, {
   safetyProfile = null,
   shell = resolveInteractiveShell(),
 } = {}) {
+  // A public-content stage's argv is the vendor's maintained recipe, never the
+  // generic assembly below — that path forwards `provider.args` and applies
+  // `applyCommandDefaults`, either of which can hand a contributor-controlled
+  // review a saved `--dangerously-skip-permissions`. `tui: true` tells the
+  // recipe to drop only the flags that require `--print` and keep every
+  // enforcement flag. Fail closed when the pairing declares no attachable recipe: the
+  // caller is supposed to have asked `supportsTuiPublicReviewPosture` first, so
+  // reaching this is a routing bug and must not silently open a PTY whose
+  // posture is decorative.
+  const posture = publicReviewPostureForProfile(safetyProfile);
+  if (posture) {
+    if (!supportsTuiPublicReviewPosture(provider, posture)) {
+      throw new Error(`Provider '${provider?.id || provider?.command || 'unknown'}' cannot run an attachable ${posture} session`);
+    }
+    const recipe = buildVendorSpawnConfig(provider, {
+      effectiveModel: model,
+      effort,
+      maxConcurrentThreads,
+      systemPromptFile,
+      safetyProfile,
+      tui: true,
+    });
+    return {
+      command: recipe.command,
+      args: recipe.args,
+      commandLine: formatShellCommandLine(recipe.command, recipe.args, shell),
+      promptDelayMs: provider?.tuiPromptDelayMs || DEFAULT_TUI_PROMPT_DELAY_MS,
+    };
+  }
   const command = provider?.command || inferTuiCommand(provider?.id);
-  const baseArgs = applyCommandDefaults(
-    command,
-    isPublicReviewNoToolProfile(safetyProfile) ? [] : [...(provider?.args || [])],
-    { safetyProfile },
-  );
+  const baseArgs = applyCommandDefaults(command, [...(provider?.args || [])], provider);
   // Model+effort injection (including the antigravity-validates-the-pair special
   // case) is shared with tuiHandshake.js#buildTuiInvocation via
   // providerVendors.js#injectTuiModelAndEffort, so the two spawn paths can't
@@ -246,7 +355,7 @@ function createPasteRetryController({
   agentId,
   sessionId,
   pid,
-  useDurableRunner,
+  directLaunch,
   prompt,
   tuiConfig,
   mcpBoot,
@@ -338,11 +447,12 @@ function createPasteRetryController({
     // `^[[200~ …` session. If the shell has no live child, the command is gone:
     // fail loudly with whatever it printed instead of pasting into the shell.
     //
-    // Runner mode has no launch shell — the TUI IS the PTY process — so "does
-    // this pid have a live child?" is the wrong question (claude may have zero
-    // children at paste time) and a TUI exit kills the PTY, firing onExit. Skip
-    // the probe there.
-    if (!useDurableRunner && !(await shellHasLiveChild(pid))) {
+    // A direct launch — runner mode, or a public-content stage spawned as its
+    // own PTY (#6159) — has no launch shell: the TUI IS the PTY process. "Does
+    // this pid have a live child?" is then the wrong question (claude may have
+    // zero children at paste time) and a TUI exit kills the PTY, firing onExit.
+    // Skip the probe there.
+    if (!directLaunch && !(await shellHasLiveChild(pid))) {
       if (isFinalized()) return; // a real onExit may have finalized during the probe await
       await finishStartupFailure(
         'tui-exited-early',
@@ -554,11 +664,20 @@ export async function spawnTuiAgent({
   agentDir,
   executionId,
   laneName,
-  cleanupWorktreeFn,
   isTruthyMetaFn,
+  ownsPrWorkflow,
   leanMode = false,
   useDurableRunner = false,
+  // The public-content execution profile this run enforces (null for an
+  // ordinary agent task). Threaded through to the session so the PTY child
+  // gets the same allowlisted environment its headless sibling would.
+  safetyProfile = null,
 }) {
+  // The SAME call `createAgentTuiSession` branches on — resolved here because
+  // the prompt handshake below is wired before the spawn happens. Everything
+  // that is not a login shell has the provider binary as its own PTY process,
+  // which is what both consumers below actually depend on.
+  const directLaunch = resolveTuiLaunchShape({ useDurableRunner, safetyProfile }) !== 'login-shell';
   const outputFile = join(agentDir, 'output.txt');
   // Raw PTY bytes spool to disk continuously rather than accumulate in-memory.
   // A chatty TUI (token-tick repaints, status lines) emits hundreds of chunks
@@ -582,9 +701,45 @@ export async function spawnTuiAgent({
   // Resolved from the shared helper, so this is byte-identical to the path the
   // prompt told the agent to write (see resolveSentinelPath).
   const doneSentinelPath = resolveDoneSentinelPath(cwd, agentId);
+  // Every TUI that is a real coding harness drives its own push → PR → review
+  // → merge, whether or not it can type `/do:pr` (#3733) — a Claude TUI runs
+  // the slashdo command, codex/antigravity/grok/OpenCode run the plain
+  // `git`/`gh` equivalent from the same prompt. Only a lean `--bare` session
+  // still hands the lifecycle back to PortOS. Resolved once up front (rather
+  // than inside finish()) so the merge-gate contract check below and the
+  // completion dispatch finish() hands off to read the same answer.
+  const prOwnership = resolvePrOwnership({
+    task,
+    isTruthyMeta: isTruthyMetaFn,
+    persisted: ownsPrWorkflow,
+    providerId: provider?.id,
+    providerCommand: provider?.command,
+    leanMode,
+  });
+  // Does this run's own task shape say it owed a merge (#5876)? A run PortOS
+  // still backstops (no PR at all, or a lean session) or one whose prompt
+  // hands the PR to a human (JIRA, claim flow) never owed one, so the
+  // contract check below is inert for those — see mergeGateContract.js.
+  const mergeGateIsOwed = mergeGateOwed({
+    taskOpenPR: prOwnership.taskOpenPR,
+    ownsPrWorkflow: prOwnership.agentOwnsPR,
+    leaveOpen: leavesPrForHuman(task),
+  });
   const promptPreview = prompt.replace(/\s+/g, ' ').slice(0, 100);
   const commandName = tuiConfig.command.split('/').pop();
   let finalized = false;
+  // Synchronous re-entrancy guard for finish() — see its own comment for why
+  // `finalized` alone isn't enough once the merge-gate check adds awaits
+  // before it (#5876).
+  let finishing = false;
+  // A finish() call's args, dropped by the `finishing` guard while an earlier
+  // call was still deciding whether to finalize — replayed if that call ends
+  // up NOT finalizing (see finish()'s own comments on both).
+  let pendingFinish = null;
+  // Caps the merge-gate re-prompt (#5876) at once per run — a local closure
+  // counter is enough: the check only ever runs from this same live process,
+  // and a fresh spawn (a real retry) starts a fresh closure with its own flag.
+  let mergeGateReprompted = false;
   let immediateFallbackAnalysis = null;
   const detectImmediateFallbackSignal = createImmediateFallbackSignalDetector();
   // Holds the wait-it-out window for a provider signal carrying a `graceMs`
@@ -596,6 +751,15 @@ export async function spawnTuiAgent({
   // createOomNudgeGate for why this is a separate mechanism from the gate above.
   const detectLocalRuntimeOom = createLocalRuntimeOomDetector();
   const oomNudgeGate = createOomNudgeGate();
+  // A request the TUI keeps retrying and the provider never answers. Every
+  // reaper reads such a session as busy (the retry ladder repaints the screen),
+  // so without this the run holds its lane until the max-runtime ceiling — see
+  // createRetryStallGate.
+  const retryStallGate = createRetryStallGate();
+  // A tool-permission dialog nobody is present to answer. Declined on sight —
+  // the launch posture already decided the run's scope — then nudged along
+  // once the session goes quiet. See createToolPermissionGate.
+  const toolPermissionGate = createToolPermissionGate();
   // Guards ingestDoneSentinel to a single read. finish() is its only caller and
   // is itself guarded by `finalized`, so this is defensive — it pins the
   // read-at-most-once invariant at the helper.
@@ -658,11 +822,11 @@ export async function spawnTuiAgent({
   // paste into a startup banner, a trust menu, or a returned shell prompt.
   // agy enables bracketed paste on alt-screen entry, before its composer (and
   // before its trust gate) exists, so it needs the extra composer-footer gate.
-  // The durable runner pty.spawns the TUI directly (no launch shell), so the
-  // tracker must not wait for a shell paste-mode OFF that will never come.
+  // A direct launch pty.spawns the TUI itself (no launch shell), so the tracker
+  // must not wait for a shell paste-mode OFF that will never come.
   const inputReady = createInputReadyTracker({
     ...(isAntigravityCommand(tuiConfig.command) ? { readyTextPattern: AGY_INPUT_READY_PATTERN } : {}),
-    directLaunch: useDurableRunner,
+    directLaunch,
   });
   let trustAccepted = false;
   let autoModeDeclined = false;
@@ -715,9 +879,12 @@ export async function spawnTuiAgent({
   // different things in two places.
   const sentinelPresent = () => !!doneSentinelPath && existsSync(doneSentinelPath);
 
+  // Returns the sentinel's `summary` text (or null on a second call / no
+  // sentinel / an empty summary) — the merge-gate contract check below reads
+  // this same return value rather than re-reading the file a second time.
   const ingestDoneSentinel = async () => {
-    if (sentinelIngested) return;
-    if (!sentinelPresent()) return;
+    if (sentinelIngested) return null;
+    if (!sentinelPresent()) return null;
     sentinelIngested = true;
     const contents = await readFile(doneSentinelPath, 'utf8').catch(err => {
       console.error(`❌ ingestDoneSentinel readFile failed: ${err.message}`);
@@ -729,13 +896,76 @@ export async function spawnTuiAgent({
     // read mode-agnostically in finalizeAgent). A legacy plain-markdown sentinel
     // parses back as its own text, so this is a no-op change for existing types.
     const { summary } = parseSentinelPayload(contents);
-    if (!summary) return;
+    if (!summary) return null;
     // Shared constant, not a literal: `extractAgentSummary` anchors the PR-body
     // extraction on this exact line to tell the agent's summary apart from the
     // lifecycle telemetry above it. Reword it here only, and the noise returns.
     appendLine(SENTINEL_COMPLETION_MARKER);
     const truncated = summary.length > 4096 ? `${summary.slice(0, 4096)}\n…[truncated]` : summary;
     for (const line of truncated.split('\n')) appendLine(line);
+    return summary;
+  };
+
+  // Sentinel-file watcher. The agent's prompt instructs it to write
+  // .agent-done in the workspace after running /simplify + /do:pr and then
+  // stop (it does NOT `/quit` — that is a UI command it can't invoke). This
+  // watcher is the PRIMARY finalize path: it fires finish() shortly after the
+  // sentinel appears, and finish()'s own cleanup kills the still-running TUI
+  // session. The actual sentinel READ happens in finish() (via
+  // ingestDoneSentinel) so the resolution is captured no matter which path
+  // finalizes. A normal shell exit or explicit provider failure handles
+  // agents that do not write the sentinel.
+  //
+  // `watchForFile` is one-shot (it detects, closes itself, then calls back) —
+  // so a run whose merge-gate check re-prompts and deletes the sentinel to
+  // await a SECOND completion needs a brand-new watcher, not a re-trigger of
+  // this one. Factored out so both call sites build the exact same watcher.
+  const armSentinelWatcher = () => (doneSentinelPath ? watchForFile(doneSentinelPath, async () => {
+    if (finalized) return;
+    await finish({ success: true, exitCode: 0, reason: 'agent-signaled-done' });
+  }) : null);
+
+  /**
+   * Merge Gate contract check (#5876) — runs on a successful sentinel, before
+   * ANY teardown, for a run whose own task shape said it owed a merge. Asks
+   * the forge whether the PR this run opened actually landed and, if it is
+   * still open with no blocker stated in the agent's own summary, re-pastes
+   * one corrective nudge into the still-attached session instead of paying
+   * for a cold recovery agent (`agentRepoStateVerification.js`) to do the
+   * same merge later. See mergeGateContract.js for the decision table.
+   *
+   * @returns {Promise<boolean>} true when a re-prompt went out — the caller
+   *   must NOT finalize this call; false means finalize normally.
+   */
+  const checkMergeGateCompliance = async (summary) => {
+    if (!mergeGateIsOwed || mergeGateReprompted) return false;
+    const branchName = await git.getBranch(cwd).catch(() => null);
+    if (!branchName) return false;
+    const prProbe = await probePrForBranch(cwd, branchName).catch(() => null);
+    const verdict = resolveMergeGateVerdict({ prProbe, summary });
+    if (verdict !== 'needs-reprompt') return false;
+    if (!pasteController?.resubmit({ text: buildMergeGateReprompt(prProbe.prUrl || '<PR_URL>'), label: 'merge-gate contract nudge' })) {
+      // Session is already gone — nothing to nudge; fall through to finalize.
+      return false;
+    }
+    mergeGateReprompted = true;
+    // Reopen the completion window: a fresh `.agent-done` write after the
+    // nudge must be re-ingested (not silently skipped by the once-only guard)
+    // and needs a brand-new watcher — the original already closed itself on
+    // its first (this) detection.
+    sentinelIngested = false;
+    if (doneSentinelPath) await rm(doneSentinelPath).catch(() => {});
+    // Armed unconditionally — the sentinel is already gone, so a missing
+    // `activeAgents` entry (an anomaly this code doesn't otherwise expect)
+    // must not also leave the run with no watcher at all. `stopRunMachinery`
+    // reads it back off the map to tear it down at real finalize; if the
+    // entry is missing there too, the watcher self-closes on its next fire.
+    const newWatcher = armSentinelWatcher();
+    const agentData = activeAgents.get(agentId);
+    if (agentData) agentData.doneSentinelWatcher = newWatcher;
+    appendLine(`🔁 Merge Gate not finished (PR still OPEN, no blocker stated) — re-prompted the session (1 nudge only)`);
+    emitLog('warn', `🔁 Merge-gate contract nudge sent for ${agentId} — PR still OPEN with no stated blocker`, { agentId });
+    return true;
   };
 
   /**
@@ -764,7 +994,27 @@ export async function spawnTuiAgent({
   };
 
   const finish = async ({ success, exitCode = 0, error = null, reason = 'completed' }) => {
+    // `finalized` alone used to be the whole re-entrancy guard, safe because it
+    // was set SYNCHRONOUSLY as this function's first act. The merge-gate check
+    // below needs `ingestDoneSentinel`'s summary before it can decide whether
+    // to finalize at all, which pushes `finalized = true` past several awaits —
+    // wide enough for a second trigger (the shell exiting right after the
+    // sentinel appears) to also pass the `if (finalized)` gate before the first
+    // call sets it, double-firing `finalizeAgent`. `finishing` closes that
+    // window synchronously; `finalized` still means "truly done" and is what
+    // `pasteController.resubmit()` reads, so it must stay false while a
+    // re-prompt is still possible.
+    //
+    // A trigger dropped here while the first call is mid-decision is not
+    // discarded: it's the one call that could carry news the first call
+    // doesn't have (the shell exiting right in this window), so it's replayed
+    // once that call settles on "not finalizing after all" — see below.
     if (finalized) return;
+    if (finishing) {
+      pendingFinish = { success, exitCode, error, reason };
+      return;
+    }
+    finishing = true;
     // PortOS is going down. Whatever path got here — the PTY exiting under
     // TreeKill, a provider-signal failure, a paste that failed because the shell died —
     // the cause is the host restart, not the agent, so there is no outcome to
@@ -787,18 +1037,43 @@ export async function spawnTuiAgent({
       await abandonForHostShutdown();
       return;
     }
+
+    // Ingest the .agent-done sentinel BEFORE any teardown decision, so its
+    // markdown summary lands in outputBuffer/output.txt regardless of WHICH
+    // path finalized the agent, AND so the merge-gate contract check right
+    // below reads the same text without a second file read. The completion
+    // workflow writes the sentinel and stops; the 2s doneSentinelWatcher is
+    // what normally calls finish(). Idempotent via `sentinelIngested`.
+    const sentinelSummary = await ingestDoneSentinel();
+
+    // Merge Gate contract check (#5876): only for a run that actually
+    // succeeded AND signaled that success via a real `.agent-done` summary —
+    // an ordinary clean exit with no sentinel (or one with an empty summary)
+    // is not the "the agent believes its Merge Gate is done" signal this
+    // reads; re-prompting THAT would paste into a shell whose TUI child may
+    // already be gone, parking the run on a nudge that can never land.
+    // Returns true (and this call does NOT finalize) exactly once, when the
+    // run owed a merge, the PR is open, and the summary names no blocker —
+    // see mergeGateContract.js for the full decision table.
+    if (success && sentinelSummary !== null && await checkMergeGateCompliance(sentinelSummary)) {
+      // Not finalizing — reopen the re-entrancy gate for the next completion
+      // signal the re-prompt is expected to produce. A trigger that arrived
+      // WHILE this call was deciding (dropped by the `finishing` guard above)
+      // is the only thing that could tell us the session actually died during
+      // that window, so replay it now rather than losing it — otherwise the
+      // run would sit waiting for a nudge with nothing left alive to receive it.
+      finishing = false;
+      if (pendingFinish) {
+        const replay = pendingFinish;
+        pendingFinish = null;
+        return finish(replay);
+      }
+      return;
+    }
+
     finalized = true;
 
     const agentData = stopRunMachinery();
-
-    // Ingest the .agent-done sentinel BEFORE draining, so its markdown summary
-    // lands in outputBuffer/output.txt regardless of WHICH path finalized the
-    // agent. The completion workflow writes the sentinel and stops; the 2s
-    // doneSentinelWatcher is what normally calls finish(). Reading it here
-    // (not just in the watcher) keeps the resolution captured even when shell exit
-    // finalizes first. Idempotent
-    // via `sentinelIngested`.
-    await ingestDoneSentinel();
 
     // Drain pending parsed lines AND raw chunks before the final state
     // writes so completion events don't beat the last output batch to disk.
@@ -858,24 +1133,11 @@ export async function spawnTuiAgent({
       completionError: finalError,
     });
 
-    // Every TUI that is a real coding harness drives its own push → PR → review
-    // → merge, whether or not it can type `/do:pr` (#3733) — a Claude TUI runs
-    // the slashdo command, codex/antigravity/grok/OpenCode run the plain
-    // `git`/`gh` equivalent from the same prompt. Only a lean `--bare` session
-    // still hands the lifecycle back to PortOS. Derived from the same predicate
-    // the prompt builder used so neither side can believe the other owns the PR.
-    const taskOpenPR = isTruthyMetaFn(task.metadata?.openPR);
-    const taskReviewLoopFollowUp = isTruthyMetaFn(task.metadata?.reviewLoopFollowUp);
-    const agentOwnsPR = taskOpenPR && agentOwnsPrWorkflow({ providerType: PROVIDER_TYPES.TUI, leanMode });
-    // …but PR-claim verification (#3358) stays keyed on the SLASH-command
-    // predicate. A run PortOS still backstops (it re-checks the forge at cleanup
-    // and opens the PR itself when the agent skipped it) must not be failed here
-    // for a PR that is about to exist — finalize runs before that net.
-    const prClaimExpected = taskOpenPR && canTypeSlashCommands({
-      providerId: provider?.id,
-      providerCommand: provider?.command,
-      leanMode,
-    });
+    // `prOwnership` was resolved once, up front, near `doneSentinelPath`, so the
+    // merge-gate contract check above and the completion dispatch below read the
+    // same answer (#3733); see `resolvePrOwnership` for why finalize's
+    // `prClaimExpected` and cleanup's `agentOwnsPR` are two predicates (#3358).
+    //
     // Whether finalize's check ACTUALLY produced a forge answer, filled in from
     // its return below. Deliberately not `prClaimExpected`: finalize substitutes
     // `{ok:true}` for a user-terminated run and for a check that threw, and a
@@ -885,10 +1147,10 @@ export async function spawnTuiAgent({
     let noChangesToShip = false;
 
     // try/finally so a throw from finalizeAgent (e.g. processAgentCompletion
-    // hook crash) still runs the local cleanup — sentinel removal, worktree
-    // cleanup, pid unregister, activeAgents delete, session kill. Without
-    // this, a memory-extraction crash would strand the worktree and the
-    // shell session on disk.
+    // hook crash) still runs the local cleanup — sentinel removal, the shared
+    // completion dispatch (pipeline, worktree, retry hold), pid unregister,
+    // activeAgents delete, session kill. Without this, a memory-extraction
+    // crash would strand the worktree and the shell session on disk.
     // The verdict finalizeAgent actually persisted. A PR-claim downgrade (#3358)
     // must reach cleanup too — cleaning up as a success removes the worktree and
     // deletes the local branch, destroying the state the retry needs. Left at
@@ -911,7 +1173,7 @@ export async function spawnTuiAgent({
         error: finalError || undefined,
         completionReason: reason,
         workspacePath: cwd,
-        prExpected: prClaimExpected,
+        prExpected: prOwnership.prClaimExpected,
         // The run window the commit criterion is evaluated against (#3637).
         startedAt: agentData?.startedAt ?? null,
       });
@@ -923,38 +1185,19 @@ export async function spawnTuiAgent({
       // its own file and may still be running.
       if (doneSentinelPath) await rm(doneSentinelPath).catch(() => {});
 
-      const prCreation = resolvePrCreation({ taskOpenPR, agentOwnsPr: agentOwnsPR, prClaimVerified, noChangesToShip });
-      // Only the two modes that can still open a PR (and thus spawn a follow-up
-      // that needs these) pay for the resolve. `never` — the dominant path, an
-      // agent that opened and landed its own PR — discards them.
-      const reviewOptions = prCreation !== PR_CREATION.NEVER
-        ? await resolveReviewLoopOptions(task.metadata, { normalize: normalizeReviewers, isTruthyMeta: isTruthyMetaFn })
-          .catch(err => {
-            emitLog('warn', `TUI review options unavailable for ${agentId}: ${err.message}`, { agentId });
-            return {};
-          })
-        : {};
-      await cleanupWorktreeFn(agentId, cleanupSuccess, {
-        prCreation,
-        prCompletion: resolvePrCompletion(task.metadata),
-        ...reviewOptions,
-        skipMerge: taskReviewLoopFollowUp || agentOwnsPR,
-        description: task.description,
-        agentOutput: getOutputBuffer(),
-        originalTask: task
-      }).catch(err => emitLog('warn', `TUI worktree cleanup failed for ${agentId}: ${err.message}`, { agentId }));
-
-      // Release the retry hold: flip the failed task back to `pending` carrying a
-      // pointer at whatever the run left behind — the branch (or whole worktree)
-      // `cleanupWorktreeFn` just preserved because the run failed with commits on
-      // it. Without the pointer the retry starts clean and redoes work already
-      // sitting on disk (#3368); without the hold that release replaces, the retry
-      // could be dequeued before the pointer landed (#3373). Imported lazily for the
-      // same reason `cleanupWorktreeFn` is injected: pulling the cleanup graph in at
-      // module top level races this file's own init in the agentLifecycle cycle.
-      await import('./agentWorktreeCleanup.js')
-        .then(({ releaseRetryHold }) => releaseRetryHold({ agentId, task, success: cleanupSuccess }))
-        .catch(err => emitLog('warn', `TUI retry-hold release failed for ${agentId}: ${err.message}`, { agentId }));
+      // Pipeline progression → worktree cleanup with the PR disposition →
+      // retry-hold release, in the one owner both in-process spawners share.
+      // Caught so a throw there cannot skip the in-memory teardown below — this
+      // runs off a PTY exit, outside any request lifecycle.
+      await runSpawnerCompletionCleanup({
+        agentId,
+        task,
+        success: cleanupSuccess,
+        prOwnership,
+        prClaimVerified,
+        noChangesToShip,
+        outputBuffer: getOutputBuffer(),
+      }).catch(err => emitLog('warn', `TUI completion cleanup failed for ${agentId}: ${err.message}`, { agentId }));
 
       if (agentData?.pid) unregisterSpawnedAgent(agentData.pid);
       activeAgents.delete(agentId);
@@ -967,7 +1210,7 @@ export async function spawnTuiAgent({
    *
    * Deliberately NOT `finish()`: finalizing here would record an outcome for a
    * run that never reached one, and its cleanup path removes the `.agent-done`
-   * sentinel and hands the worktree to `cleanupWorktreeFn` — destroying exactly
+   * sentinel and hands the worktree to `cleanupAgentWorktree` — destroying exactly
    * the state a resume needs. So this only stops the machinery and flushes what
    * was captured; the agent record stays `running` and the worktree stays on
    * disk. The next boot's orphan sweep reads the host-shutdown marker, sees this
@@ -1167,9 +1410,41 @@ export async function spawnTuiAgent({
         }
       }
 
+      // Same gating as the OOM nudge above: before the prompt is in there is no
+      // request of ours for the provider to be retrying. Acted on by the
+      // provider-signal timer, on its own poll, like the other gates.
+      if (promptSubmittedAt) retryStallGate.observe(stripped, now);
+
+      // The permission dialog is Claude Code chrome. Watching another vendor's
+      // session for it would only ever match an ECHO — a Codex or agy agent
+      // investigating a stalled run cats its raw.txt straight into this stream
+      // — and answer a dialog that is not there with keystrokes into a working
+      // composer.
+      const permissionDialog = promptSubmittedAt && isClaudeCommand(tuiConfig.command)
+        ? toolPermissionGate.observe(stripped, now)
+        : null;
+      if (permissionDialog === 'exhausted') {
+        await finish({
+          success: false,
+          exitCode: 1,
+          error: `${tuiConfig.command} kept asking for tool permissions an unattended run cannot grant (${TOOL_PERMISSION_DECLINE_MAX} dialogs declined) — the model keeps reaching outside the run's allowed scope`,
+          reason: 'permission-prompt-loop',
+        });
+        return;
+      }
+      if (permissionDialog) {
+        // "No" is the last option and option 1 is highlighted: arrow down to it,
+        // then Enter — lands under both of Ink's selection models, whereas a bare
+        // digit is immediate-select in some builds and ignored in others.
+        shellService.writeToSession(sessionId, `${'\x1b[B'.repeat(Math.max(0, permissionDialog.noOption - 1))}${SUBMIT_KEY}`);
+        appendLine(`🚫 Declined ${tuiConfig.command} permission prompt for ${permissionDialog.toolCall || 'a tool call'} — an unattended run never widens its scope (${permissionDialog.count}/${TOOL_PERMISSION_DECLINE_MAX})`);
+      }
+
       if (!promptSentAt) {
-        const lowerStripped = stripped.toLowerCase();
-        if (lowerStripped.includes('command not found') && lowerStripped.includes(commandName.toLowerCase())) {
+        // Only the login-shell path can reach this: it is the shell PRINTING
+        // "command not found". A direct PTY resolves the executable before it
+        // spawns (createAgentTuiSession), because there is no shell to print it.
+        if (detectMissingTuiBinary(stripped, commandName)) {
           // finish() uses try/finally internally: finalizeAgent errors re-throw after
           // cleanup, so finish() can reject. The outer try/catch in handleData already
           // handles any such rejection via emitLog — no additional .catch() needed here.
@@ -1202,17 +1477,23 @@ export async function spawnTuiAgent({
     // record as a completed run. finish() intercepts that case — see its
     // host-shutdown guard (#3202).
     const code = typeof exitCode === 'number' ? exitCode : killed ? 130 : 0;
-    // A signal-terminated shell reports the wait-status exit code — 0 for a
+    // A signal-terminated process reports the wait-status exit code — 0 for a
     // plain SIGTERM/SIGHUP — so `code === 0` alone cannot mean "finished
     // normally". Treat any signal as an abnormal end. This is the backstop for
     // the case the host-shutdown guard can't cover: a SIGKILL'd or crashed
     // portos-server never runs its shutdown handler, so the flag is never set,
     // yet the agent's PTY still dies with us (#3202).
+    //
+    // The reading holds for BOTH session shapes. A login shell carried its
+    // hosted CLI's status out via the run-then-exit wrapper; a direct PTY
+    // (#6159) simply IS the CLI, so the code and signal are the CLI's own.
+    // Reason codes stay `shell-*`: that is what COMPLETION_REASON_ANALYSES
+    // registers.
     const signaled = !!signal;
     const outcome = killed
-      ? { error: 'TUI shell session was killed', reason: 'shell-killed' }
+      ? { error: 'TUI session was killed', reason: 'shell-killed' }
       : signaled
-        ? { error: `TUI shell session was terminated by signal ${signal} — the run was cut short, not completed`, reason: 'shell-signaled' }
+        ? { error: `TUI session was terminated by signal ${signal} — the run was cut short, not completed`, reason: 'shell-signaled' }
         : { error: null, reason: 'shell-exit' };
     await finish({ success: code === 0 && !killed && !signaled, exitCode: code, ...outcome });
   };
@@ -1220,8 +1501,10 @@ export async function spawnTuiAgent({
   // Repo-owner-pinned GH_TOKEN for the agent's own `gh pr create` (see
   // resolveForgeTokenEnv). Resolved here since createAgentTuiSession is sync.
   // Skip when the provider supplies its own GH_TOKEN/GITHUB_TOKEN so its explicit
-  // credential wins.
-  const forgeTokenEnv = providerSuppliesGithubToken(provider)
+  // credential wins — and skip for a public-content stage, which must never hold
+  // a forge credential (the allowlist in createAgentTuiSession strips it anyway;
+  // not resolving it means it is never read out of the keychain to begin with).
+  const forgeTokenEnv = providerSuppliesGithubToken(provider) || isPublicReviewRestrictedProfile(safetyProfile)
     ? {}
     : await git.resolveForgeTokenEnv(cwd);
 
@@ -1266,6 +1549,7 @@ export async function spawnTuiAgent({
       forgeTokenEnv,
       doneSentinelPath,
       useDurableRunner,
+      safetyProfile,
       onData: handleData,
       onExit: handleExit,
       onInitialCommandSent: () => { commandInjected = true; },
@@ -1277,7 +1561,11 @@ export async function spawnTuiAgent({
     // PTY. Distinguish that deterministic configuration failure from a runner
     // outage/refusal so it is blocked with the existing actionable
     // command-not-found guidance rather than retried as a transient rejection.
-    const reason = useDurableRunner && /^Command executable unavailable:/i.test(message)
+    //
+    // A LOCAL direct PTY raises the SAME failure with the same prefix — see the
+    // pre-spawn resolve in createAgentTuiSession's restricted branch (#6159) —
+    // so the test is no longer gated on the runner.
+    const reason = /^Command executable unavailable:/i.test(message)
       ? 'command-not-found'
       : useDurableRunner ? 'spawn-rejected' : 'spawn-error';
     if (useDurableRunner) {
@@ -1415,7 +1703,7 @@ export async function spawnTuiAgent({
     agentId,
     sessionId,
     pid,
-    useDurableRunner,
+    directLaunch,
     prompt,
     tuiConfig,
     mcpBoot,
@@ -1610,6 +1898,21 @@ export async function spawnTuiAgent({
       resubmitAfterSignal();
       return;
     }
+    const stall = retryStallGate.takeStall();
+    if (stall) {
+      failOverToFallback(stall).catch((err) =>
+        emitLog('error', `TUI agent ${agentId} retry-stall fallback finish failed: ${err?.message || err}`, { agentId }));
+      return;
+    }
+    // A declined permission dialog ends the turn; once the session is quiet,
+    // tell it why and send it back to work.
+    const declined = toolPermissionGate.takeNudge(Date.now(), lastOutputAt);
+    if (declined) {
+      if (pasteController?.resubmit({ text: TOOL_PERMISSION_NUDGE_TEXT, label: 'declined-permission nudge' })) {
+        appendLine(`🔁 Nudged the session to continue after declined permission prompt ${declined}`);
+      }
+      return;
+    }
     // Nudge a session a local-GPU OOM parked. Rides this timer rather than one
     // of its own so the nudge cadence and the fail-over verdict stay on the same
     // clock — and so there is one fewer interval to leak past finish().
@@ -1620,19 +1923,7 @@ export async function spawnTuiAgent({
     }
   }, PROVIDER_SIGNAL_POLL_MS);
 
-  // Sentinel-file watcher. The agent's prompt instructs it to write
-  // .agent-done in the workspace after running /simplify + /do:pr and then
-  // stop (it does NOT `/quit` — that is a UI command it can't invoke). This
-  // watcher is the PRIMARY finalize path: it fires finish() shortly after the
-  // sentinel appears, and finish()'s own cleanup kills
-  // the still-running TUI session. The actual sentinel READ happens in finish()
-  // (via ingestDoneSentinel) so the resolution is captured no matter which path
-  // finalizes. A normal shell exit or explicit provider failure handles agents
-  // that do not write the sentinel.
-  const doneSentinelWatcher = doneSentinelPath ? watchForFile(doneSentinelPath, async () => {
-    if (finalized) return;
-    await finish({ success: true, exitCode: 0, reason: 'agent-signaled-done' });
-  }) : null;
+  const doneSentinelWatcher = armSentinelWatcher();
 
   activeAgents.set(agentId, {
     process: ptyProcess || { kill: () => shellService.killSession(sessionId) },

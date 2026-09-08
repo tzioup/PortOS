@@ -18,17 +18,18 @@ import BrailleSpinner from '../BrailleSpinner';
 import LocalSetupPanel from './LocalSetupPanel';
 import useDrawerTab from '../../hooks/useDrawerTab';
 import { isLoopbackHost } from '../../lib/loopbackHost.js';
+import { PORTS } from '../../lib/ports.js';
 import {
   getSettings, updateSettings, getImageGenStatus, generateImage,
   registerTool, updateTool, getToolsList,
   saveHfToken, clearHfToken,
 } from '../../services/api';
-import { deriveAvailableBackends, imageGenReadiness, isCloudCliMode, IMAGE_GEN_MODE, AGY_IMAGEGEN_DEFAULT_MODEL, AGY_IMAGEGEN_IMAGE_MODEL, CODEX_IMAGEGEN_DEFAULT_EFFORT, GROK_ASPECT_RATIOS, RENDER_TARGET_BACKEND_AUTO, RENDER_TARGET_OPTIONS, VIDEO_RENDER_MODES, modeLabel, normalizeRenderPinValue, supportsCloudModelOverride } from '../../lib/imageGenBackends';
+import { deriveAvailableBackends, imageGenReadiness, isCloudCliMode, IMAGE_GEN_MODE, AGY_IMAGEGEN_DEFAULT_MODEL, AGY_IMAGEGEN_IMAGE_MODEL, CODEX_IMAGEGEN_DEFAULT_EFFORT, CODEX_IMAGEGEN_DEFAULT_MODEL, GROK_ASPECT_RATIOS, RENDER_TARGET_BACKEND_AUTO, RENDER_TARGET_OPTIONS, VIDEO_RENDER_MODES, modeLabel, normalizeRenderPinValue, supportsCloudModelOverride } from '../../lib/imageGenBackends';
 import { resolveCleanersFromConfig } from '../../lib/imageCleaners';
 import { useMediaJobSse } from '../../hooks/useMediaJobSse';
 import { useAgyModels } from '../../hooks/useAgyModels';
 import { useHfTokenStatus } from '../../hooks/useHfTokenStatus';
-import { CODEX_EFFORT_LEVELS } from '../../utils/providers';
+import { effortLevelsForProvider } from '../../utils/providers';
 
 const SDAPI_TOOL_ID = 'sdapi';
 const CODEX_TOOL_ID = 'codex-imagegen';
@@ -36,11 +37,6 @@ const GROK_TOOL_ID = 'grok-imagegen';
 const AGY_TOOL_ID = 'agy-imagegen';
 // Mirror of server/services/imageGen/modes.js — shown as placeholder/default
 // hints so the user sees what a blank Model / Effort field will actually use.
-// The server owns the real default; these are display-only. The effort default
-// lives in the shared imageGenBackends lib (imported above) so the Render Queue
-// and this settings form don't drift; the model default stays local (only used
-// here as a placeholder string).
-const CODEX_IMAGEGEN_DEFAULT_MODEL = 'gpt-5.6-luna';
 const DEFAULT_TEST_PROMPT = 'a small cyberpunk fox sitting on a neon-lit rooftop at night, cinematic, highly detailed';
 const normalizeUrl = (url) => (url || '').trim().replace(/\/+$/, '');
 
@@ -110,7 +106,13 @@ export function ImageGenTab() {
   // never rendered, only round-tripped at save time so sibling keys
   // (defaultModelId) survive the settings PUT's wholesale slice replace.
   const [videoGenMode, setVideoGenMode] = useState('');
-  const [videoGenDisplaySleep, setVideoGenDisplaySleep] = useState(true);
+  const [videoGenDisplaySleep, setVideoGenDisplaySleep] = useState(false);
+  // fal.ai queue REST API key (#6213) — usability-gated on this being set
+  // (settings, or the FAL_KEY env var server-side). No enabled toggle: the
+  // key's presence IS the opt-in, same shape as loras.js's Civitai key.
+  const [falApiKey, setFalApiKey] = useState('');
+  // reactor.inc fast-h3 API key (#6214) — same usability-gate shape as fal above.
+  const [reactorApiKey, setReactorApiKey] = useState('');
   const videoGenSliceRef = useRef({});
   const [sdapiUrl, setSdapiUrl] = useState('');
   const [pythonPath, setPythonPath] = useState('');
@@ -122,6 +124,13 @@ export function ImageGenTab() {
   const [codexModel, setCodexModel] = useState('');
   // Empty = use the shipped default effort (CODEX_IMAGEGEN_DEFAULT_EFFORT).
   const [codexEffort, setCodexEffort] = useState('');
+  // Codex's effort ladder is MODEL-gated, so the options track the model field
+  // above rather than a fixed constant: the gpt-6 family has no `minimal` rung
+  // and rejects it with an HTTP 400, failing the render.
+  const codexEffortLevels = effortLevelsForProvider(
+    { id: 'codex', command: 'codex' },
+    codexModel.trim() || CODEX_IMAGEGEN_DEFAULT_MODEL,
+  );
   const [codexParallelLimit, setCodexParallelLimit] = useState(1);
   // Grok Build CLI provider config — gated by `grokEnabled` the same way as
   // Codex (renders spend the user's Grok quota). No model/effort fields:
@@ -175,7 +184,9 @@ export function ImageGenTab() {
     denoiseByMode: { external: false, local: false, codex: false, grok: false, agy: false },
     renderDefaultsJson: '{}',
     videoGenMode: '',
-    videoGenDisplaySleep: true,
+    videoGenDisplaySleep: false,
+    falApiKey: '',
+    reactorApiKey: '',
   });
 
   const [status, setStatus] = useState(null);
@@ -247,7 +258,9 @@ export function ImageGenTab() {
         // ('auto'/blank → '', i.e. no pin) for the select.
         const vg = (s?.videoGen && typeof s.videoGen === 'object') ? s.videoGen : {};
         const vgMode = normalizeRenderPinValue(vg.mode) || '';
-        const vgDisplaySleep = vg.displaySleep !== false;
+        const vgDisplaySleep = vg.displaySleep === true;
+        const vgFalApiKey = vg.fal?.apiKey || '';
+        const vgReactorApiKey = vg.reactor?.apiKey || '';
         const m = ig.mode || IMAGE_GEN_MODE.EXTERNAL;
         const url = normalizeUrl(ig.external?.sdapiUrl || ig.sdapiUrl);
         const py = ig.local?.pythonPath || '';
@@ -283,6 +296,8 @@ export function ImageGenTab() {
         setRenderDefaults(rd);
         setVideoGenMode(vgMode);
         setVideoGenDisplaySleep(vgDisplaySleep);
+        setFalApiKey(vgFalApiKey);
+        setReactorApiKey(vgReactorApiKey);
         videoGenSliceRef.current = vg;
         setSdapiUrl(url);
         setPythonPath(py);
@@ -311,6 +326,8 @@ export function ImageGenTab() {
           renderDefaultsJson: JSON.stringify(rd),
           videoGenMode: vgMode,
           videoGenDisplaySleep: vgDisplaySleep,
+          falApiKey: vgFalApiKey,
+          reactorApiKey: vgReactorApiKey,
         });
         setToolRegistered(tools.some((t) => t.id === SDAPI_TOOL_ID));
         setCodexToolRegistered(tools.some((t) => t.id === CODEX_TOOL_ID));
@@ -402,7 +419,9 @@ export function ImageGenTab() {
     || denoiseByMode.external !== saved.denoiseByMode.external
     || JSON.stringify(renderDefaults) !== saved.renderDefaultsJson
     || videoGenMode !== saved.videoGenMode
-    || videoGenDisplaySleep !== saved.videoGenDisplaySleep;
+    || videoGenDisplaySleep !== saved.videoGenDisplaySleep
+    || falApiKey !== saved.falApiKey
+    || reactorApiKey !== saved.reactorApiKey;
 
   const handleSave = async () => {
     setSaving(true);
@@ -447,7 +466,13 @@ export function ImageGenTab() {
       ),
       // Install-wide video pin (#3231 Phase 4). Spread over the loaded slice so
       // sibling keys (defaultModelId) survive the wholesale slice replace.
-      videoGen: { ...videoGenSliceRef.current, mode: videoGenMode || null, displaySleep: videoGenDisplaySleep },
+      videoGen: {
+        ...videoGenSliceRef.current,
+        mode: videoGenMode || null,
+        displaySleep: videoGenDisplaySleep,
+        fal: { ...videoGenSliceRef.current.fal, apiKey: falApiKey.trim() || undefined },
+        reactor: { ...videoGenSliceRef.current.reactor, apiKey: reactorApiKey.trim() || undefined },
+      },
     };
     try {
       await updateSettings(patch, { silent: true });
@@ -465,6 +490,8 @@ export function ImageGenTab() {
         renderDefaultsJson: JSON.stringify(patch.renderDefaults),
         videoGenMode,
         videoGenDisplaySleep,
+        falApiKey: falApiKey.trim(),
+        reactorApiKey: reactorApiKey.trim(),
       });
       // Reflect the pruned no-op entries back into the editor state so the
       // dirty check compares like against like after a save.
@@ -603,8 +630,9 @@ export function ImageGenTab() {
   if (loading) return <BrailleSpinner text="Loading image gen settings" />;
 
   // The advertised A1111 URL must be the canonical user-facing endpoint
-  // (`<tailscale-host>.<tailnet>.ts.net:5555` / `<tailscale-ip>:5555`), not
-  // the loopback HTTP mirror at :5553 or a localhost dev URL — those aren't
+  // (`<tailscale-host>.<tailnet>.ts.net:PORTS.API` / `<tailscale-ip>:PORTS.API`),
+  // not the loopback HTTP mirror on PORTS.API_LOCAL or a localhost dev URL —
+  // those aren't
   // reachable from other tailnet machines.
   const advertisedA1111Url = (() => {
     if (typeof window === 'undefined') return null;
@@ -612,11 +640,11 @@ export function ImageGenTab() {
     // Local dev / loopback mirror — we can't infer the tailnet hostname
     // from the browser; tell the user to look it up.
     if (isLoopbackHost(h)) return null;
-    // Real tailnet host — use the canonical user-facing port (:5555) and
+    // Real tailnet host — use the canonical user-facing API port and
     // match the currently-active scheme so the hint works in both HTTPS-on
     // (Tailscale cert provisioned) and HTTP-only PortOS deployments.
     const scheme = window.location.protocol === 'http:' ? 'http' : 'https';
-    return `${scheme}://${h}:5555`;
+    return `${scheme}://${h}:${PORTS.API}`;
   })();
 
   return (
@@ -765,9 +793,37 @@ export function ImageGenTab() {
           />
           <span>
             <span className="block font-medium text-white">Sleep display during local MLX video renders</span>
-            <span className="block text-xs text-gray-500 mt-0.5">Keeps the system awake while reducing WindowServer GPU contention on affected Apple silicon. Turn off only when another headless workflow manages display power.</span>
+            <span className="block text-xs text-gray-500 mt-0.5">Off by default. Keeps the system awake while putting the screen to sleep, which reduces WindowServer GPU contention on affected Apple silicon. Turn on only if you hit the GPU-watchdog crash during a render — this is also settable per-render on the Video Gen page.</span>
           </span>
         </label>
+        <FormField
+          label={<>fal.ai API key<span className="block text-xs text-gray-500 mt-0.5">Enables the fal.ai queue video backend on the Video Gen page and in FableLoom. Get a key at fal.ai/dashboard/keys, or set the FAL_KEY environment variable instead.</span></>}
+          labelClassName="text-sm text-gray-300"
+        >
+          <input
+            id="fal-api-key"
+            type="password"
+            autoComplete="off"
+            value={falApiKey}
+            onChange={(e) => setFalApiKey(e.target.value)}
+            placeholder="fal-key-..."
+            className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-port-accent"
+          />
+        </FormField>
+        <FormField
+          label={<>reactor.inc API key<span className="block text-xs text-gray-500 mt-0.5">Enables the reactor.inc fast-h3 video backend on the Video Gen page and in FableLoom, or set the REACTOR_API_KEY environment variable instead.</span></>}
+          labelClassName="text-sm text-gray-300"
+        >
+          <input
+            id="reactor-api-key"
+            type="password"
+            autoComplete="off"
+            value={reactorApiKey}
+            onChange={(e) => setReactorApiKey(e.target.value)}
+            placeholder="reactor-key-..."
+            className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-port-accent"
+          />
+        </FormField>
         <div className="space-y-3">
           {RENDER_TARGET_OPTIONS.map(({ id, label, video }) => {
             const entry = renderDefaults[id] || {};
@@ -953,11 +1009,11 @@ export function ImageGenTab() {
                 className="w-full bg-port-bg border border-port-border rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-port-accent"
               >
                 <option value="">Default ({CODEX_IMAGEGEN_DEFAULT_EFFORT})</option>
-                {CODEX_EFFORT_LEVELS.map((lvl) => (
+                {codexEffortLevels.map((lvl) => (
                   <option key={lvl} value={lvl}>{lvl}</option>
                 ))}
               </select>
-              <p className="text-xs text-gray-500 mt-1">Passed as <code>codex exec -c model_reasoning_effort=&lt;level&gt;</code>. Lower effort is cheaper; leave on the shipped default (<code>{CODEX_IMAGEGEN_DEFAULT_EFFORT}</code>) or drop to <code>minimal</code> for the cheapest possible renders.</p>
+              <p className="text-xs text-gray-500 mt-1">Passed as <code>codex exec -c model_reasoning_effort=&lt;level&gt;</code>. Lower effort is cheaper; leave on the shipped default (<code>{CODEX_IMAGEGEN_DEFAULT_EFFORT}</code>) or drop to <code>{codexEffortLevels[0]}</code> for the cheapest possible renders. The levels offered depend on the model above.</p>
             </FormField>
             <FormField label="Parallel render limit" labelClassName="block text-xs font-medium text-gray-400 mb-1">
               <input
@@ -1283,7 +1339,7 @@ export function ImageGenTab() {
               {advertisedA1111Url ? (
                 <>Other machines should set their SD API URL to <code className="text-gray-300">{advertisedA1111Url}</code></>
               ) : (
-                <>Other machines should set their SD API URL to <code className="text-gray-300">https://&lt;your-tailscale-host&gt;:5555</code> (run <code className="text-gray-300">tailscale status</code> on this machine to see the hostname).</>
+                <>Other machines should set their SD API URL to <code className="text-gray-300">https://&lt;your-tailscale-host&gt;:{PORTS.API}</code> (run <code className="text-gray-300">tailscale status</code> on this machine to see the hostname).</>
               )}
             </div>
           </div>

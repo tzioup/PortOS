@@ -85,9 +85,14 @@ vi.mock('../lib/fileUtils.js', async (importOriginal) => {
 });
 vi.mock('../lib/slashdoLoader.js', async (importOriginal) => {
   const actual = await importOriginal();
+  const loadFile = vi.fn().mockResolvedValue(null);
   return {
     ...actual,
-    loadSlashdoFile: vi.fn().mockResolvedValue(null),
+    loadSlashdoFile: loadFile,
+    loadSlashdoBundle: vi.fn(async (...args) => {
+      const body = await loadFile(...args);
+      return body == null ? null : { body, files: {} };
+    }),
     loadSlashdoLib: vi.fn().mockResolvedValue(null),
     // #3110 — staging the resolved copy is real disk I/O; mocked so tests can
     // assert the pointer path without writing under data/.
@@ -100,19 +105,21 @@ tryReadFile: vi.fn().mockResolvedValue(null),
 }));
 // Code Review Defaults resolver — mocked so tests can control the install-wide
 // default reviewer list threaded into buildAgentPrompt without touching disk.
-// Default matches pickCodeReviewDefaults's unset shape (`['copilot']`).
+// Most prompt-builder cases need an explicit reviewer to exercise their
+// completion text; opt-in/empty-default cases override this fixture locally.
 vi.mock('./codeReview.js', () => ({
   getCodeReviewDefaults: vi.fn().mockResolvedValue({ reviewers: ['copilot'] }),
 }));
 
 import { buildLightContextPrompt, buildAgentPrompt, buildCompletionGuidelineBullet, reconcileSplitContext, buildReviewLoopFollowUpSection, getAppWorkspace, getAgentInstructionsContext, detectSkillTemplates, loadSkillTemplates, UI_AUDIT_RUNTIME_RULE, UI_AUDIT_TASK_TYPES, UNATTENDED_RUN_RULE } from './agentPromptBuilder.js';
+
 import { getCodeReviewDefaults } from './codeReview.js'; // mocked above — control the configured default
 import { isTruthyMeta } from './agentState.js';
 import { buildPrompt } from './promptService.js'; // mocked above — inspect call args
 import { getMemorySection } from './memoryRetriever.js';
 import { getDigitalTwinForPrompt } from './digital-twin.js';
 import { getToolsSummaryForPrompt } from './tools.js';
-import { loadSlashdoFile, loadSlashdoLib, writeResolvedSlashdoBody } from '../lib/slashdoLoader.js'; // mocked above — control the inlined body
+import { loadSlashdoFile, loadSlashdoLib, loadSlashdoBundle, writeResolvedSlashdoBody } from '../lib/slashdoLoader.js'; // mocked above — control the inlined body
 import { SLASHDO_INLINE_BUDGET_CHARS } from '../lib/slashdoInvocation.js';
 import { DEFAULT_TASK_PROMPTS } from './taskPromptDefaults.js';
 // The heading a task-type hook's prompt points at to locate the sentinel path.
@@ -278,6 +285,72 @@ describe('reconcileSplitContext', () => {
   it('leaves a genuinely-separate prompt untouched', () => {
     const task = { description: 'Add a button', metadata: { prompt: 'Do the thing\nsomehow' } };
     expect(reconcileSplitContext(task)).toBe(task);
+  });
+});
+
+describe('tool-free public-review stage completion', () => {
+  // The Eligibility Gate runs with every tool removed. The No-Code contract
+  // (deliver via an API call, then write the sentinel) sent the model narrating
+  // "I will now update PortOS" instead of printing the JSON envelope.
+  const gateTask = () => makeTask({
+    metadata: {
+      context: 'Security scan status: passed.', noCodeOutput: true, discardWorktree: true, openPR: false,
+      executionProfile: 'public-review-gate',
+    },
+  });
+
+  it('tells the model its reply is the deliverable and never mentions a sentinel or API action', () => {
+    const prompt = buildLightContextPrompt(gateTask(), '/repo', null, isTruthyMeta, {
+      providerId: 'claude-ollama', providerCommand: 'claude',
+    });
+    expect(prompt).toMatch(/## Completion \(Tool-Free Reasoning\)/);
+    expect(prompt).toMatch(/final message of this reply/);
+    expect(prompt).not.toMatch(/## Completion \(No Code Output\)/);
+    expect(prompt).not.toMatch(/\.agent-done/);
+    expect(prompt).not.toMatch(/API request or command/);
+  });
+});
+
+describe('sandboxed public-review actions stage completion', () => {
+  // Stage 3 has tools and a discarded worktree; its deliverable is the JSON
+  // payload in the sentinel, which the No-Code contract explicitly disclaims.
+  it('gets the programmatic-output sentinel contract, not the API-action one', () => {
+    const task = makeTask({
+      metadata: { noCodeOutput: true, discardWorktree: true, openPR: false, executionProfile: 'public-review-actions' },
+    });
+    const prompt = buildLightContextPrompt(task, '/repo', null, isTruthyMeta, {
+      providerId: 'codex-tui', providerCommand: 'codex',
+    });
+    expect(prompt).toMatch(/exact payload format described in your task instructions/);
+    expect(prompt).not.toMatch(/## Completion \(No Code Output\)/);
+    expect(prompt).not.toMatch(/## Completion \(Tool-Free Reasoning\)/);
+  });
+
+  // #6062 made this stage attachable on a TUI provider whose vendor declares an
+  // attachable recipe. A TUI run finalizes on the `.agent-done` watcher and
+  // `dispatchTaskOutputHook` reads the payload from that same file, so the
+  // contract only holds if the posture — not the provider type — decides it.
+  // Were the TUI arm to win here, an attachable Stage 3 would be told to run
+  // `/simplify` + `/do:pr` in a discarded worktree and its decision payload
+  // would have to be scraped back out of repaint-heavy PTY output.
+  it('gives the same sentinel-payload contract on a TUI provider as on a headless one', () => {
+    const task = () => makeTask({
+      metadata: { noCodeOutput: true, discardWorktree: true, openPR: false, executionProfile: 'public-review-actions' },
+    });
+    // Same provider record, spawned two ways — so the ONLY variable is the
+    // spawn mode, which is exactly the thing that must not move the contract.
+    const headless = buildLightContextPrompt(task(), '/repo', null, isTruthyMeta, {
+      providerType: 'cli', providerId: 'claude-code', providerCommand: 'claude',
+    });
+    const tui = buildLightContextPrompt(task(), '/repo', null, isTruthyMeta, {
+      providerType: 'tui', providerId: 'claude-code', providerCommand: 'claude',
+    });
+    expect(tui).toMatch(/exact payload format described in your task instructions/);
+    expect(tui).toMatch(/\.agent-done/);
+    // The TUI push/PR workflow must stay suppressed — the worktree is discarded.
+    expect(tui).not.toMatch(/## Completion Workflow/);
+    expect(tui).not.toMatch(/YOU run the Completion Workflow/);
+    expect(tui).toBe(headless);
   });
 });
 
@@ -891,7 +964,9 @@ describe('buildLightContextPrompt', () => {
       expect(prompt).toMatch(/review your changed code for reuse, quality, and efficiency/i);
     });
 
-    it('renders the Completion Workflow with /do:push when openPR is false', () => {
+    it('renders the Completion Workflow with /do:push when openPR is false and there is no worktree', () => {
+      // No worktree: the agent stands on the branch it should push, and PortOS
+      // merges nothing on exit — so /do:push is the right completion step.
       const prompt = buildLightContextPrompt(
         makeTask({ metadata: { simplify: true, openPR: false } }),
         '/r', null, isTruthyMeta, { isTui: true });
@@ -899,6 +974,28 @@ describe('buildLightContextPrompt', () => {
       expect(prompt).not.toMatch(/`\/do:pr`/);
       // /do:push doesn't open a PR — no merge step should be emitted.
       expect(prompt).not.toMatch(/gh pr merge/);
+    });
+
+    it('renders a commit-only Completion Workflow for a worktree with openPR false — PortOS merges it back', () => {
+      // Worktree + no PR is the auto-merge posture: cleanup merges the branch
+      // into the source checkout and deletes it. A push has no consumer there,
+      // and the remote copy `/do:push` left behind is what the repo-state audit
+      // reported as "never deleted" and filed recovery agents for (every
+      // module-hygiene audit of 2026-09-06/07).
+      const prompt = buildLightContextPrompt(
+        makeTask({ metadata: { simplify: true, openPR: false } }),
+        '/r',
+        { branchName: 'cos/task-1/agent-a', worktreePath: '/tmp/wt', baseBranch: 'main' },
+        isTruthyMeta, { isTui: true });
+      expect(prompt).toMatch(/## Completion Workflow/);
+      expect(prompt).toMatch(/^1\. `\/simplify`/m);
+      expect(prompt).toMatch(/^2\. Stage only the files you changed \(never `git add -A` \/ `git add \.`\) and commit with a conventional message/m);
+      expect(prompt).toMatch(/Do NOT push and do NOT open a PR: PortOS merges this branch into `main` in the source checkout after you exit and deletes it/);
+      expect(prompt).not.toMatch(/^\s*\d+\.\s+`\/do:push/m);
+      expect(prompt).not.toMatch(/`\/do:pr`/);
+      expect(prompt).not.toMatch(/gh pr merge/);
+      // The sentinel template keeps its branch slot — that is the branch PortOS merges.
+      expect(prompt).toMatch(/## Branch\n\s+<branch name>/);
     });
 
     it('runs slashdo-free local reviewers before GitHub PR creation, then keeps PR-side review after it', () => {
@@ -1219,11 +1316,11 @@ describe('buildLightContextPrompt', () => {
       // gate only recognized OpenCode + lean mode, so codex fell through to the
       // slashdo path.
       const prompt = buildLightContextPrompt(
-        makeTask({ metadata: { openPR: true, reviewLoop: true } }),
+        makeTask({ metadata: { openPR: true, reviewLoop: true, reviewers: ['copilot'] } }),
         '/r',
         { branchName: 'claim/x', worktreePath: '/tmp/wt', baseBranch: 'main' },
         isTruthyMeta,
-        { isTui: true, providerId: 'codex-tui', providerCommand: 'codex' });
+        { isTui: true, providerId: 'codex-tui', providerCommand: 'codex', defaultReviewers: ['copilot'] });
       expect(prompt).toMatch(/## Completion Workflow/);
       expect(prompt).toMatch(/does NOT have slashdo/);
       expect(prompt).not.toMatch(/`\/do:pr`/);
@@ -1322,7 +1419,7 @@ describe('buildLightContextPrompt', () => {
         });
       expect(prompt).toMatch(/### CLI Reviewer Procedure \(codex\)/);
       expect(prompt).toMatch(/RECIPE: codex --sandbox read-only review/);
-      expect(prompt).toMatch(/do NOT probe the CLI/);
+      expect(prompt).toMatch(/verify isolation flags with the installed CLI/);
     });
 
     it('points an over-budget CLI-reviewer recipe at its staged file instead of pasting 40KB', () => {
@@ -1586,16 +1683,18 @@ describe('buildLightContextPrompt', () => {
       expect(prompt).toMatch(/gh pr merge "<PR_URL>" --merge --delete-branch/);
     });
 
-    it('uses /do:push (not /do:pr) for Claude Code CLI when openPR is false', () => {
+    it('tells Claude Code CLI to commit only (no /do:push) when PortOS merges the worktree branch back', () => {
+      // Same auto-merge posture as the TUI case above, on the CLI path.
       const prompt = buildLightContextPrompt(
         makeTask({ metadata: { openPR: false, simplify: true } }),
         '/r',
-        { branchName: 'b', worktreePath: '/tmp/wt' },
+        { branchName: 'b', worktreePath: '/tmp/wt', baseBranch: 'main' },
         isTruthyMeta,
         { isTui: false, providerId: 'claude-code' });
-      expect(prompt).toMatch(/`\/do:push`/);
+      expect(prompt).toMatch(/^\s*\d+\.\s+Stage only the files you changed \(never `git add -A` \/ `git add \.`\) and commit with a conventional message/m);
+      expect(prompt).toMatch(/Do NOT push and do NOT open a PR: PortOS merges this branch into `main` in the source checkout after you exit and deletes it/);
+      expect(prompt).not.toMatch(/^\s*\d+\.\s+`\/do:push/m);
       expect(prompt).not.toMatch(/`\/do:pr`/);
-      // /do:push doesn't open a PR — no merge step should be emitted.
       expect(prompt).not.toMatch(/gh pr merge/);
     });
 
@@ -1626,6 +1725,7 @@ describe('buildLightContextPrompt', () => {
       const prompt = buildLightContextPrompt(
         makeTask({ metadata: {
           reviewLoopFollowUp: true,
+          reviewLoopReviewers: ['copilot'],
           reviewLoopPRUrl: 'https://github.com/o/r/pull/9',
           reviewLoopPRBranch: 'b',
           reviewLoopPRNumber: 9,
@@ -1635,7 +1735,7 @@ describe('buildLightContextPrompt', () => {
         }}),
         '/r',
         { branchName: 'b', worktreePath: '/tmp/wt' },
-        isTruthyMeta);
+        isTruthyMeta, { defaultReviewers: ['copilot'] });
       expect(prompt).toMatch(/## Review-Loop Follow-up/);
       expect(prompt).toMatch(/task-src-1/);
       expect(prompt).toMatch(/gh pr merge "https:\/\/github\.com\/o\/r\/pull\/9" --merge --delete-branch/);
@@ -1832,8 +1932,8 @@ describe('buildLightContextPrompt', () => {
     });
 
     it('does not leak default usernames/stop-mode/reviewer-applies when no Code Review Defaults are set', () => {
-      // Same task, no `codeReviewDefaults` option → the lone-copilot default,
-      // which suppresses `--review-with` entirely and emits none of the flags.
+      // Same task, no `codeReviewDefaults` option → the empty install default,
+      // which emits none of the reviewer flags.
       const prompt = buildLightContextPrompt(
         makeTask({ metadata: { openPR: true, reviewLoop: true } }),
         '/r',
@@ -2221,11 +2321,9 @@ describe('buildLightContextPrompt', () => {
       expect(prompt).not.toMatch(/## Resuming Unfinished Work/);
     });
 
-    it('worktreeCommitGuidance: hasSlashdo + !willOpenPR emits the push-only Completion wording', () => {
-      // Claude Code CLI with a worktree but no PR (e.g. a managed-app task
-      // whose flow is "push the branch, no PR"). The agent owns its own
-      // /simplify + /do:push, so the worktree guidance points at the
-      // Completion section's push (not the PR variant).
+    it('worktreeCommitGuidance: hasSlashdo + !willOpenPR says commit only — PortOS merges the branch back', () => {
+      // Claude Code CLI with a worktree but no PR is the auto-merge posture: the
+      // worktree guidance must not point the agent at a push nothing consumes.
       const prompt = buildLightContextPrompt(
         makeTask({ metadata: { openPR: false, simplify: true } }),
         '/r',
@@ -2233,9 +2331,8 @@ describe('buildLightContextPrompt', () => {
         isTruthyMeta,
         { isTui: false, providerId: 'claude-code' });
       expect(prompt).toMatch(/## Git Worktree/);
-      // Push-only Completion wording — NOT the "push and PR" variant.
-      expect(prompt).toMatch(/the \*\*Completion\*\* section below drives the push\./);
-      expect(prompt).not.toMatch(/drives the push and PR/);
+      expect(prompt).toMatch(/Commit your changes here — do NOT push\. PortOS merges this branch back after you exit/);
+      expect(prompt).not.toMatch(/drives the push/);
       // And NOT the post-exit handoff message (that's the codex/antigravity path).
       expect(prompt).not.toMatch(/The system will push and open a PR after you exit/);
     });
@@ -2252,6 +2349,35 @@ describe('buildLightContextPrompt', () => {
       expect(prompt).toMatch(/Stage 2 of 3: "prose"/);
       expect(prompt).toMatch(/Previous stage: "idea"/);
       expect(prompt).toMatch(/agent-prev-1[\\/]output\.txt/);
+    });
+
+    it('keeps a stage inside its worktree when the previous output is inlined in full', () => {
+      // The pointer names a file under data/cos/agents — outside every agent
+      // worktree. Under a sandboxed permission posture reading it is a dialog
+      // nobody answers (agent-e057cca7), and the text is already in the prompt.
+      const inlined = buildLightContextPrompt(makeTask({
+        metadata: { pipeline: {
+          previousStageAgentId: 'agent-prev-1',
+          previousStageOutput: JSON.stringify({ eligibility: 'passed', eligibleNumbers: [6223] }),
+          currentStage: 2,
+          stages: [{ name: 'scan' }, { name: 'gate' }, { name: 'review' }],
+        }}
+      }), '/r', null, isTruthyMeta);
+      expect(inlined).toMatch(/hand-off is inlined below in full/);
+      expect(inlined).not.toMatch(/output\.txt/);
+      expect(inlined).toMatch(/"eligibleNumbers":\[6223\]/);
+
+      // A clipped inline says so, and still never points outside the worktree.
+      const clipped = buildLightContextPrompt(makeTask({
+        metadata: { pipeline: {
+          previousStageAgentId: 'agent-prev-1',
+          previousStageOutput: 'x'.repeat(12_001),
+          currentStage: 2,
+          stages: [{ name: 'scan' }, { name: 'gate' }, { name: 'review' }],
+        }}
+      }), '/r', null, isTruthyMeta);
+      expect(clipped).toMatch(/clipped to its first 12000 characters/);
+      expect(clipped).not.toMatch(/output\.txt/);
     });
 
     it('renders a direct preflight summary when the previous stage has no agent', () => {
@@ -2423,21 +2549,29 @@ describe('buildAgentPrompt — provider type routing', () => {
     });
 
     it('without leanMode a claude TUI still gets the slashdo workflow', async () => {
+      // A worktree with no PR is commit-only on every path (PortOS merges it
+      // back), so the slashdo marker is `/simplify` — only a slashdo-capable
+      // session is told to run it.
+      const task = splitTask();
       const prompt = await buildAgentPrompt(
-        splitTask(), {}, '/r', wt, isTruthyMeta,
+        { ...task, metadata: { ...task.metadata, simplify: true } }, {}, '/r', wt, isTruthyMeta,
         { providerType: 'tui', providerId: 'claude-code-tui', providerCommand: 'claude' });
-      expect(prompt).toMatch(/\/do:push/);
+      expect(prompt).toMatch(/^1\. `\/simplify`/m);
+      expect(prompt).not.toMatch(/does NOT have slashdo/);
+      expect(prompt).not.toMatch(/^\s*\d+\.\s+`\/do:push/m);
     });
 
     it('splits a STANDARD (non-lean) claude TUI too, keeping slashdo in the system prompt', async () => {
+      const task = splitTask();
       const parts = await buildAgentPrompt(
-        splitTask(), {}, '/r', wt, isTruthyMeta,
+        { ...task, metadata: { ...task.metadata, simplify: true } }, {}, '/r', wt, isTruthyMeta,
         { providerType: 'tui', providerId: 'claude-code-tui', providerCommand: 'claude', split: true });
       // Task in the user prompt, contract (with slashdo — NOT slashdo-free) in system.
       expect(parts.userPrompt).toMatch(/Add a button to the dashboard/);
       expect(parts.userPrompt).not.toMatch(/## Completion Workflow/);
       expect(parts.systemPrompt).toMatch(/## Completion Workflow/);
-      expect(parts.systemPrompt).toMatch(/\/do:push/);
+      expect(parts.systemPrompt).toMatch(/^1\. `\/simplify`/m);
+      expect(parts.systemPrompt).not.toMatch(/does NOT have slashdo/);
     });
 
     it('split parts carry exactly the combined prompt for a standard claude CLI (no drift)', async () => {
@@ -2914,7 +3048,7 @@ describe('discardWorktree (reasoning-only) completion contract', () => {
 
 // #2507 — CoS app-improve/self-improvement tasks pin no `reviewers`, so the
 // review loop must resolve them from the install's Code Review Defaults
-// (settings.codeReview.reviewers) rather than the hardcoded copilot default,
+// (settings.codeReview.reviewers) rather than a hardcoded reviewer,
 // which stalls on installs without GitHub Copilot review enabled.
 describe('buildAgentPrompt — reviewer resolution honors Code Review Defaults (#2507)', () => {
   const reviewLoopTask = () => makeTask({ metadata: { openPR: true, reviewLoop: true, simplify: false } });
@@ -2930,11 +3064,11 @@ describe('buildAgentPrompt — reviewer resolution honors Code Review Defaults (
     expect(prompt).not.toMatch(/--review-with copilot/);
   });
 
-  it('falls back to copilot (unchanged behavior) when no default is configured', async () => {
-    vi.mocked(getCodeReviewDefaults).mockResolvedValueOnce({ reviewers: ['copilot'] });
+  it('keeps review opt-in when no default is configured', async () => {
+    vi.mocked(getCodeReviewDefaults).mockResolvedValueOnce({ reviewers: [] });
     const prompt = await buildAgentPrompt(reviewLoopTask(), {}, '/r', { branchName: 'b', worktreePath: '/tmp/wt' }, isTruthyMeta, claudeCliOpts);
-    // Lone-copilot default is suppressed from --review-with (buildReviewWithArgs
-    // isDefaultOnly), so /do:pr runs without an explicit reviewer flag.
+    // An empty default is suppressed from --review-with, so /do:pr runs without
+    // an explicit reviewer flag.
     expect(prompt).toMatch(/`\/do:pr`/);
     expect(prompt).not.toMatch(/--review-with claude/);
   });
@@ -2947,7 +3081,7 @@ describe('buildAgentPrompt — reviewer resolution honors Code Review Defaults (
     expect(prompt).not.toMatch(/--review-with claude/);
   });
 
-  it('degrades to the hardcoded copilot default when the settings read fails', async () => {
+  it('keeps review opt-in when the settings read fails', async () => {
     vi.mocked(getCodeReviewDefaults).mockRejectedValueOnce(new Error('settings unavailable'));
     const prompt = await buildAgentPrompt(reviewLoopTask(), {}, '/r', { branchName: 'b', worktreePath: '/tmp/wt' }, isTruthyMeta, claudeCliOpts);
     expect(prompt).toMatch(/`\/do:pr`/);
@@ -2978,7 +3112,7 @@ describe('buildReviewLoopFollowUpSection — CLI reviewer procedure inlining', (
       expect(out).toContain('CLI Reviewer Procedure');
       expect(out).toContain(LOOP_SENTINEL);
       // The vague invocation step points the agent at the inlined procedure.
-      expect(out).toMatch(/do NOT probe the CLI/i);
+      expect(out).toMatch(/verify isolation flags with the installed CLI/i);
     });
   }
 
@@ -3273,6 +3407,40 @@ describe('buildAgentPrompt — slashdo prompt-size controls', () => {
     expect(prompt).toContain('do-review');
   });
 
+  it('stages a small deferred entrypoint so its references resolve outside the managed app', async () => {
+    const body = 'Read lib/audit.md when auditing.';
+    const files = { 'audit.md': 'Audit procedure' };
+    vi.mocked(loadSlashdoBundle).mockResolvedValueOnce({ body, files });
+    const prompt = await buildAgentPrompt(
+      slashdoTask({ reviewers: ['codex'] }), {}, '/managed-app', null, isTruthyMeta,
+      { providerType: 'cli', providerId: 'codex' });
+    expect(writeResolvedSlashdoBody).toHaveBeenCalledWith('review', body, { files });
+    expect(prompt).toContain('/install/data/cos/slashdo-resolved/review.md');
+    expect(prompt).toContain('relative to the file containing that reference');
+    expect(prompt).not.toContain(body);
+    expect(prompt).toContain('--review-with codex');
+  });
+
+  it('rebuilds an eager body if a deferred bundle cannot be staged', async () => {
+    vi.mocked(loadSlashdoBundle).mockResolvedValueOnce({
+      body: 'Read lib/audit.md', files: { 'audit.md': 'Audit procedure' },
+    });
+    vi.mocked(loadSlashdoFile).mockResolvedValueOnce('Complete inline audit procedure');
+    vi.mocked(writeResolvedSlashdoBody).mockRejectedValueOnce(new Error('EACCES'));
+    const prompt = await buildAgentPrompt(
+      slashdoTask(), {}, '/managed-app', null, isTruthyMeta,
+      { providerType: 'cli', providerId: 'codex' });
+    expect(prompt).toContain('Complete inline audit procedure');
+    expect(prompt).not.toContain('Read lib/audit.md');
+  });
+
+  it('rejects a missing required procedure instead of dispatching an invocation alone', async () => {
+    vi.mocked(loadSlashdoBundle).mockRejectedValueOnce(new Error('Missing required slashdo library: audit.md'));
+    await expect(buildAgentPrompt(
+      slashdoTask(), {}, '/r', null, isTruthyMeta,
+      { providerType: 'cli', providerId: 'codex' })).rejects.toThrow('Missing required slashdo library');
+  });
+
   it('inlines the body when it is under budget, and stages no file', async () => {
     vi.mocked(loadSlashdoFile).mockResolvedValue(UNDER);
     const prompt = await buildAgentPrompt(
@@ -3415,11 +3583,10 @@ describe('buildAgentPrompt — slashdo prompt-size controls', () => {
       expect(skipArg()).not.toContain('ollama-review-loop');
     });
 
-    it('prunes NOTHING on an unconfigured install (a lone copilot default is the unset shape)', async () => {
-      // pickCodeReviewDefaults collapses "nothing configured" to ['copilot'], so a
-      // lone copilot can't authorize pruning — and pinning --review-with copilot on
-      // an install without Copilot review is the #2507 stall.
-      vi.mocked(getCodeReviewDefaults).mockResolvedValue({ reviewers: ['copilot'] });
+    it('prunes NOTHING on an unconfigured install', async () => {
+      // An empty default cannot authorize pruning or pin a reviewer on an
+      // install that has not opted into code review.
+      vi.mocked(getCodeReviewDefaults).mockResolvedValue({ reviewers: [] });
       const prompt = await buildAgentPrompt(
         slashdoTask(), {}, '/r', null, isTruthyMeta,
         { providerType: 'cli', providerId: 'codex' });
@@ -3487,13 +3654,90 @@ describe('buildAgentPrompt — slashdo prompt-size controls', () => {
       // Two review sources ⇒ the multi-reviewer wrapper is reachable.
       expect(skipped).not.toContain('multi-reviewer-loop');
     });
+  });
 
-    it('keys the staged file on the prune set so two reviewer sets do not share a copy', async () => {
-      await buildAgentPrompt(
-        slashdoTask({ reviewers: ['codex'] }), {}, '/r', null, isTruthyMeta,
+  // slashdo puts an explicit `--review-with` above every saved or inherited
+  // default (lib/review-config-defaults.md), and PortOS passes `slashdoArgs`
+  // through verbatim — so the flag in the invocation is what the run WILL use.
+  // Pruning the body (or pinning a reviewer) from task metadata instead is how a
+  // prompt requests one reviewer, omits its loop, and names another. #6261.
+  describe('an explicit --review-with in slashdoArgs', () => {
+    const skipArg = () => vi.mocked(loadSlashdoFile).mock.calls.at(-1)[1].skipIncludes;
+
+    it('prunes for the explicit flag, not for the task metadata behind it', async () => {
+      const prompt = await buildAgentPrompt(
+        slashdoTask({ slashdoArgs: '--review-with ollama', reviewers: ['codex'] }),
+        {}, '/r', null, isTruthyMeta,
         { providerType: 'cli', providerId: 'codex' });
-      const [, , opts] = vi.mocked(writeResolvedSlashdoBody).mock.calls.at(-1);
-      expect(opts.skipIncludes).toContain('copilot-review-loop');
+      const skipped = skipArg();
+      // The reviewer the run will actually invoke keeps its loop…
+      expect(skipped).not.toContain('ollama-review-loop');
+      // …and the metadata reviewer's is what drops out.
+      expect(skipped).toContain('local-agent-review-loop');
+      // Naming codex here would tell the agent to use a reviewer whose loop was
+      // just pruned away.
+      expect(prompt).not.toContain('--review-with codex');
+    });
+
+    it('preserves an explicit `none` opt-out inherited from Code Review Defaults', async () => {
+      vi.mocked(getCodeReviewDefaults).mockResolvedValue({ reviewers: ['codex'] });
+      const prompt = await buildAgentPrompt(
+        slashdoTask({ slashdoArgs: '--review-with none' }), {}, '/r', null, isTruthyMeta,
+        { providerType: 'cli', providerId: 'codex' });
+      expect(prompt).toContain('--review-with none');
+      // `none` sets REVIEW_AGENTS=[] with no fallback, so no loop is reachable.
+      expect(skipArg()).toEqual(expect.arrayContaining([
+        'copilot-review-loop', 'github-reviewer-loop', 'local-agent-review-loop',
+        'ollama-review-loop', 'multi-reviewer-loop',
+      ]));
+      expect(prompt).not.toContain('--review-with codex');
+    });
+
+    it('states each suffix exactly once — in the invocation, not again as a pin', async () => {
+      const args = '--review-with agy[gemini-3.8-flash]~opt~max=1~effort=medium';
+      const prompt = await buildAgentPrompt(
+        // The metadata names a DIFFERENT loop variant, so a metadata-derived pin
+        // would both prune away agy's loop and add a second set of suffixes.
+        slashdoTask({ slashdoArgs: args, reviewers: ['ollama'], reviewerEfforts: { ollama: 'high' } }),
+        {}, '/r', null, isTruthyMeta,
+        { providerType: 'cli', providerId: 'codex' });
+      expect(prompt).not.toContain('--review-with ollama');
+      expect(skipArg()).not.toContain('local-agent-review-loop');
+      expect(prompt.split('~effort=').length - 1).toBe(1);
+      expect(prompt.split('~max=').length - 1).toBe(1);
+      expect(prompt.split('~opt').length - 1).toBe(1);
+    });
+
+    it('reads the equals form the same as the spaced one', async () => {
+      const prompt = await buildAgentPrompt(
+        slashdoTask({ slashdoArgs: '--review-with=ollama', reviewers: ['codex'] }),
+        {}, '/r', null, isTruthyMeta,
+        { providerType: 'cli', providerId: 'codex' });
+      expect(skipArg()).not.toContain('ollama-review-loop');
+      expect(skipArg()).toContain('local-agent-review-loop');
+      expect(prompt).not.toContain('--review-with codex');
+    });
+
+    it('prunes and pins NOTHING when the explicit value cannot be safely read', async () => {
+      vi.mocked(getCodeReviewDefaults).mockResolvedValue({ reviewers: ['codex'] });
+      const prompt = await buildAgentPrompt(
+        // A slug outside the grammar PortOS mirrors: guessing which loop it needs
+        // is how the run loses the one it reaches.
+        slashdoTask({ slashdoArgs: '--review-with some-future-reviewer' }),
+        {}, '/r', null, isTruthyMeta,
+        { providerType: 'cli', providerId: 'codex' });
+      expect(skipArg()).toEqual([]);
+      expect(prompt).toContain('--review-with some-future-reviewer');
+      expect(prompt).not.toContain('--review-with codex');
+    });
+
+    it('leaves the metadata contract in charge when the args name no reviewer', async () => {
+      const prompt = await buildAgentPrompt(
+        slashdoTask({ slashdoArgs: '--issues 42', reviewers: ['codex'] }),
+        {}, '/r', null, isTruthyMeta,
+        { providerType: 'cli', providerId: 'codex' });
+      expect(prompt).toContain('--review-with codex');
+      expect(skipArg()).toContain('copilot-review-loop');
     });
   });
 });
@@ -3822,5 +4066,45 @@ describe('planner attribution', () => {
     );
     expect(prompt).not.toMatch(/## Planner Attribution/);
     expect(prompt).not.toMatch(/planner:/);
+  });
+});
+
+describe('auto-merge posture (worktree, no PR) is commit-only on every path', () => {
+  // `portosMergesBranchOnExit` is the one decision the completion, hygiene and
+  // worktree sections all key on. It is pinned through the rendered prompts
+  // (here and in the TUI/CLI cases above) rather than as a truth table — a wrong
+  // answer re-arms the `/do:push` that filed a recovery agent after every
+  // module-hygiene audit on 2026-09-06/07, and the prompt is where that shows.
+  it('api path: the simplify step, instructions and Git Hygiene all say commit only, never /do:push', async () => {
+    const prompt = await buildAgentPrompt(
+      makeTask({ metadata: { openPR: false, simplify: true } }),
+      {}, '/r',
+      { branchName: 'cos/task-1/agent-a', worktreePath: '/tmp/wt', baseBranch: 'main' },
+      isTruthyMeta, { providerType: 'api' });
+    expect(prompt).toMatch(/Fix any issues found, then commit your changes \(do NOT push — PortOS merges this branch back into the source checkout after you exit/);
+    expect(prompt).toMatch(/Commit your changes \(see Git Hygiene below\) — do NOT push, PortOS merges this branch back on exit/);
+    expect(prompt).toMatch(/\*\*Commit only — do NOT push\.\*\* Stage specific files \(no `git add -A`\), use `feat:`\/`fix:`\/`breaking:` prefix in the commit message, no Co-Authored-By annotations\. PortOS merges this branch back into the source checkout after you exit and deletes it, so do NOT run `git push` or `\/do:push` yourself/);
+    expect(prompt).not.toMatch(/Commit and push using `\/do:push`/);
+    expect(prompt).not.toMatch(/Commit and push your changes/);
+    // The Guidelines bullet already described the merge-back; it still does.
+    expect(prompt).toMatch(/Your worktree branch will be automatically merged back to the source branch/);
+  });
+
+  it('api path: the same task WITHOUT a worktree keeps commit-and-push', async () => {
+    const prompt = await buildAgentPrompt(
+      makeTask({ metadata: { openPR: false, simplify: true } }),
+      {}, '/r', null, isTruthyMeta, { providerType: 'api' });
+    expect(prompt).toMatch(/commit and push using `\/do:push`/);
+    expect(prompt).toMatch(/Commit and push using `\/do:push`/);
+    expect(prompt).not.toMatch(/PortOS merges this branch back/);
+  });
+
+  it('buildCompletionGuidelineBullet renders the commit-only TUI wording when there is no completion command', () => {
+    const bullet = buildCompletionGuidelineBullet({
+      isReadOnly: false, isTui: true, tuiCompletionCommand: null,
+      worktreeInfo: { worktreePath: '/wt' }, willOpenPR: false,
+    });
+    expect(bullet).toMatch(/commit only — no push; PortOS merges your branch back after you exit/);
+    expect(bullet).not.toMatch(/`\/do:push`/);
   });
 });

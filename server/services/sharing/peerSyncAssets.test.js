@@ -315,12 +315,13 @@ describe('buildFableLoomAssetManifest — scene renders', () => {
     const imageBytes = Buffer.from('scene-image');
     const videoBytes = Buffer.from('scene-video');
     writeImage('scene.png', imageBytes);
+    writeImage('anchor.png', imageBytes);
     writeVideo('video-1.mp4', videoBytes);
 
     const manifest = await buildFableLoomAssetManifest({
       episodes: [
         { nodes: [{ id: 'node-1', image: 'scene.png', videoHistoryId: 'video-1' }] },
-        { nodes: [{ id: 'node-2', image: 'scene.png', videoHistoryId: 'video-1' }] },
+        { nodes: [{ id: 'node-2', image: 'scene.png', videoHistoryId: 'video-1', visualCanon: { characterAppearances: [{ referenceImage: 'anchor.png' }] } }] },
       ],
     });
 
@@ -330,7 +331,53 @@ describe('buildFableLoomAssetManifest — scene renders', () => {
     expect(manifest).toContainEqual({
       filename: 'video-1.mp4', kind: 'video', sha256: sha(videoBytes),
     });
-    expect(manifest).toHaveLength(2);
+    expect(manifest).toContainEqual(expect.objectContaining({ filename: 'anchor.png', kind: 'image' }));
+    expect(manifest).toHaveLength(3);
+  });
+
+  it('includes typed playback assets — entry, hold loops, and transition exits (#6006)', async () => {
+    const entryBytes = Buffer.from('entry-clip');
+    const holdBytes = Buffer.from('hold-clip');
+    const exitBytes = Buffer.from('exit-clip');
+    writeVideo('entry-1.mp4', entryBytes);
+    writeVideo('hold-1.mp4', holdBytes);
+    writeVideo('exit-1.mp4', exitBytes);
+
+    const manifest = await buildFableLoomAssetManifest({
+      episodes: [{
+        nodes: [{
+          id: 'node-1',
+          // No legacy node.videoHistoryId — only typed playbackAssets.
+          playbackAssets: {
+            entryVideoHistoryId: 'entry-1',
+            holdLoopVideoHistoryIds: ['hold-1'],
+            exitByTransition: { 'trans-1': 'exit-1' },
+          },
+        }],
+      }],
+    });
+
+    expect(manifest).toContainEqual({ filename: 'entry-1.mp4', kind: 'video', sha256: sha(entryBytes) });
+    expect(manifest).toContainEqual({ filename: 'hold-1.mp4', kind: 'video', sha256: sha(holdBytes) });
+    expect(manifest).toContainEqual({ filename: 'exit-1.mp4', kind: 'video', sha256: sha(exitBytes) });
+    expect(manifest).toHaveLength(3);
+  });
+
+  it('deduplicates a video id referenced by both node.videoHistoryId and playbackAssets', async () => {
+    const videoBytes = Buffer.from('shared-clip');
+    writeVideo('shared-1.mp4', videoBytes);
+
+    const manifest = await buildFableLoomAssetManifest({
+      episodes: [{
+        nodes: [{
+          id: 'node-1',
+          videoHistoryId: 'shared-1',
+          playbackAssets: { entryVideoHistoryId: 'shared-1', holdLoopVideoHistoryIds: ['shared-1'] },
+        }],
+      }],
+    });
+
+    expect(manifest).toEqual([{ filename: 'shared-1.mp4', kind: 'video', sha256: sha(videoBytes) }]);
   });
 });
 

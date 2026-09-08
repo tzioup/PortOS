@@ -194,7 +194,7 @@ export default function ListEnrichment({
               {items.length > 1 && (
                 <button
                   onClick={() => removeItem(index)}
-                  className="absolute top-2 right-2 p-1.5 text-gray-500 hover:text-red-400 opacity-40 sm:opacity-0 sm:group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                  className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center absolute top-2 right-2 p-1.5 text-gray-500 hover:text-red-400 opacity-40 sm:opacity-0 sm:group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
                   title="Remove" aria-label="Remove"
                 >
                   <X size={16} />
@@ -411,7 +411,7 @@ export default function ListEnrichment({
                 className="w-full px-4 py-3 bg-port-bg border border-port-border rounded-lg text-white font-mono text-sm resize-y focus:outline-hidden focus:border-port-accent"
               />
             ) : (
-              <pre className="p-4 bg-port-bg rounded-lg text-sm text-gray-300 whitespace-pre-wrap overflow-auto max-h-96">
+              <pre className="p-4 bg-port-bg rounded-lg text-sm text-gray-300 whitespace-pre-wrap break-words overflow-auto max-h-96">
                 {documentContent}
               </pre>
             )}

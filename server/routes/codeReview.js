@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { asyncHandler, ServerError } from '../lib/errorHandler.js'
-import { validateRequest, LOCAL_LLM_REVIEWERS, normalizeReviewerEffort, reviewerEffortLevels, reviewerEffortsFromDefaults } from '../lib/validation.js'
+import { validateRequest, isToolFreeReviewer, isProviderReviewer, reviewerModelsFromDefaults, normalizeReviewerEffort, reviewerEffortLevels, reviewerEffortsFromDefaults } from '../lib/validation.js'
 import { getSettings } from '../services/settings.js'
 import { runLocalCodeReview, getCodeReviewDefaults, getReviewerCliInstalled } from '../services/codeReview.js'
 
@@ -9,7 +9,9 @@ const router = Router()
 
 // Body shape for POST /api/code-review/local. `model` and `effort` are optional —
 // when omitted (or empty) we fall back to the model / reasoning effort configured
-// on the Code Review Defaults panel. The diff is sent as-is; agents can pipe
+// on the Code Review Defaults panel, and with no configured model either, to the
+// model the backend itself reports serving when that is unambiguous (see
+// `resolveServedModel`). The diff is sent as-is; agents can pipe
 // `gh pr diff <N>` straight into it without preprocessing.
 // `effort` is checked against the ladder for the REQUESTED backend rather than a
 // flat union of every local level: the two backends are separate identities in
@@ -18,7 +20,7 @@ const router = Router()
 // silently drop it — a 200 with the effort ignored instead of a 400. Same
 // normalizer both places, so they can't disagree.
 const localReviewRequestSchema = z.object({
-  backend: z.enum(LOCAL_LLM_REVIEWERS),
+  backend: z.string().refine(isToolFreeReviewer),
   model: z.string().optional(),
   effort: z.string().optional(),
   diff: z.string().min(1, 'diff must be non-empty'),
@@ -38,7 +40,7 @@ const localReviewRequestSchema = z.object({
 })
 
 // GET /api/code-review/defaults — resolved global defaults (settings.codeReview
-// + hardcoded fallback). The Code Reviewers settings page reads this to render the
+// + an empty opt-in fallback). The Code Reviewers settings page reads this to render the
 // initial state; TaskAddForm + ScheduleTab read it to seed new reviewer lists.
 // `installed` (per-CLI-reviewer boolean, TTL-probed) rides alongside so a
 // picker can flag a configured reviewer whose binary isn't on this machine
@@ -49,15 +51,18 @@ router.get('/defaults', asyncHandler(async (_req, res) => {
 }))
 
 // POST /api/code-review/local — run a single review pass against the
-// configured local-LLM backend (LM Studio or Ollama) and return the findings
+// configured local-LLM backend (LM Studio, Ollama, or MTPLX) and return the findings
 // text the agent will act on. Synchronous: keeps the agent's `curl` step
 // simple — one request, one body back.
 router.post('/local', asyncHandler(async (req, res) => {
   const body = validateRequest(localReviewRequestSchema, req.body)
   const settings = await getSettings()
-  const configured = body.backend === 'lmstudio'
-    ? settings.codeReview?.lmstudioModel
-    : settings.codeReview?.ollamaModel
+  // Keyed off the roster's `<reviewer>Model` scalar rather than a per-backend
+  // branch, so a backend added to LOCAL_LLM_REVIEWERS reads its own configured
+  // model instead of silently inheriting another backend's.
+  const configured = isProviderReviewer(body.backend)
+    ? reviewerModelsFromDefaults(settings.codeReview)[body.backend]
+    : settings.codeReview?.[`${body.backend}Model`]
   const model = body.model || configured
   // Per-request effort wins over the panel default; absent in both = omit the
   // field entirely so the model reasons however it normally would. The stored
@@ -73,8 +78,11 @@ router.post('/local', asyncHandler(async (req, res) => {
     timeoutMs: body.timeoutMs,
   })
   if (!result.ok) {
+    // A model neither the request, the panel, nor the backend's own listing could
+    // supply is the caller's config gap (400) — the 502 bucket is for a reviewer
+    // that was actually asked and failed.
     throw new ServerError(result.error || 'Code review failed', {
-      status: 502,
+      status: result.code === 'NO_MODEL' ? 400 : 502,
       context: { backend: result.backend, model: result.model }
     })
   }

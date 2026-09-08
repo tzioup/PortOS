@@ -7,6 +7,7 @@ const mock = vi.hoisted(() => ({
   stopRun: vi.fn(),
   assertVision: vi.fn(),
   readTaskCatalog: vi.fn(),
+  readTaskInventory: vi.fn(),
   executeTaskRequests: vi.fn(),
   executeToolCall: vi.fn(),
   readVisibility: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock('./runner.js', () => ({ stopRun: (...args) => mock.stopRun(...args) }));
 vi.mock('./persistentMindTaskCapability.js', () => ({
   buildPersistentMindTaskCapabilityPrompt: ({ enabled }) => `Task access: ${enabled ? 'ON' : 'OFF'}`,
   readPersistentMindTaskCatalog: (...args) => mock.readTaskCatalog(...args),
+  readPersistentMindTaskInventory: (...args) => mock.readTaskInventory(...args),
   executePersistentMindTaskRequests: (...args) => mock.executeTaskRequests(...args),
 }));
 vi.mock('./persistentMindVisibility.js', () => ({
@@ -62,6 +64,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mock.root.config.persistentMindCapabilities = { createTasks: true };
   mock.readTaskCatalog.mockResolvedValue({ apps: [{ id: 'portos' }], providers: [{ id: 'codex' }] });
+  mock.readTaskInventory.mockResolvedValue([]);
   mock.readVisibility.mockResolvedValue({ readiness: 'ready', workspaces: [] });
   mock.executeTaskRequests.mockResolvedValue([]);
   mock.executeCallRequest.mockResolvedValue(null);
@@ -70,12 +73,34 @@ beforeEach(() => {
   mock.runPrompt.mockResolvedValue({ text: JSON.stringify({
     thinkingSummary: 'I connected the new request to the durable fact.',
     message: 'Here is the answer.',
-    memoryCandidates: [{ content: 'Remember this.', type: 'fact', category: 'other', tags: [] }],
+    memoryCandidates: [{ content: 'Remember this.', type: 'fact', category: 'other', tags: [], protection: 'important' }],
     selfWake: null,
   }) });
 });
 
 describe('persistent mind adapter', () => {
+  it.each([
+    'OpenAI Codex v1\nuser\n{"message":"example"}',
+    JSON.stringify({ toolCalls: [{ name: 'catalog-name', arguments: {} }], memoryCandidates: [{ content: 'Example memory' }] }),
+  ])('rejects prompt echoes before any side effects', async (text) => {
+    mock.runPrompt.mockResolvedValue({ text });
+    await expect(createPersistentMindTurnAdapter().run({
+      turnId: 'echo-turn', wake: { kind: 'self' }, ...profile,
+      signal: new AbortController().signal, context: { text: '# Context' },
+    })).rejects.toThrow(/instead of an assistant response/);
+    expect(mock.executeToolCall).not.toHaveBeenCalled();
+    expect(mock.executeTaskRequests).not.toHaveBeenCalled();
+    expect(mock.executeCallRequest).not.toHaveBeenCalled();
+    expect(mock.createPersistentMindMemoryFromCandidate).not.toHaveBeenCalled();
+    expect(mock.runPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['', 'OpenAI Codex v1\nuser\nSummarize prior events'])('rejects unusable summaries', async (text) => {
+    mock.runPrompt.mockResolvedValue({ text });
+    await expect(createPersistentMindTurnAdapter().summarize({ events: [], ...profile }))
+      .rejects.toThrow(/instead of an assistant response/);
+  });
+
   it('prepares editable prompt and curated memory context without inference', async () => {
     const prepared = await createPersistentMindTurnAdapter().prepare({ profile });
     expect(prepared).toMatchObject({
@@ -110,7 +135,7 @@ describe('persistent mind adapter', () => {
       'mind.thought', 'mind.reply', 'mind.memory.created',
     ]);
     expect(mock.createPersistentMindMemoryFromCandidate).toHaveBeenCalledWith({
-      content: 'Remember this.', type: 'fact', category: 'other', tags: [], summary: '',
+      content: 'Remember this.', type: 'fact', category: 'other', tags: [], summary: '', protection: 'important',
       candidateId: 'turn-1:0', turnId: 'turn-1',
     });
     expect(mock.runPrompt.mock.calls[0][0].prompt).toContain('Task access: ON');
@@ -148,6 +173,44 @@ describe('persistent mind adapter', () => {
     expect(mock.runPrompt.mock.calls[1][0].prompt).toContain('Completed tool results');
     expect(recordCapabilityEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'request' }));
     expect(recordCapabilityEvent).toHaveBeenCalledWith(expect.objectContaining({ kind: 'result' }));
+  });
+
+  it('saves protected candidates before cleanup and bounds deduplicated memories across rounds', async () => {
+    const candidates = Array.from({ length: 5 }, (_, index) => ({ content: `Lasting fact ${index}`, protection: 'core-identity' }));
+    mock.runPrompt
+      .mockResolvedValueOnce({ text: JSON.stringify({
+        memoryCandidates: candidates,
+        toolCalls: [{ name: 'mind.cleanup', arguments: { scopes: ['history'] } }],
+      }) })
+      .mockResolvedValueOnce({ text: JSON.stringify({
+        message: 'Finished cleanup.', memoryCandidates: [candidates[0], { content: 'An extra fact' }],
+      }) });
+    mock.executeToolCall.mockImplementationOnce(async () => {
+      expect(mock.createPersistentMindMemoryFromCandidate).toHaveBeenCalledTimes(5);
+      return { state: 'completed', result: { ok: true } };
+    });
+    const result = await createPersistentMindTurnAdapter().run({
+      turnId: 'turn-protected-cleanup', wake: { kind: 'message', message: { id: 'message-cleanup', text: 'Remember and clean up.' } },
+      ...profile, context: { text: '# Context' },
+    });
+    expect(mock.createPersistentMindMemoryFromCandidate).toHaveBeenCalledTimes(5);
+    expect(mock.createPersistentMindMemoryFromCandidate.mock.calls.map(([candidate]) => candidate.candidateId))
+      .toEqual(Array.from({ length: 5 }, (_, index) => `turn-protected-cleanup:${index}`));
+    expect(result.events.filter((event) => event.kind === 'mind.memory.created')).toHaveLength(5);
+    expect(result.events.find((event) => event.kind === 'mind.reply').data.displayText).toContain('additional memories were not saved');
+  });
+
+  it('refuses cleanup when its preceding memory save fails', async () => {
+    mock.createPersistentMindMemoryFromCandidate.mockRejectedValueOnce(new Error('Storage unavailable'));
+    mock.runPrompt.mockResolvedValueOnce({ text: JSON.stringify({
+      memoryCandidates: [{ content: 'My lasting identity', protection: 'core-identity' }],
+      toolCalls: [{ name: 'mind_cleanup', arguments: { scopes: ['history'] } }],
+    }) });
+    await expect(createPersistentMindTurnAdapter().run({
+      turnId: 'turn-failed-save', wake: { kind: 'self', reason: 'Maintain memories' },
+      ...profile, context: { text: '# Context' },
+    })).rejects.toThrow('cleanup was not run');
+    expect(mock.executeToolCall).not.toHaveBeenCalled();
   });
 
   it('never executes a new tool request from the final provider round', async () => {
@@ -507,6 +570,98 @@ describe('persistent mind adapter', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('admits the summary and every tool round through the per-call boundary', async () => {
+    mock.root.config.persistentMindCapabilities = { readPortos: true };
+    mock.runPrompt
+      .mockResolvedValueOnce({ text: 'An earlier stretch of my life.' })
+      .mockResolvedValueOnce({ text: JSON.stringify({
+        thinkingSummary: 'I need the catalog result.',
+        toolCalls: [{ name: 'catalog.search', arguments: { query: 'example' } }],
+      }) })
+      .mockResolvedValueOnce({ text: JSON.stringify({
+        thinkingSummary: 'I used the catalog result.',
+        message: 'I found one match.',
+        toolCalls: [],
+      }) });
+    const admitted = [];
+    const callBoundary = vi.fn(async (descriptor, run) => {
+      admitted.push(descriptor);
+      return run({ reportRunId: () => {} });
+    });
+    const adapter = createPersistentMindTurnAdapter();
+
+    await adapter.summarize({
+      events: [{ id: 'event-1', kind: 'mind.reply' }],
+      previousSummary: null,
+      ...profile,
+      signal: new AbortController().signal,
+      callBoundary,
+    });
+    await adapter.run({
+      turnId: 'turn-boundary',
+      wake: { kind: 'message', message: { id: 'message-boundary', text: 'Find the example.' } },
+      ...profile,
+      signal: new AbortController().signal,
+      context: { text: '# Context' },
+      recordCapabilityEvent: vi.fn(async () => true),
+      callBoundary,
+    });
+
+    expect(admitted).toEqual([
+      { purpose: 'summary' },
+      { purpose: 'turn', round: 0 },
+      { purpose: 'tool-round', round: 1 },
+    ]);
+    expect(mock.runPrompt).toHaveBeenCalledTimes(3);
+  });
+
+  it('starts no further provider call once the boundary denies a later round', async () => {
+    mock.root.config.persistentMindCapabilities = { readPortos: true };
+    mock.runPrompt.mockResolvedValue({ text: JSON.stringify({
+      thinkingSummary: 'Still working.',
+      toolCalls: [{ name: 'catalog.search', arguments: { query: 'example' } }],
+    }) });
+    const callBoundary = vi.fn(async (descriptor, run) => {
+      if (descriptor.round > 0) throw Object.assign(new Error('CoS actions budget exhausted'), { persistentMindCallDenied: true });
+      return run({ reportRunId: () => {} });
+    });
+
+    await expect(createPersistentMindTurnAdapter().run({
+      turnId: 'turn-denied',
+      wake: { kind: 'message', message: { id: 'message-denied', text: 'Keep searching.' } },
+      ...profile,
+      signal: new AbortController().signal,
+      context: { text: '# Context' },
+      recordCapabilityEvent: vi.fn(async () => true),
+      callBoundary,
+    })).rejects.toThrow('CoS actions budget exhausted');
+
+    // The first round ran and its tool executed; the denial stopped the second
+    // round before the provider was reached again.
+    expect(mock.runPrompt).toHaveBeenCalledTimes(1);
+    expect(mock.executeToolCall).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports the concrete run id to the boundary as soon as the provider creates it', async () => {
+    mock.runPrompt.mockImplementation(async ({ onRunCreated }) => {
+      onRunCreated?.('run-42');
+      throw new Error('provider stream ended without a response');
+    });
+    const reported = [];
+    const callBoundary = vi.fn((_descriptor, run) => run({ reportRunId: (id) => reported.push(id) }));
+
+    await expect(createPersistentMindTurnAdapter().run({
+      turnId: 'turn-runid',
+      wake: { kind: 'message', message: { id: 'message-runid', text: 'Hello.' } },
+      ...profile,
+      signal: new AbortController().signal,
+      context: { text: '# Context' },
+      recordCapabilityEvent: vi.fn(async () => true),
+      callBoundary,
+    })).rejects.toThrow('provider stream ended without a response');
+    expect(reported).toEqual(['run-42']);
   });
 
   it('makes the provider harness tradeoff explicit', () => {

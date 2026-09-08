@@ -28,9 +28,8 @@
  * report their working setup as broken.
  */
 
-import { getOpencodeLocalProviderNamespace, isOpencodeCommand } from './providerModels.js';
+import { localRuntimeNamespace, isOpencodeCommand, parseOpencodeConfigContent } from './providerModels.js';
 import { opencodeLocalBaseUrl } from './opencodeConfig.js';
-import { isGatewayNamespace } from './providerGateways.js';
 import { PORTS } from './ports.js';
 import { isLocalInstanceHost, isLocalInstanceEndpoint, localEndpointPort } from './localEndpoint.js';
 
@@ -77,8 +76,7 @@ export function localBackendForProvider(provider) {
  * `defaultBaseUrl` is read from `opencodeConfig.js`'s provider table rather than
  * re-typed: that table is what a spawned OpenCode actually talks to when the
  * provider stores no config of its own, so a second copy here would eventually
- * probe a port nothing is on and call a working setup broken. LM Studio has no
- * row there (nothing spawns OpenCode against it), so it carries its own.
+ * probe a port nothing is on and call a working setup broken.
  *
  * `manageUrl` is the client route that installs/starts it — the Models → LLMs
  * page owns every one of these flows, so an unmet requirement links there
@@ -132,10 +130,18 @@ export const LOCAL_RUNTIMES = Object.freeze({
     id: 'lmstudio',
     label: 'LM Studio',
     command: 'lms',
-    defaultBaseUrl: 'http://localhost:1234/v1',
+    defaultBaseUrl: opencodeLocalBaseUrl('lmstudio'),
     manageUrl: '/models/llms',
     docsUrl: 'https://lmstudio.ai/download',
     modelsHint: 'Download a model in LM Studio and start its local server.',
+    // No pre-spawn context preparation, unlike Ollama's
+    // `ensureOllamaAgentContext`: LM Studio fixes a model's context length when
+    // the instance is LOADED, and the only lever PortOS holds is
+    // `lmStudioManager.loadModelWithArgs`, which UNLOADS whatever the user has
+    // resident and cold-loads the weights again. Paying that on every agent
+    // spawn — and evicting a model the operator loaded in the app — is worse
+    // than honouring the window they chose, so an `lmstudioBacked` provider's
+    // `numCtx` is set where the model is loaded, not here.
   }),
   vllm: Object.freeze({
     id: 'vllm',
@@ -188,7 +194,7 @@ export const LOCAL_RUNTIMES = Object.freeze({
     // Dedicated loopback port — never 11434, which is a PortOS-managed Ollama.
     defaultBaseUrl: `http://127.0.0.1:${PORTS.SLOTSTREAM}/v1`,
     manageUrl: '/models/llms',
-    docsUrl: 'https://github.com/carloslfu/slotstream',
+    docsUrl: 'https://github.com/atomantic/PortOS/blob/main/docs/features/slotstream.md',
     modelsHint: 'A start never fetches weights — add a checkpoint on Models → LLMs, then start Slotstream there.',
     servesOneModel: true,
     standbyWhenStopped: true,
@@ -266,16 +272,10 @@ function envBaseUrl(kind) {
 
 /** The `baseURL` an OpenCode provider config declares for `namespace`, if any. */
 function opencodeConfiguredBaseUrl(provider, namespace) {
-  const stored = provider?.envVars?.OPENCODE_CONFIG_CONTENT;
-  if (typeof stored !== 'string' || stored === '') return null;
-  let parsed = null;
-  try {
-    parsed = JSON.parse(stored);
-  } catch {
-    // A hand-edited config that no longer parses tells us nothing about the
-    // endpoint; fall through to the provider's own fields.
-    return null;
-  }
+  // A hand-edited config that no longer parses tells us nothing about the
+  // endpoint; `parseOpencodeConfigContent` answers null and we fall through to
+  // the provider's own fields.
+  const parsed = parseOpencodeConfigContent(provider?.envVars?.OPENCODE_CONFIG_CONTENT);
   const baseUrl = parsed?.provider?.[namespace]?.options?.baseURL;
   return typeof baseUrl === 'string' && baseUrl.trim() !== '' ? baseUrl : null;
 }
@@ -296,11 +296,59 @@ export function localRuntimeKind(provider) {
   if (!provider || typeof provider !== 'object') return null;
   // Marker-based, NOT command-based: this also resolves `claude-ollama`, which
   // carries `ollamaBacked` without being an OpenCode provider.
-  const namespace = getOpencodeLocalProviderNamespace(provider);
-  if (namespace && !isGatewayNamespace(namespace)) return namespace;
+  const namespace = localRuntimeNamespace(provider);
+  if (namespace) return namespace;
   if (provider?.id === 'slotstream' || /slotstream/i.test(provider?.name || '')) return 'slotstream';
   if (Number(localEndpointPort(provider?.endpoint)) === PORTS.SLOTSTREAM) return 'slotstream';
+  // The shipped `mtplx` record is a plain OpenAI-compatible API provider with no
+  // marker of its own — `mtplxBacked` only ever rides the OpenCode/Claude CLI
+  // wrappers, never this record (#6466). `id` is the one signal it carries.
+  // Deliberately NO port arm here, unlike slotstream two lines up: slotstream's
+  // port is a PortOS-dedicated constant, while MTPLX's is user-configurable and
+  // its default (`:8000`) is a generic port — keying on it would claim an
+  // unrelated local API as MTPLX. `isMtplxProvider` in `mtplxServerManager.js`
+  // layers a narrower port check on top of this for an unmarked/unnamed
+  // provider aimed at wherever the managed daemon is actually listening right
+  // now; that check needs live process state this side-effect-free module
+  // cannot import without a cycle.
+  if (provider?.id === 'mtplx') return 'mtplx';
   return localBackendForProvider(provider);
+}
+
+/**
+ * Whether a provider may be handed `model` — the one rule for validating a
+ * stored model pin against a provider record.
+ *
+ * Two providers are pass-throughs, for opposite reasons:
+ *
+ *   - one that enumerates NO models has nothing to validate against, so any id
+ *     is its caller's to choose;
+ *   - one backed by a LOCAL daemon has a `models` array that is only a cached
+ *     snapshot, while the daemon on this machine is the authority. Every model
+ *     picker in PortOS deliberately offers what the daemon reports rather than
+ *     what the record lists, so judging a local pin against the record rejects
+ *     a model that is installed and serving — that is how a pr-reviewer stage
+ *     pinned to a freshly pulled Ollama model got "not offered by provider" on
+ *     every dispatch.
+ *
+ * The shipped `mtplx` API record falls into the second bucket now that
+ * `localRuntimeKind` names it (#6466): it lists one static id, but `mtplx serve`
+ * names its process after whatever checkpoint is actually loaded, so the
+ * record's `models` array is exactly the same kind of stale snapshot Ollama's
+ * is — pass-through is correct here for the same reason, not a side effect of
+ * the collapse.
+ *
+ * Anything else enumerates its own catalog, and a pin outside it reaches the
+ * CLI as a model it cannot serve.
+ *
+ * @param {object|null|undefined} provider
+ * @param {string|null|undefined} model
+ * @returns {boolean}
+ */
+export function modelPinIsOffered(provider, model) {
+  const offered = Array.isArray(provider?.models) ? provider.models : [];
+  if (offered.length === 0 || localRuntimeKind(provider)) return true;
+  return offered.includes(model);
 }
 
 /**

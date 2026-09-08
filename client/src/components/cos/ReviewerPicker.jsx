@@ -15,9 +15,33 @@ import {
   reviewerLabel,
   sanitizeReviewerModelInput
 } from './constants';
-import { normalizeReviewerSlug } from '../../lib/reviewerPins';
+import ProviderModelSelector from '../ProviderModelSelector';
+import { selectableModelsForProvider } from '../../utils/providers';
+import { isProviderReviewer, normalizeReviewerSlug } from '../../lib/reviewerPins';
 
 const normalizeReviewerValue = (value) => normalizeReviewerSlug(value);
+
+// The Model dropdown's "type an id instead" entry. Carries a `[`/`]` pair on
+// purpose: `sanitizeReviewerModelInput` strips both, so this string can never
+// arrive from the free-text input and be mistaken for a stored pin — and the
+// server drops any id containing them, so it could not have been persisted by an
+// older build either.
+const CUSTOM_MODEL_OPTION = '[custom]';
+
+// Shared row grid, one template for the header and every row so their columns
+// cannot drift apart. The wide form keeps minimum tracks for order, provider,
+// model, effort, optional, max, and remove — together ~32rem, so the collapse is
+// keyed to a CONTAINER query (`@xl`), not a viewport one: this picker also
+// renders inside a narrow dashboard tile on a wide screen, where a viewport
+// `sm:` was unconditionally true and forced the wide grid into a ~250px column.
+// Below `@xl` a row collapses to a stacked 2-column label/value block, so a
+// narrow container never scrolls horizontally. The header is wide-only — in the
+// stacked form each cell carries its own inline label, since a header far above
+// a stacked row doesn't associate.
+const WIDE_TRACKS = '@xl:grid-cols-[2.5rem_minmax(5rem,1fr)_minmax(8rem,2fr)_minmax(7rem,1fr)_auto_3.25rem_auto]';
+const ROW_CLASS = `grid grid-cols-[auto_1fr] ${WIDE_TRACKS} items-center gap-x-2 gap-y-1 px-1.5 py-1.5 rounded border border-port-border bg-port-bg @xl:border-transparent @xl:bg-transparent @xl:py-0.5 @xl:rounded-none`;
+const CELL_LABEL_CLASS = '@xl:hidden text-[10px] uppercase tracking-wide text-gray-600';
+const HEADER_CLASS = `hidden @xl:grid ${WIDE_TRACKS} items-center gap-x-2 px-1.5 text-[10px] uppercase tracking-wide text-gray-600`;
 
 /**
  * Ordered multi-reviewer picker, rendered as one row per reviewer with the five
@@ -51,17 +75,40 @@ const normalizeReviewerValue = (value) => normalizeReviewerSlug(value);
  * - **Max Iterations** → the numeric `~max=<n>` round cap (blank = slashdo's
  *   built-in default, `0` = loop until clean).
  *
- * Controlled: emits the full next shape via onChange so the parent can store
+ * Controlled: emits the next shape via onChange so the parent can store
  * `reviewers` / `usernames` / `optionalReviewers` / `reviewerModels` /
  * `reviewerEfforts` / `reviewerMaxRounds` / `reviewStopMode` / `reviewerApplies`
  * however it persists them.
  *
+ * `defaults` is the resolved fallback the parent seeded the props from (the
+ * install-wide Code Review Defaults, as token-keyed maps for the pins). When
+ * provided, `emit()` OMITS any key whose value is deep-equal to
+ * `defaults[key]` — a field the user never touched stays absent from the
+ * payload, which is exactly what `resolveReviewerConfig` reads as "inherit".
+ * Without it the picker would freeze the defaults-of-that-moment into a
+ * permanent task override on first touch (#6208). Omit the prop where a full
+ * emit is correct — the surface that edits the defaults themselves has no
+ * fallback to inherit from.
+ *
+ * Absent keeps meaning inherit and an explicitly-empty value keeps meaning
+ * "clear": the comparison is against the resolved default, never against
+ * emptiness, so `{}` / `[]` equal only a matching default and are otherwise
+ * emitted as a real override that clears it. (One key is exempt: the server
+ * drops an empty `reviewers` list before persisting, so `reviewers: []`
+ * resolves to the default chain either way — pre-existing server behavior.)
+ *
+ * Known trade-off: the diff is against the CURRENT default, so an override
+ * that happens to equal it (e.g. set before the default changed to match) is
+ * indistinguishable from "never touched" and reverts to inherit the next time
+ * any other field is edited. The effective reviewers are unchanged at that
+ * moment — the pin only stops shadowing future default changes.
+ *
  * `modelOptions` is the resolved model-picker data, shaped like
  * `useReviewerModelOptions()`'s return: `{ optionsByReviewer, defaultModels,
- * freeText, unavailable, loaded }`. Callers keep owning their own
- * `api.getLocalLlmStatus` / `api.getProviders` fetches (that's what the hook is
- * for) — passing nothing degrades every Model cell to a free-text input, which is
- * still fully usable, rather than hiding the column.
+ * freeText, unavailable, providerDisabled, loaded }`. Callers keep owning their
+ * own `api.getLocalLlmStatus` / `api.getProviders` fetches (that's what the hook
+ * is for) — passing nothing degrades every Model cell to a free-text input, which
+ * is still fully usable, rather than hiding the column.
  *
  * `showRunFlags={false}` hides the stop-mode select and the "reviewer applies
  * fixes" checkbox for surfaces that can't honor them — the `/do:next` claim
@@ -72,11 +119,16 @@ const normalizeReviewerValue = (value) => normalizeReviewerSlug(value);
  * `installed` is a per-reviewer-slug install probe from the Code Review
  * Defaults endpoint (`GET /api/code-review/defaults`'s `installed` field,
  * #3606) — `{ claude: true, antigravity: false, ... }`. Only an explicit
- * `false` renders a "not installed" badge; `undefined` (not a CLI reviewer,
- * or the caller didn't fetch it) renders nothing. Warn-only: a reviewer stays
- * selectable and selected even when flagged not-installed, since the CLI
- * check is local-machine-only and a federated peer (or a later install) may
- * satisfy it.
+ * `false` counts as missing; `undefined` (not a CLI reviewer, or the caller
+ * didn't fetch it) says nothing.
+ *
+ * Together with `modelOptions.providerDisabled`, that decides which reviewers
+ * the **Add** row offers up front: one whose CLI is missing here, or whose
+ * provider records are all switched off, is folded behind a `+N unavailable`
+ * toggle. Warn-only either way — the toggle reveals them with a badge and they
+ * stay selectable, and an ALREADY-SELECTED reviewer always renders its row
+ * (badged), since both checks are local-machine-only and the reviewer list is
+ * federation-wide config a peer may satisfy.
  */
 export default function ReviewerPicker({
   reviewers = [],
@@ -89,20 +141,43 @@ export default function ReviewerPicker({
   installed = null,
   stopMode = DEFAULT_REVIEW_STOP_MODE,
   reviewerApplies = false,
+  defaults = null,
   onChange,
   disabled = false,
   showRunFlags = true
 }) {
   const id = useId();
+  const [addProviderId, setAddProviderId] = useState('');
+  const [addProviderModel, setAddProviderModel] = useState('');
+  const providerRecords = modelOptions?.providers || [];
+  const addProvider = providerRecords.find(provider => provider.id === addProviderId);
+  const labelFor = (token) => isProviderReviewer(token)
+    ? providerRecords.find(provider => `provider:${provider.id}` === token)?.name || token.slice(9)
+    : reviewerLabel(token);
   const [usernameInput, setUsernameInput] = useState('');
   const [usernameError, setUsernameError] = useState('');
+  // Reviewers whose Model cell the user switched to free text by picking the
+  // "Custom…" entry. Lowercased tokens, matching the case-insensitive keying the
+  // pin maps use. Purely presentational — nothing is stored until an id is typed,
+  // so this never has to round-trip through `onChange`.
+  const [customModelTokens, setCustomModelTokens] = useState(() => new Set());
+  // Whether the Add row also lists the reviewers this machine can't run (see
+  // `hiddenAddable`). Presentational only — nothing about it is stored.
+  const [showUnavailable, setShowUnavailable] = useState(false);
+  const isCustomModel = (token) => customModelTokens.has(token.toLowerCase());
+  const setCustomModel = (token, on) => setCustomModelTokens((prev) => {
+    const next = new Set(prev);
+    if (on) next.add(token.toLowerCase()); else next.delete(token.toLowerCase());
+    return next;
+  });
   // Render the parent's list (de-duped, order-preserving) so display === stored
   // state for valid input while staying robust to malformed/legacy duplicates —
   // dupes would otherwise collide on the `key={value}` below and corrupt
-  // reorder/remove. An empty list shows the "defaults to Copilot" hint and lets
-  // the user clear copilot; the server/submit layer resolves [] → ['copilot'].
+  // reorder/remove. An empty list shows the opt-in hint and lets the user clear
+  // the chain entirely; no reviewer is silently inferred from the active AI
+  // provider.
   const selected = Array.isArray(reviewers) ? [...new Set(reviewers.map(normalizeReviewerValue))] : [];
-  const available = REVIEWER_OPTIONS.filter(o => !selected.includes(o.value));
+  const addable = REVIEWER_OPTIONS.filter(o => !selected.includes(o.value));
   const hasNonCopilot = selected.some(r => r !== 'copilot');
   const selectedUsernames = normalizeReviewUsernames(usernames);
   const atMaxUsernames = selectedUsernames.length >= MAX_REVIEW_USERNAMES;
@@ -145,32 +220,122 @@ export default function ReviewerPicker({
   // normally does", so clearing the select DELETES the key rather than writing `''`.
   const effortsMap = asMap(reviewerEfforts);
   const efforts = keyedLookup(effortsMap);
-  // Only an explicit `false` counts — `undefined` covers both "not a CLI
-  // reviewer" (copilot/lmstudio/ollama/@username) and "caller didn't fetch
-  // `installed`", neither of which should render a warning badge.
-  const notInstalled = (token) => installed?.[token] === false;
-  const renderInstalledBadge = (token) => notInstalled(token) && (
-    <Pill
-      tone="warning"
-      size="xs"
-      className="shrink-0"
-      title={`${reviewerLabel(token)}'s CLI binary wasn't found on this machine. It still runs (federation-wide config), but the review loop here will report it unsatisfied until it's installed.`}
-    >
-      not installed
-    </Pill>
-  );
+  // Why this reviewer can't run here, or null when nothing says it can't.
+  //
+  // Two independent signals, both warn-only and both reported only when the
+  // caller actually fetched them — a reviewer stays selectable and selected
+  // either way, since the checks are local-machine-only and a federated peer
+  // (or a later install / a flip in Settings) may satisfy them:
+  //
+  // - `installed[token] === false` — the CLI binary isn't on PATH. Only an
+  //   explicit `false` counts; `undefined` covers both "not a CLI reviewer"
+  //   (copilot/@username) and "caller didn't fetch `installed`".
+  // - `providerDisabled[token]` — every provider record fronting that binary is
+  //   switched off on this install, so the user has said they don't use it. A
+  //   `/api/providers` that failed or hasn't landed reports nothing (see the
+  //   hook), so this never fires on a slow page.
+  const unavailability = (token) => {
+    if (isProviderReviewer(token)) {
+      const provider = providerRecords.find(record => `provider:${record.id}` === token);
+      if (modelOptions?.loaded && !provider) return { label: 'missing', title: 'This reviewer provider is no longer configured on this machine.' };
+      if (provider?.enabled === false) return { label: 'disabled', title: 'Enable this provider in AI Providers before running its review.' };
+      return null;
+    }
+    if (installed?.[token] === false) {
+      return {
+        label: 'not installed',
+        title: `${labelFor(token)}'s CLI binary wasn't found on this machine. It still runs (federation-wide config), but the review loop here will report it unsatisfied until it's installed.`
+      };
+    }
+    if (modelOptions?.providerDisabled?.[token]) {
+      return {
+        label: 'disabled',
+        title: `${labelFor(token)}'s provider records are all switched off in Settings → AI Providers, so this machine isn't set up to use it. Adding it still works — the review loop spawns its CLI directly, and a federated peer may have it enabled.`
+      };
+    }
+    return null;
+  };
+  const renderUnavailableBadge = (token) => {
+    const reason = unavailability(token);
+    return reason && (
+      <Pill tone="warning" size="xs" className="shrink-0" title={reason.title}>
+        {reason.label}
+      </Pill>
+    );
+  };
+  // The Add row lists what this machine can actually run, so a reviewer whose
+  // CLI is missing or whose providers are all switched off is folded behind a
+  // count instead of padding the row with things the review loop would report
+  // unsatisfied. HIDDEN, not dropped: the checks are local-machine-only and the
+  // reviewer list is federation-wide config, so the toggle reveals them (badged)
+  // rather than making a peer's reviewer unconfigurable from here.
+  const hiddenAddable = addable.filter(opt => unavailability(opt.value));
+  const addOptions = showUnavailable
+    ? addable
+    : addable.filter(opt => !hiddenAddable.includes(opt));
 
-  const emit = (next) => onChange?.({
-    reviewers: selected,
-    usernames: selectedUsernames,
-    optionalReviewers: optionalTokens,
-    reviewerMaxRounds: maxRoundsMap,
-    reviewerModels: modelsMap,
-    reviewerEfforts: effortsMap,
-    stopMode,
-    reviewerApplies,
-    ...next
-  });
+  // Case-insensitive equality for the token lists (reviewer slugs are already
+  // lowercased; GitHub usernames are case-insensitive). Order matters ONLY for
+  // `reviewers` — the chain runs in click order — so the username lists compare
+  // as sorted sets; otherwise a same-membership reorder would over-emit.
+  const listsEqual = (a, b, ordered) => {
+    if (!Array.isArray(a) || !Array.isArray(b)) return a === b;
+    if (a.length !== b.length) return false;
+    const left = a.map((value) => String(value).toLowerCase());
+    const right = b.map((value) => String(value).toLowerCase());
+    if (!ordered) {
+      left.sort();
+      right.sort();
+    }
+    return left.every((value, index) => value === right[index]);
+  };
+  // Case-insensitive-key equality for the token-keyed pin maps. Values compare
+  // strictly: `0` (loop until clean) must never equal absent, and `{}` equals
+  // only a matching default so an explicit clear is still emitted.
+  const mapsEqual = (a, b) => {
+    const entries = (map) => {
+      if (!map || typeof map !== 'object' || Array.isArray(map)) return map;
+      return Object.entries(map)
+        .map(([key, value]) => [key.toLowerCase(), value])
+        .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+    };
+    const left = entries(a);
+    const right = entries(b);
+    if (!Array.isArray(left) || !Array.isArray(right)) return left === right;
+    if (left.length !== right.length) return false;
+    return left.every(([key, value], index) => right[index][0] === key && right[index][1] === value);
+  };
+  const equalsBaseline = (key, value, baseline) => {
+    if (key === 'reviewers') return listsEqual(value, baseline, true);
+    if (key === 'usernames' || key === 'optionalReviewers') return listsEqual(value, baseline, false);
+    if (key === 'reviewerMaxRounds' || key === 'reviewerModels' || key === 'reviewerEfforts') return mapsEqual(value, baseline);
+    return value === baseline;
+  };
+
+  const emit = (next) => {
+    const full = {
+      reviewers: selected,
+      usernames: selectedUsernames,
+      optionalReviewers: optionalTokens,
+      reviewerMaxRounds: maxRoundsMap,
+      reviewerModels: modelsMap,
+      reviewerEfforts: effortsMap,
+      stopMode,
+      reviewerApplies,
+      ...next
+    };
+    // No baseline (the surface editing the defaults themselves): full snapshot,
+    // exactly as before.
+    if (!defaults || typeof defaults !== 'object') {
+      onChange?.(full);
+      return;
+    }
+    const partial = {};
+    for (const key of Object.keys(full)) {
+      if (!equalsBaseline(key, full[key], defaults[key])) partial[key] = full[key];
+    }
+    onChange?.(partial);
+  };
 
   const toggleOptional = (token) => emit({
     optionalReviewers: isOptional(token) ? withoutToken(token) : [...optionalTokens, token]
@@ -238,7 +403,11 @@ export default function ReviewerPicker({
   // the value is in fact stored. `staleSuffix` names why it's absent; `setClass`
   // differs only so the two columns stay visually distinguishable — passed as a
   // COMPLETE class string, never interpolated, or Tailwind's scanner won't emit it.
-  const renderPinSelect = ({ selectId, value, options, onChange, ariaLabel, title, staleSuffix, setClass, maxWidthClass }) => (
+  //
+  // `trailingOption` appends one non-model entry after the list (the Model
+  // column's "Custom…" escape). It is a UI action, not a pin — the caller's
+  // `onChange` recognizes its sentinel value and never stores it.
+  const renderPinSelect = ({ selectId, value, options, onChange, ariaLabel, title, staleSuffix, setClass, maxWidthClass, trailingOption = null }) => (
     <select
       id={selectId}
       value={value}
@@ -253,6 +422,7 @@ export default function ReviewerPicker({
       <option value="">— default —</option>
       {value && !options.includes(value) && <option value={value}>{value} {staleSuffix}</option>}
       {options.map((option) => <option key={option} value={option}>{option}</option>)}
+      {trailingOption && <option value={trailingOption.value}>{trailingOption.label}</option>}
     </select>
   );
 
@@ -267,7 +437,7 @@ export default function ReviewerPicker({
   // the static ladder when it didn't, so a caller that passes no `modelOptions`
   // keeps a working (just unnarrowed) select rather than losing the cell.
   const renderEffortCell = (token) => {
-    const subject = reviewerLabel(token);
+    const subject = labelFor(token);
     const stored = efforts.get(token) ?? '';
     const ladder = reviewerEffortLevels(token);
     if (!ladder?.length) return renderNoPinCell(`${subject} has no reasoning-effort control`);
@@ -351,25 +521,36 @@ export default function ReviewerPicker({
   // The Model cell. Only MODEL_SELECTABLE_REVIEWERS get one — copilot has no CLI
   // and a `@username` reviewer is a person/bot, so neither takes a model.
   //
-  // A local backend's installed-model list is authoritative (the server probed
-  // it), so those render a closed `<select>`. A CLI reviewer renders a text input
-  // + `<datalist>` instead: its catalog is a stored snapshot, and an Ollama-backed
-  // `claude` or a Bedrock-form id can be anything the environment provides — a
-  // closed list would lock out valid ids. `loaded` gates the "nothing installed"
-  // messaging so a pre-fetch render doesn't accuse a healthy backend of being
-  // empty.
+  // Every reviewer with a resolved catalog renders a `<select>`: the ids are
+  // known, and a dropdown is how the rest of this table's pins are set. What
+  // differs between the two reviewer kinds is the ESCAPE HATCH, not the control:
+  //
+  // - A probed local backend's installed-model list is authoritative (the server
+  //   asked the running daemon), so its select is closed — an id it doesn't list
+  //   isn't installed.
+  // - A CLI reviewer's catalog is a stored snapshot, and an Ollama-backed
+  //   `claude` or a Bedrock-form id can be anything the environment provides, so
+  //   its select carries a trailing "Custom…" entry that swaps the cell for a
+  //   free-text input (with the same ids offered as a `<datalist>`). Clearing
+  //   that input returns the cell to the dropdown. A CLI reviewer whose catalog
+  //   resolved EMPTY (grok/kimi/opencode ship only a configured-default sentinel)
+  //   starts in the free-text form directly — a select of nothing is a dead
+  //   control — and so does a row already pinned to an id outside the catalog, so
+  //   that pin stays editable rather than reading as an unpickable oddity.
+  //
+  // `loaded` gates the "nothing installed" messaging so a pre-fetch render
+  // doesn't accuse a healthy backend of being empty.
   const renderModelCell = (token) => {
-    if (!MODEL_SELECTABLE_REVIEWERS.includes(token)) return renderNoPinCell(`${reviewerLabel(token)} takes no model`);
-    const subject = reviewerLabel(token);
+    if (!MODEL_SELECTABLE_REVIEWERS.includes(token) && !isProviderReviewer(token)) return renderNoPinCell(`${labelFor(token)} takes no model`);
+    const subject = labelFor(token);
     const pinnedValue = models.get(token);
     const value = pinnedValue ?? '';
     const defaultModel = modelOptions?.defaultModels?.[token] || '';
     const options = modelOptions?.optionsByReviewer?.[token] || [];
     const inputId = `${id}-model-${token}`;
     const listId = `${id}-modellist-${token}`;
-    // No resolved options AND a closed picker would be a dead control, so fall
-    // back to free-text: better a typed id than no way to set one at all.
-    const freeText = modelOptions?.freeText?.[token] !== false || options.length === 0;
+    // Whether this reviewer may carry an id its catalog doesn't list at all.
+    const acceptsTypedId = modelOptions?.freeText?.[token] !== false;
     // Why a local backend has no options, so the empty state says the useful
     // thing instead of a bare "default" placeholder. Only meaningful once the
     // probe settled — before that, an empty list is "not fetched yet", not a fact.
@@ -378,13 +559,23 @@ export default function ReviewerPicker({
           ? `${subject} isn't reachable — start it from Models → LLMs to list its models. You can still type an id.`
           : `No ${subject} models listed — add one in Models → LLMs, or type an id.`)
       : null;
+    // A closed select over nothing would be a dead control, so a reviewer with no
+    // resolved options falls back to free text whichever kind it is: better a
+    // typed id than no way to set one at all.
+    const freeText = acceptsTypedId
+      ? (options.length === 0 || isCustomModel(token) || (Boolean(value) && !options.includes(value)))
+      : options.length === 0;
 
     if (!freeText) {
       return renderPinSelect({
         selectId: inputId,
         value: value || (defaultModel && options.includes(defaultModel) ? defaultModel : ''),
         options,
-        onChange: (model) => setModel(token, model),
+        onChange: (model) => {
+          // The escape hatch is a UI mode, not an id — never store the sentinel.
+          if (model === CUSTOM_MODEL_OPTION) { setCustomModel(token, true); return; }
+          setModel(token, model);
+        },
         ariaLabel: `Model for ${subject}`,
         title: value
           ? `${subject} reviews with ${value}. Choose "default" to let it pick.`
@@ -393,27 +584,40 @@ export default function ReviewerPicker({
           : `${subject} uses the model configured for its backend. Pick one to pin it for this run.`,
         staleSuffix: '(not installed)',
         setClass: 'text-port-accent border-port-accent/50',
-        maxWidthClass: 'max-w-[190px]'
+        maxWidthClass: 'max-w-[190px]',
+        // Only a reviewer that can run an id outside its catalog gets the escape.
+        trailingOption: acceptsTypedId ? { value: CUSTOM_MODEL_OPTION, label: 'Custom…' } : null
       });
     }
 
+    // "Custom…" was picked with nothing pinned yet — start empty so the field
+    // reads as the blank the user is about to fill, not as an id already in play.
+    const inputValue = value || (isCustomModel(token) ? '' : defaultModel);
     return (
       <>
         <input
           id={inputId}
           type="text"
           list={options.length ? listId : undefined}
-          value={value || defaultModel}
+          value={inputValue}
           disabled={disabled}
           maxLength={MAX_REVIEWER_MODEL_LENGTH}
           placeholder={defaultModel ? `${defaultModel} (default)` : 'default'}
           onChange={(e) => setModel(token, e.target.value)}
+          // Leaving the field with nothing pinned is how the user backs out of
+          // Custom…: with no id to keep, the catalog dropdown is the more useful
+          // control. Deliberately on blur rather than on an empty onChange —
+          // clearing the field to retype an id would otherwise swap the control
+          // out from under the cursor mid-edit.
+          onBlur={() => { if (!value && options.length) setCustomModel(token, false); }}
           aria-label={`Model for ${subject}`}
           title={value
             ? `${subject} reviews with ${value}. Clear to let it use its own default.`
-            : (defaultModel
-              ? `${subject} uses ${defaultModel} by default. Type or pick another id to pin one.`
-              : (emptyHint || `${subject} uses its own default model. Type or pick an id to pin one.`))}
+            : (options.length
+              ? `Type an id ${subject} accepts. Leave it empty to go back to its listed models.`
+              : (defaultModel
+                ? `${subject} uses ${defaultModel} by default. Type an id to pin one.`
+                : (emptyHint || `${subject} uses its own default model. Type an id to pin one.`)))}
           className={`w-full min-w-0 max-w-[190px] px-1.5 py-0.5 text-[11px] font-mono rounded border bg-port-bg min-h-[28px] disabled:opacity-40 focus:outline-none focus:border-port-accent ${value
             ? 'text-port-accent border-port-accent/50'
             : 'text-gray-500 border-port-border/60'}`}
@@ -472,18 +676,32 @@ export default function ReviewerPicker({
     emit({ reviewers: next });
   };
 
-  // Shared row grid. Desktop keeps minimum tracks for order, provider, model,
-  // effort, optional, max, and remove; under `sm` it collapses to a stacked
-  // 2-column label/value block so a narrow screen never needs horizontal
-  // scrolling. The header row is desktop-only — on mobile each cell carries
-  // its own inline label, since a header far above a stacked row doesn't
-  // associate.
-  const ROW_CLASS = 'grid grid-cols-[auto_1fr] sm:grid-cols-[2.5rem_minmax(5rem,1fr)_minmax(8rem,2fr)_minmax(7rem,1fr)_auto_3.25rem_auto] items-center gap-x-2 gap-y-1 px-1.5 py-1.5 rounded border border-port-border bg-port-bg sm:border-transparent sm:bg-transparent sm:py-0.5 sm:rounded-none';
-  const CELL_LABEL_CLASS = 'sm:hidden text-[10px] uppercase tracking-wide text-gray-600';
-  const HEADER_CLASS = 'hidden sm:grid sm:grid-cols-[2.5rem_minmax(5rem,1fr)_minmax(8rem,2fr)_minmax(7rem,1fr)_auto_3.25rem_auto] items-center gap-x-2 px-1.5 text-[10px] uppercase tracking-wide text-gray-600';
-
   return (
-    <div className="flex flex-col gap-2 w-full">
+    <div className="@container flex flex-col gap-2 w-full">
+      {providerRecords.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <ProviderModelSelector
+            providers={providerRecords}
+            selectedProviderId={addProviderId}
+            selectedModel={addProviderModel}
+            availableModels={addProvider ? selectableModelsForProvider(addProvider, addProvider.models || []) : []}
+            onProviderChange={value => { setAddProviderId(value); setAddProviderModel(''); }}
+            onModelChange={setAddProviderModel}
+            emptyProviderOption="Choose a reviewer provider"
+            emptyModelOption="Provider default"
+            alwaysShowModel
+            disabled={disabled}
+          />
+          <button type="button" disabled={disabled || !addProviderId || selected.includes(`provider:${addProviderId}`)}
+            className="text-sm text-port-accent disabled:opacity-50 self-start"
+            onClick={() => {
+              const token = `provider:${addProviderId}`;
+              emit({ reviewers: [...selected, token], reviewerModels: { ...modelsMap, ...(addProviderModel ? { [token]: addProviderModel } : {}) } });
+              setAddProviderId(''); setAddProviderModel('');
+            }}>Add provider reviewer</button>
+          <p className="text-xs text-gray-500">Choose from your enabled AI providers. Providers need an API text transport or an enforced tool-free harness to run reviews.</p>
+        </div>
+      )}
       <div className="flex flex-col gap-1">
         <span className="text-xs text-gray-500">Reviewers (in order):</span>
         {selected.length > 0 && (
@@ -497,21 +715,21 @@ export default function ReviewerPicker({
               <span className="text-center">Max</span>
               <span className="sr-only">Remove</span>
             </div>
-            <div className="flex flex-col gap-1.5 sm:gap-0.5">
+            <div className="flex flex-col gap-1.5 @xl:gap-0.5">
               {selected.map((value, index) => (
                 <div
                   key={value}
                   className={ROW_CLASS}
                   title={REVIEWER_OPTIONS.find(o => o.value === value)?.description}
                 >
-                  <div className="flex items-center gap-0.5 col-span-2 sm:col-span-1">
+                  <div className="flex items-center gap-0.5 col-span-2 @xl:col-span-1">
                     <span className="text-port-accent font-mono text-xs">{index + 1}.</span>
                     <button
                       type="button"
                       disabled={disabled || index === 0}
                       onClick={() => move(index, -1)}
                       className="text-gray-500 hover:text-white disabled:opacity-30 disabled:hover:text-gray-500"
-                      aria-label={`Move ${reviewerLabel(value)} earlier`}
+                      aria-label={`Move ${labelFor(value)} earlier`}
                     >
                       <ChevronUp size={12} />
                     </button>
@@ -520,14 +738,14 @@ export default function ReviewerPicker({
                       disabled={disabled || index === selected.length - 1}
                       onClick={() => move(index, 1)}
                       className="text-gray-500 hover:text-white disabled:opacity-30 disabled:hover:text-gray-500"
-                      aria-label={`Move ${reviewerLabel(value)} later`}
+                      aria-label={`Move ${labelFor(value)} later`}
                     >
                       <ChevronDown size={12} />
                     </button>
                   </div>
-                  <span className="flex items-center gap-1 min-w-0 col-span-2 sm:col-span-1">
-                    <span className="text-xs text-gray-300 truncate">{reviewerLabel(value)}</span>
-                    {renderInstalledBadge(value)}
+                  <span className="flex items-center gap-1 min-w-0 col-span-2 @xl:col-span-1">
+                    <span className="text-xs text-gray-300 truncate">{labelFor(value)}</span>
+                    {renderUnavailableBadge(value)}
                   </span>
                   <span className={CELL_LABEL_CLASS}>Model</span>
                   <div className="min-w-0">{renderModelCell(value)}</div>
@@ -535,19 +753,19 @@ export default function ReviewerPicker({
                   <div className="min-w-0">{renderEffortCell(value)}</div>
                   <span className={CELL_LABEL_CLASS}>Optional</span>
                   <div>
-                    {renderOptToggle(value, reviewerLabel(value), isOptional(value)
-                      ? `${reviewerLabel(value)} is non-blocking (~opt): an inconclusive verdict from it won't block the merge. Click to make it blocking.`
-                      : `${reviewerLabel(value)} gates the merge. Click to make it non-blocking (~opt) — its inconclusive verdicts won't block the merge (a hard failure still does).`)}
+                    {renderOptToggle(value, labelFor(value), isOptional(value)
+                      ? `${labelFor(value)} is non-blocking (~opt): an inconclusive verdict from it won't block the merge. Click to make it blocking.`
+                      : `${labelFor(value)} gates the merge. Click to make it non-blocking (~opt) — its inconclusive verdicts won't block the merge (a hard failure still does).`)}
                   </div>
                   <span className={CELL_LABEL_CLASS}>Max iterations</span>
-                  <div>{renderMaxRounds(value, reviewerLabel(value))}</div>
-                  <div className="col-span-2 sm:col-span-1 justify-self-end">
+                  <div>{renderMaxRounds(value, labelFor(value))}</div>
+                  <div className="col-span-2 @xl:col-span-1 justify-self-end">
                     <button
                       type="button"
                       disabled={disabled}
                       onClick={() => remove(value)}
                       className="text-gray-500 hover:text-port-error"
-                      aria-label={`Remove ${reviewerLabel(value)}`}
+                      aria-label={`Remove ${labelFor(value)}`}
                     >
                       <X size={12} />
                     </button>
@@ -558,7 +776,7 @@ export default function ReviewerPicker({
           </>
         )}
         {selected.length === 0 && (
-          <span className="text-xs text-gray-600 italic">none — defaults to Copilot</span>
+          <span className="text-xs text-gray-600 italic">none — code review is disabled by default</span>
         )}
       </div>
 
@@ -571,10 +789,10 @@ export default function ReviewerPicker({
         </details>
       )}
 
-      {available.length > 0 && (
+      {addable.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-xs text-gray-600 mr-1">Add:</span>
-          {available.map(opt => (
+          {addOptions.map(opt => (
             <button
               key={opt.value}
               type="button"
@@ -585,9 +803,23 @@ export default function ReviewerPicker({
             >
               <Plus size={11} />
               {opt.label}
-              {renderInstalledBadge(opt.value)}
+              {renderUnavailableBadge(opt.value)}
             </button>
           ))}
+          {hiddenAddable.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowUnavailable(!showUnavailable)}
+              className="px-1.5 py-0.5 text-xs text-gray-600 hover:text-gray-300 underline decoration-dotted"
+              title={showUnavailable
+                ? 'Hide the reviewers whose CLI is missing or whose providers are switched off on this machine'
+                : `Show ${hiddenAddable.length} reviewer${hiddenAddable.length === 1 ? '' : 's'} whose CLI isn't installed here or whose providers are all switched off — still addable for a federated peer that has them`}
+            >
+              {showUnavailable
+                ? 'hide unavailable'
+                : `+${hiddenAddable.length} unavailable`}
+            </button>
+          )}
         </div>
       )}
 
@@ -598,15 +830,15 @@ export default function ReviewerPicker({
       <div className="flex flex-col gap-1.5 pt-1 border-t border-port-border/50">
         <span className="text-xs text-gray-500">GitHub reviewers (gate merge):</span>
         {selectedUsernames.length > 0 ? (
-          <div className="flex flex-col gap-1.5 sm:gap-0.5">
+          <div className="flex flex-col gap-1.5 @xl:gap-0.5">
             {selectedUsernames.map((value) => (
               <div
                 key={value}
                 className={ROW_CLASS}
                 title="GitHub username requested as a PR reviewer to gate the merge"
               >
-                <span className="text-port-accent font-mono text-xs col-span-2 sm:col-span-1">@</span>
-                <span className="text-xs text-gray-300 col-span-2 sm:col-span-1 truncate">{value}</span>
+                <span className="text-port-accent font-mono text-xs col-span-2 @xl:col-span-1">@</span>
+                <span className="text-xs text-gray-300 col-span-2 @xl:col-span-1 truncate">{value}</span>
                 <span className={CELL_LABEL_CLASS}>Model</span>
                 <div className="min-w-0">{renderModelCell(`@${value}`)}</div>
                 <span className={CELL_LABEL_CLASS}>Effort</span>
@@ -619,7 +851,7 @@ export default function ReviewerPicker({
                 </div>
                 <span className={CELL_LABEL_CLASS}>Max iterations</span>
                 <div>{renderMaxRounds(`@${value}`, `@${value}`)}</div>
-                <div className="col-span-2 sm:col-span-1 justify-self-end">
+                <div className="col-span-2 @xl:col-span-1 justify-self-end">
                   <button
                     type="button"
                     disabled={disabled}

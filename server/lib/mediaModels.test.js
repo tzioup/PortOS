@@ -56,6 +56,89 @@ describe('LTX-2.5 CUDA compatibility upgrade', () => {
   });
 });
 
+describe('FastMetal download size disclosure', () => {
+  // #5871: the name quoted the MLX DiT alone while the entry pulled the whole
+  // repo. The picker shows the NAME and the disclosure panel shows the number —
+  // the regression is the two disagreeing, so that is what this pins.
+  it('quotes the same download size in each shipped name as in its disclosure', async () => {
+    const { loadMediaModels } = await import('./mediaModels.js');
+    const rows = loadMediaModels().video.mlx.filter((m) => m.id.startsWith('fastmetal_'));
+    expect(rows).toHaveLength(3);
+    for (const row of rows) {
+      const quoted = row.name.match(/~([\d.]+) GB download/);
+      expect(quoted, `${row.id} name must quote a download size`).not.toBeNull();
+      const gb = row.disclosure.estimatedDownloadGb;
+      // Exact, not "close enough": a tolerance wide enough to be comfortable is
+      // also wide enough to re-admit the bug this pins (a name a GB off its own
+      // panel). If a name must round, the disclosure moves with it.
+      expect(Number(quoted[1]), `${row.id}: name says ${quoted[1]} GB, disclosure says ${gb} GB`).toBe(gb);
+    }
+  });
+
+  // 14.14 GB of the 14B repo is an `ema/` copy of the DiT the entry script
+  // never loads. Only the narrowed row may quote the smaller figure.
+  it('narrows the 14B row off its duplicated ema/ DiT', async () => {
+    const { loadMediaModels } = await import('./mediaModels.js');
+    const rows = loadMediaModels().video.mlx;
+    const fourteen = rows.find((m) => m.id === 'fastmetal_14b_qad');
+    expect(fourteen.repoFiles).toContain('mlx_dit.safetensors');
+    expect(fourteen.repoFiles.some((f) => f.startsWith('ema/'))).toBe(false);
+    // The unnarrowed siblings must NOT claim a subset they do not download.
+    for (const id of ['fastmetal_1_3b_qad', 'fastmetal_5b_qad']) {
+      expect(rows.find((m) => m.id === id).repoFiles).toBeUndefined();
+    }
+  });
+
+  // The path that actually bites a real install: the boot BEFORE migration 336
+  // runs still reads the registry off disk, so the loader — not just the
+  // migration — has to correct it. This is also what fails if someone later
+  // reorders `upgradeFastMetalDownloadSizes` after applyVideoDisclosures (which
+  // only fills an ABSENT block) or drops it from the videoEntries chain.
+  it('corrects a persisted stale registry on load, before the migration runs', async () => {
+    writeFileSync(registryFile, JSON.stringify({
+      video: {
+        mlx: [{
+          id: 'fastmetal_14b_qad',
+          name: 'FastMetal 14B QAD (~25 GB download, 36+ GB RAM, 3-step)',
+          repo: 'FastVideo/FastMetal-14B-QAD',
+          runtime: 'fastvideo',
+          disclosure: { estimatedDownloadGb: 42.3, reviewedAt: '2026-09-02' },
+        }],
+        cuda: [],
+      },
+    }, null, 2));
+
+    const { loadMediaModels } = await import('./mediaModels.js');
+    const row = loadMediaModels().video.mlx.find((m) => m.id === 'fastmetal_14b_qad');
+
+    expect(row.name).toBe('FastMetal 14B QAD (~27.1 GB download, 36+ GB RAM, 3-step)');
+    expect(row.disclosure.estimatedDownloadGb).toBe(27.1);
+    expect(row.repoFiles.some((f) => f.startsWith('ema/'))).toBe(false);
+  });
+
+  it('corrects a stale persisted row but leaves a renamed or re-pointed one alone', async () => {
+    const { upgradeFastMetalDownloadSizes } = await import('./mediaModels.js');
+    const shipped = {
+      id: 'fastmetal_14b_qad',
+      repo: 'FastVideo/FastMetal-14B-QAD',
+      name: 'FastMetal 14B QAD (~25 GB download, 36+ GB RAM, 3-step)',
+      disclosure: { estimatedDownloadGb: 42.3 },
+    };
+    const renamed = { ...shipped, name: 'My big video model' };
+    const fork = { ...shipped, repo: 'example/FastMetal-fork' };
+
+    const [upgraded, keptRename, keptFork] = upgradeFastMetalDownloadSizes([shipped, renamed, fork]);
+
+    expect(upgraded.name).toBe('FastMetal 14B QAD (~27.1 GB download, 36+ GB RAM, 3-step)');
+    expect(upgraded.disclosure.estimatedDownloadGb).toBe(27.1);
+    expect(upgraded.repoFiles.some((f) => f.startsWith('ema/'))).toBe(false);
+    expect(keptRename.name).toBe('My big video model');
+    // A rename does not forfeit the size correction the panel needs.
+    expect(keptRename.disclosure.estimatedDownloadGb).toBe(27.1);
+    expect(keptFork).toBe(fork);
+  });
+});
+
 describe('mediaModels registry', () => {
   it('seeds the registry file on first load', async () => {
     expect(existsSync(registryFile)).toBe(false);
@@ -1506,5 +1589,43 @@ describe('video bucket selection is an MLX/CUDA axis, not an OS one', () => {
     const reg = loadMediaModels();
     expect(reg.video.cuda.map((m) => m.id)).toContain('user-cuda');
     expect(reg.video.mlx.map((m) => m.id)).not.toContain('user-cuda');
+  });
+});
+
+// The load-time upgrade chain's ORDER is load-bearing — `upgradeFastMetalDownloadSizes`
+// has to precede `applyVideoDisclosures` (which only fills an ABSENT disclosure), and
+// `dropRetiredEntries` has to run first so a withdrawn model is not decorated on its
+// way out. Pinning the list here makes a reorder a deliberate two-file edit rather
+// than a silently-shipped behavior change.
+describe('video registry upgrade chain', () => {
+  it('runs the upgraders in the order the constraints require', async () => {
+    const { VIDEO_REGISTRY_UPGRADE_NAMES } = await import('./mediaModels.js');
+    expect([...VIDEO_REGISTRY_UPGRADE_NAMES]).toEqual([
+      'dropRetiredEntries',
+      'upgradeMiniMaxH3OutputControls',
+      'upgradeLtx25AudioControls',
+      'upgradeFastMetalDownloadSizes',
+      'backfillRuntime',
+      'upgradeLegacyCudaLtxRuntime',
+      'upgradeLtx25CudaMemoryFloor',
+    ]);
+  });
+
+  // The two CUDA-only rows must stay off the MLX bucket: `ltx_video` is a legacy
+  // diffusers CUDA row, and re-pointing an MLX entry of the same id at the
+  // `cuda_video` runtime would break its dispatch.
+  it('applies the CUDA-only upgraders to the cuda bucket only', async () => {
+    writeFileSync(registryFile, JSON.stringify({
+      video: {
+        mlx: [{ id: 'ltx_video', name: 'LTX Video' }],
+        cuda: [{ id: 'ltx_video', name: 'LTX Video' }],
+      },
+    }, null, 2));
+
+    const { loadMediaModels } = await import('./mediaModels.js');
+    const registry = loadMediaModels();
+
+    expect(registry.video.mlx.find((m) => m.id === 'ltx_video').runtime).toBeUndefined();
+    expect(registry.video.cuda.find((m) => m.id === 'ltx_video').runtime).toBe('cuda_video');
   });
 });

@@ -1,9 +1,13 @@
+import { hydratePrivateKeys, persistPrivateKeys } from './privateKeyStore.js';
 import { join } from 'path';
 import { EventEmitter } from 'events';
 import { safeJSONParse, PATHS, atomicWrite, tryReadFile, tryReadFileStrict } from '../lib/fileUtils.js';
 import { createFileWriteQueue } from '../lib/fileWriteQueue.js';
 import { canonicalStringify, isPlainObject, POLLUTING_KEYS } from '../lib/objects.js';
-import { recordUserAction } from './userActions.js';
+// `./userActions.js` is imported lazily at its single call site below, NOT here.
+// It reaches the DB schema/query layer, and settings.js is imported by nearly
+// every service — a static edge instantiated that subtree in ~200 suites that
+// never write a ledger row.
 
 // POLLUTING_KEYS (`__proto__`/`constructor`/`prototype`) is the project-wide
 // prototype-pollution denylist (defined in server/lib/objects.js). Without it,
@@ -68,7 +72,7 @@ settingsEvents.setMaxListeners(50);
 //   write resolves.
 const loadRaw = async () => {
   const raw = await tryReadFile(SETTINGS_FILE);
-  return safeJSONParse(raw ?? '{}', {});
+  return hydratePrivateKeys(safeJSONParse(raw ?? '{}', {}), PATHS.data);
 };
 
 /**
@@ -168,7 +172,7 @@ export const reloadSettings = async () => {
     settingsEvents.emit('settings:invalidated');
     return {};
   }
-  const cleaned = stripStoreKeys(settings);
+  const cleaned = stripStoreKeys(await hydratePrivateKeys(settings, PATHS.data));
   settingsEvents.emit('settings:updated', cleaned);
   return cleaned;
 };
@@ -232,7 +236,7 @@ const diffSettings = (prev, next) => {
  * feature writes. Only `PUT /api/settings` passes `'user'`. `reloadSettings` does
  * not call this at all, so a backup restore is excluded by construction.
  */
-const save = async (settings, { actor = 'system' } = {}) => {
+const save = async (settings, { actor = 'system', skipUserAction = false } = {}) => {
   const cleaned = stripStoreKeys(settings);
   // Stamp `timezoneUpdatedAt` whenever the effective `timezone` actually
   // changes, so timezone-dependent schedulers can gate catch-up/re-evaluation
@@ -253,7 +257,8 @@ const save = async (settings, { actor = 'system' } = {}) => {
   // atomicWrite (temp-file + rename) so a mid-write crash never truncates
   // settings.json. Pass a pre-stringified string to preserve the trailing
   // newline; atomicWrite's own JSON.stringify omits it.
-  await atomicWrite(SETTINGS_FILE, JSON.stringify(cleaned, null, 2) + '\n');
+  await atomicWrite(SETTINGS_FILE, JSON.stringify(await persistPrivateKeys(cleaned, PATHS.data, { previousSettings: prev }), null, 2) + '\n');
+  await hydratePrivateKeys(cleaned, PATHS.data);
   // Warn AFTER the successful write so a thrown write never produces
   // a misleading "stripped" log line for a write that didn't happen.
   if (isPlainObject(settings)) {
@@ -266,9 +271,10 @@ const save = async (settings, { actor = 'system' } = {}) => {
   // A no-op save writes no ledger row: the settings page PUTs the whole object
   // on every visit, and a log full of "changed nothing" rows would bury the
   // changes that matter.
-  if (change && change.keysChanged.length > 0) {
+  if (!skipUserAction && change && change.keysChanged.length > 0) {
     const happenedAt = new Date().toISOString();
     const changedKeys = change.keysChanged.join(',');
+    const { recordUserAction } = await import('./userActions.js');
     await recordUserAction({
       type: 'settings.update',
       actor,
@@ -310,7 +316,7 @@ export const getSettingsWithStatus = async () => {
     // covers BOTH failure modes (malformed content and an unreadable-but-present
     // file); only a genuinely ABSENT file (fresh install) caches `{}`.
     const { corrupt, settings } = await readSettingsStrict();
-    const loaded = stripStoreKeys(settings);
+    const loaded = stripStoreKeys(await hydratePrivateKeys(settings, PATHS.data));
     // A save()/reloadSettings() may have populated the cache via the
     // settings:updated listener while this cold read was awaiting the disk read.
     // Prefer that fresher in-memory value over our (older) on-disk snapshot.

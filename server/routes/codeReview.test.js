@@ -49,6 +49,18 @@ describe('GET /api/code-review/defaults', () => {
 })
 
 describe('POST /api/code-review/local', () => {
+  it('resolves a provider-backed model default and rejects unsafe provider identities', async () => {
+    settingsSvc.getSettings.mockResolvedValue({ codeReview: { providerModels: { 'provider:example-gpu': 'pinned-coder' } } });
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({ ok: true, findings: 'NO FINDINGS' });
+    const res = await request(makeApp()).post('/api/code-review/local')
+      .send({ backend: 'provider:example-gpu', diff: 'example diff' });
+    expect(res.status).toBe(200);
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(expect.objectContaining({ backend: 'provider:example-gpu', model: 'pinned-coder' }));
+    const invalid = await request(makeApp()).post('/api/code-review/local')
+      .send({ backend: 'provider:example-gpu~opt', diff: 'example diff' });
+    expect(invalid.status).toBe(400);
+  });
+
   it('returns 400 when diff is empty (Zod min(1) rejection)', async () => {
     const res = await request(makeApp())
       .post('/api/code-review/local')
@@ -142,6 +154,26 @@ describe('POST /api/code-review/local', () => {
     )
   })
 
+  // The old lmstudio-or-else ternary handed every non-lmstudio backend the
+  // OLLAMA model id, so a third backend would have reviewed with the wrong model.
+  it('reads each backend\'s own configured model scalar', async () => {
+    settingsSvc.getSettings.mockResolvedValue({
+      codeReview: { ollamaModel: 'ollama-model', mtplxModel: 'mtplx-model' },
+    })
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: true, backend: 'mtplx', model: 'mtplx-model', findings: 'No findings.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'mtplx', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(200)
+    expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
+      expect.objectContaining({ backend: 'mtplx', model: 'mtplx-model' }),
+    )
+  })
+
   it('passes the caller-supplied model through when present', async () => {
     settingsSvc.getSettings.mockResolvedValue({
       codeReview: { ollamaModel: 'settings-model' },
@@ -161,6 +193,24 @@ describe('POST /api/code-review/local', () => {
     expect(codeReviewSvc.runLocalCodeReview).toHaveBeenCalledWith(
       expect.objectContaining({ model: 'caller-model' }),
     )
+  })
+
+  // A model neither the request, the panel, nor the backend's own listing could
+  // supply is the caller's config gap, not a reviewer that was asked and failed —
+  // an agent retrying a 502 would retry forever against an unset setting.
+  it('returns 400 when the service could not resolve a model', async () => {
+    codeReviewSvc.runLocalCodeReview.mockResolvedValue({
+      ok: false,
+      code: 'NO_MODEL',
+      error: 'No model configured for mtplx reviewer and mtplx is serving no models — set one on the Settings → Code Reviewers page.',
+    })
+
+    const res = await request(makeApp())
+      .post('/api/code-review/local')
+      .send({ backend: 'mtplx', diff: 'diff --git a b' })
+
+    expect(res.status).toBe(400)
+    expect(res.body.error).toMatch(/No model configured/)
   })
 
   it('returns 502 when the service returns { ok: false }', async () => {

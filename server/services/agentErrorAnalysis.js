@@ -1,3 +1,4 @@
+import { isPrivateSecurityTask } from '../lib/privateSecurityPolicy.js';
 /**
  * Agent Error Analysis
  *
@@ -13,6 +14,7 @@ import { redactOutput } from '../lib/commandSecurity.js';
 import { stripAnsi } from '../lib/ansiStrip.js';
 import { describeOllamaContextOverflow, parseOllamaContextOverflow } from '../lib/ollamaContext.js';
 import { retryHoldMetadata } from '../lib/taskRetryHold.js';
+import { TUI_TOOL_PERMISSION_PROMPT_PATTERN } from '../lib/tuiHandshake.js';
 import {
   INVESTIGATION_CIRCUIT_MAX_CREATIONS,
   INVESTIGATION_HEADLINE_PREFIX,
@@ -195,6 +197,35 @@ export const ERROR_PATTERNS = [
       message: 'Provider CLI could not load its config file',
       suggestedFix: 'The CLI failed while loading its own config (for codex, `~/.codex/config.toml`), before the prompt was read — every retry fails the same way until the file parses. Check it for a syntax error or a key this CLI version no longer accepts.'
     })
+  },
+  {
+    // The CLI rejected the ARGV PortOS built, before reading the prompt — a flag
+    // that is unknown, or (the common one) legal only in another mode. Same Tier
+    // 1 blast radius as a bad config file: every retry dies identically in a few
+    // seconds, so it belongs up here with the other pre-prompt rejections.
+    //
+    // Registering it also stops a subtler failure. A TUI run that dies this
+    // early has NOTHING in its transcript but the shell's echo of the argv, so
+    // the loose sweep below classifies the run off PortOS's own launch flags —
+    // `--mcp-config '{"mcpServers":{}}'` filed a Stage 3 pr-reviewer run as
+    // "MCP server error" three times running while the real line, one row down,
+    // read `--no-session-persistence can only be used with --print mode`
+    // (agent-a12b1837). The flag name is echoed because it is PortOS-authored
+    // argv, never user data.
+    pattern: /(?:^|\n|\bError:\s*)(--[a-z0-9][a-z0-9-]*)\s+(?:can only be used with\s+([^\n]{1,80})|is (?:not a known|an unknown|not a valid)[^\n]{0,60})/i,
+    category: 'cli-config-invalid',
+    actionable: true,
+    origin: 'runner', // fully structured — the CLI's own argv rejection
+    escalation: 'Correct the flag set PortOS builds for this provider/posture in server/lib/providerVendors.js, then approve the retry.',
+    extract: (match) => {
+      const flag = match[1];
+      const requires = redactFailureSnippet(match[2] || '').replace(/[.,;]+$/, '').slice(0, CONFIG_EXPECTED_MAX_CHARS);
+      return {
+        message: `Provider CLI rejected the flag ${flag}`,
+        suggestedFix: `The CLI exited while parsing its arguments, before the prompt was delivered, so every retry fails identically.${requires ? ` It reports that \`${flag}\` only works with ${requires}.` : ''} PortOS builds this argv itself — fix the posture/vendor recipe in server/lib/providerVendors.js (an attachable \`tuiSpawnArgs\` recipe must drop every flag that requires \`--print\`), not the provider record.`,
+        rejectedCliFlag: flag
+      };
+    }
   },
 
   // ===== API & Authentication Errors =====
@@ -509,7 +540,18 @@ export const ERROR_PATTERNS = [
     }
   },
   {
-    pattern: /MCP.?(?:server|connection|error)|mcp.?(?:failed|timeout)/i,
+    // `MCP` as a standalone WORD followed by error prose on the same line. The
+    // previous shape — `MCP.?(?:server|connection|error)` — treated `.` as "any
+    // character", so it matched the `"mcpServers"` key inside the empty
+    // `--mcp-config '{"mcpServers":{}}'` object PortOS puts on every Claude
+    // public-review argv. That is the OPPOSITE of an MCP failure (it is how
+    // PortOS says "load no MCP servers at all"), and a run that died before
+    // producing anything but its own echoed command line was filed as an MCP
+    // outage three times running (agent-a12b1837). So: `\b…\b` rejects
+    // `mcpServers`, the `(?![-\w])` rejects the `--mcp-config` /
+    // `--strict-mcp-config` flag spellings, and the lookahead demands actual
+    // failure prose nearby rather than a mere mention.
+    pattern: /\bmcp\b(?![-\w])(?=[^\n]{0,120}\b(?:error|errored|failed|failure|unavailable|disconnected|refused|crashed|timed out|timeout|not (?:available|running|found|connected))\b)/i,
     category: 'mcp-error',
     actionable: false,
     extract: () => ({
@@ -910,6 +952,16 @@ export const COMPLETION_REASON_ANALYSES = {
     message: 'Agent session was terminated by a signal',
     suggestedFix: 'The TUI session was killed rather than exiting on its own — usually a PortOS restart taking its child processes down. The task resumes from the preserved worktree; no agent-side fix is needed.'
   },
+  // The TUI spawner declined TOOL_PERMISSION_DECLINE_MAX permission dialogs
+  // (createToolPermissionGate) and the model was still reaching outside the
+  // run's scope. Registered so the post-mortem does not fall through to the
+  // transcript keyword sweep — which would scrape the dialog chrome itself.
+  'permission-prompt-loop': {
+    category: 'timeout',
+    actionable: false,
+    message: 'Agent kept asking for tool permissions an unattended run cannot grant',
+    suggestedFix: 'Every permission dialog was declined and the model kept reaching outside the run\'s allowed scope (paths outside the worktree, tools the posture forbids). A fallback provider retries the task; if it recurs, pin the stage to a stronger model or remove the outside-path references from its prompt.'
+  },
   'command-not-found': {
     category: 'spawn-error',
     actionable: true,
@@ -922,7 +974,7 @@ export const COMPLETION_REASON_ANALYSES = {
     actionable: true,
     escalation: 'Confirm the required CLI/tool is installed and on PATH for the agent user (or fix the command), then approve the retry.',
     message: 'Failed to start the agent session',
-    suggestedFix: 'The shell/PTY session could not be created. Check system resources and the provider command configuration.'
+    suggestedFix: 'The PTY session could not be created. Check system resources, whether too many sessions are already open, and the provider command configuration.'
   },
   // The runner refused the spawn outright — a command missing from its
   // allowlist, malformed cliArgs, or the runner simply unreachable. No child
@@ -975,7 +1027,9 @@ export const AWAITING_INPUT_MARKERS = [
   /Enter to select/i,
   /↑\/↓ to navigate/,
   /❯\s*1\./,
-  /Do you want to proceed\?/i,
+  // Claude Code's tool-permission dialog — the live gate that declines it
+  // (createToolPermissionGate) reads the same pattern.
+  TUI_TOOL_PERMISSION_PROMPT_PATTERN,
   /Press Enter to continue/i
 ];
 
@@ -1386,6 +1440,24 @@ export async function maybeCreateInvestigationTask(agentId, task, analysis) {
  * }}
  */
 export function resolveFailedTaskDecision(task, errorAnalysis, { agentId = null, now = Date.now() } = {}) {
+  // A PERMANENT failure (#6124) re-fails identically on every re-dispatch — a
+  // pipeline stage whose agent finished with no parseable output has nothing a
+  // retry could read differently. Block on the FIRST occurrence, ahead of the
+  // actionable branch, and file NO investigation task: an investigation agent
+  // is another unbounded spawn against a cause the block already names.
+  if (errorAnalysis?.permanent) {
+    return {
+      status: 'blocked',
+      investigationAnalysis: null,
+      metadataUpdates: {
+        failureCount: (Number(task.metadata?.failureCount) || 0) + 1,
+        lastErrorCategory: errorAnalysis.category || 'unknown',
+        blockedReason: errorAnalysis.message || 'The run failed permanently and will not be retried',
+        blockedCategory: errorAnalysis.category || 'permanent-failure'
+      }
+    };
+  }
+
   // Actionable errors get blocked immediately. The investigation task (created
   // by the wrapper unless the failure is an API-access error) gets the original
   // analysis verbatim.
@@ -1498,6 +1570,12 @@ export function resolveTypeFailureSignal({ success, terminatedByUser = false, ho
  * spawnable once `releaseRetryHold` writes the resume pointer (#3373).
  */
 export async function resolveFailedTaskUpdate(task, errorAnalysis, agentId, now = Date.now()) {
+  if (isPrivateSecurityTask(task)) {
+    return { status: 'blocked', metadata: { ...task.metadata, blockedAt: new Date(now).toISOString(),
+      blockedCategory: 'private-security-assessment-failed',
+      blockedReason: 'Private assessment did not produce a validated report. Inspect its local output and configuration; no automatic investigation or provider fallback will run.' } };
+  }
+
   const decision = resolveFailedTaskDecision(task, errorAnalysis, { agentId, now });
   const { failureCount, lastErrorCategory } = decision.metadataUpdates;
 
@@ -1517,7 +1595,10 @@ export async function resolveFailedTaskUpdate(task, errorAnalysis, agentId, now 
     emitLog('warn', `🚫 Task ${task.id} blocked after ${failureCount} failures (${lastErrorCategory})`, {
       taskId: task.id, failureCount, category: lastErrorCategory
     });
-    await maybeCreateInvestigationTask(agentId, task, decision.investigationAnalysis);
+    // A null analysis is the permanent-failure branch's explicit "do not
+    // investigate" — see resolveFailedTaskDecision. Every other blocked path
+    // supplies one.
+    if (decision.investigationAnalysis) await maybeCreateInvestigationTask(agentId, task, decision.investigationAnalysis);
     const at = new Date(now).toISOString();
     return {
       status: 'blocked',

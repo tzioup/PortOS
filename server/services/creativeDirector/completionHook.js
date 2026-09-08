@@ -27,6 +27,7 @@ import { join } from 'path';
 import { getProject, updateProject, updateScene, updateRun, recordRun } from './local.js';
 import { enqueueTreatmentTask } from './agentBridge.js';
 import { advanceAfterPlanStepSettled } from './planAdvance.js';
+import { registerCreativeDirectorProjectStarter } from './projectStartSink.js';
 import { dispatchSceneEvaluation } from './sceneEvaluator.js';
 import { runSceneRender } from './sceneRunner.js';
 import { runStitch } from './stitchRunner.js';
@@ -44,12 +45,23 @@ import {
 } from './deliverableGate.js';
 
 export async function handleCreativeDirectorCompletion(task, agentId, success) {
+  const videoAttempt = task?.metadata?.videoProduction;
+  if (videoAttempt) {
+    const { settleVideoAttempt } = await import('./videoExecution.js');
+    await settleVideoAttempt(videoAttempt.projectId, videoAttempt.attemptId, { status: success ? 'completed' : 'failed' });
+  }
   const meta = task?.metadata?.creativeDirector;
   if (!meta?.projectId) return;
   const project = await getProject(meta.projectId).catch(() => null);
   if (!project) {
     console.log(`⚠️ CD completion hook: project ${meta.projectId} not found`);
     return;
+  }
+
+  if (project.workspace === 'video' && meta.productionRevision !== (project.videoWorkRevision || 0)) {
+    const ownsPlanWrite = meta.kind === 'plan' && project.plan?.submittedProductionRevision === meta.productionRevision
+      && project.videoWorkRevision === meta.productionRevision + 1;
+    if (!ownsPlanWrite) return;
   }
 
   // #4146 — a `plan`/`treatment` agent's deliverable is the PATCH its prompt
@@ -264,6 +276,10 @@ export async function advanceAfterSceneSettled(projectId, opts = {}) {
   const skipSeedDeferSceneId = opts.skipSeedDeferSceneId || null;
   const project = await getProject(projectId);
   if (!project) return;
+  if (project.workspace === 'video') {
+    const { videoReviewAllowsDispatch } = await import('./videoReview.js');
+    if (!await videoReviewAllowsDispatch(projectId, [])) return;
+  }
   if (project.status === 'paused' || project.status === 'failed') return;
 
   // No treatment yet → enqueue treatment task.
@@ -608,9 +624,20 @@ export async function advanceAfterSceneSettled(projectId, opts = {}) {
  */
 export async function startCreativeDirectorProject(projectId) {
   const project = await getProject(projectId).catch(() => null);
-  if (project?.directive) return advanceAfterPlanStepSettled(projectId);
+  if (project?.workspace === 'video') {
+    const { videoReviewAllowsDispatch } = await import('./videoReview.js');
+    if (!await videoReviewAllowsDispatch(projectId, [])) return;
+  }
+  if (project?.directive && (project.workspace !== 'video' || project.treatment)) return advanceAfterPlanStepSettled(projectId);
   return advanceAfterSceneSettled(projectId);
 }
+
+// Wire the pipeline-facing seam (#5920). `pipeline/episodeVideo.js` starts the CD
+// project it just built through `projectStartSink.js` rather than importing this
+// module, which is what keeps the two halves out of one import cycle. Registering
+// here (rather than at a call site) means every importer of the completion hook
+// arms the seam — see the sink's header for why boot imports this module.
+registerCreativeDirectorProjectStarter(startCreativeDirectorProject);
 
 // Test-only: clear the module-level in-memory dedup sets so suites that leave
 // a seed-frame defer armed (deferred but never fired the settle event) don't

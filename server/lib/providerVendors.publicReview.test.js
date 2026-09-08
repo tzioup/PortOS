@@ -8,10 +8,13 @@ import {
 } from './agentExecutionProfiles.js';
 import {
   buildVendorSpawnConfig,
+  enforcedPublicReviewPosturesForProvider,
   publicReviewPosturesForProvider,
   publicReviewProviderBlock,
   supportsPublicReviewProvider,
   supportsPublicReviewActionsProvider,
+  supportsTuiPublicReviewActionsProvider,
+  supportsTuiPublicReviewPosture,
 } from './providerVendors.js';
 
 const localClaude = {
@@ -28,17 +31,34 @@ const localClaude = {
 const codex = { id: 'codex-cli', type: 'cli', command: 'codex', models: ['gpt-5.6'] };
 const antigravity = { id: 'antigravity-cli', type: 'cli', command: 'agy', models: ['gemini-3.6-flash-high'] };
 const grok = { id: 'grok-cli', type: 'cli', command: 'grok' };
+const opencodeOllama = {
+  id: 'opencode-ollama-tui',
+  type: 'tui',
+  command: 'opencode',
+  ollamaBacked: true,
+  models: ['gemma3:27b'],
+};
 
 describe('public-review provider postures', () => {
   // The whole point of the posture table: eligibility is DECLARED per vendor,
   // so an install that has only one of these can still configure every stage.
   it('derives each provider’s eligible postures from its vendor row', () => {
-    expect(publicReviewPosturesForProvider(codex)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
-    expect(publicReviewPosturesForProvider(antigravity)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    expect(publicReviewPosturesForProvider(codex)).toEqual([PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    expect(publicReviewPosturesForProvider(antigravity)).toEqual([PUBLIC_REVIEW_ACTIONS_POSTURE]);
     expect(publicReviewPosturesForProvider(grok)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
-    // Claude Code has permission modes but no OS-level sandbox flag, so it is
-    // deliberately tool-free-only and fails closed for the actions stage.
-    expect(publicReviewPosturesForProvider(localClaude)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE]);
+    expect(publicReviewPosturesForProvider(localClaude)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
+  });
+
+  // The actions stage is open to every enabled binary provider; the ENFORCED
+  // list is the subset with a vendor sandbox recipe, which is what the schedule
+  // UI reports beside the picker.
+  it('distinguishes a vendor-sandboxed actions stage from a worktree-only one', () => {
+    const opencode = { id: 'opencode', type: 'cli', command: 'opencode' };
+    expect(publicReviewPosturesForProvider(opencode)).toEqual([]);
+    expect(enforcedPublicReviewPosturesForProvider(opencode)).toEqual([]);
+    expect(enforcedPublicReviewPosturesForProvider(codex)).toEqual([PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    expect(enforcedPublicReviewPosturesForProvider(localClaude)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    expect(enforcedPublicReviewPosturesForProvider({ ...codex, type: 'api' })).toEqual([]);
   });
 
   // Regression (#5830): the spawn gate passes the posture a STAGE requires,
@@ -50,38 +70,136 @@ describe('public-review provider postures', () => {
     expect(publicReviewProviderBlock(codex, undefined)).toBeNull();
     // The transport is irrelevant when nothing is being enforced: a TUI session
     // and an api provider run ordinary tasks all day.
-    expect(publicReviewProviderBlock({ ...codex, type: 'tui' }, null, { tui: true })).toBeNull();
+    expect(publicReviewProviderBlock({ ...codex, type: 'tui' }, null)).toBeNull();
     expect(publicReviewProviderBlock({ ...codex, type: 'api' }, null)).toBeNull();
   });
 
   it('blocks a requested posture the provider has no recipe for, naming that posture', () => {
-    expect(publicReviewProviderBlock(codex, PUBLIC_REVIEW_NO_TOOL_POSTURE)).toBeNull();
+    expect(publicReviewProviderBlock(codex, PUBLIC_REVIEW_NO_TOOL_POSTURE)).toMatchObject({ category: 'public-review-provider-unsupported' });
     expect(publicReviewProviderBlock(codex, PUBLIC_REVIEW_ACTIONS_POSTURE)).toBeNull();
 
     // claude has permission modes but no sandbox flag — tool-free only.
     expect(publicReviewProviderBlock(localClaude, PUBLIC_REVIEW_NO_TOOL_POSTURE)).toBeNull();
-    expect(publicReviewProviderBlock(localClaude, PUBLIC_REVIEW_ACTIONS_POSTURE)).toEqual({
+    expect(publicReviewProviderBlock({ ...localClaude, type: 'api' }, PUBLIC_REVIEW_ACTIONS_POSTURE)).toEqual({
       reason: "Provider 'claude-ollama' has no enforced sandboxed-actions public-content review mode",
       category: 'public-review-actions-provider-unsupported',
     });
 
-    // A TUI session has no enforced argv, whatever its vendor row declares.
-    expect(publicReviewProviderBlock({ ...codex, type: 'tui' }, PUBLIC_REVIEW_NO_TOOL_POSTURE, { tui: true })).toEqual({
-      reason: "Provider 'codex-cli' has no enforced no-tool public-content review mode",
-      category: 'public-review-provider-unsupported',
+    // A TUI record of a recipe-bearing vendor is spawned headless through
+    // that recipe, so it is as eligible as its CLI sibling. An api provider
+    // has no binary to spawn and no recipe.
+    expect(publicReviewProviderBlock({ ...codex, id: 'codex-tui', type: 'tui' }, PUBLIC_REVIEW_NO_TOOL_POSTURE)).not.toBeNull();
+    expect(publicReviewProviderBlock({ ...codex, id: 'codex-tui', type: 'tui' }, PUBLIC_REVIEW_ACTIONS_POSTURE)).toBeNull();
+    expect(publicReviewProviderBlock({ id: 'grok', type: 'api', command: undefined }, PUBLIC_REVIEW_ACTIONS_POSTURE)).toEqual({
+      reason: "Provider 'grok' has no enforced sandboxed-actions public-content review mode",
+      category: 'public-review-actions-provider-unsupported',
     });
   });
 
-  it('fails closed for transports and vendors with no maintained recipe', () => {
-    // A TUI session and an HTTP api provider have no enforced argv at all.
-    expect(publicReviewPosturesForProvider({ ...codex, type: 'tui' }, { tui: true })).toEqual([]);
+  // The user's enabled providers are commonly the TUI records (the CLI
+  // siblings switched off), and a stage runs the same binary headless either
+  // way — so a TUI record carries its vendor's postures.
+  it('derives the same postures for a TUI record of a recipe-bearing vendor', () => {
+    expect(publicReviewPosturesForProvider({ ...codex, id: 'codex-tui', type: 'tui' })).toEqual([PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    expect(publicReviewPosturesForProvider({ ...grok, id: 'grok-tui', type: 'tui' })).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    expect(publicReviewPosturesForProvider({ ...localClaude, id: 'claude-ollama-tui', type: 'tui' })).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE, PUBLIC_REVIEW_ACTIONS_POSTURE]);
+    // The headless recipe, not the TUI argv, is what the stage spawns.
+    const config = buildVendorSpawnConfig({ ...codex, id: 'codex-tui', type: 'tui', args: ['--full-auto'] }, {
+      effectiveModel: 'gpt-5.6',
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+    });
+    expect(config.args).toEqual(expect.arrayContaining(['exec', '--sandbox', 'workspace-write']));
+    expect(config.args).not.toContain('--full-auto');
+  });
+
+  // OpenCode is how a user actually drives a local Ollama model, so the gate
+  // has to be configurable on it — otherwise the only local option is a Claude
+  // binary pointed at an Anthropic-compatible shim.
+  it('offers the no-tool gate on a local-backed OpenCode wrapper', () => {
+    expect(publicReviewPosturesForProvider(opencodeOllama))
+      .toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE]);
+    // Enforced for the gate (config recipe), worktree-only for the actions
+    // stage — OpenCode ships no OS sandbox of its own.
+    expect(enforcedPublicReviewPosturesForProvider(opencodeOllama)).toEqual([PUBLIC_REVIEW_NO_TOOL_POSTURE]);
+  });
+
+  // The gate's enforcement rides in OPENCODE_CONFIG_CONTENT, which the
+  // public-review env allowlist keeps only for a config declaring on-box
+  // endpoints — so a wrapper fronting a hosted gateway must not be offered a
+  // stage it cannot authenticate.
+  it('withholds the gate from an OpenCode wrapper with no local backend', () => {
+    const gateway = { id: 'opencode-openrouter-tui', type: 'tui', command: 'opencode', gatewayBacked: 'openrouter' };
+    expect(publicReviewPosturesForProvider(gateway)).toEqual([]);
+    expect(supportsPublicReviewProvider(gateway)).toBe(false);
+  });
+
+  // The marker alone is not enough, and this is the security case, not a tidy-up:
+  // `cliChildEnv.js` strips a config whose endpoint is off-box, and a stripped
+  // config does not harden the child — OpenCode falls back to reading the user's
+  // own ~/.config/opencode with its tools, plugins and MCP servers intact, while
+  // the stage still reports an enforced tool-free gate. Eligibility must use the
+  // same locality rule the allowlist does.
+  it('withholds the gate from an ollama-marked wrapper pointed off-box', () => {
+    const relocated = {
+      ...opencodeOllama,
+      envVars: {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { ollama: { options: { baseURL: 'http://192.0.2.10:11434/v1' } } },
+        }),
+      },
+    };
+    expect(supportsPublicReviewProvider(relocated)).toBe(false);
+    // A config that keeps the daemon on this machine is still eligible.
+    expect(supportsPublicReviewProvider({
+      ...opencodeOllama,
+      envVars: {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify({
+          provider: { ollama: { options: { baseURL: 'http://127.0.0.1:11434/v1' } } },
+        }),
+      },
+    })).toBe(true);
+  });
+
+  // Every other local runtime is rejected at spawn time by
+  // `validatePublicReviewModel` (`public-review-runtime-unsupported` — only an
+  // Ollama catalog can be probed for the authoritative no-tools answer), so
+  // offering them would put a permanently blocking choice in the picker.
+  it('withholds the gate from local runtimes the model check cannot validate', () => {
+    for (const marker of ['llamaBacked', 'vllmBacked', 'sglangBacked', 'mtplxBacked']) {
+      const provider = { id: `opencode-${marker}`, type: 'tui', command: 'opencode', [marker]: true };
+      expect(supportsPublicReviewProvider(provider), marker).toBe(false);
+      expect(publicReviewPosturesForProvider(provider), marker).toEqual([]);
+    }
+  });
+
+  it('builds the OpenCode gate on its read-only agent with a namespaced model and no provider args', () => {
+    const config = buildVendorSpawnConfig({ ...opencodeOllama, args: ['--agent', 'build'] }, {
+      effectiveModel: 'gemma3:27b',
+      effort: 'low',
+      safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
+    });
+    expect(config).toEqual({
+      command: 'opencode',
+      args: ['run', '--agent', 'plan', '-m', 'ollama/gemma3:27b'],
+      stdinMode: 'prompt',
+    });
+    // A saved `--agent build` would select the tool-enabled agent; `--effort` is
+    // not an `opencode run` flag at all.
+    expect(config.args).not.toContain('build');
+    expect(config.args).not.toContain('--effort');
+  });
+
+  it('fails closed for the no-tool gate on transports and vendors with no maintained recipe', () => {
+    // An HTTP api provider has no binary to spawn and no enforced argv.
     expect(publicReviewPosturesForProvider({ ...codex, type: 'api' })).toEqual([]);
-    // An unknown command must never inherit claude's always-true fallback row.
+    // A namespace-less opencode record, and kimi/cursor, have no maintained
+    // no-tool recipe, so they can run only the actions stage. An unknown command
+    // must never inherit claude's always-true fallback row for the gate either.
+    expect(publicReviewPosturesForProvider({ id: 'opencode-tui', type: 'tui', command: 'opencode' })).toEqual([]);
     expect(publicReviewPosturesForProvider({ id: 'custom', type: 'cli', command: 'custom-agent' })).toEqual([]);
-    // opencode/kimi/cursor have no maintained no-tool or sandbox recipe yet.
-    expect(publicReviewPosturesForProvider({ id: 'opencode', type: 'cli', command: 'opencode' })).toEqual([]);
     expect(supportsPublicReviewProvider({ id: 'kimi', type: 'cli', command: 'kimi' })).toBe(false);
-    expect(supportsPublicReviewActionsProvider(localClaude)).toBe(false);
+    expect(supportsPublicReviewActionsProvider(localClaude)).toBe(true);
+    expect(supportsPublicReviewActionsProvider({ ...localClaude, type: 'api' })).toBe(false);
   });
 
   it('builds the final reviewer with the bounded Codex sandbox and no provider args', () => {
@@ -104,14 +222,8 @@ describe('public-review provider postures', () => {
     expect(config.args).not.toContain('unsafe.json');
   });
 
-  it('builds the Codex gate stage read-only rather than workspace-write', () => {
-    const config = buildVendorSpawnConfig(codex, {
-      effectiveModel: 'gpt-5.6',
-      safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
-    });
-    expect(config.args).toEqual(expect.arrayContaining(['exec', '--sandbox', 'read-only']));
-    expect(config.args).not.toContain('workspace-write');
-    expect(config.args).not.toContain('--approve-for-me');
+  it('rejects read-only Codex because filesystem restrictions do not remove tools', () => {
+    expect(() => buildVendorSpawnConfig(codex, { safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE })).toThrow(/no enforced no-tool/);
   });
 
   it('builds the final reviewer with the bounded Antigravity sandbox and selected effort', () => {
@@ -135,10 +247,8 @@ describe('public-review provider postures', () => {
     expect(config.args).not.toContain('unsafe-model');
   });
 
-  it('builds the Antigravity gate stage in plan mode, which cannot edit', () => {
-    const config = buildVendorSpawnConfig(antigravity, { safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE });
-    expect(config.args).toEqual(expect.arrayContaining(['--sandbox', '--mode', 'plan', '--disable-slash-commands']));
-    expect(config.args).not.toContain('accept-edits');
+  it('rejects Antigravity plan mode because it does not remove tools', () => {
+    expect(() => buildVendorSpawnConfig(antigravity, { safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE })).toThrow(/no enforced no-tool/);
   });
 
   it('builds grok’s two postures from its own permission-mode and sandbox flags', () => {
@@ -162,11 +272,135 @@ describe('public-review provider postures', () => {
     expect(actions.args).not.toContain('plan');
   });
 
-  it('rejects the action profile for a provider with no maintained sandbox', () => {
-    expect(() => buildVendorSpawnConfig(localClaude, {
-      effectiveModel: 'safe-model',
+  it('builds the Claude actions stage inside its OS sandbox, not under skip-permissions', () => {
+    const config = buildVendorSpawnConfig({ ...localClaude, args: ['--dangerously-skip-permissions'] }, {
+      effectiveModel: 'qwen3.8:27b',
+      effort: 'high',
+      systemPromptFile: '/tmp/example-system.md',
       safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
-    })).toThrow(/no enforced sandboxed-actions public-review posture/);
+    });
+    expect(config.command).toBe('claude');
+    expect(config.streamFormat).toBe('stream-json');
+    expect(config.args).toEqual(expect.arrayContaining([
+      '--permission-mode', 'acceptEdits', '--settings', '--strict-mcp-config', '--print',
+      '--append-system-prompt-file', '/tmp/example-system.md', '--model', 'qwen3.8:27b', '--effort', 'high',
+    ]));
+    const settings = JSON.parse(config.args[config.args.indexOf('--settings') + 1]);
+    expect(settings.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: true, network: { allowedDomains: [] } });
+    expect(config.args[config.args.indexOf('--disallowedTools') + 1]).toBe('WebFetch,WebSearch');
+    expect(config.args).not.toContain('--dangerously-skip-permissions');
+    expect(config.args).not.toContain('--restricted');
+    expect(config.args).not.toContain('plan');
+    expect(config.args).toContain('--bare');
+    const cloud = buildVendorSpawnConfig({ id: 'claude-code', type: 'cli', command: 'claude' }, {
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+    });
+    expect(cloud.args).not.toContain('--bare');
+    const cloudGate = buildVendorSpawnConfig({ id: 'claude-code', type: 'cli', command: 'claude' }, {
+      safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
+    });
+    expect(cloudGate.args).not.toContain('--bare');
+    expect(cloudGate.args).toContain('--restricted');
+  });
+
+  // #6062 — Stage 3 may run as an ATTACHABLE session so an operator can watch
+  // and steer the longest, least predictable stage in the pipeline. `tui: true`
+  // is a per-recipe opt-in, and it drops ONLY the flags that require `--print`.
+  it('keeps every Claude actions enforcement flag when the recipe is built for a TUI session', () => {
+    const claudeTui = { id: 'claude-tui', type: 'tui', command: 'claude', args: ['--dangerously-skip-permissions'] };
+    const headless = buildVendorSpawnConfig(claudeTui, {
+      effectiveModel: 'sonnet',
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+    });
+    const tui = buildVendorSpawnConfig(claudeTui, {
+      effectiveModel: 'sonnet',
+      safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+      tui: true,
+    });
+
+    expect(tui.command).toBe('claude');
+    // The whole sandbox recipe survives — this is what makes attaching safe.
+    expect(tui.args).toEqual(expect.arrayContaining([
+      '--permission-mode', 'acceptEdits',
+      '--settings', headless.args[headless.args.indexOf('--settings') + 1],
+      '--disallowedTools', 'WebFetch,WebSearch',
+      '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+      '--no-chrome', '--disable-slash-commands',
+      '--model', 'sonnet',
+    ]));
+    // Nothing inside the session can lift the sandbox: the only lever is
+    // `sandbox.filesystem.disabled`, and the recipe never emits it.
+    expect(JSON.parse(tui.args[tui.args.indexOf('--settings') + 1]).sandbox)
+      .not.toHaveProperty('filesystem');
+    // A saved skip-permissions arg is still ignored — provider.args is never
+    // forwarded on this path, headless or attachable.
+    expect(tui.args).not.toContain('--dangerously-skip-permissions');
+    // …and ONLY the flags that require `--print` are gone. `--no-session-persistence`
+    // is in the SHARED posture set rather than the headless output block, and
+    // leaving it on the attachable argv made the CLI exit(1) at parse time
+    // ("can only be used with --print mode") — three seconds in, before the
+    // prompt was pasted, on every retry of a Stage 3 pr-reviewer run.
+    const printOnly = ['--print', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--no-session-persistence'];
+    expect(headless.args).toEqual(expect.arrayContaining(printOnly));
+    for (const flag of printOnly) {
+      expect(tui.args).not.toContain(flag);
+    }
+    expect(headless.args.filter((a) => !printOnly.includes(a))).toEqual(tui.args);
+  });
+
+  it('declares attachability per recipe, and never for the tool-free postures', () => {
+    const claudeTui = { id: 'claude-tui', type: 'tui', command: 'claude' };
+    expect(supportsTuiPublicReviewActionsProvider(claudeTui)).toBe(true);
+    // An interactive session for a reasoner with no tools buys nothing and
+    // widens the boundary for free — no row declares it.
+    expect(supportsTuiPublicReviewPosture(claudeTui, PUBLIC_REVIEW_NO_TOOL_POSTURE)).toBe(false);
+    // Vendors whose actions recipe has not been reviewed for a PTY stay headless.
+    expect(supportsTuiPublicReviewActionsProvider({ id: 'codex-tui', type: 'tui', command: 'codex' })).toBe(false);
+    expect(supportsTuiPublicReviewActionsProvider({ id: 'grok-tui', type: 'tui', command: 'grok' })).toBe(false);
+    expect(supportsTuiPublicReviewActionsProvider(antigravity)).toBe(false);
+    // …as do non-binary records, whatever their vendor.
+    expect(supportsTuiPublicReviewActionsProvider({ id: 'claude-api', type: 'api', command: 'claude' })).toBe(false);
+    expect(supportsTuiPublicReviewActionsProvider({ id: 'opencode-api', type: 'api', command: 'opencode' })).toBe(false);
+    // #6238's attachable OpenCode recipe was later withdrawn from the
+    // sandboxed-actions posture entirely (see "rejects both headless and
+    // attachable OpenCode actions without OS isolation" below) — an MTPLX or
+    // gateway wrapper is no more eligible than any other OpenCode backend.
+    expect(supportsTuiPublicReviewActionsProvider({ id: 'opencode-tui', type: 'tui', command: 'opencode', mtplxBacked: true })).toBe(false);
+    expect(supportsTuiPublicReviewActionsProvider({ id: 'opencode-cli', type: 'cli', command: 'opencode' })).toBe(false);
+    expect(supportsTuiPublicReviewPosture({ id: 'opencode-tui', type: 'tui', command: 'opencode', ollamaBacked: true }, PUBLIC_REVIEW_NO_TOOL_POSTURE)).toBe(false);
+  });
+
+  // #6238 — OpenCode's headless actions run is a one-shot `opencode run …`,
+  // which cannot become an interactive session by dropping flags; the
+  // attachable recipe is the BARE binary (OpenCode's TUI entry point) with the
+  // same agent/model flags, and the spawner pastes the prompt as for any TUI.
+  it('rejects both headless and attachable OpenCode actions without OS isolation', () => {
+    for (const tui of [true, false]) expect(() => buildVendorSpawnConfig(opencodeOllama, { safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE, tui })).toThrow(/no enforced sandboxed-actions/);
+  });
+
+  it('refuses to build an attachable argv for a vendor with no attachable recipe', () => {
+    // Failing closed matters more here than anywhere else on this path: the
+    // headless fallback tier emits `--print`/`exec`/`run` argv, which in a PTY
+    // neither accepts a pasted prompt nor enforces anything.
+    for (const provider of [
+      { id: 'codex-tui', type: 'tui', command: 'codex' },
+      { id: 'grok-tui', type: 'tui', command: 'grok' },
+      { id: 'antigravity-tui', type: 'tui', command: 'agy' },
+    ]) {
+      expect(() => buildVendorSpawnConfig(provider, {
+        safetyProfile: PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE,
+        tui: true,
+      })).toThrow(/no attachable sandboxed-actions public-review recipe/);
+    }
+    expect(() => buildVendorSpawnConfig({ id: 'claude-tui', type: 'tui', command: 'claude' }, {
+      safetyProfile: PUBLIC_REVIEW_GATE_EXECUTION_PROFILE,
+      tui: true,
+    })).toThrow(/no attachable no-tool public-review recipe/);
+  });
+
+  it('never falls through to an ordinary agent for an unsupported posture', () => {
+    const provider = { id: 'unknown-agent', type: 'cli', command: 'example-agent', args: ['--yolo'] };
+    for (const safetyProfile of [PUBLIC_REVIEW_ACTIONS_EXECUTION_PROFILE, PUBLIC_REVIEW_GATE_EXECUTION_PROFILE]) expect(() => buildVendorSpawnConfig(provider, { safetyProfile })).toThrow(/no enforced/);
   });
 
   it('builds a fresh no-tool argv and ignores dangerous saved provider args', () => {

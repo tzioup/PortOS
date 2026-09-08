@@ -4,21 +4,13 @@ import toast from '../ui/Toast';
 import Banner from '../ui/Banner';
 import * as api from '../../services/api';
 import ReviewerPicker from '../cos/ReviewerPicker';
+import GoalFidelityControls from './GoalFidelityControls';
 import useReviewerModelOptions from '../../hooks/useReviewerModelOptions';
 import { reviewerModelsFromDefaults, reviewerModelsToDefaults, reviewerEffortsFromDefaults, reviewerEffortsToDefaults } from '../../lib/reviewerModels';
 import {
   DEFAULT_REVIEWERS,
   DEFAULT_REVIEW_STOP_MODE,
-  MODEL_CAPABLE_CLI_REVIEWERS,
-  reviewerLabel,
 } from '../cos/constants';
-
-// The CLI reviewers named in the help text below, derived from the roster the
-// schema and `pickCodeReviewDefaults` generate from rather than spelled out — the
-// literal sentence drifted twice as reviewers shipped (#3839). Adding a reviewer
-// to MODEL_CAPABLE_CLI_REVIEWERS now updates this copy with no edit here.
-const CLI_REVIEWER_LIST = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' })
-  .format(MODEL_CAPABLE_CLI_REVIEWERS.map(reviewerLabel));
 
 // Global Code Review Defaults — the chain the Review Loop uses when a task or
 // task-type config didn't pin its own reviewers. Owns the Settings › Code
@@ -39,6 +31,7 @@ export default function CodeReviewersTab() {
   const [reviewerEfforts, setReviewerEfforts] = useState({});
   const [stopMode, setStopMode] = useState(DEFAULT_REVIEW_STOP_MODE);
   const [reviewerApplies, setReviewerApplies] = useState(false);
+  const [goalFidelity, setGoalFidelity] = useState({ enabled: true, backend: null, model: null, effort: null });
   const [installed, setInstalled] = useState({});
   const modelOptions = useReviewerModelOptions();
 
@@ -60,6 +53,14 @@ export default function CodeReviewersTab() {
           setReviewerEfforts(reviewerEffortsFromDefaults(defaults));
           setStopMode(defaults.stopMode || DEFAULT_REVIEW_STOP_MODE);
           setReviewerApplies(defaults.reviewerApplies === true);
+          // `enabled` defaults ON, so an absent block must read as on — not as a
+          // stored `false` the next save would then persist.
+          setGoalFidelity({
+            enabled: defaults.goalFidelity?.enabled !== false,
+            backend: defaults.goalFidelity?.backend || null,
+            model: defaults.goalFidelity?.model || null,
+            effort: defaults.goalFidelity?.effort || null,
+          });
           setInstalled(defaults.installed && typeof defaults.installed === 'object' && !Array.isArray(defaults.installed) ? defaults.installed : {});
         } else {
           setLoadError(true);
@@ -90,6 +91,15 @@ export default function CodeReviewersTab() {
       reviewerApplies,
       ...reviewerModelsToDefaults(reviewerModels),
       ...reviewerEffortsToDefaults(reviewerEfforts),
+      // Absent keys are dropped rather than sent as null: the schema treats an
+      // absent scalar as "inherit", and persisting an explicit null would be a
+      // pin the resolver can't tell from a deliberate one.
+      goalFidelity: {
+        enabled: goalFidelity.enabled,
+        ...(goalFidelity.backend ? { backend: goalFidelity.backend } : {}),
+        ...(goalFidelity.model ? { model: goalFidelity.model } : {}),
+        ...(goalFidelity.effort ? { effort: goalFidelity.effort } : {}),
+      },
     };
     const ok = await api.updateSettings({ codeReview: payload }, { silent: true })
       .then(() => true)
@@ -105,7 +115,7 @@ export default function CodeReviewersTab() {
         <h2 className="text-base font-semibold text-white">Code Review Defaults</h2>
       </div>
       <p className="text-xs text-gray-500">
-        Default Review Loop reviewer chain — used by ad-hoc CoS tasks and task-type schedules that haven't pinned their own. Local-LLM reviewers route the diff through PortOS's local code-review endpoint; the {CLI_REVIEWER_LIST} reviewers invoke their CLI directly. Each runs the model pinned on its row (Claude also supports an Ollama-backed CLI for local-only setups — type one of your installed Ollama models).
+        Choose providers and models for the default review chain used by CoS tasks and schedules without their own override. Leave the chain empty to disable code review by default. Provider reviews retain the selected provider's configuration; existing harness and GitHub reviewer choices remain available below. Choose <span className="font-mono">Custom…</span> on a reviewer row to enter a model absent from its catalog.
       </p>
 
       {loadError && (
@@ -155,6 +165,13 @@ export default function CodeReviewersTab() {
             }}
           />
 
+          <GoalFidelityControls
+            value={goalFidelity}
+            modelOptions={modelOptions}
+            disabled={saving || loadError}
+            onChange={setGoalFidelity}
+          />
+
           <div className="flex justify-end">
             <button
               type="button"
@@ -170,4 +187,3 @@ export default function CodeReviewersTab() {
     </div>
   );
 }
-

@@ -1,3 +1,5 @@
+import { planVideoBatch, supportsWarmVideoBatch, validateVideoBatch } from './batch.js';
+import { normalizeVideoFailure } from '../../lib/videoFailure.js';
 /**
  * Video Gen — local render runner (mlx_video on macOS, diffusers on Windows).
  *
@@ -11,12 +13,12 @@
  */
 
 import { execFile } from '../../lib/childProcess.js';
-import { unlink, rm, mkdtemp } from 'fs/promises';
+import { mkdtemp } from 'fs/promises';
 import { join, basename } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
-import { ensureDir, PATHS } from '../../lib/fileUtils.js';
+import { ensureDir, PATHS, unlinkGuarded, rmGuarded } from '../../lib/fileUtils.js';
 import { ServerError } from '../../lib/errorHandler.js';
 import {
   isDefaultI2vReferenceMode, normalizeI2vReferenceMode, resolveI2vReferenceStrength,
@@ -24,12 +26,8 @@ import {
 import { videoGenEvents } from './events.js';
 import { broadcastSse, closeJobAfterDelay } from '../../lib/sseUtils.js';
 import { getVideoModels, getDefaultVideoModelId, getTextEncoderRepo } from '../../lib/mediaModels.js';
-import {
-  captureSystemCapabilities,
-  detectSystemCapabilities,
-  isHardwareCompatible,
-  withHardwareCompatibility,
-} from '../../lib/systemCapabilities.js';
+import { hardwareUnavailableReason, isHardwareCompatible } from '../../lib/systemCapabilities.js';
+import { resolveVideoModelSelection } from './modelSelection.js';
 import { findFfmpeg, findFfprobe } from '../../lib/ffmpeg.js';
 import { inspectModelCache, findCachedRepoFile, findCachedRepoFiles } from '../../lib/hfCache.js';
 import { safeChildProcessOptions } from '../../lib/processEnv.js';
@@ -78,6 +76,7 @@ import {
   draftDecodeDeclineReason,
   resolveVideoDraftDecoder,
 } from '../../lib/videoDraftDecoders.js';
+import { isDefaultVideoStreamingMode } from '../../lib/videoStreamingMode.js';
 // Re-export the extracted runtime + history surface so existing deep imports
 // (`from '../videoGen/local.js'`) keep resolving every symbol they used to.
 export * from './runtimes.js';
@@ -127,6 +126,7 @@ export const VIDEO_MODELS = Object.fromEntries(getVideoModels().map((m) => [m.id
 // the client renders no picker instead of a one-entry select.
 const decorateVideoModel = (m) => (m ? {
   ...m,
+  supportsWarmBatch: supportsWarmVideoBatch(m),
   lastFrameAnchored: modelAnchorsLastFrame(m),
   runtimeLoraCapable: byovRuntimeLoraCapable(m.runtime),
   textEncoderOptions: publicVideoTextEncoderOptions(m),
@@ -153,7 +153,7 @@ export const listVideoModels = () => getVideoModels().map(decorateVideoModel);
 
 export const defaultVideoModelId = (capabilities) => getDefaultVideoModelId(capabilities);
 
-export async function generateVideo({ pythonPath, prompt, negativePrompt = '', modelId, width = null, height = null, numFrames = null, fps = 24, steps, guidanceScale, seed, tiling = 'auto', disableAudio = false, sourceImagePath = null, uploadedTempPath = null, uploadedTempPaths = [], lastImagePath = null, keyframes = null, extendFromVideoPath = null, audioFilePath = null, audioStartSec = null, mode = null, imageStrength = null, i2vReferenceMode = null, loras = null, icReferencePaths = null, icStrength = null, icAttentionStrength = null, icSkipStage2 = false, textEncoderId = null, speedProfileId = null, draftDecode = null, visualConditioning = null, hidden = false, jobId: providedJobId = null }) {
+export async function generateVideo({ pythonPath, prompt, negativePrompt = '', modelId, width = null, height = null, numFrames = null, fps = 24, steps, guidanceScale, seed, batchSize = 1, tiling = 'auto', disableAudio = false, sourceImagePath = null, uploadedTempPath = null, uploadedTempPaths = [], lastImagePath = null, keyframes = null, extendFromVideoPath = null, audioFilePath = null, audioStartSec = null, mode = null, imageStrength = null, i2vReferenceMode = null, loras = null, icReferencePaths = null, icStrength = null, icAttentionStrength = null, icSkipStage2 = false, textEncoderId = null, speedProfileId = null, draftDecode = null, streamingMode = null, visualConditioning = null, hidden = false, displaySleep = null, jobId: providedJobId = null }) {
   uploadedTempPaths = Array.isArray(uploadedTempPaths) ? uploadedTempPaths : [];
   if (!prompt?.trim()) throw new ServerError('Prompt is required', { status: 400, code: 'VALIDATION_ERROR' });
   // Single-flight is now enforced by the mediaJobQueue worker upstream — only
@@ -161,31 +161,13 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
   // callers (legacy / tests) bypass the queue and would clobber the shared active process
   // on concurrent calls; that's an explicit "don't do that" contract.
 
-  const needsCuda = (requirements) => requirements?.requiresNvidiaGpu
-    || requirements?.minVramGb != null
-    || requirements?.minCudaComputeCapability != null;
-  let capabilities = captureSystemCapabilities();
-  // `undefined`/empty means the caller omitted the field and may use the
-  // configured default. Explicit null is a routed-job sentinel and must remain
-  // an unknown model so an older dispatcher cannot render a remote job locally.
-  const modelWasOmitted = modelId === undefined || modelId === '';
-  let selectedModelId = modelWasOmitted ? defaultVideoModelId(capabilities) : modelId;
-  let resolvedModel = resolveVideoModel(selectedModelId);
-  if (needsCuda(resolvedModel?.hardwareRequirements)) {
-    capabilities = await detectSystemCapabilities();
-    if (modelWasOmitted) selectedModelId = defaultVideoModelId(capabilities);
-    resolvedModel = resolveVideoModel(selectedModelId);
-  }
+  const { modelId: selectedModelId, model } = await resolveVideoModelSelection(modelId, { resolveModel: resolveVideoModel });
   modelId = selectedModelId;
-  const model = resolvedModel && withHardwareCompatibility(
-    resolvedModel,
-    capabilities,
-    resolvedModel.hardwareRequirements,
-  );
   if (!model) throw new ServerError(`Unknown video model: ${modelId}`, { status: 400, code: 'VALIDATION_ERROR' });
+  validateVideoBatch({ batchSize, seed }, model);
   if (!isHardwareCompatible(model.hardwareCompatibility)) {
     throw new ServerError(
-      `Video model "${modelId}" is unavailable on this machine: ${model.hardwareCompatibility.reasons.join(' · ')}`,
+      hardwareUnavailableReason(`Video model "${modelId}"`, model.hardwareCompatibility),
       { status: 400, code: 'MODEL_HARDWARE_UNAVAILABLE' },
     );
   }
@@ -432,7 +414,8 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
     : 64;
   const w = Math.floor(Number(width) / resolutionStep) * resolutionStep;
   const h = Math.floor(Number(height) / resolutionStep) * resolutionStep;
-  const actualSeed = seed != null && seed !== '' ? Number(seed) : Math.floor(Math.random() * 2147483647);
+  const batch = batchSize > 1 ? planVideoBatch({ jobId, batchSize, seed }) : null;
+  const actualSeed = batch ? batch[0].seed : seed != null && seed !== '' ? Number(seed) : Math.floor(Math.random() * 2147483647);
   // User-facing speed profile (#4875). Resolved BEFORE the sampler so it can
   // drive steps/guidance/stage-2 together — a half-applied schedule would make
   // the profile's speed claim false. `null` whenever the request is
@@ -670,7 +653,7 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
         ? [audioFilePath]
         : []),
     ];
-    return Promise.all(paths.filter(Boolean).map((path) => unlink(path).catch(() => {})));
+    return Promise.all(paths.filter(Boolean).map((path) => unlinkGuarded(path).catch(() => {})));
   };
   if (isIcLoraMode(mode) && icLoraSpecForMode(mode)?.referenceKind === 'image'
     && Array.isArray(icReferencePaths) && icReferencePaths.length) {
@@ -717,6 +700,7 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
   const createdAt = new Date().toISOString();
   const meta = {
     id: jobId,
+    ...(batch ? { batchId: jobId, batchSize, batchIndex: 0 } : {}),
     prompt,
     negativePrompt,
     modelId,
@@ -789,6 +773,13 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
     // declined request never sets it, a record can never claim a draft decode
     // the render did not perform.
     ...(draftDecoder ? { draftDecode: draftDecoder.id } : {}),
+    // Block-streaming request (#6499). Recorded as the REQUESTED mode, same
+    // convention as speedProfileId/draftDecode above — 'auto' and absence are
+    // the same request, so a quality-default render's history row stays
+    // byte-identical to one from before this setting existed. What the
+    // bridge ACTUALLY did (active/reason/peakMb) is stamped separately by
+    // finalizeGeneratedVideo from the child's STREAMPOLICY: report.
+    ...(isDefaultVideoStreamingMode(streamingMode) ? {} : { streamingMode }),
     // IC-LoRA remix settings, stamped so the lightbox Remix flow can round-trip
     // them. The reference clip is recorded by BASENAME (not the absolute
     // staging path) — history is user-facing and a durable upload path is both
@@ -889,23 +880,26 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
       icSkipStage2,
       speedProfile,
       draftDecoder,
+      streamingMode,
       ffmpegPath: ffmpeg,
       ffprobePath: ffprobe,
     }));
+    if (batch) args.push('--batch-seeds', JSON.stringify(batch.map((item) => item.seed)));
   } catch (err) {
     job.status = 'error';
     const reason = err.message || 'Failed to build video gen args';
     console.log(`❌ Video generation buildArgs error [${jobId.slice(0, 8)}]: ${reason}`);
     broadcastSse(job, { type: 'error', error: reason });
-    videoGenEvents.emit('failed', { generationId: jobId, error: reason });
+    videoGenEvents.emit('failed', { generationId: jobId, error: reason, failure: normalizeVideoFailure(err, { prompts: [prompt, negativePrompt] }) });
     void cleanupTempFiles({ includeUploads: true, includeUntrackedAudio: true });
-    void rm(stepwiseDir, { recursive: true, force: true });
+    void rmGuarded(stepwiseDir, { recursive: true, force: true });
     closeJobAfterDelay(videoJobState.jobs, jobId);
     throw err;
   }
 
   await spawnAndWatchVideo({
     jobId,
+    batch,
     // Keeps this render's ETA samples in its own cost bucket — a speed profile
     // changes the slope, not just the step count.
     speedProfileId: speedProfile?.id ?? null,
@@ -924,7 +918,13 @@ export async function generateVideo({ pythonPath, prompt, negativePrompt = '', m
     height: h,
     numFrames: parsedNumFrames,
     steps: actualSteps,
-    videoGenSettings: (await getSettings())?.videoGen,
+    // This render's own choice (the `displaySleep` request field) wins over
+    // the install-wide settings default so a page reload/resume replays the
+    // choice the user actually made, not whatever Settings holds now.
+    videoGenSettings: {
+      ...(await getSettings())?.videoGen,
+      ...(displaySleep != null ? { displaySleep } : {}),
+    },
   });
 
   return { jobId, generationId: jobId, filename, mode: 'local', model: modelId };

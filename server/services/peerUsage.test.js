@@ -28,11 +28,14 @@ vi.mock('./usage.js', async () => {
 const { buildUsageDigest, getUsage } = await import('./usage.js');
 const {
   getUsageSnapshot,
+  getUsageManifest,
   applyUsageRemote,
   getFleetUsage,
+  getFleetQuotaEntries,
   forgetInstanceUsage,
   PEER_USAGE_FILE,
 } = await import('./peerUsage.js');
+const { recordLocalQuotaCards, readLocalQuotaCards, PROVIDER_QUOTAS_FILE } = await import('./providerQuotaShare.js');
 
 afterAll(cleanup);
 
@@ -91,9 +94,22 @@ const readStoreFile = async () => JSON.parse(await readFile(PEER_USAGE_FILE, 'ut
 
 beforeEach(async () => {
   localUsage = usageFixture();
-  // Reset the store between cases — every test starts with no peer digests.
+  // Reset the stores between cases — every test starts with no peer digests
+  // and no quota readings of our own.
   const { atomicWrite } = await import('../lib/fileUtils.js');
   await atomicWrite(PEER_USAGE_FILE, { instances: {} });
+  await atomicWrite(PROVIDER_QUOTAS_FILE, { quotas: [] });
+});
+
+const quotaCard = (over = {}) => ({
+  family: 'claude',
+  label: 'Claude Code',
+  supported: true,
+  plan: 'subscription',
+  limits: [{ key: 'week', label: 'Current week', percentUsed: 40, percentRemaining: 60, resetsAt: null, timezone: null }],
+  activity: [{ period: 'Last 24h', requests: 10, sessions: 1, notes: [] }],
+  fetchedAt: '2026-08-31T00:00:00.000Z',
+  ...over,
 });
 
 describe('federated usage digest', () => {
@@ -192,6 +208,98 @@ describe('usage sync category', () => {
     await applyUsageRemote({ instances: { 'inst-peer': peerEntry() } });
     const { data } = await getUsageSnapshot();
     expect(Object.keys(data.instances).sort()).toEqual(['inst-peer', 'inst-self']);
+  });
+});
+
+describe('usage sync manifest (#5759)', () => {
+  const otherEntry = (overrides = {}) => peerEntry({
+    instanceId: 'inst-other',
+    name: 'Render Box',
+    capturedAt: '2026-08-30T08:00:00.000Z',
+    ...overrides,
+  });
+
+  it('publishes one capturedAt per instance instead of the digests', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry(), 'inst-other': otherEntry() } });
+
+    const { data } = await getUsageManifest();
+    expect(data.instances).toEqual({
+      'inst-self': '2026-08-30T12:00:00.000Z',
+      'inst-peer': '2026-08-30T09:00:00.000Z',
+      'inst-other': '2026-08-30T08:00:00.000Z',
+    });
+  });
+
+  // The two endpoints must agree or the puller caches a checksum for state it
+  // never fetched. A pre-manifest peer only ever sees the snapshot's, so this
+  // is also what keeps ITS short-circuit honest.
+  it('reports the same checksum as the snapshot, whole or slot-scoped', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry(), 'inst-other': otherEntry() } });
+
+    const manifest = await getUsageManifest();
+    expect((await getUsageSnapshot()).checksum).toBe(manifest.checksum);
+    expect((await getUsageSnapshot({ slots: ['inst-peer'] })).checksum).toBe(manifest.checksum);
+  });
+
+  it('changes only when an instance digest actually advances', async () => {
+    const before = (await getUsageManifest()).checksum;
+    // A digest that loses the LWW race moves no capturedAt, so nothing to fetch.
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry() } });
+    const withPeer = (await getUsageManifest()).checksum;
+    expect(withPeer).not.toBe(before);
+
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry({ capturedAt: '2026-08-29T00:00:00.000Z' }) } });
+    expect((await getUsageManifest()).checksum).toBe(withPeer);
+  });
+
+  it('serves only the requested slots, so one instance advancing moves one digest', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry(), 'inst-other': otherEntry() } });
+
+    const { data } = await getUsageSnapshot({ slots: ['inst-peer'] });
+    expect(Object.keys(data.instances)).toEqual(['inst-peer']);
+    expect(data.instances['inst-peer'].usage.totalTokens.output).toBe(4000);
+  });
+
+  it('still serves everything when no slots are named (a pre-manifest peer)', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry(), 'inst-other': otherEntry() } });
+
+    for (const slots of [undefined, [], null]) {
+      const { data } = await getUsageSnapshot({ slots });
+      expect(Object.keys(data.instances).sort()).toEqual(['inst-other', 'inst-peer', 'inst-self']);
+    }
+  });
+
+  // A retirement advances no slot's capturedAt, so it can only reach a peer by
+  // riding every response — the slot-scoped one included.
+  it('rides tombstones on the manifest and on a slot-scoped snapshot', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry(), 'inst-other': otherEntry() } });
+    await forgetInstanceUsage('inst-peer');
+
+    expect((await getUsageManifest()).data.tombstones).toEqual([
+      { instanceId: 'inst-peer', deletedAt: expect.any(String) },
+    ]);
+    expect((await getUsageSnapshot({ slots: ['inst-other'] })).data.tombstones).toHaveLength(1);
+  });
+
+  // The whole round trip, both directions, against the shipped merge: a puller
+  // that fetches ONLY the diffed slot converges exactly as a whole-payload one.
+  it('converges a receiver that fetches only the advanced slot', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry(), 'inst-other': otherEntry() } });
+    const held = (await getUsageManifest()).data.instances;
+
+    // A source peer whose `inst-other` digest moved on; everything else is level.
+    const advanced = otherEntry({ capturedAt: '2026-09-02T00:00:00.000Z', usage: buildUsageDigest(usageFixture({ tokensOut: 7777 })) });
+    const remoteManifest = { ...held, 'inst-other': advanced.capturedAt };
+    const { diffManifestSlots } = await import('../lib/syncManifest.js');
+    const stale = diffManifestSlots(remoteManifest, held);
+    expect(stale).toEqual(['inst-other']);
+
+    const partial = { instances: Object.fromEntries(stale.map((id) => [id, advanced])) };
+    expect(await applyUsageRemote(partial)).toEqual({ applied: true, count: 1 });
+    const store = await readStoreFile();
+    expect(store.instances['inst-other'].usage.totalTokens.output).toBe(7777);
+    // The slot we did NOT fetch is untouched, not dropped.
+    expect(store.instances['inst-peer'].usage.totalTokens.output).toBe(4000);
   });
 });
 
@@ -336,5 +444,54 @@ describe('fleet report', () => {
     await applyUsageRemote({ instances: { 'inst-peer': peerEntry() } });
     const outside = await getFleetUsage({ from: '2026-09-01', to: '2026-09-30', providers: [] });
     expect(outside.totals.tokensOut).toBe(0);
+  });
+});
+
+describe('federated subscription-quota readings', () => {
+  it('publishes this machine\'s readings and advances the LWW stamp past them', async () => {
+    await recordLocalQuotaCards([quotaCard()]);
+    const { data } = await getUsageSnapshot();
+    const self = data.instances['inst-self'];
+    expect(self.quotas).toEqual([expect.objectContaining({ family: 'claude', plan: 'subscription' })]);
+    // A quota refresh with no new AI runs must still move the slot, or no peer
+    // would ever pull it: `capturedAt` is both the LWW stamp and the manifest.
+    expect(self.capturedAt).toBe('2026-08-31T00:00:00.000Z');
+  });
+
+  it('re-records only what changed, so a repeated read is not a new slot to pull', async () => {
+    expect((await recordLocalQuotaCards([quotaCard()])).changed).toBe(true);
+    // Same reading, later clock: the claim is unchanged, so the file is not.
+    expect((await recordLocalQuotaCards([quotaCard({ fetchedAt: '2026-08-31T01:00:00.000Z' })])).changed).toBe(false);
+    expect((await recordLocalQuotaCards([quotaCard({ limits: [] })])).changed).toBe(true);
+  });
+
+  it('merges a narrowed read instead of retiring the families it skipped', async () => {
+    await recordLocalQuotaCards([quotaCard(), quotaCard({ family: 'codex', label: 'Codex' })]);
+    await recordLocalQuotaCards([quotaCard({ activity: [{ period: 'Last 24h', requests: 99, sessions: 3, notes: [] }] })]);
+    const { quotas } = await readLocalQuotaCards();
+    expect(quotas.map((q) => q.family).sort()).toEqual(['claude', 'codex']);
+    expect(quotas.find((q) => q.family === 'claude').activity[0].requests).toBe(99);
+  });
+
+  it('rebuilds a peer\'s readings to the wire shape and excludes API-billed instances', async () => {
+    await applyUsageRemote({
+      instances: {
+        'inst-peer': peerEntry({ quotas: [quotaCard({ raw: 'transcript', limits: [{ key: 'week', percentUsed: 90 }] })] }),
+        'inst-billed': peerEntry({ instanceId: 'inst-billed', name: 'Rented Box', quotas: [quotaCard()] }),
+      },
+    });
+    const all = await getFleetQuotaEntries();
+    expect(all.map((e) => e.instanceId).sort()).toEqual(['inst-billed', 'inst-peer']);
+    const peer = all.find((e) => e.instanceId === 'inst-peer');
+    expect(Object.hasOwn(peer.quotas[0], 'raw')).toBe(false);
+    expect(peer.quotas[0].limits[0].percentRemaining).toBe(10);
+
+    const kept = await getFleetQuotaEntries({ excludeInstanceIds: ['inst-billed'] });
+    expect(kept.map((e) => e.instanceId)).toEqual(['inst-peer']);
+  });
+
+  it('leaves out a peer that published no readings', async () => {
+    await applyUsageRemote({ instances: { 'inst-peer': peerEntry() } });
+    expect(await getFleetQuotaEntries()).toEqual([]);
   });
 });

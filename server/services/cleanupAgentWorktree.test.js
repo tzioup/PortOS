@@ -1,6 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // --- Mock every dependency agentWorktreeCleanup.js pulls in transitively ---
+
+// Cleanup launches this audit without awaiting it. Its own suite covers the
+// probes; keep its daemon/provider graph out of these cleanup workflow tests.
+vi.mock('./agentRepoStateVerification.js', () => ({
+  verifyAgentRepoState: vi.fn().mockResolvedValue(undefined)
+}));
 
 vi.mock('../lib/childProcess.js', () => ({
   spawn: vi.fn(),
@@ -39,6 +45,7 @@ vi.mock('./cos.js', () => ({
   addTask: vi.fn().mockResolvedValue(undefined),
   emitLog: vi.fn(),
   getTaskById: vi.fn().mockResolvedValue(null),
+  forceSpawnTask: vi.fn().mockResolvedValue({ success: true }),
   getAgent: vi.fn().mockResolvedValue(null),
   getAgentRecord: vi.fn().mockResolvedValue(null)
 }));
@@ -205,6 +212,14 @@ vi.mock('./github.js', () => ({
   findPullRequestForBranch: (...args) => findPullRequestForBranchMock(...args)
 }));
 
+// `deleteMergedRemoteCopy` reads the remote-tracking ref and runs its
+// lease-protected delete through execGit directly (git.js has no helper for
+// either). Defaults to a non-zero exit — the answer that leaves everything alone.
+const execGitMock = vi.fn().mockResolvedValue({ exitCode: 128, stdout: '', stderr: '' });
+vi.mock('../lib/execGit.js', () => ({
+  execGit: (...args) => execGitMock(...args)
+}));
+
 // The `if-missing` safety net asks finalize's own PR-claim check whether
 // the agent actually opened the PR it was told to open (#3733).
 const verifyPrClaimMock = vi.fn();
@@ -227,7 +242,7 @@ import { existsSync as existsSyncMock } from 'fs';
 // They used to be pulled through the `subAgentSpawner.js` barrel, which was
 // retired in #3450.
 import { cleanupAgentWorktree, spawnMergeRecoveryTask, spawnReviewLoopFollowUp, resolveResumePointer, resolveTaskResumePatch, recordTaskResumePointer, releaseRetryHold, resumePointerMetadata } from './agentWorktreeCleanup.js';
-import { getAgent, getAgentRecord, getTaskById, addTask, updateTask } from './cos.js';
+import { getAgent, getAgentRecord, getTaskById, addTask, forceSpawnTask, updateTask } from './cos.js';
 import { removeWorktree } from './worktreeManager.js';
 import { PATHS } from '../lib/fileUtils.js';
 import * as git from './git.js';
@@ -657,7 +672,7 @@ describe('cleanupAgentWorktree - PR-creation path', () => {
     expect(addTask).toHaveBeenCalledTimes(1);
     const [followUp, taskType, opts] = addTask.mock.calls[0];
     expect(taskType).toBe('internal');
-    expect(opts).toEqual({ raw: true });
+    expect(opts).toEqual({ raw: true, suppressDequeue: false });
     expect(followUp.metadata.reviewLoopFollowUp).toBe(true);
     expect(followUp.metadata.reviewLoopPRUrl).toBe('https://github.com/test/repo/pull/42');
     expect(followUp.metadata.reviewLoopPRBranch).toBe('cos/task-abc123');
@@ -1640,6 +1655,7 @@ describe('spawnReviewLoopFollowUp', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     addTask.mockResolvedValue({ id: 'sys-rl-x' });
+    forceSpawnTask.mockResolvedValue({ success: true });
   });
 
   it('should not spawn when prUrl is missing', async () => {
@@ -1703,6 +1719,86 @@ describe('spawnReviewLoopFollowUp', () => {
       prUrl: 'https://github.com/o/r/pull/9', prBranch: 'cos/task-1/agent-1', sourceWorkspace: '/ws'
     });
     expect(addTask.mock.calls[0][0].metadata.app).toBe('example-app');
+  });
+
+  it('persists fork coordinates so the follow-up can attach a worktree to a fork PR head (#6064)', async () => {
+    // A fork head has no `origin/<branch>`, so without these the follow-up is
+    // queued and then blocked at workspace prep. The key is the generic
+    // `forkHead` that `resolveTaskForkHead` reads for every producer.
+    await spawnReviewLoopFollowUp({
+      originalAgentId: 'agent-1',
+      originalTask: { id: 'task-1', metadata: {}, description: 'X' },
+      prUrl: 'https://github.com/o/r/pull/9',
+      prBranch: 'contributor/fix-thing',
+      forkHead: { remoteUrl: 'https://github.com/contributor/r.git', ownerLogin: 'contributor' },
+      sourceWorkspace: '/ws',
+    });
+    expect(addTask.mock.calls[0][0].metadata).toMatchObject({
+      reviewLoopPRBranch: 'contributor/fix-thing',
+      forkHead: { remoteUrl: 'https://github.com/contributor/r.git', ownerLogin: 'contributor' },
+    });
+  });
+
+  it('stores null fork coordinates for a same-repo PR branch', async () => {
+    await spawnReviewLoopFollowUp({
+      originalAgentId: 'agent-1',
+      originalTask: { id: 'task-1', metadata: {}, description: 'X' },
+      prUrl: 'https://github.com/o/r/pull/9', prBranch: 'cos/task-1/agent-1', sourceWorkspace: '/ws',
+    });
+    expect(addTask.mock.calls[0][0].metadata.forkHead).toBeNull();
+  });
+
+  // Dispatch ownership: an autonomous follow-up belongs to the auto-run-gated
+  // dequeue, while an explicitly requested one must not wait for it.
+  it('leaves the spawn to the dequeue by default', async () => {
+    const result = await spawnReviewLoopFollowUp({
+      originalAgentId: 'agent-1',
+      originalTask: { id: 'task-1', metadata: {}, description: 'X' },
+      prUrl: 'https://github.com/o/r/pull/9', prBranch: 'cos/task-1/agent-1', sourceWorkspace: '/ws'
+    });
+    expect(addTask.mock.calls[0][2]).toMatchObject({ raw: true, suppressDequeue: false });
+    expect(forceSpawnTask).not.toHaveBeenCalled();
+    expect(result.dispatch).toBeUndefined();
+  });
+
+  it('force-spawns an immediate dispatch and suppresses the racing dequeue', async () => {
+    const result = await spawnReviewLoopFollowUp({
+      originalAgentId: null,
+      originalTask: { id: 'app-pr-widget-9', metadata: { app: 'widget' }, description: 'Resolve and merge PR #9 for Widget' },
+      prUrl: 'https://github.com/o/r/pull/9', prBranch: 'fix/save', sourceWorkspace: '/ws',
+      dispatch: 'immediate'
+    });
+    const [followUp, taskType, opts] = addTask.mock.calls[0];
+    expect(taskType).toBe('internal');
+    expect(opts).toMatchObject({ raw: true, suppressDequeue: true });
+    expect(forceSpawnTask).toHaveBeenCalledWith(followUp.id);
+    expect(result.dispatch).toEqual({ started: true, reason: null });
+  });
+
+  it('reports why an immediate dispatch did not start, leaving the task queued', async () => {
+    forceSpawnTask.mockResolvedValue({ error: 'No available agent slots (3/3)' });
+    const result = await spawnReviewLoopFollowUp({
+      originalAgentId: null,
+      originalTask: { id: 'app-pr-widget-9', metadata: { app: 'widget' }, description: 'Resolve and merge PR #9 for Widget' },
+      prUrl: 'https://github.com/o/r/pull/9', prBranch: 'fix/save', sourceWorkspace: '/ws',
+      dispatch: 'immediate'
+    });
+    expect(result.dispatch).toEqual({ started: false, reason: 'No available agent slots (3/3)' });
+  });
+
+  // A duplicate rejection persists nothing under the id we just minted, so
+  // force-spawning it would answer 'Task not found' for a follow-up that is in
+  // fact already queued. Report the record that exists instead.
+  it('returns the already-queued task on a duplicate rejection instead of force-spawning a phantom id', async () => {
+    addTask.mockResolvedValue({ id: 'sys-rl-existing', status: 'pending', duplicate: true });
+    const result = await spawnReviewLoopFollowUp({
+      originalAgentId: null,
+      originalTask: { id: 'app-pr-widget-9', metadata: { app: 'widget' }, description: 'Resolve and merge PR #9 for Widget' },
+      prUrl: 'https://github.com/o/r/pull/9', prBranch: 'fix/save', sourceWorkspace: '/ws',
+      dispatch: 'immediate'
+    });
+    expect(result).toMatchObject({ id: 'sys-rl-existing', duplicate: true });
+    expect(forceSpawnTask).not.toHaveBeenCalled();
   });
 });
 
@@ -2014,5 +2110,91 @@ describe('cleanupAgentWorktree — re-entrancy (duplicate completion paths)', ()
     removeWorktree.mockResolvedValue({ merged: false, removed: true, warnings: [] });
     await cleanupAgentWorktree('agent-1', true, { prCreation: 'never' });
     expect(removeWorktree).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('cleanupAgentWorktree - remote copy of a locally merged branch', () => {
+  // The auto-merge posture (worktree, no PR) lands the branch by local merge and
+  // deletes it. An agent that pushed the branch anyway leaves origin a copy
+  // nothing reads, which the repo-state audit then reports and files a recovery
+  // agent for. Cleanup deletes that copy itself — off the shared clone's
+  // remote-tracking ref (a worktree push updates it, so the common no-push case
+  // never touches the network), only when the pushed tip is already merged, and
+  // lease-protected so a copy origin moved past is refused rather than deleted.
+  const BRANCH = 'cos/task-abc123';
+  const REF = `refs/heads/${BRANCH}`;
+  const SHA = 'a'.repeat(40);
+  const mergedLocally = () => removeWorktree.mockResolvedValue({ merged: true, removed: true, uncommittedSaved: false, warnings: [] });
+  const tracking = (sha) => ({ exitCode: sha ? 0 : 1, stdout: sha ? `${sha}\n` : '', stderr: '' });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // `clearAllMocks` drains calls, not once-queues — reset both mocks so a test
+    // that stops early can never hand its leftover answers to the next one.
+    execGitMock.mockReset().mockResolvedValue({ exitCode: 128, stdout: '', stderr: '' });
+    git.isBranchMergedInto.mockReset().mockResolvedValue(false);
+    getAgent.mockResolvedValue(mockWorktreeAgent());
+  });
+  afterEach(() => removeWorktree.mockResolvedValue(undefined));
+
+  it('deletes origin\'s copy, lease-protected, when the pushed tip is already merged', async () => {
+    mergedLocally();
+    execGitMock
+      .mockResolvedValueOnce(tracking(SHA))
+      .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+    git.isBranchMergedInto.mockResolvedValueOnce(true);
+    const warnings = await cleanupAgentWorktree('agent-1', true, {});
+    expect(execGitMock).toHaveBeenNthCalledWith(1, ['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${BRANCH}`], '/mock/workspace', { ignoreExitCode: true });
+    expect(git.isBranchMergedInto).toHaveBeenCalledWith('/mock/workspace', SHA, 'HEAD');
+    expect(execGitMock).toHaveBeenNthCalledWith(2, ['push', `--force-with-lease=${REF}:${SHA}`, 'origin', `:${REF}`], '/mock/workspace', { ignoreExitCode: true });
+    // A clean finish, not a cleanup issue — no warning, so no recovery task.
+    expect(warnings).toEqual([]);
+  });
+
+  it('never touches the network when this clone never pushed the branch', async () => {
+    mergedLocally();
+    execGitMock.mockResolvedValueOnce(tracking(null));
+    await cleanupAgentWorktree('agent-1', true, {});
+    expect(execGitMock).toHaveBeenCalledTimes(1);
+    expect(git.isBranchMergedInto).not.toHaveBeenCalled();
+  });
+
+  it('leaves the copy alone when the pushed tip is not merged into the checkout', async () => {
+    mergedLocally();
+    execGitMock.mockResolvedValueOnce(tracking(SHA));
+    git.isBranchMergedInto.mockResolvedValueOnce(false);
+    const warnings = await cleanupAgentWorktree('agent-1', true, {});
+    expect(execGitMock).toHaveBeenCalledTimes(1);
+    expect(warnings).toEqual([]);
+  });
+
+  it('never asks about the remote unless cleanup actually merged the branch', async () => {
+    removeWorktree.mockResolvedValue({ merged: false, removed: true, uncommittedSaved: false, warnings: [] });
+    await cleanupAgentWorktree('agent-1', true, { skipMerge: true });
+    expect(execGitMock).not.toHaveBeenCalled();
+  });
+
+  it('a refused delete is not a cleanup warning — the repo-state audit reports what is left', async () => {
+    mergedLocally();
+    execGitMock
+      .mockResolvedValueOnce(tracking(SHA))
+      .mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: ` ! [rejected] ${BRANCH} (stale info)` });
+    git.isBranchMergedInto.mockResolvedValueOnce(true);
+    const warnings = await cleanupAgentWorktree('agent-1', true, {});
+    // The delete was attempted and refused — the silence is deliberate, not a skip.
+    expect(execGitMock).toHaveBeenCalledTimes(2);
+    expect(execGitMock.mock.calls[1][0][0]).toBe('push');
+    expect(warnings).toEqual([]);
+  });
+
+  it('a git call that throws is swallowed — cleanup still returns its warnings and finishes', async () => {
+    // Every await in the helper carries its own catch; drop one and a spawn
+    // failure rejects the whole cleanup, losing its warnings and the follow-up.
+    mergedLocally();
+    execGitMock
+      .mockResolvedValueOnce(tracking(SHA))
+      .mockRejectedValueOnce(new Error('spawn git ENOENT'));
+    git.isBranchMergedInto.mockResolvedValueOnce(true);
+    await expect(cleanupAgentWorktree('agent-1', true, {})).resolves.toEqual([]);
   });
 });

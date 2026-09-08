@@ -32,16 +32,72 @@ describe('ReviewerPicker', () => {
       expect(screen.queryByText('not installed')).not.toBeInTheDocument();
     });
 
-    it('flags an unselected reviewer in the Add row too', () => {
+    it('flags an unselected reviewer once the Add row reveals it', async () => {
+      const user = userEvent.setup();
       render(<ReviewerPicker reviewers={['copilot']} installed={{ antigravity: false }} onChange={() => {}} />);
-      const addButton = screen.getByRole('button', { name: /Antigravity/ });
-      expect(addButton).toHaveTextContent('not installed');
+      await user.click(screen.getByRole('button', { name: /1 unavailable/ }));
+      expect(screen.getByRole('button', { name: /Antigravity/ })).toHaveTextContent('not installed');
+    });
+  });
+
+  // The Add row lists what this machine can actually run. Hidden, not dropped:
+  // both signals are local-machine-only and the reviewer list is
+  // federation-wide config, so a peer's reviewer stays configurable from here.
+  describe('unavailable reviewers in the Add row', () => {
+    const modelOptions = { providerDisabled: { kimi: true, cursor: true } };
+
+    it('hides a missing CLI and an all-off provider behind one count', () => {
+      render(
+        <ReviewerPicker
+          reviewers={['copilot']}
+          installed={{ antigravity: false }}
+          modelOptions={modelOptions}
+          onChange={() => {}}
+        />
+      );
+      expect(screen.getByRole('button', { name: /3 unavailable/ })).toBeInTheDocument();
+      for (const hidden of [/Antigravity/, /Kimi/, /Cursor Agent/]) {
+        expect(screen.queryByRole('button', { name: hidden })).not.toBeInTheDocument();
+      }
+      // An available reviewer is still offered up front.
+      expect(screen.getByRole('button', { name: /Codex/ })).toBeInTheDocument();
+    });
+
+    it('reveals them, badged with which signal fired, and adds them normally', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['copilot']}
+          installed={{ antigravity: false }}
+          modelOptions={modelOptions}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByRole('button', { name: /3 unavailable/ }));
+      expect(screen.getByRole('button', { name: /Kimi/ })).toHaveTextContent('disabled');
+      expect(screen.getByRole('button', { name: /Antigravity/ })).toHaveTextContent('not installed');
+      await user.click(screen.getByRole('button', { name: /Kimi/ }));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewers: ['copilot', 'kimi'] }));
+    });
+
+    it('keeps an already-selected unavailable reviewer visible, badged', () => {
+      render(
+        <ReviewerPicker reviewers={['kimi']} modelOptions={modelOptions} onChange={() => {}} />
+      );
+      expect(screen.getByText('Kimi').parentElement).toHaveTextContent('disabled');
+    });
+
+    it('offers the whole roster when neither signal was fetched', () => {
+      render(<ReviewerPicker reviewers={['copilot']} onChange={() => {}} />);
+      expect(screen.queryByRole('button', { name: /unavailable/ })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Kimi/ })).toBeInTheDocument();
     });
   });
 
   it('shows the empty-state hint when no reviewers are selected', () => {
     render(<ReviewerPicker reviewers={[]} onChange={() => {}} />);
-    expect(screen.getByText(/none — defaults to Copilot/)).toBeInTheDocument();
+    expect(screen.getByText(/none — code review is disabled by default/)).toBeInTheDocument();
   });
 
   it('de-dupes a malformed list with duplicates (order-preserving)', () => {
@@ -308,11 +364,50 @@ describe('ReviewerPicker', () => {
       expect(screen.getByRole('option', { name: 'qwen2.5-coder:32b' })).toBeInTheDocument();
     });
 
-    it('renders a CLI reviewer as a free-text input so an env-specific id can be typed', () => {
+    it('renders a CLI reviewer as a dropdown of its catalog', () => {
       render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={() => {}} />);
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('SELECT');
+      expect(screen.getByRole('option', { name: 'claude-tier-a' })).toBeInTheDocument();
+    });
+
+    it('offers a CLI reviewer a Custom… escape that swaps in a free-text input', () => {
+      const onChange = vi.fn();
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
       // An Ollama-backed / Bedrock-form claude id can't be enumerated, so the
-      // control must accept a typed value rather than only a pick.
+      // escape must accept a typed value rather than only a pick.
       expect(screen.getByLabelText('Model for Claude').tagName).toBe('INPUT');
+      // The sentinel is a UI mode, not an id — it must never be stored as a pin.
+      expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it('does not offer the Custom… escape to a probed local backend', () => {
+      render(<ReviewerPicker reviewers={['ollama']} modelOptions={modelOptions} onChange={() => {}} />);
+      // Ollama's list is the daemon's own answer: an id it doesn't list isn't installed.
+      expect(screen.queryByRole('option', { name: 'Custom…' })).not.toBeInTheDocument();
+    });
+
+    it('leaving an empty Custom… field returns the cell to the dropdown', () => {
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={() => {}} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
+      fireEvent.blur(screen.getByLabelText('Model for Claude'));
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('SELECT');
+    });
+
+    it('keeps the Custom… input mounted while a typed id is being edited', () => {
+      render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={() => {}} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
+      // Clearing the field to retype must not swap the control out mid-edit.
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: 'x' } });
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '' } });
+      expect(screen.getByLabelText('Model for Claude').tagName).toBe('INPUT');
+    });
+
+    it('keeps a pin outside the catalog editable rather than unpickable', () => {
+      render(<ReviewerPicker reviewers={['claude']} reviewerModels={{ claude: 'llama3.1:70b' }} modelOptions={modelOptions} onChange={() => {}} />);
+      const control = screen.getByLabelText('Model for Claude');
+      expect(control.tagName).toBe('INPUT');
+      expect(control).toHaveValue('llama3.1:70b');
     });
 
     it('falls back to free-text when no options resolved (a closed empty select would be dead)', () => {
@@ -358,6 +453,7 @@ describe('ReviewerPicker', () => {
     it('treats a whitespace-only entry as a clear, not a pin', () => {
       const onChange = vi.fn();
       render(<ReviewerPicker reviewers={['codex']} reviewerModels={{ codex: 'gpt-tier-a' }} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '[custom]' } });
       fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '   ' } });
       expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: {} }));
     });
@@ -417,6 +513,7 @@ describe('ReviewerPicker', () => {
       // `foo]~opt` would close the selector early and leave slashdo reading the
       // rest as a suffix; the server drops such an id, so accepting it here would
       // show a pin that never persists.
+      fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: '[custom]' } });
       fireEvent.change(screen.getByLabelText('Model for Codex'), { target: { value: 'foo]~opt' } });
       expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: { codex: 'foo~opt' } }));
     });
@@ -424,6 +521,7 @@ describe('ReviewerPicker', () => {
     it('keeps a space in a typed id (slashdo selectors are free-form)', () => {
       const onChange = vi.fn();
       render(<ReviewerPicker reviewers={['claude']} modelOptions={modelOptions} onChange={onChange} />);
+      fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: '[custom]' } });
       fireEvent.change(screen.getByLabelText('Model for Claude'), { target: { value: 'Some Model (High)' } });
       expect(onChange).toHaveBeenCalledWith(expect.objectContaining({ reviewerModels: { claude: 'Some Model (High)' } }));
     });
@@ -568,6 +666,131 @@ describe('ReviewerPicker', () => {
       expect(details).not.toHaveAttribute('open');
       await user.click(summary);
       expect(details).toHaveAttribute('open');
+    });
+  });
+
+  describe('defaults-aware emit (#6208)', () => {
+    const DEFAULTS = {
+      reviewers: ['copilot'],
+      usernames: [],
+      optionalReviewers: [],
+      reviewerMaxRounds: {},
+      reviewerModels: {},
+      reviewerEfforts: {},
+      stopMode: 'all',
+      reviewerApplies: false,
+    };
+
+    it('emits the full snapshot when no defaults are provided', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(<ReviewerPicker reviewers={['codex', 'antigravity']} onChange={onChange} />);
+      await user.click(screen.getByLabelText('Remove Codex'));
+      expect(onChange).toHaveBeenCalledWith(expect.objectContaining({
+        reviewers: ['antigravity'],
+        usernames: [],
+        optionalReviewers: [],
+        reviewerMaxRounds: {},
+        reviewerModels: {},
+        reviewerEfforts: {},
+      }));
+    });
+
+    it('omits every key that still equals the defaults when only the stop-mode changes', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'antigravity']}
+          stopMode="all"
+          defaults={{ ...DEFAULTS, reviewers: ['codex', 'antigravity'] }}
+          onChange={onChange}
+        />
+      );
+      await user.selectOptions(screen.getByLabelText('Stop mode:'), 'on-clean');
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ stopMode: 'on-clean' });
+    });
+
+    it('emits only reviewers when one is removed from a seeded list', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'antigravity']}
+          defaults={{ ...DEFAULTS, reviewers: ['codex', 'antigravity'] }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Remove Codex'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ reviewers: ['antigravity'] });
+    });
+
+    it('emits an explicitly-emptied map that clears a default pin (absent ≠ empty)', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex']}
+          optionalReviewers={['codex']}
+          defaults={{ ...DEFAULTS, reviewers: ['codex'], optionalReviewers: ['codex'] }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Codex blocking'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ optionalReviewers: [] });
+    });
+
+    it('omits a pin map that already matches the defaults when an unrelated control changes', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex']}
+          reviewerModels={{ codex: 'gpt-5' }}
+          defaults={{ ...DEFAULTS, reviewers: ['codex'], reviewerModels: { codex: 'gpt-5' } }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Codex non-blocking'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ optionalReviewers: ['codex'] });
+    });
+
+    it('compares membership lists order-insensitively (reviewers stay order-sensitive)', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex', 'antigravity']}
+          optionalReviewers={['antigravity', 'codex']}
+          defaults={{ ...DEFAULTS, reviewers: ['codex', 'antigravity'], optionalReviewers: ['codex', 'antigravity'] }}
+          onChange={onChange}
+        />
+      );
+      // Reordering the reviewers IS a change (run order); the same-membership
+      // optional set in another order is not — only reviewers is emitted.
+      await user.click(screen.getByLabelText('Move Antigravity earlier'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ reviewers: ['antigravity', 'codex'] });
+    });
+
+    it('compares pin-map keys case-insensitively', async () => {
+      const onChange = vi.fn();
+      const user = userEvent.setup();
+      render(
+        <ReviewerPicker
+          reviewers={['codex']}
+          reviewerModels={{ Codex: 'gpt-5' }}
+          defaults={{ ...DEFAULTS, reviewers: ['codex'], reviewerModels: { codex: 'gpt-5' } }}
+          onChange={onChange}
+        />
+      );
+      await user.click(screen.getByLabelText('Make Codex non-blocking'));
+      expect(onChange).toHaveBeenCalledTimes(1);
+      expect(onChange).toHaveBeenCalledWith({ optionalReviewers: ['codex'] });
     });
   });
 });

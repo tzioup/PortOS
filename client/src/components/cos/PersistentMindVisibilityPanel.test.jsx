@@ -28,14 +28,28 @@ const blockedVisibility = (overrides = {}) => ({
 });
 
 describe('PersistentMindVisibilityPanel', () => {
-  it('turns a blocked snapshot into direct repair and permission actions', () => {
+  it('makes missing world access actionable and shows release context without enabling anything', () => {
+    renderPanel({ orientation: {
+      eidoverse: { status: 'offline', canBuild: false, connected: false },
+      release: { status: 'available', version: '1.0.0', highlights: ['Example release improvement'] },
+      modelPolicy: { continuity: 'Identity and memories persist.' },
+    } });
+    expect(screen.getByRole('region', { name: 'Mind orientation' })).toHaveTextContent('World building off');
+    expect(screen.getByRole('link', { name: 'Open Eidoverse' })).toHaveAttribute('href', '/eidoverse');
+    expect(screen.getByRole('link', { name: 'Configure mind tools' })).toHaveAttribute('href', '/cos/mind?panel=tools');
+    expect(screen.getByRole('link', { name: 'Change thinking model' })).toHaveAttribute('href', '/cos/mind?panel=settings');
+    expect(screen.getByText('Example release improvement')).toBeInTheDocument();
+  });
+
+  it('distinguishes diagnostics from delegation and explains repairs', () => {
     renderPanel(blockedVisibility());
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Delegated work is blocked');
-    expect(screen.getByRole('link', { name: /manage permissions/i })).toHaveAttribute('href', '/cos/tools');
+    expect(screen.getByRole('alert')).toHaveTextContent('This does not block all delegated work');
+    expect(screen.getByRole('link', { name: /manage permissions/i })).toHaveAttribute('href', '/cos/mind?panel=tools');
     expect(screen.getByRole('link', { name: /managed apps/i })).toHaveAttribute('href', '/apps');
     expect(screen.getByRole('link', { name: /manage reviewers/i })).toHaveAttribute('href', '/models/code-reviewers');
-    expect(screen.getByRole('link', { name: /open app settings/i })).toHaveAttribute('href', '/apps/example-app/overview?edit=1&appTab=general');
+    expect(screen.queryByRole('link', { name: /open app settings/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/Restart PortOS after changing its runtime/)).toBeInTheDocument();
   });
 
   it('links submodule blockers to the affected app instead of hiding the cause', () => {

@@ -60,6 +60,10 @@ export default function PromptFromMedia({
   setPrompt,
   setNegativePrompt,
   applyKind,
+  // Hard character cap the video backend the host is composing for enforces
+  // (reactor.inc fast-h3: 800). Forwarded so the generated video prompt is
+  // written inside the budget rather than coming back unrenderable.
+  maxVideoPromptLength,
   initialSource = null,
   disabled = false,
   alwaysOpen = false,
@@ -162,12 +166,18 @@ export default function PromptFromMedia({
       providerId: selectedProviderId,
       model: selectedModel || undefined,
       effort: effort || undefined,
+      maxVideoPromptLength: maxVideoPromptLength > 0 ? maxVideoPromptLength : undefined,
     };
     const data = await promptFromMedia(payload).catch(() => null);
     setRunning(false);
     if (!data) return;
     setResult(data);
-    toast.success('Prompts ready');
+    // Name the trim rather than letting a cut prompt read as a thin analysis.
+    if (data.videoPromptTruncated) {
+      toast.warning(`Prompts ready — the video prompt was trimmed to fit the ${maxVideoPromptLength} character render limit`);
+    } else {
+      toast.success('Prompts ready');
+    }
     if (onResult) onResult(data);
   };
 
@@ -244,7 +254,7 @@ export default function PromptFromMedia({
               <button
                 type="button"
                 onClick={() => { setSource(null); setResult(null); }}
-                className="p-1.5 text-gray-400 hover:text-white min-h-[36px] min-w-[36px] flex items-center justify-center"
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center p-1.5 text-gray-400 hover:text-white"
                 aria-label="Clear selected media"
               >
                 <X className="w-3.5 h-3.5" />

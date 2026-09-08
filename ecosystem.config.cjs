@@ -124,8 +124,14 @@ const PORTS = {
   EIDOVERSE_HOST: 5563, // Optional HTTPS/WebSocket bridge to Eidoverse Worlds on :8940
   SLOTSTREAM: 5564,    // Loopback SSD-streaming MoE runtime (never 11434 — that collides with Ollama)
   LLAMA_SERVER: 5568,  // Loopback llama.cpp speculative-decoding server
+  FLEET_LLM: 18022, // Authenticated shared inference queue for dedicated hosts
+
   VLLM_QWEN: 18020,    // Loopback vLLM Qwen3.8-27B (DFlash 2) container — started by the operator, never by PortOS
   SGLANG_QWEN: 18021,  // Loopback SGLang Qwen3.8-27B container (Hopper/Blackwell) — started by the operator, never by PortOS
+  // Loopback listener for `tailcat forward <tc> LOCAL:5555` when adding a federated
+  // peer without a Tailscale account. Prefer 15555; if busy, PortOS picks the next free port.
+  TAILCAT_INGRESS: 5565, // Loopback-only remote API ingress for managed Tailcat serve
+  TAILCAT_FORWARD: 15555,
   POSTGRES: pgMode === 'native' ? 5432 : 5561 // Active PostgreSQL port (unused in file mode)
 };
 

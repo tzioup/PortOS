@@ -74,9 +74,58 @@ describe('pickCliProvider', () => {
     const result = pickCliProvider({ ollama: providers.ollama }, {});
     expect(result.error).toMatch(/No enabled CLI provider/);
   });
+
+  // A locally-backed provider's `models` array is a cached snapshot; the daemon
+  // is the authority. Judging the pin against the record drops a model the user
+  // just pulled and silently downgrades the run to the provider's default.
+  it('honors a model pin on a local-runtime provider whose cached list omits it', () => {
+    const local = cli('grok-ollama', {
+      command: 'grok', ollamaBacked: true,
+      models: ['qwen3-coder:30b'], defaultModel: 'qwen3-coder:30b',
+    });
+    const { model } = pickCliProvider([local], { providerId: 'grok-ollama', model: 'gemma3:27b' });
+    expect(model).toBe('gemma3:27b');
+  });
+
+  // A provider that enumerates nothing has no catalog to validate against, so
+  // the pin stands rather than collapsing to the provider default.
+  it('honors a model pin on a provider that enumerates no models', () => {
+    const bare = cli('bare-cli', { defaultModel: 'configured-default' });
+    const { model } = pickCliProvider([bare], { providerId: 'bare-cli', model: 'anything-goes' });
+    expect(model).toBe('anything-goes');
+  });
 });
 
 describe('runCliProviderPrompt', () => {
+  it('refuses unknown safety profiles, unsupported commands, and extra arguments before spawning', async () => {
+    for (const args of [
+      { provider: cli('claude'), safetyProfile: 'unknown-profile' },
+      { provider: cli('custom-agent'), safetyProfile: 'public-review-gate' },
+      { provider: cli('claude'), safetyProfile: 'public-review-gate', extraArgs: ['--dangerously-skip-permissions'] },
+    ]) {
+      expect(await runCliProviderPrompt({ ...args, prompt: 'untrusted diff' })).toMatchObject({ error: expect.stringContaining('no enforced tool-free') });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')('enforces the shared no-tool argv and environment on an actual child', async () => {
+    const { mkdtemp, writeFile, rm } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = await mkdtemp(join(tmpdir(), 'review-cli-test-'));
+    const command = join(dir, 'claude');
+    await writeFile(command, '#!/usr/bin/env node\nprocess.stdin.resume(); process.stdin.on("end", () => process.stdout.write(JSON.stringify({ args: process.argv.slice(2), forgeToken: process.env.GH_TOKEN || null })));', { mode: 0o755 });
+    const result = await runCliProviderPrompt({
+      provider: { ...cli('example-claude'), command, args: ['--dangerously-skip-permissions', '--model', 'wrong-model'], envVars: { GH_TOKEN: 'example-secret' } },
+      model: 'pinned-model', prompt: 'untrusted diff', cwd: dir, safetyProfile: 'public-review-gate',
+    }).finally(() => rm(dir, { recursive: true, force: true }));
+    expect(result.partial).toBe(false);
+    const child = JSON.parse(result.text);
+    expect(child.args).toEqual(expect.arrayContaining(['--restricted', '--tools', '', '--model', 'pinned-model']));
+    expect(child.args).not.toContain('--dangerously-skip-permissions');
+    expect(child.args).not.toContain('wrong-model');
+    expect(child.forgeToken).toBeNull();
+  });
+
   it('rejects a missing command without spawning', async () => {
     const result = await runCliProviderPrompt({ provider: { id: 'x' }, prompt: 'hi' });
     expect(result.error).toMatch(/no command/i);

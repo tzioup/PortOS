@@ -1,5 +1,5 @@
-import { existsSync } from 'fs';
-import { join } from 'path';
+import { existsSync, realpathSync } from 'fs';
+import { join, resolve } from 'path';
 import { readFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import * as gitService from './git.js';
@@ -7,7 +7,9 @@ import * as pm2Service from './pm2.js';
 import { bufferedSpawnOrThrow } from '../lib/bufferedSpawn.js';
 import { parseCommandArgs, validateCommand } from '../lib/commandSecurity.js';
 import { isDetachedRunning, spawnDetached } from '../lib/detachedSpawn.js';
+import { PATHS } from '../lib/fileUtils.js';
 import { PORTOS_APP_ID } from '../lib/appIdentity.js';
+import { startPortosSelfUpdate } from './portosSelfUpdate.js';
 import { syncManagedAppFork } from './managedAppRepositories.js';
 
 const CMD_TIMEOUT_MS = 5 * 60 * 1000;
@@ -21,6 +23,67 @@ function runCommand(cmd, args, cwd) {
   return bufferedSpawnOrThrow(cmd, args, { cwd, timeoutMs: CMD_TIMEOUT_MS });
 }
 
+/**
+ * End the update at a git conflict the pull step could not resolve, handing the
+ * checkout to a CoS agent.
+ *
+ * `updateDefaultBranch` already tried a fast-forward and then a
+ * `pull --rebase --autostash`; reaching here means the checkout needs judgement
+ * no scripted pull can supply, so nothing downstream may run on it — it may be
+ * mid-rebase or carrying conflict markers. The task's first line is stable per
+ * repo path so `addTask`'s description+app dedup collapses repeated failed
+ * update attempts onto the one open task rather than queueing an agent per click.
+ *
+ * The CoS task store is imported lazily: this module is reached by every app
+ * operation, while the conflict branch is rare, and a static import would pull
+ * the whole CoS state graph into that closure (see "Import scoping" in
+ * server/AGENTS.md).
+ *
+ * @returns {Promise<{success: false, steps: object[]}>} the update's own result
+ *   shape. Never rejects — a failed enqueue must not mask the conflict message.
+ */
+async function failWithGitConflict({ app, repoPath, pullResult, stepId, emit, steps }) {
+  const error = pullResult.error || 'unknown git error';
+  const message = `Could not update ${repoPath}: ${error}. `
+    + `A CoS agent has been queued to resolve it.`;
+  emit(stepId, 'error', message);
+  steps.push({ step: stepId, success: false, message });
+  const label = app?.name || repoPath;
+  const branch = pullResult.branch || 'the default branch';
+  // `app` is what routes the agent's workspace: agentWorkspacePrep resolves the
+  // cwd as `getAppWorkspace(metadata.app)`, which returns the app's PRIMARY
+  // repoPath. A companion repository has no app record of its own, so claiming
+  // the app there would spawn the agent in the wrong checkout — one that isn't
+  // even conflicted. Only the primary repo may carry it; a companion conflict
+  // runs from the default workspace and is steered by the absolute path below.
+  const isPrimaryRepo = app?.repoPath === repoPath;
+  const task = {
+    description: `Resolve git conflict in ${label} at ${repoPath}`,
+    priority: 'HIGH',
+    app: (isPrimaryRepo && app?.id) || null,
+    context: `Updating ${label} failed: the checkout could not be brought onto origin/${branch}. `
+      + `A fast-forward and then a rebase with --autostash were both attempted. `
+      + `Error: ${error}\n\n`
+      + `The conflicted repository is at ${repoPath}`
+      + (isPrimaryRepo ? '' : ` — a companion repository of ${label}, NOT your default workspace, so work there explicitly`)
+      + `. Finish or abort any in-progress rebase, reconcile the working tree, commit or restore the `
+      + `stashed work, then leave the checkout clean on origin/${branch} so the update can be re-run.`,
+    position: 'top'
+  };
+  const created = await import('./cosTaskStore.js')
+    .then(({ addTask }) => addTask(task, 'internal'))
+    .catch((err) => {
+      console.error(`❌ Failed to queue conflict-resolution task for ${label}: ${err.message}`);
+      return null;
+    });
+  if (created?.duplicate) {
+    console.log(`⚠️ Conflict-resolution task already open for ${label} (${created.id})`);
+  } else if (created) {
+    console.log(`🔀 Queued conflict-resolution task ${created.id} for ${label} on ${branch}`);
+  }
+  return { success: false, steps };
+}
+
 // Per-app lock to prevent concurrent updates
 const updatingApps = new Set();
 const DASHBOARD_OPEN_SCRIPT = 'scripts/open-ui-in-browser.js';
@@ -31,6 +94,10 @@ const DASHBOARD_OPEN_CONTROL_DIR = join(tmpdir(), 'portos-dashboard-open');
  * restarted. The handoff is deliberately detached through the shared
  * double-fork helper: PM2's tree-kill would otherwise take the helper down
  * with portos-server before it can wait for the browser to return.
+ *
+ * Only the paths that restart PortOS from HERE need it. The delegated
+ * self-update does not: update.sh runs `open-ui-in-browser.js` itself once the
+ * ecosystem is back up.
  *
  * @param {object} app
  * @returns {Promise<void>}
@@ -54,6 +121,9 @@ async function startDashboardHandoff(app) {
   const handoff = await spawnDetached(
     process.execPath,
     [scriptPath],
+    // spawnDetached leaves this process's tree on every platform — pm2 kills on
+    // Windows with `taskkill /T`, which walks the same parent tree the POSIX
+    // double-fork escapes, so without it the handoff dies with portos-server.
     { cwd: app.repoPath, controlDir: DASHBOARD_OPEN_CONTROL_DIR, cleanup: true },
   ).catch((err) => {
     console.error(`⚠️ Dashboard auto-open could not start: ${err.message}`);
@@ -65,22 +135,61 @@ async function startDashboardHandoff(app) {
 }
 
 /**
+ * Whether two filesystem paths name the same directory. A trailing slash, a
+ * symlinked checkout, or a different case on APFS/NTFS all spell one path more
+ * than one way — and the caller below turns "these differ" into "take the
+ * ATTACHED spawn", which is exactly the headless failure of #5976. Resolve
+ * symlinks where possible, and case-fold on the platforms whose filesystems
+ * are case-insensitive by default (mirrors `scripts/lib/directInvocation.js`).
+ *
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function isSamePath(a, b) {
+  if (!a || !b) return false;
+  const caseFold = process.platform === 'win32' || process.platform === 'darwin';
+  const normalize = (path) => {
+    // realpath throws when the path does not exist yet; resolve() alone still
+    // collapses a trailing slash and any '..' segment.
+    const absolute = (() => {
+      try {
+        return realpathSync(resolve(path));
+      } catch {
+        return resolve(path);
+      }
+    })();
+    return caseFold ? absolute.toLowerCase() : absolute;
+  };
+  return normalize(a) === normalize(b);
+}
+
+/**
  * Run a full update cycle for an app:
  * 1. switch to origin's default branch and fast-forward it
  * 2. run an explicitly declared app update routine, when one exists
  * 3. restart the app's PM2 processes
  *
- * PortOS owns its comprehensive update.sh/update.ps1 lifecycle separately.
  * A generic managed app must opt in to dependency installs, migrations, or a
  * build: guessing those steps from a package.json can freeze or break apps
  * whose lifecycle does not resemble PortOS.
  *
+ * PortOS itself is a managed app, and its comprehensive update.sh/update.ps1
+ * lifecycle is delegated to `portosSelfUpdate` — the same launcher the Update
+ * page uses — which owns the restart and the dashboard handoff for that case.
+ * That branch resolves as soon as the detached script is RUNNING and reports
+ * `selfUpdateStarted`, because this process does not outlive the script's
+ * `pm2 delete`.
+ *
  * @param {object} app - The app object (must have repoPath, pm2ProcessNames, pm2Home)
  * @param {function} emit - Callback (step, status, message) for progress updates
- * @param {{syncFork?: boolean}} options
- * @returns {Promise<{success: boolean, steps: object[]}>}
+ * @param {object} [options]
+ * @param {boolean} [options.syncFork] - fast-forward the origin fork first
+ * @param {boolean} [options.acknowledgeFork] - PortOS preflight acknowledgement
+ * @param {boolean} [options.acknowledgePersistentMindImageBackup] - PortOS preflight acknowledgement
+ * @returns {Promise<{success: boolean, steps: object[], selfUpdateStarted?: boolean}>}
  */
-export async function updateApp(app, emit, { syncFork = false } = {}) {
+export async function updateApp(app, emit, options = {}) {
   const dir = app.repoPath;
   if (updatingApps.has(dir)) {
     return { success: false, steps: [{ step: 'lock', success: false, message: 'Update already in progress' }] };
@@ -88,13 +197,17 @@ export async function updateApp(app, emit, { syncFork = false } = {}) {
   updatingApps.add(dir);
 
   try {
-    return await _doUpdate(app, emit, { syncFork });
+    return await _doUpdate(app, emit, options);
   } finally {
     updatingApps.delete(dir);
   }
 }
 
-async function _doUpdate(app, emit, { syncFork }) {
+async function _doUpdate(app, emit, {
+  syncFork = false,
+  acknowledgeFork = false,
+  acknowledgePersistentMindImageBackup = false,
+}) {
   const dir = app.repoPath;
   const steps = [];
   const packageManager = app.type === 'bun' ? 'bun' : 'npm';
@@ -115,6 +228,9 @@ async function _doUpdate(app, emit, { syncFork }) {
 
   emit('git-pull', 'running', 'Updating from origin default branch...');
   const pullResult = await gitService.updateDefaultBranch(dir);
+  if (pullResult.conflict) {
+    return failWithGitConflict({ app, repoPath: dir, pullResult, stepId: 'git-pull', emit, steps });
+  }
   const pullMsg = pullResult.output?.trim() || `${pullResult.branch} is up to date`;
   emit('git-pull', 'done', pullMsg);
   steps.push({ step: 'git-pull', success: true, message: pullMsg });
@@ -127,6 +243,9 @@ async function _doUpdate(app, emit, { syncFork }) {
     const stepId = `git-pull:companion-${index + 1}`;
     emit(stepId, 'running', `Pulling companion repository ${index + 1}/${companionRepoPaths.length}...`);
     const companionPull = await gitService.updateDefaultBranch(companionPath);
+    if (companionPull.conflict) {
+      return failWithGitConflict({ app, repoPath: companionPath, pullResult: companionPull, stepId, emit, steps });
+    }
     const companionMessage = companionPull.output?.trim() || `${companionPull.branch} is up to date`;
     emit(stepId, 'done', companionMessage);
     steps.push({ step: stepId, success: true, message: companionMessage });
@@ -137,7 +256,16 @@ async function _doUpdate(app, emit, { syncFork }) {
   const configuredUpdate = typeof app.updateCommand === 'string' ? app.updateCommand.trim() : '';
   const standardScript = process.platform === 'win32' ? 'update.ps1' : 'update.sh';
   const standardScriptPath = join(dir, standardScript);
-  if (configuredUpdate || pkg?.scripts?.['portos:update'] || existsSync(standardScriptPath)) {
+  const usesStandardScript = !configuredUpdate && !pkg?.scripts?.['portos:update'] && existsSync(standardScriptPath);
+  // PortOS running THIS checkout's own standard update script is the one case
+  // whose update routine deletes the process awaiting it — and the only shape
+  // updateExecutor knows how to launch, since it resolves update.sh from
+  // `PATHS.root` rather than from the app record. Both narrowings matter: a
+  // PortOS record carrying a custom `updateCommand`, or pointing somewhere
+  // other than this checkout, keeps the ordinary attached path rather than
+  // silently running a different script than the one configured.
+  const detachSelfUpdate = app.id === PORTOS_APP_ID && usesStandardScript && isSamePath(dir, PATHS.root);
+  if (configuredUpdate || pkg?.scripts?.['portos:update'] || usesStandardScript) {
     // A configured runtime may be an absolute Bun path, which is trusted app
     // configuration but not a commandSecurity allowlist token. Only free-form
     // registry commands go through that parser; the package-script form is a
@@ -150,13 +278,54 @@ async function _doUpdate(app, emit, { syncFork }) {
           ? { valid: true, baseCommand: 'powershell', args: ['-ExecutionPolicy', 'Bypass', '-File', standardScriptPath] }
           : { valid: true, baseCommand: standardScriptPath, args: [] };
     if (!command.valid) throw new Error(`Update command is not allowed: ${command.error}`);
+    if (app.id === PORTOS_APP_ID && !detachSelfUpdate) {
+      // Never silent: this is PortOS about to run its update routine ATTACHED,
+      // and an attached run is what left the install headless in #5976. Name
+      // which of the three narrowings declined it, so an operator debugging the
+      // misconfiguration is not sent after the wrong one.
+      const reason = configuredUpdate
+        ? 'a custom update command is configured'
+        : pkg?.scripts?.['portos:update']
+          ? 'a portos:update package script is configured'
+          : 'repoPath is not this checkout';
+      console.log(`⚠️ PortOS update is using the attached path — ${reason}`);
+    }
     emit('app-update', 'running', 'Running the app update routine...');
+    if (detachSelfUpdate) {
+      // PortOS is itself a managed app, so an App Management update reaches
+      // update.sh through THIS path. `portosSelfUpdate` owns everything about
+      // launching that script — including why nothing may await it — and this
+      // returns the moment it is running. Read that module before changing this.
+      //
+      // `refresh`, not `reconcile`: the git-pull step above already advanced
+      // this checkout, so the out-of-sync gate would only be re-asking whether
+      // the pull we just did happened.
+      //
+      // No `io`: App Management renders the run from its own `app:update:step`
+      // frames (`onStep`), so mirroring the whole stream onto
+      // `portos:update:*` as well would double the fan-out for no new reader.
+      await startPortosSelfUpdate({
+        acknowledgeFork,
+        acknowledgePersistentMindImageBackup,
+        preflightAlreadyRun: true,
+        mode: 'refresh',
+        onStep: emit,
+      });
+      const launched = 'PortOS update running — this process restarts as part of it';
+      emit('app-update', 'running', launched);
+      steps.push({ step: 'app-update', success: true, message: launched });
+      return { success: true, steps, selfUpdateStarted: true };
+    }
     await runCommand(command.baseCommand, command.args, dir);
     emit('app-update', 'done', 'App update routine complete');
     steps.push({ step: 'app-update', success: true });
   }
 
-  const processNames = app.pm2ProcessNames || [];
+  // update.sh/update.ps1 close with their own `pm2 start ecosystem.config.cjs`
+  // (and their own dashboard handoff), so restarting PortOS on top of the
+  // detached script would be redundant and would race it — the script may not
+  // have finished re-registering the processes we would be restarting.
+  const processNames = detachSelfUpdate ? [] : (app.pm2ProcessNames || []);
   if (processNames.length > 0) {
     emit('restart', 'running', 'Restarting app...');
     await startDashboardHandoff(app);

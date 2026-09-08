@@ -1,15 +1,16 @@
 import { useCallback, useState, useEffect, useRef } from 'react';
 import { useSearchParams } from 'react-router';
-import { RefreshCw, Clock, AlertTriangle, DatabaseZap } from 'lucide-react';
+import { RefreshCw, Clock, AlertTriangle, DatabaseZap, Network } from 'lucide-react';
 import * as api from '../services/api';
 import BrailleSpinner from '../components/BrailleSpinner';
 import PageSkeleton from '../components/ui/PageSkeleton';
 import Pill from '../components/ui/Pill';
-import { formatCompactCount, formatCompactCountOrDash as formatNumber, formatUsd, timeUntil } from '../utils/formatters';
+import { formatCompactCount, formatCompactCountOrDash as formatNumber, formatUsd, timeAgo, timeUntil } from '../utils/formatters';
 import { useAsyncAction } from '../hooks/useAsyncAction';
 import { useAutoRefetch } from '../hooks/useAutoRefetch';
 import SubscriptionSavingsCard from '../components/usage/SubscriptionSavingsCard';
 import FleetUsageCard from '../components/usage/FleetUsageCard';
+import ModelsTabsHeader from '../components/models/ModelsTabsHeader';
 
 // How often to re-ask while a provider's quota reading is still being taken. A
 // CLI/TUI scrape is a 10-20s spawn, so this is a handful of polls, not a loop.
@@ -49,7 +50,7 @@ function UsageMeter({ limit }) {
   return (
     <div className="py-1 sm:py-2 border-b border-port-border last:border-0">
       <div className="flex items-baseline justify-between gap-2 mb-0.5 sm:mb-1">
-        <span className="text-white text-xs sm:text-base truncate">{limit.label}</span>
+        <span className="text-white text-xs sm:text-base truncate" title={limit.label}>{limit.label}</span>
         <span className="shrink-0 text-gray-400 text-[10px] sm:text-sm">
           {remaining == null ? '—' : `${remaining}% left`}
         </span>
@@ -60,11 +61,11 @@ function UsageMeter({ limit }) {
           style={{ width: `${Math.min(100, Math.max(0, used))}%` }}
         />
       </div>
-      <div className="flex items-start justify-between gap-1 mt-0.5 sm:mt-1">
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-0.5 sm:gap-1 mt-0.5 sm:mt-1">
         <span className="text-[9px] sm:text-xs text-gray-500">{used}% used</span>
         {limit.resetsAt && (
-          <span className="flex min-w-0 text-[9px] sm:text-xs text-gray-500 items-start justify-end gap-1 text-right leading-tight">
-            <Clock size={11} /> resets {formatResetsAt(limit.resetsAt)}
+          <span className="flex min-w-0 text-[9px] sm:text-xs text-gray-500 items-start sm:justify-end gap-1 sm:text-right leading-tight">
+            <Clock size={11} className="shrink-0" /> resets {formatResetsAt(limit.resetsAt)}
           </span>
         )}
       </div>
@@ -84,6 +85,21 @@ function StatTile({ label, value, detail }) {
   );
 }
 
+// A subscription is one account across every federated instance, but each
+// instance can only read its own CLI's panel. When peers have contributed a
+// reading, say so on the card and name them — the meters are the freshest
+// reading across the fleet and the activity counts are summed, which is a
+// different claim than "what this box saw".
+function FleetSourcesPill({ fleet }) {
+  if (!fleet || fleet.count < 2) return null;
+  const describe = (i) => `${i.self ? 'this machine' : (i.name || i.instanceId)}${i.self || !i.fetchedAt ? '' : ` (read ${timeAgo(i.fetchedAt)})`}`;
+  return (
+    <Pill tone="context" size="xs" icon={Network} className="hidden sm:inline-flex shrink-0" title={fleet.instances.map(describe).join(' · ')}>
+      {fleet.count} instances
+    </Pill>
+  );
+}
+
 // One subscription-quota card per enabled provider family. Providers with no
 // queryable usage surface (supported: false) render a muted note, never an
 // error; a supported adapter that failed transiently shows a soft warning.
@@ -91,11 +107,14 @@ function ProviderQuotaCard({ quota, onRefresh, refreshing, disabled }) {
   return (
     <div className="bg-port-card border border-port-border rounded-lg p-2 sm:rounded-xl sm:p-4">
       <div className="flex items-center justify-between gap-1 sm:gap-2 mb-1 sm:mb-2">
-        <h3 className="text-sm sm:text-base font-semibold text-white truncate">{quota.label}</h3>
+        {/* min-w-0 so the provider name shrinks with the card instead of being
+            crushed to nothing by the fixed-width controls beside it. */}
+        <h3 className="min-w-0 text-sm sm:text-base font-semibold text-white truncate">{quota.label}</h3>
         <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           {quota.plan && quota.plan !== 'unknown' && (
             <Pill tone="context" size="xs" className="hidden sm:inline-flex">{quota.plan}</Pill>
           )}
+          <FleetSourcesPill fleet={quota.fleet} />
           {/* Per-card refresh: every family's reading is its own multi-second
               CLI/TUI scrape, so re-reading one provider must not respawn all
               of them. */}
@@ -157,7 +176,10 @@ function ProviderQuotaCard({ quota, onRefresh, refreshing, disabled }) {
           {/* Backends with no queryable quota report observed counts instead of
               a meter — a percentage we cannot measure must not be invented. */}
           {quota.metrics?.length > 0 && (
-            <div className="grid grid-cols-2 gap-2">
+            // One tile per row on a phone: these cells sit inside an already
+            // half-width mobile card, and two columns of it wrapped a tile's
+            // label and detail onto four lines apiece.
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {quota.metrics.map((m) => (
                 <StatTile key={m.key} label={m.label} value={m.value} detail={m.detail} />
               ))}
@@ -165,7 +187,7 @@ function ProviderQuotaCard({ quota, onRefresh, refreshing, disabled }) {
           )}
 
           {quota.activity?.length > 0 && (
-            <div className="hidden sm:grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+            <div className="hidden sm:grid sm:grid-cols-2 gap-2 pt-1">
               {quota.activity.map((a) => (
                 <StatTile
                   key={a.period}
@@ -833,8 +855,10 @@ function InternalUsageMetrics() {
           Informational estimate of what this usage would have cost under API billing (PortOS runs on subscriptions).
           {' '}<span className="text-gray-400">Measured</span> rows are the provider CLI&rsquo;s own per-message counts, read from its local
           transcript — full per-turn input, output, and prompt-cache reads/writes, each priced at its own rate.
-          {' '}<span className="text-gray-400">Estimated</span> rows are runs with no readable transcript (local models, or a provider
-          that writes none): input is approximated from the initial prompt only and cache traffic is not counted, so those rows
+          {' '}Grok rows are measured the same way once a turn completes; a run killed mid-turn falls back to its chat history.
+          {' '}<span className="text-gray-400">Estimated</span> rows are runs with no token counts to read: Antigravity writes a
+          session transcript but no token fields, so its rows are sized from that transcript&rsquo;s text, and a run with no session
+          file at all (local models) is approximated from the initial prompt only with no cache traffic counted — those rows
           understate real usage substantially.
           Rates are as of {report?.pricingAsOf || 'the last update'} and exclude batch and long-context tiers.
           {' '}Rows marked ~ use an approximated rate.
@@ -1013,6 +1037,7 @@ function InternalUsageMetrics() {
 export function UsagePage() {
   return (
     <div className="space-y-6">
+      <ModelsTabsHeader activeTab="usage" />
       <ProviderQuotaSection />
       <InternalUsageMetrics />
     </div>

@@ -21,6 +21,7 @@ import {
   resolveReconcileDrainGate,
   resolveSwarmBlock,
 } from './cosTaskPreStepBlocks.js';
+import { DISPATCH_HINT_FANOUT_GUIDANCE } from '../lib/dispatchLabels.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const GEN_SRC = readFileSync(join(__dirname, 'cosTaskGenerator.js'), 'utf-8');
@@ -30,6 +31,24 @@ const PRESTEP_SRC = readFileSync(join(__dirname, 'cosTaskPreStepBlocks.js'), 'ut
 // about the call's shape reads both, so moving code between them can neither
 // break it nor silently disarm it.
 const LAYER_SRC = `${GEN_SRC}\n${PRESTEP_SRC}`;
+
+// #6112 — an abandoned volunteer claim is released deterministically, and the
+// release must happen BEFORE the "no zombies → park" early return. A repo whose
+// only stuck issues are abandoned claims has zero zombies on every pass, so a
+// release ordered after the park would never run at all.
+describe('issue-reconcile releases abandoned claims before it can park', () => {
+  it('calls the releaser ahead of every parking / dispatch return', () => {
+    const start = PRESTEP_SRC.indexOf('export async function resolveIssueReconcileBlock');
+    const body = PRESTEP_SRC.slice(start, PRESTEP_SRC.indexOf('\n}', start));
+    const releaseIdx = body.indexOf('releaseAbandonedClaims(result.abandoned');
+    expect(releaseIdx, 'the pre-step must release abandoned claims').toBeGreaterThan(-1);
+    expect(releaseIdx).toBeLessThan(body.indexOf("reason: 'no-zombie-issues'"));
+    expect(releaseIdx).toBeLessThan(body.indexOf('resolveReconcileDrainGate('));
+    // But never before the null guard: a transient/unsupported scan has no
+    // `abandoned` set to read, and must skip without writing to the forge.
+    expect(body.indexOf('if (!result) return { skip: true };')).toBeLessThan(releaseIdx);
+  });
+});
 
 // The {issueAuthorFilter} directive is shared by the scheduled claim-work router
 // AND the manual /do:next button (buildClaimWorkTask), so it is a standalone
@@ -215,6 +234,19 @@ describe('resolveSwarmBlock', () => {
     expect(block).not.toContain('gh pr view');
   });
 
+  it('routes each fan-out agent from its own issue\u2019s model:/effort: labels', () => {
+    // The orchestrator is the only actor in this flow that chooses how an agent
+    // runs, and planners have been labeling issues all along. Without this the
+    // swarm dispatched all N agents at the run's default and the routing was lost.
+    const block = resolveSwarmBlock('claim-issue', 3);
+    expect(block).toContain(DISPATCH_HINT_FANOUT_GUIDANCE);
+    // Partitioning (which issues run together) and routing (how each one runs)
+    // are separate decisions, and Phase A is where the labels get carried.
+    expect(block).toMatch(/Keep each picked issue's `model:` \/ `effort:` labels/);
+    // …and the orchestrator has to say what it routed each issue at.
+    expect(block).toMatch(/Name the model and effort you used for each issue/);
+  });
+
   it('is a no-op for non-forge claim types (plan-task / jira have no swarm flow)', () => {
     expect(resolveSwarmBlock('plan-task', 6)).toBe('');
     expect(resolveSwarmBlock('claim-issue-jira', 6)).toBe('');
@@ -291,12 +323,13 @@ describe('resolveReconcileDrainGate', () => {
  */
 describe('applyPerpetualDrainCap', () => {
   const fakeSchedule = (dispatchCount = 0) => ({
-    INTERVAL_TYPES: { ON_DEMAND: 'on-demand', PERPETUAL: 'perpetual' },
+    INTERVAL_TYPES: { ON_DEMAND: 'on-demand', CRON: 'cron' },
     getPerpetualDrainState: vi.fn(async () => ({ signature: null, dispatchCount })),
     parkPerpetual: vi.fn(async () => {})
   });
   const app = { id: 'app-1', name: 'App One' };
-  const perpetual = (over = {}) => ({ type: 'perpetual', ...over });
+  // The drain signal is the orthogonal `perpetual` flag, not the cadence type.
+  const perpetual = (over = {}) => ({ type: 'on-demand', perpetual: true, ...over });
 
   it('parks drain-cap once the budget is spent, clearing the signature in the park write', async () => {
     const ts = fakeSchedule(5);
@@ -333,12 +366,15 @@ describe('applyPerpetualDrainCap', () => {
 
   it('ignores non-perpetual intervals entirely', async () => {
     const ts = fakeSchedule(500);
-    expect(await applyPerpetualDrainCap(app, 'security', { type: 'daily', drainDispatchCap: 5 }, ts)).toEqual({ skip: false });
+    expect(await applyPerpetualDrainCap(app, 'security', { type: 'cron', cronExpression: '0 7 * * *', drainDispatchCap: 5 }, ts)).toEqual({ skip: false });
     expect(ts.getPerpetualDrainState).not.toHaveBeenCalled();
+    // A reconcile task WITHOUT the flag is no longer special-cased by name.
+    expect(await applyPerpetualDrainCap(app, 'branch-reconcile', { type: 'on-demand', drainDispatchCap: 5 }, ts)).toEqual({ skip: false });
   });
 
-  it('applies the cap to the on-demand reconciliation drain', async () => {
+  it('applies the cap to a cron-scheduled perpetual drain, not just an on-demand one', async () => {
     const ts = fakeSchedule(5);
-    expect(await applyPerpetualDrainCap(app, 'branch-reconcile', { type: 'on-demand', drainDispatchCap: 5 }, ts)).toEqual({ skip: true });
+    const cronDrain = { type: 'cron', cronExpression: '0 7 * * *', perpetual: true, drainDispatchCap: 5 };
+    expect(await applyPerpetualDrainCap(app, 'branch-reconcile', cronDrain, ts)).toEqual({ skip: true });
   });
 });

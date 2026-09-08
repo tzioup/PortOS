@@ -33,14 +33,15 @@ import { asyncHandler, ServerError } from '../lib/errorHandler.js';
 import { validateRequest, isPaginationRequested, paginateArray } from '../lib/validation.js';
 import { uploadSingle } from '../lib/multipart.js';
 import * as tracks from '../services/tracks/index.js';
-import * as albums from '../services/albums/index.js';
+import { createTrackWithAlbum, updateTrackWithAlbum, removeTrackFromAlbum } from '../services/trackAlbumMembership.js';
 import {
   listMusicLibrary, importUploadedTrack, statMusicTrack,
   isSupportedMusicUpload, assertSafeMusicFilename, MUSIC_UPLOAD_MAX_BYTES,
 } from '../services/pipeline/musicLibrary.js';
 import {
-  startYoutubeImport, attachImportSseClient, cancelYoutubeImport, YOUTUBE_URL_RE,
+  startYoutubeImport, attachImportSseClient, cancelYoutubeImport,
 } from '../services/trackYoutubeImport.js';
+import { YOUTUBE_VIDEO_URL_RE, YOUTUBE_URL_INVALID_MESSAGE } from '../lib/youtubeUrl.js';
 import { generateChiptuneScore, renderChiptuneTrack, publishChiptuneTrack } from '../services/chiptune.js';
 
 const router = Router();
@@ -102,7 +103,7 @@ const attachSchema = z.object({
 });
 
 const youtubeImportSchema = z.object({
-  url: z.string().trim().regex(YOUTUBE_URL_RE, 'Not a recognized YouTube URL (expected youtube.com/watch, youtu.be, or m.youtube.com)'),
+  url: z.string().trim().regex(YOUTUBE_VIDEO_URL_RE, YOUTUBE_URL_INVALID_MESSAGE),
 });
 
 // Reuse the pipeline audio stage's multipart upload contract (50MB, audio MIME).
@@ -158,29 +159,6 @@ async function attachAudioAsRender(trackId, filename) {
   });
 }
 
-// Membership reconcile, track→album direction (the inverse of the album route's
-// reconcileAlbumMembership). When a track's `albumId` changes, append it to the
-// new album's ordered `trackIds` (if absent) and drop it from the previous
-// album's list — so `track.albumId` (the membership truth) and `album.trackIds`
-// (the order) never disagree. Calls the album SERVICE directly (not the album
-// ROUTE) so this can't re-enter the album route's track-side reconcile and loop.
-// Best-effort: a missing/deleted album id is skipped.
-async function reconcileTrackAlbum(trackId, prevAlbumId, nextAlbumId) {
-  if (prevAlbumId === nextAlbumId) return;
-  if (prevAlbumId) {
-    const prev = await albums.getAlbum(prevAlbumId).catch(() => null);
-    if (prev && (prev.trackIds || []).includes(trackId)) {
-      await albums.updateAlbum(prevAlbumId, { trackIds: prev.trackIds.filter((id) => id !== trackId) }).catch(() => {});
-    }
-  }
-  if (nextAlbumId) {
-    const next = await albums.getAlbum(nextAlbumId).catch(() => null);
-    if (next && !(next.trackIds || []).includes(trackId)) {
-      await albums.updateAlbum(nextAlbumId, { trackIds: [...(next.trackIds || []), trackId] }).catch(() => {});
-    }
-  }
-}
-
 // Backward-compatible by default: returns the full tracks array. When a client
 // passes `limit`/`offset`, the response becomes the bounded
 // `{ items, total, limit, offset }` envelope every paginated PortOS list shares.
@@ -217,8 +195,7 @@ router.post('/import/:jobId/cancel', (req, res) => {
 
 router.post('/', asyncHandler(async (req, res) => {
   const body = validateRequest(createSchema, req.body ?? {});
-  const track = await tracks.createTrack(body);
-  if (track.albumId) await reconcileTrackAlbum(track.id, '', track.albumId);
+  const { track } = await createTrackWithAlbum(body);
   res.status(201).json(track);
 }));
 
@@ -229,8 +206,7 @@ router.get('/:id', asyncHandler(async (req, res) => {
 router.patch('/:id', asyncHandler(async (req, res) => {
   const body = validateRequest(patchSchema, req.body ?? {});
   const prev = await requireTrack(req.params.id);
-  const track = await tracks.updateTrack(req.params.id, body);
-  if ('albumId' in body) await reconcileTrackAlbum(track.id, prev.albumId, track.albumId);
+  const track = await updateTrackWithAlbum(prev, body);
   res.json(track);
 }));
 
@@ -239,7 +215,7 @@ router.delete('/:id', asyncHandler(async (req, res) => {
   const result = await tracks.deleteTrack(req.params.id);
   // Drop the deleted track from its album's ordered list so the album doesn't
   // render a dangling (missing) entry.
-  if (prev?.albumId) await reconcileTrackAlbum(req.params.id, prev.albumId, '');
+  if (prev?.albumId) await removeTrackFromAlbum(req.params.id, prev.albumId);
   res.json(result);
 }));
 

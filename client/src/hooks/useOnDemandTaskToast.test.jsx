@@ -45,6 +45,28 @@ describe('useOnDemandTaskToast — idle outcome', () => {
     fire({ taskType: 'layered-intelligence', appName: 'App One', outcome: 'idle', reason: null });
     expect(toastSpy.mock.calls[0][0]).toMatch(/nothing to do right now/);
   });
+
+  it('surfaces the pr-reviewer skip reason (security guard not ready) instead of "nothing to do"', () => {
+    renderHook(() => useOnDemandTaskToast());
+    fire({ taskType: 'pr-reviewer', appName: 'PortOS', outcome: 'idle', reason: 'security-guard-not-ready' });
+    expect(toastSpy).toHaveBeenCalledTimes(1);
+    const [msg, opts] = toastSpy.mock.calls[0];
+    expect(msg).toMatch(/model-abuse classifier.*isn't ready/i);
+    expect(msg).not.toMatch(/nothing to do/);
+    expect(opts.icon).toBe('⚠️');
+  });
+
+  it('falls back to the raw reason string for an unglossed pr-reviewer code', () => {
+    renderHook(() => useOnDemandTaskToast());
+    fire({ taskType: 'pr-reviewer', appName: 'PortOS', outcome: 'idle', reason: 'some-future-code' });
+    expect(toastSpy.mock.calls[0][0]).toMatch(/some-future-code/);
+  });
+
+  it('falls back to the generic idle toast for a pr-reviewer idle result with no reason', () => {
+    renderHook(() => useOnDemandTaskToast());
+    fire({ taskType: 'pr-reviewer', appName: 'PortOS', outcome: 'idle', reason: null });
+    expect(toastSpy.mock.calls[0][0]).toMatch(/nothing to do right now/);
+  });
 });
 
 describe('useOnDemandTaskToast — transient outcome', () => {
@@ -170,5 +192,36 @@ describe('useOnDemandTaskToast — parked outcome', () => {
     expect(msg).not.toMatch(/matches an org/);
     expect(msg).toMatch(/set it to "self" or "any"/);
     expect(msg).toMatch(/0 of 10 open/);
+  });
+});
+
+describe('useOnDemandTaskToast — programmatic handler results', () => {
+  beforeEach(() => { handlers.clear(); toastSpy.mockClear(); });
+  afterEach(cleanup);
+
+  const fireHandled = (payload) => handlers.get('cos:schedule:on-demand-handled')?.(payload);
+
+  it('reports what the handler actually did — no agent task appears to watch', () => {
+    renderHook(() => useOnDemandTaskToast());
+    fireHandled({
+      taskType: 'universe-bible-describe', dispatched: true,
+      summary: 'Described 3 of 3 bible entries (7 fields) in "Example Universe"',
+    });
+    const [msg, opts] = toastSpy.mock.calls[0];
+    expect(msg).toMatch(/Described 3 of 3 bible entries/);
+    expect(opts.icon).toBe('✅');
+  });
+
+  it('names the handler\'s own reason when it declines', () => {
+    // A decline is not a failure — nothing to do, or a setting that needs
+    // picking — so it stays calm but must not be a silent no-op.
+    renderHook(() => useOnDemandTaskToast());
+    fireHandled({
+      taskType: 'universe-bible-images', dispatched: false,
+      summary: null, reason: 'no bible entries are missing images',
+    });
+    const [msg, opts] = toastSpy.mock.calls[0];
+    expect(msg).toMatch(/no bible entries are missing images/);
+    expect(opts.icon).toBe('💤');
   });
 });

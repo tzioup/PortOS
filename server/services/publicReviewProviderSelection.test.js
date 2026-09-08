@@ -39,6 +39,9 @@ describe('eligiblePublicReviewProviders', () => {
   it('returns this install’s own eligible providers, not a fixed vendor list', async () => {
     seed([GROK, OPENCODE, OLLAMA_API]);
     expect((await eligiblePublicReviewProviders('no-tool')).map((p) => p.id)).toEqual(['grok-cli']);
+    // The actions stage is open to every binary provider — opencode has no
+    // sandbox recipe but runs headless in the disposable worktree; the api
+    // provider has no binary at all.
     expect((await eligiblePublicReviewProviders('sandboxed-actions')).map((p) => p.id)).toEqual(['grok-cli']);
   });
 
@@ -49,8 +52,8 @@ describe('eligiblePublicReviewProviders', () => {
 
   it('keeps a momentarily-unavailable provider selectable', async () => {
     isProviderAvailable.mockReturnValue(false);
-    seed([CODEX]);
-    expect((await eligiblePublicReviewProviders('no-tool')).map((p) => p.id)).toEqual(['codex-cli']);
+    seed([GROK]);
+    expect((await eligiblePublicReviewProviders('no-tool')).map((p) => p.id)).toEqual(['grok-cli']);
   });
 });
 
@@ -67,7 +70,13 @@ describe('resolvePublicReviewProvider', () => {
   });
 
   it('drops an INELIGIBLE pin instead of running the stage on it', async () => {
-    seed([OPENCODE, CODEX], { id: 'opencode' });
+    seed([OPENCODE, GROK], { id: 'opencode' });
+    const resolved = await resolvePublicReviewProvider({ posture: 'no-tool', pinnedProviderId: 'opencode' });
+    expect(resolved).toMatchObject({ ok: true, pinHonored: false, provider: { id: 'grok-cli' } });
+  });
+
+  it('rejects a worktree-only actions pin and selects an enforced provider', async () => {
+    seed([OPENCODE, CODEX], { id: 'codex-cli' });
     const resolved = await resolvePublicReviewProvider({ posture: 'sandboxed-actions', pinnedProviderId: 'opencode' });
     expect(resolved).toMatchObject({ ok: true, pinHonored: false, provider: { id: 'codex-cli' } });
   });
@@ -81,16 +90,22 @@ describe('resolvePublicReviewProvider', () => {
 
   it('still resolves when every eligible provider is momentarily unavailable', async () => {
     isProviderAvailable.mockReturnValue(false);
-    seed([CODEX]);
+    seed([GROK]);
     await expect(resolvePublicReviewProvider({ posture: 'no-tool' }))
-      .resolves.toMatchObject({ ok: true, provider: { id: 'codex-cli' } });
+      .resolves.toMatchObject({ ok: true, provider: { id: 'grok-cli' } });
   });
 
   it('fails closed with an actionable reason when nothing on this install qualifies', async () => {
     seed([OPENCODE, OLLAMA_API]);
-    const resolved = await resolvePublicReviewProvider({ posture: 'sandboxed-actions' });
-    expect(resolved.ok).toBe(false);
-    expect(resolved.code).toBe('public-review-no-eligible-provider');
-    expect(resolved.error).toMatch(/sandboxed-actions/);
+    const gate = await resolvePublicReviewProvider({ posture: 'no-tool' });
+    expect(gate.ok).toBe(false);
+    expect(gate.code).toBe('public-review-no-eligible-provider');
+    expect(gate.error).toMatch(/no-tool/);
+
+    seed([OLLAMA_API, { ...OPENCODE, enabled: false }]);
+    const actions = await resolvePublicReviewProvider({ posture: 'sandboxed-actions' });
+    expect(actions.ok).toBe(false);
+    expect(actions.code).toBe('public-review-no-eligible-provider');
+    expect(actions.error).toMatch(/sandboxed-actions/);
   });
 });

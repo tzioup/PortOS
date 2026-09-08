@@ -5,6 +5,13 @@ import { isDirectlyInvoked } from './lib/directInvocation.js';
 import { writeStepOutput } from './lib/githubOutput.js';
 
 const TEST_FILE_RE = /\.(?:test|spec)\.[cm]?[jt]sx?$/i;
+// `git grep` pathspecs matching every extension TEST_FILE_RE recognizes. A
+// hardcoded `*.test.js`/`.jsx` pair would silently stop finding a `.test.ts(x)`
+// or `.spec.*` contract test added later, reopening the exact under-selection
+// bug the basename lookup below exists to close — the later trackedSet +
+// runnerForTest(isTestFile) filter already narrows a broad hit back down, so
+// over-matching here costs nothing.
+const TEST_FILE_GLOBS = ['*.test.*', '*.spec.*'];
 const CLIENT_LINT_RE = /^client\/src\/.*\.(?:js|jsx)$/i;
 const EXECUTABLE_RE = /\.(?:cjs|css|html|js|jsx|json|mjs|sql|ts|tsx|ya?ml)$/i;
 const MAX_CHANGED_CODE_FILES = 30;
@@ -16,9 +23,16 @@ const MAX_TARGETED_TEST_FILES = 120;
 // with `git grep` and the plan runs exactly those — failing closed to the full
 // suite for a script nothing names.
 const PYTHON_SCRIPT_RE = /^scripts\/[^/]+\.py$/;
-/** `git grep -E` pattern for a test that names this one script. */
-export const pythonReferencePattern = (scriptPath) => (
-  `(^|[^A-Za-z0-9_])${scriptPath.slice(scriptPath.lastIndexOf('/') + 1).replace(/[.]/g, '\\.')}([^A-Za-z0-9_]|$)`
+
+// Contract tests read a subject file with `readFileSync` (a cross-tree mirror
+// parity test, `server/lib/navManifest.js` reading 20+ client files by path)
+// instead of importing it, so no `vitest related` import edge reaches them
+// either. `main()` finds the tests naming a changed file's basename with
+// `git grep`, the same mechanism the python case below uses, and generalizes
+// it to every changed source — not only `.py` (issue #6363).
+/** `git grep -E` pattern for a test that names this one source file by basename. */
+export const sourceReferencePattern = (sourcePath) => (
+  `(^|[^A-Za-z0-9_])${sourcePath.slice(sourcePath.lastIndexOf('/') + 1).replace(/[.]/g, '\\.')}([^A-Za-z0-9_]|$)`
 );
 
 // Parallel runners per test job on a full plan. Decided here rather than in
@@ -87,6 +101,13 @@ const WINDOWS_RISK_RULES = [
   /^server\/services\/(?:shell|pm2|appBuilder)\b/,
   /^server\/services\/agentTuiSpawning(?:\.test)?\.js$/,
   /^server\/services\/autonomousJobs\/execution\.shellSpawn/,
+  // The voice fine-tuning service spawns a real Python trainer and settles the
+  // job from its `close`/`error` events, so its assertions are the child-process
+  // contract, not platform-independent logic. Nothing here was Windows-tagged,
+  // so the shard only saw it on a full-matrix run — which is where it failed,
+  // with an interpreter-startup budget mistaken for a state-machine defect
+  // (#6268).
+  /^server\/services\/voice\/fineTuning(?:\.test)?\.js$/,
   /^server\/routes\/apps\//,
   /^server\/routes\/scaffoldVite\.js$/,
 ];
@@ -138,6 +159,7 @@ export const WINDOWS_CONTRACT_TESTS = [
   'server/services/agentTuiSpawning.test.js',
   'server/services/agentImportCycles.test.js',
   'server/services/twinImportCycles.test.js',
+  'server/services/voice/fineTuning.test.js',
 ];
 
 // Contract guards that run on EVERY plan, whatever the impact scope selects.
@@ -173,10 +195,16 @@ export const ALWAYS_RUN_TESTS = [
   // The union-merged catalogs are `.md` to the planner — documentation-only —
   // so a rebase that doubled a row would otherwise never be re-checked.
   'scripts/catalog-merge-union.test.js',
+  // Walks the client→server/lib import graph; any server/lib file can add a
+  // Node-only import and break the client build with no edge back to here.
+  'scripts/client-server-import-purity.test.js',
   'scripts/direct-invocation-drift.test.js',
   'scripts/ensure-deps.test.js',
+  'scripts/migrations/promptBumpMigrations.guard.test.js',
   'scripts/node-version-drift.test.js',
   'scripts/repo-scan-guards.test.js',
+  // Whole-tree scanner: any server file can add an import of client source.
+  'scripts/server-imports-no-client.test.js',
   'scripts/tailnet-identity-leak.test.js',
   'server/dependency-overrides.test.js',
   // Whole-tree scanner: any server file can add a `process.env` read, and
@@ -206,6 +234,49 @@ const DOCUMENTATION_RULES = [
   /^(?:README|CHANGELOG|CONTRIBUTING|LICENSE)(?:\.|$)/i,
   /\.(?:md|mdx|png|jpe?g|gif|webp|svg|ico)$/i,
 ];
+
+// The bundled slashdo submodule (see AGENTS.md "Slashdo Commands") ships no
+// source into the tree the planner scans — `git diff` reports only the gitlink
+// pointer at this path, never the files inside it — so it can't be detected the
+// way an ordinary source change is. The two contract suites below exercise the
+// real bundled renderer and only mean anything with the submodule checked out,
+// so CI initializes it (see ci.yml) exactly when one of them is set to run.
+export const SLASHDO_GITLINK_PATH = 'lib/slashdo';
+export const SLASHDO_CONTRACT_TEST_FILES = [
+  'server/lib/slashdoLoader.test.js',
+  'server/lib/slashdoInvocation.test.js',
+];
+const SLASHDO_CONTRACT_SOURCE_FILES = [
+  'server/lib/slashdoLoader.js',
+  'server/lib/slashdoInvocation.js',
+];
+
+/**
+ * Whether this plan's server job needs `lib/slashdo` initialized.
+ *
+ * The `changedFiles` check is currently unreachable from `buildCiTestPlan`
+ * itself: `SLASHDO_GITLINK_PATH` has no recognized extension, so a real
+ * gitlink change already hits the "unclassified changed file" rule and forces
+ * `plan.full = true` first, which the `plan.full` clause above already
+ * covers. It stays as a direct, defense-in-depth check — independent of that
+ * incidental classification — and is what the unit tests below exercise
+ * against a hand-built plan.
+ *
+ * This only catches a literal edit to the two source files, not an indirect
+ * one: a shared dependency of `slashdoLoader.js`/`slashdoInvocation.js`
+ * changing would not set this, even though Vitest's real `related` selection
+ * can still transitively pull the contract tests in — in which case they run
+ * without the submodule and take the documented skip. In practice a
+ * sufficiently shared dependency changing also tends to select enough tests
+ * to exceed MAX_TARGETED_TEST_FILES and force a full plan, which does trigger
+ * this; a narrowly-shared one is the remaining gap.
+ */
+export const needsSlashdoSubmodule = (plan) => Boolean(
+  plan.full
+  || plan.changedFiles.includes(SLASHDO_GITLINK_PATH)
+  || plan.server.files.some((path) => SLASHDO_CONTRACT_TEST_FILES.includes(path))
+  || plan.server.sources.some((path) => SLASHDO_CONTRACT_SOURCE_FILES.includes(path))
+);
 
 const RUNNER_ROOTS = {
   server: [
@@ -279,13 +350,14 @@ const structuralTestsFor = (changedFiles, trackedSet) => {
   if (changedFiles.some((path) => /^server\/lib\//.test(path))) {
     add('server/lib/index.test.js');
   }
-  // The generated-manifest drift tests regenerate from the tree and compare;
-  // they import neither the route modules nor the stage call sites they scan,
-  // so no import edge selects them. Without this rule a route added on a
-  // scoped plan merged with a stale catalog (#5898), and every later full-plan
-  // PR inherited the red drift test until someone committed a regeneration.
+  // These guards read the tree rather than importing it, so no import edge
+  // selects them: the route-graph guard catches a route file nothing mounts,
+  // the parity guard a client wrapper stranded by a renamed mount, and the
+  // prompt-stage drift test a stale manifest — which is what a scoped plan
+  // let merge before this rule existed (#5898).
   if (changedFiles.some((path) => /^server\/.*\.js$/.test(path) || /^server\/lib\/.*\.generated\.json$/.test(path))) {
-    add('scripts/generate-api-route-catalog.test.js');
+    add('server/lib/apiRouteGraph.test.js');
+    add('server/lib/apiRouteParity.test.js');
     add('scripts/generate-prompt-stage-call-sites.test.js');
   }
   // The socket guard readdir-scans server/sockets/ rather than importing it, so
@@ -309,15 +381,18 @@ const structuralTestsFor = (changedFiles, trackedSet) => {
   // Both `.js` and `.jsx`: the StrictMode mounted-ref bug the first guard covers
   // reached its widest blast radius through a plain-`.js` hook (`useAsyncAction`),
   // so a `.jsx`-only trigger would miss the case that matters most, and the
-  // responsive-grid, popover-clamp, safe-storage, and heading-truncation guards
-  // read class strings, storage accesses, and JSX markup out of both extensions.
+  // responsive-grid, popover-clamp, pre-wrap/break, safe-storage,
+  // heading-truncation, and global-shadow guards read class strings, storage
+  // accesses, declarations, and JSX markup out of both extensions.
   // None of these files has a source sibling or imports an app module, so nothing
   // else selects them — without this entry they only ever run on a full suite.
   if (changedFiles.some((path) => /^client\/src\/.*\.jsx?$/.test(path))) {
+    add('client/src/globalShadowConventions.test.js');
     add('client/src/headingTruncationConventions.test.js');
     add('client/src/hooks/mountedRefConventions.test.js');
     add('client/src/pollingConventions.test.js');
     add('client/src/popoverClampConventions.test.js');
+    add('client/src/preWrapClasses.test.js');
     add('client/src/responsiveGridConventions.test.js');
     add('client/src/storageConventions.test.js');
   }
@@ -412,8 +487,10 @@ export function buildCiTestPlan(changedFiles, {
   forceFull = false,
   forceFullReason = 'full CI requested',
   appRouteOnly = false,
-  // Changed python script → tracked test files naming it (see PYTHON_SCRIPT_RE).
-  pythonContractTests = {},
+  // Changed source path → tracked test files naming its basename (see
+  // sourceReferencePattern). Covers every changed source, not only python
+  // scripts — see rule 1 of issue #6363.
+  pathContractTests = {},
 } = {}) {
   const changed = uniqueSorted(changedFiles.filter(Boolean));
   const trackedSet = new Set(trackedFiles);
@@ -516,12 +593,22 @@ export function buildCiTestPlan(changedFiles, {
   ];
 
   for (const script of pythonSources) {
-    const pythonTests = (pythonContractTests[script] || [])
+    const pythonTests = (pathContractTests[script] || [])
       .filter((path) => trackedSet.has(path) && runnerForTest(path));
     if (pythonTests.length === 0) {
       return fullPlan(changed, `python script with no parsing contract: ${script}`, { appRouteOnly });
     }
     selectedTests.push(...pythonTests);
+  }
+
+  // Every other changed source rides the same basename `git grep` lookup, but
+  // additively: unlike python, a JS/TS source is already reachable through the
+  // import graph or a feature directory, so an empty hit list here is not an
+  // error — it just means nothing reads this file as text.
+  for (const source of jsSources) {
+    const namedTests = (pathContractTests[source] || [])
+      .filter((path) => trackedSet.has(path) && runnerForTest(path));
+    selectedTests.push(...namedTests);
   }
 
   for (const testFile of trackedFiles.filter(isTestFile)) {
@@ -600,6 +687,7 @@ export function buildCiTestPlan(changedFiles, {
 /** The derived fields every plan carries: per-suite reasons and shard matrices. */
 const finishPlan = (plan, options) => ({
   ...plan,
+  slashdo: needsSlashdoSubmodule(plan),
   suiteReasons: suiteReasonsFor(plan, options),
   shards: {
     server: shardIndexes(plan.server.mode, FULL_SUITE_SHARDS.server),
@@ -656,6 +744,7 @@ export function emitGitHubPlan(plan) {
     lint_files: JSON.stringify(plan.lint.files),
     build: plan.build,
     smoke: plan.smoke,
+    slashdo: plan.slashdo,
     windows: plan.windows,
     windows_mode: plan.windowsMode,
     windows_files: JSON.stringify(plan.windowsFiles),
@@ -704,16 +793,22 @@ function main() {
   const appDiff = forceFull || !changedFiles.includes('client/src/App.jsx')
     ? null
     : execFileSync('git', ['diff', '--unified=0', `${base}...HEAD`, '--', 'client/src/App.jsx'], { encoding: 'utf8' });
-  const pythonContractTests = Object.fromEntries(changedFiles.filter(isPythonScript).map((script) => [
-    script,
-    gitGrepFiles(pythonReferencePattern(script), ['*.test.js', '*.test.jsx']),
-  ]));
+  // Every changed executable, non-test source — not only python scripts — gets
+  // a basename lookup: `git grep`-ing tracked test files for its filename finds
+  // the text-reading contract tests (mirror parity, navManifest.js's 20+ client
+  // reads) that no import edge or feature-directory match can reach. Basename
+  // matching is deliberate: a mirror test names the client copy only as e.g.
+  // 'canonPrompt.js', never by its full path. Over-selection here costs
+  // seconds; under-selection is the bug this closes (issue #6363).
+  const pathContractTests = Object.fromEntries(changedFiles
+    .filter((path) => isExecutable(path) && !isTestFile(path))
+    .map((path) => [path, gitGrepFiles(sourceReferencePattern(path), TEST_FILE_GLOBS)]));
   emitGitHubPlan(buildCiTestPlan(changedFiles, {
     trackedFiles,
     forceFull,
     forceFullReason,
     appRouteOnly: isRouteOnlyAppDiff(appDiff),
-    pythonContractTests,
+    pathContractTests,
   }));
 }
 

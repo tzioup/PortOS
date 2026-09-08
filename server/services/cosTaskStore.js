@@ -12,6 +12,7 @@
  * logic stays in cos.js while persistence lives here.
  */
 
+import { reviewerModelsFromDefaults } from '../lib/reviewerConfig.js';
 import { readFile, writeFile, stat } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
@@ -26,6 +27,8 @@ import { REQUEUED_AT_KEY } from '../lib/taskRequeue.js';
 import { isInvestigationTask } from '../lib/investigationTasks.js';
 import { PAUSED_BLOCKED_CATEGORIES, USER_DECISION_BLOCKED_CATEGORIES } from '../lib/taskBlockCategories.js';
 import { splitTaskPromptFields } from '../lib/cosTaskPrompt.js';
+import { quotaBurnProvenance, quotaBurnTaskMetadata } from '../lib/quotaBurnOrigin.js';
+import { normalizeOrchestrationMode, normalizeOrchestrationProfile } from '../lib/orchestrationProfile.js';
 import { loadState, withStateLock, ROOT_DIR } from './cosState.js';
 import { cosEvents } from './cosEvents.js';
 import { CLAIM_METADATA_KEYS, TARGET_INSTANCE_KEY, getTargetInstance } from './cosTaskClaim.js';
@@ -67,7 +70,7 @@ const isTerminalTaskStatus = (status) => status === 'completed' || status === 'b
 // with the #4153 split so the task editor can edit the agent-facing payload the
 // same way it edits the human note — deliberately WITHOUT re-classification, so
 // a multi-line note edit can't overwrite the payload (see `splitTaskPromptFields`).
-const LEGACY_DIRECT_FIELDS = ['context', 'prompt', 'model', 'provider', 'effort', 'temperature', 'thinking', 'app'];
+const LEGACY_DIRECT_FIELDS = ['context', 'prompt', 'model', 'provider', 'effort', 'temperature', 'thinking', 'app', 'orchestrationMode', 'orchestrationProfile'];
 
 // Equality for metadata values across a fresh markdown re-parse: primitives by
 // ===, arrays/objects (reviewers[], screenshots[], …) by JSON since the two
@@ -134,7 +137,7 @@ function isContentEdit(updates, existingMetadata = {}) {
 //   2. Every write through `writeTaskFile` DROPS the entry outright. mtime can
 //      be as coarse as one second on some filesystems, so a write-then-read in
 //      the same tick must not depend on the stamp having moved.
-const parsedTaskCache = new Map(); // filePath -> { stamp, tasks }
+const parsedTaskCache = new Map(); // filePath -> { stamp, tasks, byId? }
 
 // `null` = could not stat (missing/unreadable) → do not cache, distinct from a
 // legitimately empty file, which stamps normally and caches its empty parse.
@@ -143,24 +146,35 @@ const taskFileStamp = async (filePath) => {
   return stats ? `${stats.mtimeMs}:${stats.size}` : null;
 };
 
-/**
- * Read + parse a task markdown file, serving the cached parse when the file is
- * unchanged on disk.
- *
- * Always returns a DEEP COPY. Callers (`addTask`, `updateTask`, `reorderTasks`,
- * the sweeps) mutate both the array and the task objects in place; handing out
- * the cached originals would let one caller's in-flight edits leak into every
- * later reader — including edits that were never persisted.
- */
-async function readTaskFile(filePath) {
+// Private snapshots never leave this module: list readers clone the array,
+// while ID lookups clone only the matching task. Both share invalidation.
+async function readTaskSnapshot(filePath) {
   const stamp = await taskFileStamp(filePath);
   const cached = parsedTaskCache.get(filePath);
-  if (stamp && cached?.stamp === stamp) return structuredClone(cached.tasks);
+  if (stamp && cached?.stamp === stamp) return cached;
 
-  const tasks = parseTasksMarkdown(await readFile(filePath, 'utf-8'));
-  if (stamp) parsedTaskCache.set(filePath, { stamp, tasks });
+  const snapshot = { stamp, tasks: parseTasksMarkdown(await readFile(filePath, 'utf-8')) };
+  if (stamp) parsedTaskCache.set(filePath, snapshot);
   else parsedTaskCache.delete(filePath);
-  return structuredClone(tasks);
+  return snapshot;
+}
+
+async function readTaskFile(filePath) {
+  return structuredClone((await readTaskSnapshot(filePath)).tasks);
+}
+
+async function findTaskInFile(filePath, taskId) {
+  if (!existsSync(filePath)) return null;
+  const snapshot = await readTaskSnapshot(filePath);
+  if (!snapshot.byId) {
+    snapshot.byId = new Map();
+    for (const task of snapshot.tasks) {
+      // Preserve Array.find's first-match behavior for hand-edited duplicate IDs.
+      if (!snapshot.byId.has(task.id)) snapshot.byId.set(task.id, task);
+    }
+  }
+  const task = snapshot.byId.get(taskId);
+  return task ? structuredClone(task) : null;
 }
 
 /**
@@ -230,19 +244,14 @@ export const getTasks = getUserTasks;
  * Get a specific task by ID from any task source
  */
 export async function getTaskById(taskId) {
-  const { user: userTasks, cos: cosTasks } = await getAllTasks();
+  const { config } = await loadState();
+  // Keep user-first precedence, including legacy/custom IDs. Do not infer the
+  // source from a prefix or prepare grouped copies of both queues for one ID.
+  const userTask = await findTaskInFile(join(ROOT_DIR, config.userTasksFile), taskId);
+  if (userTask) return { ...userTask, taskType: 'user' };
 
-  // Search user tasks
-  const userTask = userTasks.tasks?.find(t => t.id === taskId);
-  if (userTask) {
-    return { ...userTask, taskType: 'user' };
-  }
-
-  // Search CoS internal tasks
-  const cosTask = cosTasks.tasks?.find(t => t.id === taskId);
-  if (cosTask) {
-    return { ...cosTask, taskType: 'internal' };
-  }
+  const cosTask = await findTaskInFile(join(ROOT_DIR, config.cosTasksFile), taskId);
+  if (cosTask) return { ...cosTask, taskType: 'internal' };
 
   return null;
 }
@@ -338,6 +347,16 @@ export async function addTask(taskData, taskType = 'user', { raw = false, ignore
     if (taskData.model) metadata.model = taskData.model;
     if (taskData.provider) metadata.provider = taskData.provider;
     if (taskData.effort) metadata.effort = taskData.effort;
+    // Orchestrated execution (#5992). Both keys are persisted only when they
+    // survive normalization, so a mode with no usable profile — or a profile of
+    // empty role objects — leaves the task in today's `direct` posture rather
+    // than stamping an inert override onto it. The default mode is never written:
+    // absent already means `direct`, and writing it would touch every task.
+    const orchestrationProfile = normalizeOrchestrationProfile(taskData.orchestrationProfile);
+    if (orchestrationProfile) metadata.orchestrationProfile = orchestrationProfile;
+    if (normalizeOrchestrationMode(taskData.orchestrationMode) === 'orchestrated') {
+      metadata.orchestrationMode = 'orchestrated';
+    }
     if (taskData.temperature !== undefined) metadata.temperature = taskData.temperature;
     if (taskData.thinking !== undefined) metadata.thinking = taskData.thinking;
     if (taskData.app) metadata.app = taskData.app;
@@ -510,17 +529,16 @@ export async function addTask(taskData, taskType = 'user', { raw = false, ignore
     if (taskData.liProposal && typeof taskData.liProposal === 'object' && !Array.isArray(taskData.liProposal)) {
       metadata.liProposal = taskData.liProposal;
     }
-    // Which provider family's window this burn task is spending. Read by
-    // `isCooldownExemptTask` (cosTaskGenerator.js, which owns the why) and by
-    // quotaBurnRunner's completion continuation.
-    if (taskData.quotaBurnFamily) metadata.quotaBurnFamily = taskData.quotaBurnFamily;
-    // The reset of the SHORT rolling window that will refuse first, so a run the
-    // provider refuses can block that family until the window rolls rather than
-    // letting the continuation re-dispatch into the same wall (the weekly card
-    // it gates on still reads healthy). See quotaBurnDenials.js.
-    if (Number.isFinite(taskData.quotaBurnLimitingResetAt)) {
-      metadata.quotaBurnLimitingResetAt = taskData.quotaBurnLimitingResetAt;
-    }
+    // Quota-burn provenance — which family's window this task spends, which
+    // window will refuse first, which burn step asked, and which on-demand
+    // request (if any) it was generated for. The built-in lane stamps these onto
+    // the generated task's metadata via `lib/quotaBurnOrigin.js` and reaches disk
+    // through the RAW path above; a custom-job burn reaches disk through this
+    // non-raw path instead. Both spread the SAME block so the two lanes cannot
+    // carry different provenance for the same feature — mapping the keys one at
+    // a time here is how `quotaBurnStepId` came to reach disk without ever
+    // reaching the agent (#6406). `quotaBurnOrigin.js` owns the why of each field.
+    Object.assign(metadata, quotaBurnTaskMetadata(quotaBurnProvenance(taskData)));
     if (planOnly) {
       // Plan-and-file is a single bounded CoS action. The bundled plan-task
       // command is already issue-only, so pass its supported `--yes` flag to
@@ -577,11 +595,17 @@ export async function addTask(taskData, taskType = 'user', { raw = false, ignore
   // NOTE and re-classifying a multi-line edit of it would overwrite the task's
   // real prompt. A producer that already wrote `metadata.prompt` wins over the
   // inference. See `server/lib/cosTaskPrompt.js` for the full contract.
-  const splitMetadata = splitTaskPromptFields(newTask.metadata);
-  if (splitMetadata !== newTask.metadata) newTask = { ...newTask, metadata: splitMetadata };
   // Markdown task rows are one-line records. Preserve every generated prompt
   // in the newline-safe metadata field before persistence, including raw
   // on-demand tasks that bypass the queue generator's normalization pass.
+  //
+  // This runs BEFORE the context reclassification below on purpose: a producer
+  // that hands over a multi-line description AND a multi-line context note (the
+  // pr-reviewer generator's security-scan summary) means the description is the
+  // prompt and the note is the note. Reclassifying first promoted the note to
+  // `prompt`, which then counted as an explicit producer prompt and silently
+  // discarded the stage instructions — Stage 2 ran with no gate rules and no
+  // output contract.
   if (typeof newTask.description === 'string' && newTask.description.includes('\n')) {
     newTask = {
       ...newTask,
@@ -594,6 +618,8 @@ export async function addTask(taskData, taskType = 'user', { raw = false, ignore
       },
     };
   }
+  const splitMetadata = splitTaskPromptFields(newTask.metadata);
+  if (splitMetadata !== newTask.metadata) newTask = { ...newTask, metadata: splitMetadata };
 
   // Add task to top or bottom based on position parameter
   if (taskData.position === 'top') {
@@ -708,6 +734,17 @@ async function writeTaskUpdate(taskId, updates, taskType, { now, suppressDequeue
   // Only null becomes undefined (→ deleted); absent fields never enter this loop.
   for (const f of LEGACY_DIRECT_FIELDS) {
     if (updates[f] !== undefined) updatedMetadata[f] = updates[f] ?? undefined;
+  }
+  // Re-normalize the orchestration pins the loop above just copied in verbatim
+  // (#5992), so an update lands the same persisted shape `addTask` writes: a
+  // profile of empty role objects, or the default `direct` mode, is stored as
+  // absent rather than as an inert override. A null from the route still reaches
+  // here as `undefined` and is deleted by the cleanup pass — an explicit clear.
+  if (updatedMetadata.orchestrationProfile !== undefined) {
+    updatedMetadata.orchestrationProfile = normalizeOrchestrationProfile(updatedMetadata.orchestrationProfile) ?? undefined;
+  }
+  if (updatedMetadata.orchestrationMode !== undefined) {
+    updatedMetadata.orchestrationMode = normalizeOrchestrationMode(updatedMetadata.orchestrationMode) === 'orchestrated' ? 'orchestrated' : undefined;
   }
 
   // Clear blocked/failure metadata when transitioning out of blocked status.
@@ -1320,7 +1357,7 @@ export async function resolveTaskChallenge(taskId, { outcome, note, resolvedBy }
  * (→ upheld). This is the cheap confirm/overturn pass that runs BEFORE falling back
  * to user escalation, closing the gap #2470 left ("this slice resolves manually").
  *
- * Only the in-process local reviewers (`lmstudio`/`ollama`) are re-run here; CLI
+ * Only the in-process local reviewers (`LOCAL_LLM_REVIEWERS`) are re-run here; CLI
  * reviewers are re-run by the follow-up agent itself, which then calls the manual
  * `resolveTaskChallenge` path with an explicit outcome.
  *
@@ -1346,19 +1383,21 @@ export async function resolveTaskChallengeWithRecheck(taskId, { recheck, resolve
   // stale level is null by the time it reaches here — same as the model read below.
   const recheckDefaults = await getCodeReviewDefaults().catch(() => null);
   const effort = recheckDefaults?.[`${backend}Effort`] || null;
-  let model = recheck?.model;
-  if (!model) {
-    model = backend === 'ollama' ? recheckDefaults?.ollamaModel : recheckDefaults?.lmstudioModel;
-  }
-  // A missing model is a config problem (no Code Review Defaults set), not an
-  // upstream-reviewer failure — surface it as a 4xx (RECHECK_NO_MODEL → 400), not
-  // the 502 bucket reserved for a reviewer that's actually unreachable.
-  if (!model) {
-    return { error: `No model configured for the ${backend} reviewer — set one on the Settings → Code Reviewers page.`, code: 'RECHECK_NO_MODEL' };
-  }
-  console.log(`⚖️ Re-checking challenge on ${taskId} via ${backend} (${model}${effort ? `, ${effort} effort` : ''})`);
+  // Keyed off the roster's `<reviewer>Model` scalar rather than a per-backend
+  // branch (matching `POST /api/code-review/local`): the old ollama-or-lmstudio
+  // ternary read LM STUDIO's model for any third local backend, so an `mtplx`
+  // re-check ran against a model id from the wrong daemon.
+  //
+  // An unset scalar is no longer fatal here: `runLocalCodeReview` falls back to the
+  // model the backend is actually serving when that answer is unambiguous, so a
+  // single-model daemon re-checks without one. It reports `code: 'NO_MODEL'` when it
+  // could not resolve one either, which stays a config problem (4xx) rather than the
+  // 502 bucket reserved for a reviewer that's actually unreachable.
+  const model = recheck?.model || reviewerModelsFromDefaults(recheckDefaults)[backend] || null;
+  console.log(`⚖️ Re-checking challenge on ${taskId} via ${backend} (${model || 'model from the backend'}${effort ? `, ${effort} effort` : ''})`);
   const review = await runLocalCodeReview({ backend, model, effort, diff: recheck?.diff });
   if (!review?.ok) {
+    if (review?.code === 'NO_MODEL') return { error: review.error, code: 'RECHECK_NO_MODEL' };
     return { error: `Re-check failed: ${review?.error || 'unknown reviewer error'}`, code: 'RECHECK_FAILED' };
   }
   const outcome = classifyRecheckOutcome(review.findings);
@@ -1370,6 +1409,9 @@ export async function resolveTaskChallengeWithRecheck(taskId, { recheck, resolve
     : `a blocking finding still stands (${backend})`;
   // The resolution note is auto-generated from the re-check verdict (any caller
   // `note` is intentionally not threaded here — the machine verdict is the record).
-  const note = `Auto re-check by ${backend} (${model}): ${verdict}.`;
+  // `review.model` rather than `model`: the reviewer resolves an unpinned id from
+  // what the backend is serving, and the record has to name the model that actually
+  // produced this verdict, not `null`.
+  const note = `Auto re-check by ${backend} (${review.model || model}): ${verdict}.`;
   return resolveTaskChallenge(taskId, { outcome, note, resolvedBy: resolvedBy || `recheck:${backend}` }, taskType, { now });
 }

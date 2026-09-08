@@ -74,11 +74,11 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe('AutomationTab per-app overrides', () => {
+describe('AutomationTab per-app options', () => {
   it('Configure toggle expands the provider override panel', async () => {
     await renderTab();
     const row = rowFor('layered-intelligence');
-    const configureBtn = within(row).getByRole('button', { name: /show provider and model overrides/i });
+    const configureBtn = within(row).getByRole('button', { name: /show provider and model options/i });
     expect(configureBtn).toHaveAttribute('aria-expanded', 'false');
     // Provider selector is not rendered until expanded.
     expect(within(row).queryByLabelText('Provider override')).toBeNull();
@@ -89,10 +89,31 @@ describe('AutomationTab per-app overrides', () => {
     expect(within(row).getByLabelText('Provider override')).toBeInTheDocument();
   });
 
+  it('flags a provider override that diverges from the schedule pin, collapsed', async () => {
+    // Schedule pins layered-intelligence to 'global-claude'; the app overrides
+    // it to a DIFFERENT provider — the exact silent-shadowing scenario #4783
+    // documents. Must be visible without expanding Configure.
+    await renderTab({ 'layered-intelligence': { providerId: 'claude-cli' } });
+    const row = rowFor('layered-intelligence');
+    expect(within(row).getByText('Provider override')).toBeInTheDocument();
+  });
+
+  it('does not flag an override that matches the schedule pin', async () => {
+    await renderTab({ 'layered-intelligence': { providerId: 'global-claude' } });
+    const row = rowFor('layered-intelligence');
+    expect(within(row).queryByText('Provider override')).toBeNull();
+  });
+
+  it('does not flag a task type with no app override', async () => {
+    await renderTab();
+    const row = rowFor('layered-intelligence');
+    expect(within(row).queryByText('Provider override')).toBeNull();
+  });
+
   it('changing the provider PATCHes updateAppTaskTypeOverride with providerId + cleared model', async () => {
     await renderTab();
     const row = rowFor('layered-intelligence');
-    fireEvent.click(within(row).getByRole('button', { name: /show provider and model overrides/i }));
+    fireEvent.click(within(row).getByRole('button', { name: /show provider and model options/i }));
 
     const providerSelect = within(row).getByLabelText('Provider override');
     fireEvent.change(providerSelect, { target: { value: 'claude-cli' } });
@@ -109,7 +130,7 @@ describe('AutomationTab per-app overrides', () => {
   it('changing the model PATCHes updateAppTaskTypeOverride with the model', async () => {
     await renderTab({ 'layered-intelligence': { providerId: 'claude-cli' } });
     const row = rowFor('layered-intelligence');
-    fireEvent.click(within(row).getByRole('button', { name: /show provider and model overrides/i }));
+    fireEvent.click(within(row).getByRole('button', { name: /show provider and model options/i }));
 
     fireEvent.change(within(row).getByLabelText('Model'), { target: { value: 'sonnet' } });
 
@@ -124,7 +145,7 @@ describe('AutomationTab per-app overrides', () => {
   it('excludes disabled providers from the picker', async () => {
     await renderTab();
     const row = rowFor('layered-intelligence');
-    fireEvent.click(within(row).getByRole('button', { name: /show provider and model overrides/i }));
+    fireEvent.click(within(row).getByRole('button', { name: /show provider and model options/i }));
     const providerSelect = within(row).getByLabelText('Provider override');
     expect(within(providerSelect).queryByText('Disabled')).toBeNull();
     expect(within(providerSelect).getByText('Claude Code')).toBeInTheDocument();
@@ -133,7 +154,7 @@ describe('AutomationTab per-app overrides', () => {
   it('layered-intelligence row shows a behavior link that deep-links to the Intelligence tab', async () => {
     await renderTab();
     const row = rowFor('layered-intelligence');
-    fireEvent.click(within(row).getByRole('button', { name: /show provider and model overrides/i }));
+    fireEvent.click(within(row).getByRole('button', { name: /show provider and model options/i }));
 
     const link = within(row).getByRole('button', { name: /configure behavior/i });
     fireEvent.click(link);
@@ -145,14 +166,14 @@ describe('AutomationTab per-app overrides', () => {
   it('offers the same provider picker on a task type with no hook', async () => {
     await renderTab();
     const row = rowFor('app-improvement');
-    fireEvent.click(within(row).getByRole('button', { name: /show provider and model overrides/i }));
+    fireEvent.click(within(row).getByRole('button', { name: /show provider and model options/i }));
     expect(within(row).getByLabelText('Provider override')).toBeInTheDocument();
   });
 
   it('clearing the provider sends explicit nulls, matching the other pin surfaces', async () => {
     await renderTab({ 'app-improvement': { providerId: 'claude-cli', model: 'opus' } });
     const row = rowFor('app-improvement');
-    fireEvent.click(within(row).getByRole('button', { name: /show provider and model overrides/i }));
+    fireEvent.click(within(row).getByRole('button', { name: /show provider and model options/i }));
 
     fireEvent.change(within(row).getByLabelText('Provider override'), { target: { value: '' } });
     await waitFor(() => expect(api.updateAppTaskTypeOverride).toHaveBeenCalledWith(

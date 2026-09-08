@@ -22,12 +22,12 @@ vi.mock('./providerStatus.js', () => ({
   getFallbackProvider: vi.fn(),
   getProviderStatus: vi.fn(),
 }));
-vi.mock('./agentModelSelection.js', () => ({ selectModelForTask: vi.fn() }));
+vi.mock('./agentModelSelection.js', () => ({ selectModelForTask: vi.fn(), selectModelForRole: vi.fn() }));
 
 import { resolveAgentProviderAndModel } from './agentProviderResolution.js';
 import { getActiveProvider, getAllProviders, getProviderById } from './providers.js';
 import { isProviderAvailable, getFallbackProvider, getProviderStatus } from './providerStatus.js';
-import { selectModelForTask } from './agentModelSelection.js';
+import { selectModelForRole, selectModelForTask } from './agentModelSelection.js';
 
 const TASK = { id: 'task-1', metadata: {} };
 
@@ -36,9 +36,26 @@ beforeEach(() => {
   // Sensible defaults: provider present + available, plain model selection.
   isProviderAvailable.mockReturnValue(true);
   selectModelForTask.mockResolvedValue({ model: 'm-default', tier: 'medium', reason: 'default' });
+  // The ordinary path resolves through the ARCHITECT role (#5992); with no
+  // profile that is `selectModelForTask` verbatim, which is what the real
+  // module does and what every selection assertion below is written against.
+  selectModelForRole.mockImplementation((task, _role, provider, agent) => selectModelForTask(task, provider, agent));
 });
 
 describe('resolveAgentProviderAndModel', () => {
+  it('blocks pre-upgrade issue-watcher prompts before selecting any agent provider', async () => {
+    expect(await resolveAgentProviderAndModel({ id: 'legacy', metadata: { analysisType: 'issue-watcher', provider: 'cli' } }))
+      .toMatchObject({ ok: false, permanent: true, error: expect.stringContaining('tool-free') });
+    expect(getActiveProvider).not.toHaveBeenCalled();
+    expect(getProviderById).not.toHaveBeenCalled();
+  });
+  it('blocks old trusted-maintenance tasks that predate author and discussion screening', async () => {
+    for (const analysisType of ['pr-watcher', 'issue-reconcile']) {
+      expect(await resolveAgentProviderAndModel({ id: 'legacy', metadata: { analysisType } })).toMatchObject({ ok: false, permanent: true });
+    }
+    expect(getActiveProvider).not.toHaveBeenCalled();
+  });
+
   it('fails when no active provider is configured', async () => {
     getActiveProvider.mockResolvedValue(null);
     const r = await resolveAgentProviderAndModel(TASK);
@@ -138,6 +155,13 @@ describe('resolveAgentProviderAndModel', () => {
     expect(r.provider).toBe(fallback);
     // The fallback's configured model pin wins over the normal selection.
     expect(r.selectedModel).toBe('fb-model');
+  });
+
+  it('falls back from an unavailable Ultra mapping to an offered Heavy model', async () => {
+    getActiveProvider.mockResolvedValue({ id: 'p1', type: 'cli', models: ['heavy'], ultraModel: 'unavailable', heavyModel: 'heavy' });
+    selectModelForTask.mockResolvedValue({ model: 'unavailable', tier: 'ultra', reason: 'user-preference' });
+    const result = await resolveAgentProviderAndModel(TASK);
+    expect(result.selectedModel).toBe('heavy');
   });
 
   it('honors a user-specified provider and clears any fallback pin', async () => {
@@ -349,7 +373,7 @@ describe('resolveAgentProviderAndModel', () => {
 // exact failure this branch exists to prevent. These pin that the eligible set
 // comes from the install's own enabled providers instead.
 describe('resolveAgentProviderAndModel — public-review stages', () => {
-  const CODEX = { id: 'codex-cli', type: 'cli', command: 'codex' };
+  const CLAUDE = { id: 'claude-code', type: 'cli', command: 'claude' };
   const GROK = { id: 'grok-cli', type: 'cli', command: 'grok' };
   const OPENCODE = { id: 'opencode', type: 'cli', command: 'opencode' };
   const gateTask = (metadata = {}) => ({
@@ -365,19 +389,93 @@ describe('resolveAgentProviderAndModel — public-review stages', () => {
     expect(getFallbackProvider).not.toHaveBeenCalled();
   });
 
-  it('ignores a stage pin that is not eligible for the posture', async () => {
-    getAllProviders.mockResolvedValue({ providers: [OPENCODE, CODEX], activeProvider: null });
-    const r = await resolveAgentProviderAndModel(gateTask({ provider: 'opencode' }));
-    expect(r).toMatchObject({ ok: true, provider: { id: 'codex-cli' } });
+  it('blocks queued legacy PR review tasks before any unsafe provider selection', async () => {
+    const result = await resolveAgentProviderAndModel({ id: 'old-pr', metadata: { analysisType: 'pr-reviewer', executionProfile: 'public-review-actions' } });
+    expect(result).toMatchObject({ ok: false, permanent: true });
+    expect(getAllProviders).not.toHaveBeenCalled();
   });
 
+  it('ignores a stage pin that is not eligible for the posture', async () => {
+    getAllProviders.mockResolvedValue({ providers: [OPENCODE, CLAUDE], activeProvider: null });
+    const r = await resolveAgentProviderAndModel(gateTask({ provider: 'opencode' }));
+    expect(r).toMatchObject({ ok: true, provider: { id: 'claude-code' } });
+  });
+
+  // `selectModelForTask`'s real precedence: `task.metadata.model` wins outright
+  // over everything else. The suite's flat `m-default` default cannot observe a
+  // pin that leaks through it, so the tests below that assert a pin was DROPPED
+  // install this instead — otherwise they pass no matter what the code does.
+  const useRealisticModelSelection = () => selectModelForTask.mockImplementation(async (task, provider) => (
+    task?.metadata?.model
+      ? { model: task.metadata.model, tier: 'user-specified', reason: 'user-preference' }
+      : { model: provider?.defaultModel || 'm-default', tier: 'medium', reason: 'default' }
+  ));
+
   it('keeps a model pin only on the provider it was chosen for', async () => {
-    getAllProviders.mockResolvedValue({ providers: [CODEX, GROK], activeProvider: null });
+    useRealisticModelSelection();
+    getAllProviders.mockResolvedValue({ providers: [CLAUDE, GROK], activeProvider: null });
     await expect(resolveAgentProviderAndModel(gateTask({ provider: 'grok-cli', model: 'grok-4' })))
       .resolves.toMatchObject({ provider: { id: 'grok-cli' }, selectedModel: 'grok-4' });
     // Pinned for a DIFFERENT provider — falls back to that provider's own model.
+    // The posture swap above landed on claude-code, and grok's model id must not
+    // ride along with it; leaving the pin on the task let `selectModelForTask`
+    // hand it straight back, so the swap silently kept the foreign model.
     await expect(resolveAgentProviderAndModel(gateTask({ provider: 'opencode', model: 'grok-4' })))
-      .resolves.toMatchObject({ provider: { id: 'codex-cli' }, selectedModel: 'm-default' });
+      .resolves.toMatchObject({ provider: { id: 'claude-code' }, selectedModel: 'm-default' });
+  });
+
+  // A stage pin outlives edits to the provider's own model list: the live
+  // pr-reviewer gate sat pinned to an id its provider no longer offered, so
+  // every run spawned a CLI that could not serve the model, produced no
+  // output, and was retried — matching the provider is not enough on its own.
+  it('drops a model pin the matching provider no longer offers', async () => {
+    const CURATED = { id: 'grok-cli', type: 'cli', command: 'grok', models: ['grok-4'], defaultModel: 'grok-4' };
+    getAllProviders.mockResolvedValue({ providers: [CURATED], activeProvider: null });
+
+    // Still listed → honored.
+    await expect(resolveAgentProviderAndModel(gateTask({ provider: 'grok-cli', model: 'grok-4' })))
+      .resolves.toMatchObject({ provider: { id: 'grok-cli' }, selectedModel: 'grok-4' });
+
+    // Retired from the list → the provider's own selection wins instead.
+    await expect(resolveAgentProviderAndModel(gateTask({ provider: 'grok-cli', model: 'grok-3-retired' })))
+      .resolves.toMatchObject({ provider: { id: 'grok-cli' }, selectedModel: 'm-default' });
+  });
+
+  // The drop above has to survive model selection, which is where it used to
+  // be undone: `selectModelForTask` answers `metadata.model` verbatim as its
+  // highest-priority tier, so a resolution that left the rejected pin on the
+  // task got the same id back and spawned the CLI with it — while logging that
+  // it was "using its default instead". The mock is given the real precedence
+  // here on purpose; the flat `m-default` default cannot observe the bug.
+  it('does not let model selection hand the rejected pin back', async () => {
+    useRealisticModelSelection();
+    const CURATED = { id: 'grok-cli', type: 'cli', command: 'grok', models: ['grok-4'], defaultModel: 'grok-4' };
+    getAllProviders.mockResolvedValue({ providers: [CURATED], activeProvider: null });
+
+    const r = await resolveAgentProviderAndModel(gateTask({ provider: 'grok-cli', model: 'grok-3-retired' }));
+    expect(r.selectedModel).toBe('grok-4');
+  });
+
+  // A LOCAL runtime's `models` array is a cached snapshot of what the daemon
+  // had; the daemon itself is the authority, and the stage picker offers what
+  // it reports. Judging the pin against the snapshot rejected a model that was
+  // installed and serving — the live pr-reviewer gate logged "not offered by
+  // provider" for a freshly pulled Ollama model on every dispatch.
+  it('honors a model pin on a local-runtime provider whose cached list omits it', async () => {
+    const LOCAL = {
+      id: 'grok-ollama', type: 'cli', command: 'grok', ollamaBacked: true,
+      models: ['qwen3-coder:30b'], defaultModel: 'qwen3-coder:30b',
+    };
+    getAllProviders.mockResolvedValue({ providers: [LOCAL], activeProvider: null });
+    await expect(resolveAgentProviderAndModel(gateTask({ provider: 'grok-ollama', model: 'gemma3:27b' })))
+      .resolves.toMatchObject({ provider: { id: 'grok-ollama' }, selectedModel: 'gemma3:27b' });
+  });
+
+  // A provider that enumerates no models is a pass-through, so the pin stands.
+  it('honors a model pin on a provider that enumerates no models', async () => {
+    getAllProviders.mockResolvedValue({ providers: [GROK], activeProvider: null });
+    await expect(resolveAgentProviderAndModel(gateTask({ provider: 'grok-cli', model: 'anything-goes' })))
+      .resolves.toMatchObject({ provider: { id: 'grok-cli' }, selectedModel: 'anything-goes' });
   });
 
   it('blocks PERMANENTLY when no enabled provider can enforce the posture', async () => {
@@ -388,13 +486,123 @@ describe('resolveAgentProviderAndModel — public-review stages', () => {
     expect(r.error).toMatch(/no-tool/);
   });
 
-  it('requires the sandboxed posture for the actions stage, not merely a CLI', async () => {
-    const LOCAL_CLAUDE = { id: 'claude-ollama', type: 'cli', command: 'claude', ollamaBacked: true };
-    getAllProviders.mockResolvedValue({ providers: [LOCAL_CLAUDE], activeProvider: { id: 'claude-ollama' } });
-    // Claude has a no-tool recipe but no sandbox recipe.
+  it('requires a maintained actions recipe for binary providers and rejects API spawns', async () => {
+    const OPENCODE = { id: 'opencode', type: 'cli', command: 'opencode' };
+    getAllProviders.mockResolvedValue({ providers: [OPENCODE], activeProvider: { id: 'opencode' } });
+    // opencode has no no-tool recipe, so the gate fails closed; the actions
+    // stage still runs headless in the disposable worktree.
     await expect(resolveAgentProviderAndModel({ id: 't', metadata: { executionProfile: 'public-review-gate' } }))
-      .resolves.toMatchObject({ ok: true, provider: { id: 'claude-ollama' } });
+      .resolves.toMatchObject({ ok: false, permanent: true });
     await expect(resolveAgentProviderAndModel({ id: 't', metadata: { executionProfile: 'public-review-actions' } }))
       .resolves.toMatchObject({ ok: false, permanent: true });
+
+    getAllProviders.mockResolvedValue({ providers: [{ id: 'ollama', type: 'api' }], activeProvider: { id: 'ollama' } });
+    await expect(resolveAgentProviderAndModel({ id: 't', metadata: { executionProfile: 'public-review-actions' } }))
+      .resolves.toMatchObject({ ok: false, permanent: true });
+  });
+});
+
+describe('orchestration profiles (#5992)', () => {
+  it('resolves the architect provider pin instead of the active provider', async () => {
+    const architectProvider = { id: 'p-architect', type: 'cli', defaultModel: 'm-architect', models: ['m-architect'] };
+    getProviderById.mockResolvedValue(architectProvider);
+    getActiveProvider.mockResolvedValue({ id: 'p-active', type: 'cli', defaultModel: 'm-active' });
+    selectModelForRole.mockResolvedValue({ model: 'm-architect', tier: 'user-specified', reason: 'orchestration-role-architect' });
+
+    const result = await resolveAgentProviderAndModel({
+      id: 'task-orchestrated',
+      metadata: {
+        orchestrationMode: 'orchestrated',
+        orchestrationProfile: { architect: { provider: 'p-architect', model: 'm-architect' } },
+      },
+    });
+
+    expect(getProviderById).toHaveBeenCalledWith('p-architect');
+    expect(result.ok).toBe(true);
+    expect(result.provider.id).toBe('p-architect');
+    expect(result.selectedModel).toBe('m-architect');
+  });
+
+  it('leaves a direct-mode task on its own metadata provider pin', async () => {
+    getProviderById.mockResolvedValue({ id: 'p-pinned', type: 'cli', defaultModel: 'm-pinned' });
+    getActiveProvider.mockResolvedValue({ id: 'p-active', type: 'cli', defaultModel: 'm-active' });
+
+    const result = await resolveAgentProviderAndModel({
+      id: 'task-direct',
+      metadata: {
+        provider: 'p-pinned',
+        orchestrationProfile: { architect: { provider: 'p-architect' } },
+      },
+    });
+
+    expect(getProviderById).toHaveBeenCalledWith('p-pinned');
+    expect(result.provider.id).toBe('p-pinned');
+  });
+
+  describe('caller execution-mode policy', () => {
+    // The same policy has to hold at all three doors, or the one it is missing
+    // from silently re-admits what the others refused.
+    it('carries the agent caller policy into fallback selection', async () => {
+      const primary = { id: 'p1', type: 'cli' };
+      const fallback = { id: 'p2', type: 'cli', defaultModel: 'm' };
+      getActiveProvider.mockResolvedValue(primary);
+      isProviderAvailable.mockReturnValue(false);
+      getProviderStatus.mockReturnValue({ message: 'down', reason: 'x' });
+      getAllProviders.mockResolvedValue({ providers: [primary, fallback] });
+      getFallbackProvider.mockResolvedValue({ provider: fallback, model: null, source: 'system' });
+      await resolveAgentProviderAndModel({ id: 't', metadata: { fallbackProvider: 'p2' } });
+
+      // An `api` route can never run a CoS agent task, so the chain must not be
+      // allowed to pick one and burn the single retry it has left.
+      expect(getFallbackProvider).toHaveBeenCalledWith('p1', expect.any(Object), 'p2', undefined, {
+        allowedModes: ['cli', 'tui'],
+      });
+    });
+
+    it('refuses a record whose type names no executable mode, permanently', async () => {
+      // A provider record edited to an unrecognized type used to sail past the
+      // `type === 'api'` test and reach spawn, where it dies on an unmapped
+      // dispatch. It is a config error no retry can fix.
+      const broken = { id: 'mystery', type: 'pty' };
+      getActiveProvider.mockResolvedValue(broken);
+      const r = await resolveAgentProviderAndModel(TASK);
+      expect(r).toMatchObject({ ok: false, permanent: true, providerId: 'mystery' });
+      expect(r.error).toContain('no file-writing harness');
+      expect(selectModelForTask).not.toHaveBeenCalled();
+    });
+
+    it('still admits both harness modes — a TUI pin is a legitimate agent route', async () => {
+      // Guards the generalization against over-reach: the agent policy allows
+      // cli AND tui, so tightening it to "cli" would break every TUI-pinned task.
+      const tuiPin = { id: 'claude-code-tui', type: 'tui', models: ['m-default'] };
+      getProviderById.mockResolvedValue(tuiPin);
+      getActiveProvider.mockResolvedValue({ id: 'other', type: 'cli' });
+      const r = await resolveAgentProviderAndModel({ id: 't', metadata: { provider: 'claude-code-tui' } });
+      expect(r.ok).toBe(true);
+      expect(r.provider).toBe(tuiPin);
+    });
+  });
+});
+
+// Regression: a private assessment must never inherit an active cloud provider
+// or regain write/publishing privileges from user-editable task metadata.
+describe('private assessment provider boundary', () => {
+  it('requires explicit local pins and never invokes the ordinary fallback resolver', async () => {
+    const task = { metadata: { analysisType: 'private-security-assessment', openPR: true, pipeline: { stage: 'publish' } } };
+    expect(await resolveAgentProviderAndModel(task)).toMatchObject({ ok: false, permanent: true });
+    expect(task.metadata).toMatchObject({ readOnly: true, openPR: false, fileIssues: false });
+    expect(task.metadata.pipeline).toBeUndefined();
+    expect(getActiveProvider).not.toHaveBeenCalled();
+    expect(getFallbackProvider).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform !== 'darwin')('honors the exact local pin and refuses a remote endpoint after provider edits', async () => {
+    const task = { metadata: { analysisType: 'private-security-assessment', provider: 'claude-ollama', model: 'example-local' } };
+    const provider = { id: 'claude-ollama', type: 'cli', command: 'claude', ollamaBacked: true };
+    getProviderById.mockResolvedValue(provider);
+    expect(await resolveAgentProviderAndModel(task)).toMatchObject({ ok: true, selectedModel: 'example-local' });
+    getProviderById.mockResolvedValue({ ...provider, envVars: { ANTHROPIC_BASE_URL: 'https://example.com' } });
+    expect(await resolveAgentProviderAndModel(task)).toMatchObject({ ok: false, permanent: true });
+    expect(getFallbackProvider).not.toHaveBeenCalled();
   });
 });

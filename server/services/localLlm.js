@@ -1,3 +1,4 @@
+import { localModelSafety } from '../lib/localModelSafety.js';
 /**
  * Local LLM orchestration — unifies the Ollama and LM Studio backends behind
  * one shape so the UI can list / search / install / delete models, move models
@@ -26,13 +27,15 @@
  */
 
 import { execFile } from '../lib/childProcess.js';import { promisify } from 'util'
-import { readFileSync, createWriteStream } from 'fs'
+import { createWriteStream } from 'fs'
 import { rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { fileURLToPath } from 'url'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
-import { PATHS, atomicWrite, ensureDir, pathExists, sleep } from '../lib/fileUtils.js'
+import { ensureDir, pathExists, sleep } from '../lib/fileUtils.js'
+import { readPortosEnvValue, upsertPortosEnvLine } from '../lib/portosEnv.js'
 import { ServerError } from '../lib/errorHandler.js'
 import { assessDownloadPreflight, diskInsufficientError, DOWNLOAD_VERDICTS } from '../lib/downloadPreflight.js'
 import { compareSemver } from '../lib/versionUtils.js'
@@ -52,7 +55,6 @@ import { getProviderById, getAllProviders, updateProvider, refreshProviderModels
 import { getSettings } from './settings.js'
 
 const execFileAsync = promisify(execFile)
-const ENV_PATH = join(PATHS.root, '.env')
 const DEFAULT_BACKEND = 'ollama'
 
 // `lms get` blocks until the download finishes — generous but finite so a
@@ -135,46 +137,23 @@ async function detectInstallSource(backend) {
 
 // ---- active-backend marker (.env LLM_BACKEND) --------------------------------
 
-function readEnv() {
-  const result = {}
-  let content = ''
-  try { content = readFileSync(ENV_PATH, 'utf8') } catch { return result }
-  for (const line of content.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const idx = trimmed.indexOf('=')
-    if (idx === -1) continue
-    let value = trimmed.slice(idx + 1).trim()
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1)
-    }
-    result[trimmed.slice(0, idx).trim()] = value
-  }
-  return result
-}
-
 /**
- * The active local-LLM backend, read fresh from `.env` each call. `.env` wins
- * when valid; otherwise a valid `process.env` override wins (a stale/invalid
- * `.env` marker must not mask a valid runtime env override — validate each
- * source before falling through, don't `||` on mere presence).
+ * The active local-LLM backend, read fresh from `.env` each call.
+ *
+ * **Precedence (settled in `server/lib/portosEnv.js`):** an exported
+ * `process.env` value is this run's decision and wins; the `.env` record is
+ * durable memory and loses. Validate each source before falling through.
  */
 export function getBackend() {
-  const fromFile = readEnv().LLM_BACKEND
+  const fromEnv = process.env.LLM_BACKEND
+  if (isBackend(fromEnv)) return fromEnv
+  const fromFile = readPortosEnvValue('LLM_BACKEND')
   if (isBackend(fromFile)) return fromFile
-  if (isBackend(process.env.LLM_BACKEND)) return process.env.LLM_BACKEND
   return DEFAULT_BACKEND
 }
 
 async function writeBackend(backend) {
-  let content = ''
-  try { content = readFileSync(ENV_PATH, 'utf8') } catch { /* no .env yet */ }
-  if (/^LLM_BACKEND=/m.test(content)) {
-    content = content.replace(/^LLM_BACKEND=.*/m, `LLM_BACKEND=${backend}`)
-  } else {
-    content = `LLM_BACKEND=${backend}\n${content}`
-  }
-  await atomicWrite(ENV_PATH, content)
+  await upsertPortosEnvLine('LLM_BACKEND', backend)
 }
 
 /**
@@ -250,7 +229,7 @@ export async function installBackend(backend, onProgress = () => {}) {
   // Linux Ollama: official install script.
   if (process.platform === 'linux') {
     emit('Installing Ollama via the official install script…')
-    const r = await runStreaming('bash', ['-c', 'curl -fsSL https://ollama.com/install.sh | sh'], emit, BACKEND_INSTALL_TIMEOUT_MS)
+    const r = await runStreaming('bash', [fileURLToPath(new URL('../../scripts/install-ollama.sh', import.meta.url))], emit, BACKEND_INSTALL_TIMEOUT_MS)
     if (!r.success) return { success: false, error: `Ollama install failed: ${r.error}. ${downloadHint}` }
     console.log('⬇️ Installed Ollama (linux script)')
     return { success: true, backend }
@@ -500,7 +479,7 @@ export async function upgradeBackend(backend, onProgress = () => {}) {
   // Linux Ollama: the official install script is also the upgrade path.
   if (process.platform === 'linux' && backend === 'ollama') {
     emit('Upgrading Ollama via the official install script…')
-    const r = await runStreaming('bash', ['-c', 'curl -fsSL https://ollama.com/install.sh | sh'], emit, BACKEND_INSTALL_TIMEOUT_MS)
+    const r = await runStreaming('bash', [fileURLToPath(new URL('../../scripts/install-ollama.sh', import.meta.url))], emit, BACKEND_INSTALL_TIMEOUT_MS)
     if (!r.success) {
       console.error(`⚠️ Ollama upgrade (linux script) failed: ${r.error}`)
       return { success: false, error: `Ollama upgrade failed: ${r.error}. ${downloadHint}` }
@@ -616,7 +595,7 @@ function lmStudioBadgeCapabilities(m) {
 function annotateInstalledModel(backend, rawModel, normalizedModel, capabilities) {
   const catalogEntry = getCatalog(backend, [rawModel.id]).find((entry) => entry.installed)
   return withHardwareCompatibility(
-    normalizedModel,
+    { ...normalizedModel, ...localModelSafety(catalogEntry?.repository || rawModel.id) },
     capabilities,
     catalogEntry?.hardwareRequirements || rawModel.hardwareRequirements,
   )
@@ -662,6 +641,35 @@ export async function listModels(backend, forceRefresh = false) {
     ? await ollamaManager.getInstalledModels(forceRefresh)
     : await lmStudioManager.getAvailableModels(forceRefresh)
   return normalizeModels(backend, raw)
+}
+
+/**
+ * `listModels` plus the sentinel that tells "no models installed" apart from
+ * "the list could not be read".
+ *
+ * Both managers cache an EMPTY array on a failed read rather than throwing, so
+ * `[]` alone is ambiguous — and collapsing an unreadable list into "this
+ * backend has no models" is exactly the failure the sentinel rule in AGENTS.md
+ * forbids. **`error` is the authoritative signal, not `models`**: a failed read
+ * comes back as `{ models: [], error: '<why>' }`, because that empty array is
+ * genuinely what the manager is holding. A caller that must not treat a
+ * transient daemon outage as an empty catalog checks `error` first and falls
+ * back to whatever it had before.
+ *
+ * @param {string} backend - 'ollama' | 'lmstudio'
+ * @returns {Promise<{ models: Array|null, error: string|null }>} A non-null
+ *   `error` means the listing was not readable, whatever `models` holds;
+ *   `models: null` additionally means there was no list to hold at all (the
+ *   call threw, or the backend name is unknown).
+ */
+export async function listManagedBackendModels(backend, forceRefresh = false) {
+  if (!isBackend(backend)) return { models: null, error: `unknown backend '${backend}'` }
+  const models = await listModels(backend, forceRefresh).catch((err) => ({ error: err?.message || 'model list failed' }))
+  if (!Array.isArray(models)) return { models: null, error: models.error }
+  const error = backend === 'ollama'
+    ? ollamaManager.getLastInstalledModelsError()
+    : lmStudioManager.getLastListError()
+  return { models, error: error || null }
 }
 
 /**

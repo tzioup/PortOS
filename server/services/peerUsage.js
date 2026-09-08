@@ -33,7 +33,9 @@ import { compareNewerWins, parseTsMs } from '../lib/lwwTimestamp.js';
 import { mergeTombstones, normalizeTombstones, recordTombstone, isTombstoned } from '../lib/tombstones.js';
 import { canonicalSnapshotChecksum } from '../lib/snapshotChecksum.js';
 import { roundCents } from '../lib/subscriptionSavings.js';
+import { sanitizeQuotaCards } from '../lib/fleetQuotas.js';
 import { buildUsageDigest, buildUsageReport, getUsage, USAGE_FILE } from './usage.js';
+import { readLocalQuotaCards, PROVIDER_QUOTAS_FILE } from './providerQuotaShare.js';
 
 const PEER_USAGE_FILE = join(PATHS.data, 'peer-usage.json');
 
@@ -180,6 +182,9 @@ function sanitizeEntry(entry, expectedId) {
     name: isNonEmptyStr(entry.name) ? entry.name.slice(0, 120) : expectedId,
     capturedAt: entry.capturedAt,
     usage: sanitizeDigest(entry.usage),
+    // Optional: a peer running an older build publishes no quota readings, and
+    // the fleet quota view simply has one fewer contributor.
+    quotas: sanitizeQuotaCards(entry.quotas),
   };
 }
 
@@ -195,12 +200,21 @@ function selfDigest(usageData) {
   return digestMemo.digest;
 }
 
-/** This instance's own live entry, rebuilt from `usage.json` on every read. */
+/**
+ * This instance's own live entry, rebuilt from `usage.json` (and the last quota
+ * readings) on every read.
+ *
+ * `capturedAt` is the LWW stamp AND the manifest fingerprint, so it has to move
+ * whenever anything in the entry does — a quota refresh that left it pinned to
+ * `usage.lastUpdated` would never be pulled by a peer.
+ */
 async function buildSelfEntry() {
   const { instanceId, name } = await readSelfIdentity();
   if (!instanceId) return null;
   const usage = selfDigest(getUsage());
-  return { instanceId, name: name || instanceId, capturedAt: usage.lastUpdated, usage };
+  const { quotas, capturedAt: quotasAt } = await readLocalQuotaCards();
+  const capturedAt = compareNewerWins(quotasAt, usage.lastUpdated) ? quotasAt : usage.lastUpdated;
+  return { instanceId, name: name || instanceId, capturedAt, usage, quotas };
 }
 
 /**
@@ -221,22 +235,65 @@ async function entriesWithSelf() {
 }
 
 /**
+ * The category's version map: `{ <instanceId>: capturedAt }` plus the tombstone
+ * list. A few hundred bytes, and the ONLY thing this category's checksum is
+ * computed over (see `usageChecksum`).
+ */
+function manifestOf(self, peers, tombstones) {
+  const instances = Object.fromEntries(peers.map((e) => [e.instanceId, e.capturedAt]));
+  if (self) instances[self.instanceId] = self.capturedAt;
+  return { instances, tombstones };
+}
+
+/**
+ * CANONICAL: the payload is a map keyed by instance ids arriving over the wire,
+ * so two converged peers would otherwise hash differently purely from the order
+ * they happened to learn each other — which the sync UI reads as "behind"
+ * forever.
+ *
+ * Hashed over the MANIFEST rather than the digests themselves. The digests are
+ * a pure function of the (instanceId, capturedAt) pairs — a slot is replaced
+ * whole under that stamp and never edited in place — so the manifest is a
+ * faithful fingerprint of the payload, and it is what `getUsageSnapshot`
+ * reports too. A peer that only knows `/checksum` + `/snapshot` therefore still
+ * sees the checksum change exactly when a slot advances.
+ */
+const usageChecksum = (manifest) => canonicalSnapshotChecksum(manifest);
+
+/**
+ * dataSync `getManifest` for the `usage` category. Served at
+ * `/api/sync/usage/manifest` so a puller can fetch only the slots that moved,
+ * and read locally (same function, no arguments) as "what do we already hold?"
+ * for that diff.
+ */
+export async function getUsageManifest() {
+  const { self, peers, tombstones } = await entriesWithSelf();
+  const data = manifestOf(self, peers, tombstones);
+  return { data, checksum: usageChecksum(data) };
+}
+
+/**
  * dataSync `getSnapshot` for the `usage` category: our own live digest plus
  * every peer digest we hold, so a third instance reachable only through us
  * still propagates.
+ *
+ * `slots` (a `Set`/array of instance ids, from `?slots=` on the wire) narrows
+ * the payload to the digests a manifest-aware puller actually needs. Absent —
+ * an older peer, or any caller that skipped the manifest — serves everything,
+ * which the receiver merges idempotently. The checksum is the FULL manifest's
+ * either way: it describes the category's state, not the slice we happened to
+ * serve, so the two endpoints can never disagree.
  */
-export async function getUsageSnapshot() {
+export async function getUsageSnapshot({ slots = null } = {}) {
   const { self, peers, tombstones } = await entriesWithSelf();
-  const instances = Object.fromEntries(peers.map((e) => [e.instanceId, e]));
-  if (self) instances[self.instanceId] = self;
-  // Tombstones ride the snapshot so a retirement propagates: an add-only merge
-  // alone would let any peer that still holds the digest hand it straight back.
-  const data = { instances, tombstones };
-  // CANONICAL: the payload is a map keyed by instance ids arriving over the
-  // wire, so two converged peers would otherwise hash differently purely from
-  // the order they happened to learn each other — which the sync UI reads as
-  // "behind" forever.
-  return { data, checksum: canonicalSnapshotChecksum(data) };
+  const wanted = slots instanceof Set ? slots : (Array.isArray(slots) && slots.length > 0 ? new Set(slots) : null);
+  const keep = (id) => !wanted || wanted.has(id);
+  const instances = Object.fromEntries(peers.filter((e) => keep(e.instanceId)).map((e) => [e.instanceId, e]));
+  if (self && keep(self.instanceId)) instances[self.instanceId] = self;
+  // Tombstones ride EVERY response (slot-scoped included) so a retirement
+  // propagates: an add-only merge alone would let any peer that still holds the
+  // digest hand it straight back, and a retirement moves no slot's capturedAt.
+  return { data: { instances, tombstones }, checksum: usageChecksum(manifestOf(self, peers, tombstones)) };
 }
 
 /**
@@ -401,6 +458,23 @@ export async function getFleetUsage({ from = null, to = null, providers = [], ap
 }
 
 /**
+ * Every OTHER instance's last-known subscription-quota readings, for unifying
+ * them with this machine's cards (`lib/fleetQuotas.js`).
+ *
+ * `excludeInstanceIds` drops instances the viewer marked as paying API rates
+ * rather than riding their subscriptions — the same toggle the Across
+ * Instances card uses. Those machines meter a different account, so folding
+ * their readings into these meters would be a wrong number, not a fuller one.
+ */
+export async function getFleetQuotaEntries({ excludeInstanceIds = [] } = {}) {
+  const { peers } = await entriesWithSelf();
+  const excluded = new Set(Array.isArray(excludeInstanceIds) ? excludeInstanceIds : []);
+  return peers
+    .filter((e) => !excluded.has(e.instanceId) && e.quotas?.length)
+    .map(({ instanceId, name, capturedAt, quotas }) => ({ instanceId, name, capturedAt, quotas }));
+}
+
+/**
  * Retire an instance's usage digest — called when the user removes that peer.
  *
  * A plain delete is not enough: our snapshot forwards every digest we hold, so a
@@ -423,9 +497,8 @@ export async function forgetInstanceUsage(instanceId) {
 }
 
 // Files whose fingerprint invalidates the category's checksum cache. The
-// instances file is in the set because the snapshot embeds this instance's NAME
-// — without it a rename never reaches peers and their fleet table keeps showing
-// the old one until an AI run happens to move usage.json.
-export const USAGE_CHECKSUM_PATHS = [USAGE_FILE, PEER_USAGE_FILE, dataPath('instances.json')];
+// instances file is in the set because the manifest is keyed by this instance's
+// ID — a re-identified machine must re-checksum even when no counter moved.
+export const USAGE_CHECKSUM_PATHS = [USAGE_FILE, PEER_USAGE_FILE, PROVIDER_QUOTAS_FILE, dataPath('instances.json')];
 
 export { PEER_USAGE_FILE };

@@ -1,5 +1,4 @@
 import { readdir } from 'fs/promises';
-import { homedir } from 'os';
 import { join } from 'path';
 import { getAllProviders } from './providers.js';
 import { getClaudeCodeUsage, systemTimeZone } from './claudeCodeUsage.js';
@@ -9,8 +8,13 @@ import { scrapeTuiUsage } from '../lib/tuiUsageScrape.js';
 import { createStaleWhileRevalidate, PENDING, WAIT } from '../lib/staleWhileRevalidate.js';
 import { parseHumanReset } from '../lib/quotaReset.js';
 import { readFileTail } from '../lib/fileUtils.js';
+import { codexHomeDir, readCodexRoutingOverride } from '../lib/codexUserConfig.js';
 import { getSettings } from './settings.js';
 import { getImageGenQuota, IMAGE_GEN_FAMILY } from './imageGenQuota.js';
+import { mergeFleetQuotaCards } from '../lib/fleetQuotas.js';
+import { getFleetQuotaEntries } from './peerUsage.js';
+import { recordLocalQuotaCards } from './providerQuotaShare.js';
+import { getApiBilledInstanceIds } from './usageFleetBilling.js';
 import { enabledCloudImageModes } from './imageGen/modes.js';
 
 /**
@@ -62,8 +66,6 @@ const CODEX_TAIL_BYTES = 256 * 1024;
 // its day-directory names are written in. A session older than this cannot
 // hold a window that has not already reset.
 const CODEX_MAX_WINDOW_MS = 8 * 24 * 60 * 60 * 1000;
-
-const codexHomeDir = () => process.env.CODEX_HOME || join(homedir(), '.codex');
 
 function humanizeWindowMinutes(minutes) {
   if (!Number.isFinite(minutes)) return 'window';
@@ -177,7 +179,21 @@ function codexNoWindowsMessage(rateLimits, now) {
  * Pure: map a codex `rate_limits` payload + event timestamp to the common
  * quota shape. Exported for tests.
  */
-export function mapCodexQuota(rateLimits, timestamp, { now = Date.now() } = {}) {
+/**
+ * The caveat every Codex quota card carries when the install's own
+ * `~/.codex/config.toml` re-points model routing: these meters describe the
+ * signed-in ChatGPT account, and PortOS's Codex runs may not be going there.
+ * Names no base URL — that value is machine-local and belongs only in the UI
+ * that reads it directly.
+ */
+const CODEX_ROUTING_CAVEAT = 'Your ~/.codex/config.toml overrides Codex model routing, so PortOS runs may not be counted here.';
+
+export function mapCodexQuota(rateLimits, timestamp, {
+  now = Date.now(),
+  // Injected so the mapper stays deterministic in a test: read from the
+  // install's own config by default, never probed twice per card.
+  routingOverridden = readCodexRoutingOverride()?.overridden === true,
+} = {}) {
   const limits = codexUsableWindows(rateLimits, now);
   return {
     family: 'codex',
@@ -189,9 +205,14 @@ export function mapCodexQuota(rateLimits, timestamp, { now = Date.now() } = {}) 
     approximate: true,
     // Wording is "telemetry", not "session activity": the reading can come from
     // an older session than the newest one when that session reported no window.
-    note: timestamp
-      ? `As of the last Codex rate-limit telemetry (${timestamp}). Local telemetry only.`
-      : 'As of the last Codex rate-limit telemetry. Local telemetry only.',
+    note: [
+      timestamp
+        ? `As of the last Codex rate-limit telemetry (${timestamp}). Local telemetry only.`
+        : 'As of the last Codex rate-limit telemetry. Local telemetry only.',
+      // Advisory only — a routing override never suppresses the meters, it just
+      // stops them being presented as if they described PortOS's own work.
+      routingOverridden ? CODEX_ROUTING_CAVEAT : null,
+    ].filter(Boolean).join(' '),
     ...(limits.length ? {} : { error: codexNoWindowsMessage(rateLimits, now) }),
     fetchedAt: new Date().toISOString()
   };
@@ -240,6 +261,7 @@ async function listCodexRolloutFiles(codexHome) {
 
 /** Exported for tests (which point `codexHome` at a fixture tree). */
 export async function fetchCodexQuota({ codexHome = codexHomeDir(), now = Date.now() } = {}) {
+  const routingOverridden = readCodexRoutingOverride()?.overridden === true;
   const files = await listCodexRolloutFiles(codexHome);
   // Newest-usable-wins across files, exactly as parseCodexRateLimits applies it
   // within one: keep the newest window-less reading as a fallback, but keep
@@ -256,7 +278,7 @@ export async function fetchCodexQuota({ codexHome = codexHomeDir(), now = Date.n
     if (!tail) continue;
     const found = parseCodexRateLimits(tail, { now });
     if (!found) continue;
-    const quota = mapCodexQuota(found.rateLimits, found.timestamp, { now });
+    const quota = mapCodexQuota(found.rateLimits, found.timestamp, { now, routingOverridden });
     if (quota.limits.length) return quota;
     fallback ??= quota;
   }
@@ -583,7 +605,10 @@ async function fetchClaudeQuota({ wait = WAIT.CACHED } = {}) {
     limits: data.limits,
     activity: data.activity,
     approximate: data.approximate,
-    note: data.approximate ? 'Local sessions only — does not include other devices or claude.ai.' : null,
+    // The CLI's own caption is about ONE machine's sessions. It stands only
+    // until a federated peer contributes its reading — `mergeFleetQuotaCards`
+    // replaces it with what was actually combined.
+    note: data.approximate ? 'This machine only — other federated instances have not reported a reading yet.' : null,
     fetchedAt: data.fetchedAt
   };
 }
@@ -614,7 +639,7 @@ const FAMILIES = PROVIDER_FAMILIES.map((family) => ({ ...family, fetch: FAMILY_F
  * wrapper its family's card).
  */
 export function resolveEnabledFamilies(providers) {
-  const enabled = (providers || []).filter((p) => p?.enabled && p.ollamaBacked !== true && p.mtplxBacked !== true && p.llamaBacked !== true && p.vllmBacked !== true && p.sglangBacked !== true);
+  const enabled = (providers || []).filter((p) => p?.enabled && p.ollamaBacked !== true && p.lmstudioBacked !== true && p.mtplxBacked !== true && p.llamaBacked !== true && p.vllmBacked !== true && p.sglangBacked !== true);
   return FAMILIES.filter((family) => enabled.some((p) => family.matches(p)));
 }
 
@@ -647,11 +672,39 @@ const fetchFamilyQuota = (family, { wait, providers }) =>
  * for exactly the one the user clicked instead of respawning every provider's
  * TUI. A family id that isn't enabled resolves to an empty list — the caller
  * reads that as "this card is gone", not as an error.
+ *
+ * The reading this machine takes is only ever part of the answer: a
+ * subscription is one account across every federated instance. Each card is
+ * therefore unified with what peers published for the same family before it is
+ * returned — see `lib/fleetQuotas.js` for the two merge rules.
  */
 export async function getProviderQuotas({ wait = WAIT.CACHED, family = null } = {}) {
+  const cards = await readProviderQuotas({ wait, family });
+  // Publish this machine's reading to the fleet and fold in every peer's. The
+  // two are independent — the peer read excludes our own slot — so they
+  // overlap. Recording is awaited rather than fired off so a caller that
+  // immediately re-reads (the page's per-card Refresh) sees its own reading.
+  const [, peerEntries] = await Promise.all([
+    recordLocalQuotaCards(cards).catch((err) => {
+      console.error(`❌ Could not record local quota readings: ${err?.message || err}`);
+    }),
+    getApiBilledInstanceIds()
+      .then((excludeInstanceIds) => getFleetQuotaEntries({ excludeInstanceIds }))
+      .catch((err) => {
+        // A federation read that fails must not take the cards down with it — a
+        // this-machine-only card is a smaller loss than an empty usage page.
+        console.error(`❌ Could not read federated quota readings: ${err?.message || err}`);
+        return [];
+      }),
+  ]);
+  return mergeFleetQuotaCards(cards, peerEntries);
+}
+
+/** The local readings, before any federated merge. */
+async function readProviderQuotas({ wait, family }) {
   const result = await getAllProviders();
   const providers = Array.isArray(result) ? result : (result?.providers || []);
-  const enabled = providers.filter((p) => p?.enabled && p.ollamaBacked !== true && p.mtplxBacked !== true && p.llamaBacked !== true && p.vllmBacked !== true && p.sglangBacked !== true);
+  const enabled = providers.filter((p) => p?.enabled && p.ollamaBacked !== true && p.lmstudioBacked !== true && p.mtplxBacked !== true && p.llamaBacked !== true && p.vllmBacked !== true && p.sglangBacked !== true);
   const families = resolveEnabledFamilies(providers).filter((f) => !family || f.id === family);
   const familyCards = await Promise.all(families.map((f) =>
     fetchFamilyQuota(f, { wait, providers: enabled.filter((p) => f.matches(p)) })));

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useId, useRef } from 'react'
 import { Link } from 'react-router';
 import {
   AlertTriangle, Bot, ChevronDown, ChevronRight, CircleDot, ClipboardCheck,
-  ExternalLink, Loader2, RefreshCw, Rocket, Search, Tag, User
+  ExternalLink, Loader2, MessageSquare, RefreshCw, Rocket, Search, Tag, User
 } from 'lucide-react';
 import BrailleSpinner from '../../BrailleSpinner';
 import Banner from '../../ui/Banner';
@@ -12,8 +12,10 @@ import ProviderModelSelector from '../../ProviderModelSelector';
 import { useThemeContext } from '../../ThemeContext';
 import { useCosTaskUpdates } from '../../../hooks/useCosTaskUpdates';
 import useProviderModels from '../../../hooks/useProviderModels';
+import useClaimReviewers from '../../../hooks/useClaimReviewers';
+import ClaimReviewerSource from '../ClaimReviewerSource';
 import { chipColors } from '../../../lib/chipContrast';
-import { isProcessProvider } from '../../../utils/providers';
+import { enabledProcessProviderFilter } from '../../../utils/providers';
 import * as api from '../../../services/api';
 import { timeAgo } from '../../../utils/formatters';
 
@@ -89,12 +91,6 @@ function parseRunKey(key) {
   const at = key.indexOf(':');
   return { action: key.slice(0, at), issueNumber: key.slice(at + 1) };
 }
-
-// Module-scoped so `useProviderModels` sees a stable predicate — an inline
-// arrow would be a new identity every render, re-firing the hook's fetch
-// effect forever. Matches SlashDoRunDrawer's filter: only CODING providers
-// (CLI/TUI agents with a file-writing harness) can run a `/do:next` claim.
-const enabledProcessProviderFilter = (p) => Boolean(p?.enabled) && isProcessProvider(p);
 
 // `in-progress` is the forge label a `/do:next` claim stamps on an issue it is
 // actively working (server/services/issueReconcile.js#IN_PROGRESS_LABEL), and
@@ -241,8 +237,10 @@ export default function IssuesTab({ appId, appName }) {
   // Page-level provider/model/effort pin for every Claim AND Replan button on this tab —
   // left untouched (blank), a claim resolves the install's active provider,
   // same as the bare button always did (POST /tasks/slashdo -> resolveAgentProviderAndModel;
-  // this manual path does NOT consult the app's scheduled claim-work override —
-  // that's a separate resolution used only by the automated claim-work task).
+  // this manual path does NOT consult the app's scheduled claim-work override for
+  // the PROVIDER — that pin is read only by the automated claim-work task).
+  // Scoped to the provider deliberately: the REVIEWERS below do come from that
+  // override, which is precisely the mismatch `claimReviewers` exists to surface.
   // This picker never persists across a reload; it's a session convenience for
   // "claim the next several issues with model X" without reopening the Agent
   // Operations drawer each time.
@@ -252,6 +250,11 @@ export default function IssuesTab({ appId, appName }) {
   } = useProviderModels({ filter: enabledProcessProviderFilter, allowDefault: true, silent: true, withEffort: true });
   const [effort, setEffort] = useState('');
   const [overrideContext, setOverrideContext] = useState('');
+  // The reviewers a Claim launched from this tab will actually run — NOT the
+  // Models → Code Reviewers list, whenever a claim-work override is in play (see
+  // `GET /apps/:id/claim-reviewers`). This tab has no reviewer picker, so it
+  // names them read-only beside the provider pin.
+  const claimReviewers = useClaimReviewers(appId);
 
   // Keep the event-driven path based on the latest runs without putting a
   // mutable state snapshot in its effect dependencies. Socket callbacks can
@@ -575,9 +578,23 @@ export default function IssuesTab({ appId, appName }) {
             />
           </div>
         </div>
+        {claimReviewers && (
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+            <span className="flex items-center gap-1.5 text-xs text-gray-500 uppercase tracking-wide shrink-0">
+              <ClipboardCheck size={14} /> Reviewed by
+            </span>
+            {/* No empty-list branch: the route resolves through
+                `claimSafeReviewers`, which falls back to a non-empty list rather
+                than ever handing a claim agent nothing to run. */}
+            <p className="flex-1 text-xs text-gray-400">
+              <code className="text-gray-300">{claimReviewers.csv}</code>
+              <ClaimReviewerSource source={claimReviewers.source} />
+            </p>
+          </div>
+        )}
         <div className="space-y-1">
           <label htmlFor={overrideContextId} className="block text-xs text-gray-400">
-            Override context or instructions <span className="text-gray-600">(optional)</span>
+            Extra context <span className="text-gray-600">(optional)</span>
           </label>
           <textarea
             id={overrideContextId}
@@ -676,6 +693,11 @@ export default function IssuesTab({ appId, appName }) {
                       {issue.author && <span>opened by {issue.author}</span>}
                       {issue.updatedAt && <span>updated {timeAgo(issue.updatedAt)}</span>}
                       {issue.milestone && <span className="text-cyan-400">{issue.milestone}</span>}
+                      {issue.commentCount > 0 && (
+                        <span className="flex items-center gap-1">
+                          <MessageSquare size={12} /> {issue.commentCount} comment{issue.commentCount === 1 ? '' : 's'}
+                        </span>
+                      )}
                       {issue.assignees.length > 0 ? (
                         <span className="flex items-center gap-1 text-gray-300">
                           <User size={12} /> {issue.assignees.join(', ')}

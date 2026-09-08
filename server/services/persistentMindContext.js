@@ -22,6 +22,7 @@ import {
   PERSISTENT_MIND_TRAJECTORY_LIMITS,
   assemblePersistentMindContext,
   buildPersistentMindRollup,
+  isPersistentMindCallDenial,
   isStoredPersistentMindRollup,
 } from '../lib/persistentMindTrajectory.js';
 import {
@@ -29,10 +30,19 @@ import {
   readPersistentMindHistory,
 } from './agentRunEventLog.js';
 import * as memoryBackend from './memoryBackend.js';
+import {
+  PERSISTENT_MIND_MEMORY_PROTECTION_TAGS,
+  comparePersistentMindMemories,
+  persistentMindMemoryProtection,
+  persistentMindMemoryTags,
+  persistentMindProtectMemorySchema,
+  projectPersistentMindMemory,
+} from '../lib/persistentMindMemory.js';
 
 const ROLLUP_PATH = join(PATHS.cos, 'persistent-mind-rollups.json');
 const ROLLUP_STORE_SCHEMA_VERSION = 1;
 const queueRollupWrite = createFileWriteQueue();
+const queueMemoryWrite = createFileWriteQueue();
 const promotionRuns = new Map();
 const memoryCreationRuns = new Map();
 
@@ -67,46 +77,52 @@ export function clearPersistentMindRollups(mindId = PERSISTENT_MIND_ID) {
   });
 }
 
-/** Full active memories explicitly owned by this mind, newest importance first. */
+/** Protected memories take precedence over ordinary importance-ranked context. */
 export async function readPersistentMindMemories(mindId = PERSISTENT_MIND_ID) {
-  const result = await memoryBackend.getMemories({
-    status: 'active',
-    sourceAgentId: mindId,
-    sortBy: 'importance',
-    sortOrder: 'desc',
-    limit: 100,
-  });
-  const details = await Promise.all((result.memories || []).map((memory) => memoryBackend.peekMemory(memory.id)));
-  return details.filter((memory) => memory?.status === 'active' && memory.sourceAgentId === mindId);
+  const options = { status: 'active', sourceAgentId: mindId, sortBy: 'importance', sortOrder: 'desc', limit: 100 };
+  // Query each protection tier separately so a low-score identity cannot fall
+  // outside the first page of ordinary memories before we get to sort it.
+  const pages = await Promise.all([
+    memoryBackend.getMemories(options),
+    ...Object.values(PERSISTENT_MIND_MEMORY_PROTECTION_TAGS).map((tag) => memoryBackend.getMemories({ ...options, tags: [tag] })),
+  ]);
+  const candidates = [...new Map(pages.flatMap((page) => page.memories || []).map((memory) => [memory.id, memory])).values()];
+  const details = await Promise.all(candidates.map((memory) => memoryBackend.peekMemory(memory.id)));
+  return details.filter((memory) => memory?.status === 'active' && memory.sourceAgentId === mindId)
+    .sort(comparePersistentMindMemories).slice(0, 100).map(projectPersistentMindMemory);
 }
 
-/**
- * Archive every active memory owned by this mind. Archival removes the records
- * from effective context while keeping recovery possible through Brain.
- */
-export async function archivePersistentMindMemories(mindId = PERSISTENT_MIND_ID) {
-  let archived = 0;
-  while (true) {
-    const result = await memoryBackend.getMemories({
-      status: 'active',
-      sourceAgentId: mindId,
-      sortBy: 'createdAt',
-      sortOrder: 'asc',
-      limit: 100,
-    });
-    const candidates = result.memories || [];
-    if (candidates.length === 0) break;
-    let batchArchived = 0;
-    for (const candidate of candidates) {
-      const memory = await memoryBackend.peekMemory(candidate.id);
-      if (memory?.status !== 'active' || memory.sourceAgentId !== mindId) continue;
-      await memoryBackend.deleteMemory(memory.id, false);
-      archived += 1;
-      batchArchived += 1;
+/** Bulk cleanup never archives protected memories, regardless of its caller. */
+export function archivePersistentMindMemories(mindId = PERSISTENT_MIND_ID) {
+  return queueMemoryWrite(async () => {
+    let archived = 0;
+    let preserved = 0;
+    let offset = 0;
+    while (true) {
+      const result = await memoryBackend.getMemories({
+        status: 'active', sourceAgentId: mindId,
+        sortBy: 'createdAt', sortOrder: 'asc', limit: 100, offset,
+      });
+      const candidates = result.memories || [];
+      if (candidates.length === 0) break;
+      let batchArchived = 0;
+      for (const candidate of candidates) {
+        const memory = await memoryBackend.peekMemory(candidate.id);
+        if (memory?.status !== 'active' || memory.sourceAgentId !== mindId) continue;
+        if (persistentMindMemoryProtection(memory) !== 'standard') {
+          preserved += 1;
+          continue;
+        }
+        await memoryBackend.deleteMemory(memory.id, false);
+        archived += 1;
+        batchArchived += 1;
+      }
+      // Archived rows leave the active result set; protected rows remain. Move
+      // past those retained rows even when an entire page is protected.
+      offset += candidates.length - batchArchived;
     }
-    if (batchArchived === 0) break;
-  }
-  return { archived };
+    return { archived, preserved };
+  });
 }
 
 export function recordPersistentMindRollup(input) {
@@ -138,13 +154,23 @@ const latestReadyRollup = (rollups, promptVersion) => rollups
   .sort((a, b) => a.source.toSequence - b.source.toSequence)
   .at(-1) || null;
 
+// `attempted: false` means the summarizer never reached a provider — the
+// per-call boundary refused it (budget, authorization, lifecycle). Sealing a
+// FAILED rollup for that range would be a lie AND permanent: the range id is
+// deterministic, so `alreadyAttempted` would stop every later turn from
+// retrying, and a transient refusal would silently cost the mind that stretch
+// of its life forever.
 const summaryOutcome = (summarize, input) => Promise.resolve()
   .then(() => summarize(input))
   .then(
     (summary) => typeof summary === 'string' && summary.trim()
-      ? { ok: true, summary }
-      : { ok: false, error: 'Persistent mind summarizer returned no summary text' },
-    (error) => ({ ok: false, error: String(error?.message || error || 'Persistent mind summary failed').slice(0, 500) })
+      ? { ok: true, attempted: true, summary }
+      : { ok: false, attempted: true, error: 'Persistent mind summarizer returned no summary text' },
+    (error) => ({
+      ok: false,
+      attempted: !isPersistentMindCallDenial(error),
+      error: String(error?.message || error || 'Persistent mind summary failed').slice(0, 500),
+    })
   );
 
 /**
@@ -211,40 +237,44 @@ export async function preparePersistentMindContext({
           previousProvenance: previous?.provenance ?? null,
           promptVersion,
         });
-        const rollup = await recordPersistentMindRollup({
-          id: rollupId,
-          mindId,
-          status: outcome.ok ? 'ready' : 'failed',
-          summary: outcome.ok ? outcome.summary : null,
-          error: outcome.ok ? null : outcome.error,
-          source,
-          providerId,
-          model,
-          promptVersion,
-        });
-        await appendMindEvent({
-          kind: 'mind.summary',
-          mindId,
-          // Keyed on the rollup's own createdAt (unique per attempt), not just
-          // rollup.id: a forceSummary retry reuses the same rollup id, and the
-          // shared ledger dedupes mind events by eventId regardless of age — an
-          // id derived from rollup.id alone would make a successful retry's
-          // event silently drop, leaving the replayed trajectory stuck showing
-          // the earlier failed attempt forever.
-          eventId: `mind-summary-${sha256Text(`${rollup.id}:${rollup.provenance.createdAt}`).slice(0, 32)}`,
-          data: {
-            rollupId: rollup.id,
-            status: rollup.status,
-            fromSequence: source.fromSequence,
-            toSequence: source.toSequence,
+        // A refused call never reached a provider, so the range stays
+        // unattempted and a later turn can still seal it.
+        if (outcome.attempted) {
+          const rollup = await recordPersistentMindRollup({
+            id: rollupId,
+            mindId,
+            status: outcome.ok ? 'ready' : 'failed',
+            summary: outcome.ok ? outcome.summary : null,
+            error: outcome.ok ? null : outcome.error,
+            source,
             providerId,
             model,
             promptVersion,
-            summaryText: rollup.summary,
-            error: rollup.error,
-          },
-        });
-        rollups = await readPersistentMindRollups(mindId);
+          });
+          await appendMindEvent({
+            kind: 'mind.summary',
+            mindId,
+            // Keyed on the rollup's own createdAt (unique per attempt), not just
+            // rollup.id: a forceSummary retry reuses the same rollup id, and the
+            // shared ledger dedupes mind events by eventId regardless of age — an
+            // id derived from rollup.id alone would make a successful retry's
+            // event silently drop, leaving the replayed trajectory stuck showing
+            // the earlier failed attempt forever.
+            eventId: `mind-summary-${sha256Text(`${rollup.id}:${rollup.provenance.createdAt}`).slice(0, 32)}`,
+            data: {
+              rollupId: rollup.id,
+              status: rollup.status,
+              fromSequence: source.fromSequence,
+              toSequence: source.toSequence,
+              providerId,
+              model,
+              promptVersion,
+              summaryText: rollup.summary,
+              error: rollup.error,
+            },
+          });
+          rollups = await readPersistentMindRollups(mindId);
+        }
       }
     }
   }
@@ -263,12 +293,13 @@ export async function preparePersistentMindContext({
   });
 }
 
-export function createPersistentMindMemory({ mindId = PERSISTENT_MIND_ID, ...input } = {}) {
-  return memoryBackend.createMemory({
+export function createPersistentMindMemory({ mindId = PERSISTENT_MIND_ID, protection = 'standard', ...input } = {}) {
+  return queueMemoryWrite(async () => projectPersistentMindMemory(await memoryBackend.createMemory({
     ...input,
+    tags: persistentMindMemoryTags(input.tags, protection),
     sourceAgentId: mindId,
     status: 'active',
-  });
+  })));
 }
 
 async function findExistingAutomaticMemory({ memoryApi, mindId, turnId, content }) {
@@ -294,6 +325,7 @@ async function performAutomaticMemoryCreation({
   type = 'observation',
   category = 'other',
   tags = [],
+  protection = 'standard',
   memoryApi = memoryBackend,
 } = {}) {
   if (typeof candidateId !== 'string' || !candidateId.trim()) {
@@ -318,7 +350,7 @@ async function performAutomaticMemoryCreation({
     content: normalizedContent,
     summary: typeof summary === 'string' ? summary.trim().slice(0, 500) : undefined,
     category,
-    tags: [...new Set(Array.isArray(tags) ? tags.filter((tag) => typeof tag === 'string' && tag) : [])].slice(0, 20),
+    tags: persistentMindMemoryTags(tags, protection),
     sourceTaskId: turnId,
     sourceAgentId: mindId,
     status: 'active',
@@ -330,15 +362,35 @@ async function performAutomaticMemoryCreation({
 export function createPersistentMindMemoryFromCandidate(input = {}) {
   const key = `${input.mindId || PERSISTENT_MIND_ID}:${input.candidateId || ''}`;
   if (memoryCreationRuns.has(key)) return memoryCreationRuns.get(key);
-  const run = performAutomaticMemoryCreation(input).finally(() => memoryCreationRuns.delete(key));
+  const run = queueMemoryWrite(() => performAutomaticMemoryCreation(input)).finally(() => memoryCreationRuns.delete(key));
   memoryCreationRuns.set(key, run);
   return run;
 }
 
-export async function updatePersistentMindMemory(memoryId, updates, mindId = PERSISTENT_MIND_ID) {
-  const existing = await memoryBackend.peekMemory(memoryId);
-  if (!existing || existing.sourceAgentId !== mindId) return null;
-  return memoryBackend.updateMemory(memoryId, updates);
+export function updatePersistentMindMemory(memoryId, updates, mindId = PERSISTENT_MIND_ID) {
+  return queueMemoryWrite(async () => {
+    const existing = await memoryBackend.peekMemory(memoryId);
+    if (!existing || existing.sourceAgentId !== mindId) return null;
+    const { protection, ...fields } = updates;
+    // Older clients send tags without a protection field. Keep the protection
+    // unless the user explicitly selects a different level.
+    const tags = persistentMindMemoryTags(fields.tags ?? existing.tags, protection ?? persistentMindMemoryProtection(existing));
+    return projectPersistentMindMemory(await memoryBackend.updateMemory(memoryId, { ...fields, tags }));
+  });
+}
+
+/** The mind may protect its own active records, never remove their protection. */
+export function protectPersistentMindMemory(input, mindId = PERSISTENT_MIND_ID) {
+  const { memoryId, protection } = persistentMindProtectMemorySchema.parse(input);
+  return queueMemoryWrite(async () => {
+    const existing = await memoryBackend.peekMemory(memoryId);
+    if (!existing || existing.sourceAgentId !== mindId || existing.status !== 'active') {
+      return { ok: false, success: false, error: 'Active mind-owned memory not found' };
+    }
+    const level = persistentMindMemoryProtection(existing) === 'core-identity' ? 'core-identity' : protection;
+    await memoryBackend.updateMemory(memoryId, { tags: persistentMindMemoryTags(existing.tags, level) });
+    return { ok: true, success: true, memoryId, protection: level };
+  });
 }
 
 /** Add an attributable comment/idea to the trajectory. */

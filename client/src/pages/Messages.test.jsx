@@ -1,15 +1,20 @@
 /**
- * Messages page — Beeper tab visibility (#30, real-browser pass).
+ * Messages page — Beeper tab visibility (#30, real-browser pass) and the
+ * manifest ↔ presentation sync guard (#6365).
  *
- * TABS in Messages.jsx is a static array, so the tab-strip render must filter
- * it through the same instance-feature hook the sidebar uses (`useInstanceFeatures`
- * + `filterNavByFeatures`) or the Beeper pill shows — and is clickable — even
- * when the instance feature is off.
+ * TABS in Messages.jsx is now derived from the nav manifest's
+ * `tabGroup: 'messages'`, so the tab-strip render must filter it through the
+ * same instance-feature hook the sidebar uses (`useInstanceFeatures` +
+ * `filterNavByFeatures`) or the Beeper pill shows — and is clickable — even
+ * when the instance feature is off. The `feature` field rides through from the
+ * manifest entry via `getPageNavTabs`, so the pill and the sidebar gate on one
+ * field rather than two.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router';
+import { expectPageNavTabs } from '../test/pageNavTabAssertions.js';
 
 vi.mock('../components/messages/InboxTab', () => ({ default: () => <div>inbox panel</div> }));
 vi.mock('../components/messages/ConfigTab', () => ({ default: () => <div>config panel</div> }));
@@ -28,7 +33,7 @@ vi.mock('../services/api', () => ({
 }));
 
 import { __resetInstanceFeatureCache } from '../hooks/useInstanceFeatures.js';
-import Messages from './Messages';
+import Messages, { TABS } from './Messages';
 
 beforeEach(() => {
   __resetInstanceFeatureCache();
@@ -139,5 +144,30 @@ describe('Messages — header account count scope (#30/#35)', () => {
 
     await screen.findByText('inbox panel');
     expect(await screen.findByText('0 accounts')).toBeTruthy();
+  });
+});
+
+// Messages derives its tab bar from the nav manifest's `tabGroup: 'messages'`
+// (#6365) — this pins that TABS stays in sync (id, label, declaration order)
+// and that every manifest tab has a presentation entry (icon, plus the
+// `fullBleed`/`needsAccounts`/`recordParam` flags) in Messages.jsx, which would
+// otherwise only surface as a thrown import-time error. Beeper (#30) sits
+// between Signal and Contacts, the position its manifest row declares.
+describe('Messages TABS ↔ nav manifest', () => {
+  it('renders the messages tabGroup in page order with a presentation entry each', () => {
+    expectPageNavTabs(TABS, [
+      'inbox:Inbox', 'drafts:Drafts', 'imessage:iMessage', 'signal:Signal', 'beeper:Beeper', 'contacts:Contacts', 'sync:Sync', 'config:Config',
+    ]);
+  });
+
+  // The gating tests above depend on the manifest, not a local array, carrying
+  // `feature` — pin that so a manifest row losing the field fails here rather
+  // than silently un-gating a pill.
+  it('carries the comms feature ids through from the manifest', () => {
+    const byId = Object.fromEntries(TABS.map((tab) => [tab.id, tab.feature]));
+    expect(byId.imessage).toBe('imessage');
+    expect(byId.signal).toBe('signal');
+    expect(byId.beeper).toBe('beeper');
+    expect(byId.inbox).toBeUndefined();
   });
 });
