@@ -163,7 +163,7 @@ function RingMeter({ ring, contacts, active, onClick }) {
   );
 }
 
-function ContactCard({ contact, active, onSelect, onLogTouch }) {
+function ContactCard({ contact, active, onSelect, onLogTouch, cardRef }) {
   const ring = ringFor(contact.ring);
   const energy = energyFor(contact.energy);
   const status = contactStatus(contact);
@@ -171,6 +171,7 @@ function ContactCard({ contact, active, onSelect, onLogTouch }) {
 
   return (
     <article
+      ref={cardRef}
       className={`w-full text-left border rounded p-4 transition-colors bg-port-card ${
         active ? 'border-port-accent/70 ring-1 ring-port-accent/30' : 'border-port-border hover:border-port-accent/40'
       }`}
@@ -1061,6 +1062,45 @@ export default function Tribe() {
     cadenceDays: contact.cadenceDays || ringFor(contact.ring).cadenceDays,
   });
 
+  // Deep link from Beeper's Tribe chip and linked-participant rows (#98 part
+  // C): `?person=<id>` selects that Tribe person on the Circle tab, the exact
+  // same path a click on their card takes (`selectContact`), and scrolls the
+  // card into view — the `OutreachQueue`'s `?outreach=` handling above is the
+  // sibling pattern this follows.
+  //
+  // `appliedPersonRef` fires this at most once per distinct `person` value —
+  // never on every `contacts` refresh a `tribe:changed` broadcast triggers —
+  // but still re-fires "on load AND when the param changes" per the spec,
+  // since a change to `personParam` itself resets it. An id the roster does
+  // not recognize (deleted, or someone else's stale bookmark) is marked
+  // applied and otherwise ignored: no error toast, since nothing here is a
+  // genuine fault to report.
+  const personParam = searchParams.get('person');
+  const appliedPersonRef = useRef(null);
+  const pendingScrollPersonRef = useRef(null);
+  const cardRefs = useRef({});
+
+  useEffect(() => {
+    if (!personParam) { appliedPersonRef.current = null; return; }
+    if (appliedPersonRef.current === personParam || loading) return;
+    const target = contacts.find((contact) => contact.id === personParam);
+    appliedPersonRef.current = personParam;
+    if (!target) return;
+    selectContact(target);
+    setActiveTab('circle');
+    pendingScrollPersonRef.current = personParam;
+  }, [personParam, contacts, loading]);
+
+  useEffect(() => {
+    if (!pendingScrollPersonRef.current || activeTab !== 'circle') return;
+    const id = pendingScrollPersonRef.current;
+    const frame = requestAnimationFrame(() => {
+      cardRefs.current[id]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      pendingScrollPersonRef.current = null;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeTab, filteredContacts]);
+
   const saveDraft = async () => {
     // Send only the editable fields the schema accepts. The PUT route rejects a
     // body `id` (`z.never()`) — it comes from the URL — and `lastContact` must be
@@ -1309,6 +1349,7 @@ export default function Tribe() {
                         active={selectedId === contact.id}
                         onSelect={() => selectContact(contact)}
                         onLogTouch={() => logTouch(contact.id)}
+                        cardRef={(el) => { cardRefs.current[contact.id] = el; }}
                       />
                     ))}
                     {filteredContacts.length === 0 && (
