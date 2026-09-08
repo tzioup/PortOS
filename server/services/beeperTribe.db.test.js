@@ -11,6 +11,11 @@
  *   - A group conversation creates touchpoints for senders only, and never
  *     for a truncated roster.
  *
+ * Plus #96's own criterion, which needs a real cascade to prove: a hand-made
+ * link on a participant with NO durable handle survives a purge + resweep,
+ * because it is claimed in `tribe_identities` under `kind='beeper-user'`
+ * (account id + raw `source_user_id`) rather than only cached on the mirror row.
+ *
  * `*.db.test.js` → runs ONLY via `npm run test:db` against `portos_test`
  * (registered in vitest.config.db.js's DB_TEST_INCLUDE — a `<name>.db.test.js`
  * file is not auto-globbed). Every fixture uses placeholder names/handles per
@@ -386,9 +391,14 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
     });
     expect(linked.tribePersonId).toBe(person.id);
 
-    // Nothing durable could be recorded, so no inert unscoped identity row exists.
+    // No inert unscoped kind='handle' row was written — the network the
+    // username would need is exactly what this conversation lacks. The
+    // account-scoped beeper-user claim (#96) is unaffected by that: a
+    // conversation always has an account, so this link is durable anyway.
     const identities = await tribeIdentities.listIdentitiesForPerson(person.id);
-    expect(identities).toHaveLength(0);
+    expect(identities).toEqual([expect.objectContaining({
+      kind: 'beeper-user', network: ACCOUNT_ID, handle: 'no-network-user-1',
+    })]);
   });
 
   it('does not wipe a durable handle when a later sweep re-observes the participant without one', async () => {
@@ -411,6 +421,117 @@ describe.skipIf(!runDb)('beeperTribe (#34)', () => {
       observedVia: 'participant-list',
     });
     expect(resynced.handle).toBe('@example_keeper');
+  });
+
+  // ── #96: a manual link survives a purge + resweep ────────────────────────
+  // The purge is the real one (`DELETE FROM beeper_conversations`), so the
+  // participant row and its `tribe_person_id` cache genuinely cascade away;
+  // the resweep is modelled by re-creating the conversation under a NEW
+  // PortOS UUID (a purge drops the sync cursor, so a resweep never matches
+  // the old row) with the SAME account and source_user_id.
+  it('re-links a hand-linked handle-less participant after a purge + resweep, on the first re-observation', async () => {
+    await makeAccount();
+    const conversationId = await makeConversation(`${nonce}-purge-chat`, { network: 'facebook' });
+    const person = await makePerson('Example Purged Person');
+
+    await beeperTribe.upsertParticipant({
+      conversationId,
+      sourceUserId: 'fb-purge-user-1',
+      displayName: 'Example Purged Person',
+      handle: '',
+      observedVia: 'message-sender',
+    });
+    const linked = await beeperTribe.linkParticipant({
+      conversationId, sourceUserId: 'fb-purge-user-1', personId: person.id,
+    });
+    expect(linked.tribePersonId).toBe(person.id);
+
+    // The durable half of that link — no handle classified, so this is the
+    // ONLY record of it that can outlive the row.
+    const identities = await tribeIdentities.listIdentitiesForPerson(person.id);
+    expect(identities).toContainEqual(expect.objectContaining({
+      kind: 'beeper-user', network: ACCOUNT_ID, handle: 'fb-purge-user-1',
+    }));
+
+    await query('DELETE FROM beeper_conversations WHERE id = $1', [conversationId]);
+    const gone = await query(
+      'SELECT COUNT(*)::int AS n FROM beeper_participants WHERE conversation_id = $1',
+      [conversationId],
+    );
+    expect(gone.rows[0].n).toBe(0);
+
+    const resweptConversationId = await makeConversation(`${nonce}-purge-chat-reswept`, { network: 'facebook' });
+    expect(resweptConversationId).not.toBe(conversationId);
+    const reswept = await beeperTribe.upsertParticipant({
+      conversationId: resweptConversationId,
+      sourceUserId: 'fb-purge-user-1',
+      displayName: 'Example Purged Person',
+      handle: '',
+      observedVia: 'message-sender',
+    });
+    expect(reswept.tribePersonId).toBe(person.id);
+  });
+
+  it('is a no-op when a hand-linked participant is re-linked to the SAME person', async () => {
+    await makeAccount();
+    const conversationId = await makeConversation(`${nonce}-relink-same-chat`, { network: 'facebook' });
+    const person = await makePerson('Example Relink Same Person');
+
+    await beeperTribe.upsertParticipant({
+      conversationId, sourceUserId: 'fb-relink-user-1', displayName: 'Example Relink Same Person', handle: '', observedVia: 'message-sender',
+    });
+    await beeperTribe.linkParticipant({
+      conversationId, sourceUserId: 'fb-relink-user-1', personId: person.id,
+    });
+    const again = await beeperTribe.linkParticipant({
+      conversationId, sourceUserId: 'fb-relink-user-1', personId: person.id,
+    });
+    expect(again.tribePersonId).toBe(person.id);
+    expect(again.displacedPersonId).toBeNull();
+
+    // No duplicate claim — UNIQUE (kind, network, handle) upserted in place.
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n FROM tribe_identities
+       WHERE kind = 'beeper-user' AND network = $1 AND handle = 'fb-relink-user-1'`,
+      [ACCOUNT_ID],
+    );
+    expect(rows[0].n).toBe(1);
+  });
+
+  it('moves the beeper-user claim and clears the displaced caches when the same participant is re-linked to somebody else', async () => {
+    await makeAccount();
+    const firstConversationId = await makeConversation(`${nonce}-relink-move-1`, { network: 'facebook' });
+    const secondConversationId = await makeConversation(`${nonce}-relink-move-2`, { network: 'facebook' });
+    const originalOwner = await makePerson('Example Beeper-User Original Owner');
+    const newOwner = await makePerson('Example Beeper-User New Owner');
+
+    await beeperTribe.upsertParticipant({
+      conversationId: firstConversationId, sourceUserId: 'fb-move-user-1', displayName: 'Example Beeper-User Original Owner', handle: '', observedVia: 'message-sender',
+    });
+    await beeperTribe.linkParticipant({
+      conversationId: firstConversationId, sourceUserId: 'fb-move-user-1', personId: originalOwner.id,
+    });
+
+    // The SAME Beeper user in a second chat on the same account auto-resolves
+    // through the claim alone — there is no handle to match on.
+    const second = await beeperTribe.upsertParticipant({
+      conversationId: secondConversationId, sourceUserId: 'fb-move-user-1', displayName: 'Example Beeper-User Original Owner', handle: '', observedVia: 'message-sender',
+    });
+    expect(second.tribePersonId).toBe(originalOwner.id);
+
+    const moved = await beeperTribe.linkParticipant({
+      conversationId: firstConversationId, sourceUserId: 'fb-move-user-1', personId: newOwner.id,
+    });
+    expect(moved.displacedPersonId).toBe(originalOwner.id);
+
+    const refreshed = await beeperTribe.getParticipant(secondConversationId, 'fb-move-user-1');
+    expect(refreshed.tribePersonId).toBeNull();
+    expect(await beeperTribe.resolveParticipantPerson({
+      conversationId: secondConversationId, sourceUserId: 'fb-move-user-1',
+    })).toBe(newOwner.id);
+
+    const originalIdentities = await tribeIdentities.listIdentitiesForPerson(originalOwner.id);
+    expect(originalIdentities).toHaveLength(0);
   });
 
   it('a group conversation creates touchpoints for senders only, never for a truncated roster', async () => {
