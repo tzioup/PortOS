@@ -577,14 +577,29 @@ router.put('/', asyncHandler(async (req, res) => {
   // write above so the reconcile (and the scheduler's own re-read) see the
   // value that was actually persisted, not the request body.
   const nextBeeperEnabled = merged?.beeper?.enabled === true;
+  const beeperIntervalChanged = merged?.beeper?.intervalMinutes !== previousBeeperIntervalMinutes;
   if (nextBeeperEnabled !== previousBeeperEnabled) {
+    // Fork issue #94: the flip branch does NOT always get a fresh
+    // registration. `reconcileBeeperArming` only registers the scheduler when
+    // it is not already registered (fork issue #79's re-registration guard in
+    // beeperArming.js), and a true→false save deliberately leaves the
+    // scheduler registered — it just gates per tick (see the true→false test
+    // beside this route's other Beeper tests) — so a false→true flip right
+    // after finds it already registered and the reconcile below is a no-op
+    // for the scheduler. Capture that "already registered" state BEFORE
+    // reconciling: if this save also changed the interval, the still-
+    // registered event is holding the stale `intervalMs`
+    // `createSettingsGatedSyncScheduler.js` locked in at `schedule()` time, so
+    // restart explicitly to pick up what was just persisted.
+    const { isBeeperSchedulerRegistered } = await import('../services/beeperScheduler.js');
+    const wasSchedulerRegisteredBeforeReconcile = isBeeperSchedulerRegistered();
     await reconcileBeeperArming('sync-toggle');
-  } else if (merged?.beeper?.intervalMinutes !== previousBeeperIntervalMinutes) {
+    if (nextBeeperEnabled && beeperIntervalChanged && wasSchedulerRegisteredBeforeReconcile) {
+      await restartBeeperSchedulerForIntervalChange('sync-toggle-interval-change');
+    }
+  } else if (beeperIntervalChanged) {
     // Fork issue #79: an interval-only change (no `enabled` flip) still has to
-    // take effect without a restart. The `enabled`-flip branch above already
-    // gets a fresh registration — and therefore the just-persisted interval —
-    // through `reconcileBeeperArming`, so this `else` only has work to do when
-    // that branch did not run.
+    // take effect without a restart.
     await restartBeeperSchedulerForIntervalChange('interval-change');
   }
   if (subscriptionCostsPatch !== undefined) {

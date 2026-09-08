@@ -236,10 +236,15 @@ notice a settings change mid-flight — changing `intervalMinutes` alone used to
 the next process restart. `restartBeeperScheduler()` (`server/services/beeperScheduler.js`) is the
 fix: cancel the current registration and register a fresh one, which reads
 `getBeeperSyncConfig()` again. `PUT /api/settings` calls it when a save changes
-`beeper.intervalMinutes` without also flipping `enabled` (an `enabled` flip already gets a fresh
-registration — and therefore the just-persisted interval — through `reconcileBeeperIngestion()`).
-Deliberately no immediate sweep on this path: only arming kicks one, and firing a sweep on every
-interval edit would surprise a user who is just tuning a number.
+`beeper.intervalMinutes` without also flipping `enabled`. An `enabled` flip alone does not always
+get a fresh registration: a true→false save deliberately leaves the scheduler registered (it just
+gates per tick), so a false→true flip right after finds it already registered and
+`reconcileBeeperIngestion()`'s own guard declines to re-register it. When that combination lands —
+a flip on an already-registered scheduler, with the interval also changed in the same save — `PUT
+/api/settings` restarts the scheduler explicitly too, right after reconciling, so the stale
+interval does not survive (fork issue #94). Deliberately no immediate sweep on the restart path:
+only arming kicks one, and firing a sweep on every interval edit would surprise a user who is just
+tuning a number.
 
 Per account, one sweep:
 

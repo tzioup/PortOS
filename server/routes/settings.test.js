@@ -75,13 +75,19 @@ vi.mock('../services/beeperArming.js', () => ({
 // `reconcileBeeperIngestion` (that stays reserved for an `enabled` flip). Mocked
 // for the same reason `beeperArming.js` is above — what a restart actually does
 // is covered by services/beeperScheduler.test.js.
+// `isBeeperSchedulerRegistered` defaults to `false` (mimicking a scheduler
+// that was never registered) so the existing interval-change tests below,
+// which never set this, keep exercising that path; the fork issue #94 test
+// under "beeper sync-toggle arming" overrides it to `true` for the
+// already-registered case.
 vi.mock('../services/beeperScheduler.js', () => ({
   restartBeeperScheduler: vi.fn(async () => {}),
+  isBeeperSchedulerRegistered: vi.fn(() => false),
 }));
 
 import settingsRoutes from './settings.js';
 import { reconcileBeeperIngestion } from '../services/beeperArming.js';
-import { restartBeeperScheduler } from '../services/beeperScheduler.js';
+import { restartBeeperScheduler, isBeeperSchedulerRegistered } from '../services/beeperScheduler.js';
 import { updateSettingsWith } from '../services/settings.js';
 import { hasConfiguredInstances as hasConfiguredDatadogInstances } from '../services/datadog.js';
 import { hasConfiguredInstances as hasConfiguredJiraInstances } from '../services/jira.js';
@@ -959,6 +965,30 @@ describe('Settings routes — beeper sync-toggle arming', () => {
     expect(res.status).toBe(200);
     expect(res.body.beeper.enabled).toBe(true);
   });
+
+  // Fork issue #94: a true→false save leaves the scheduler registered (see
+  // "reconciles once when enabled flips true→false" above) — it just gates
+  // per tick — so a false→true flip right after finds
+  // `isBeeperSchedulerRegistered()` already true and the reconcile is a no-op
+  // for the scheduler. When this save also changes the interval, the still-
+  // registered event is holding the stale `intervalMs`, so the route has to
+  // restart the scheduler explicitly, after reconciling, to pick up what was
+  // just persisted.
+  it('restarts the scheduler, after reconciling, when enabled flips and the interval changes on an already-registered scheduler', async () => {
+    isBeeperSchedulerRegistered.mockReturnValueOnce(true);
+    store = { beeper: { enabled: false, intervalMinutes: 5 } };
+
+    const res = await request(buildApp())
+      .put('/api/settings')
+      .send({ beeper: { enabled: true, intervalMinutes: 15 } });
+
+    expect(res.status).toBe(200);
+    expect(reconcileBeeperIngestion).toHaveBeenCalledTimes(1);
+    expect(restartBeeperScheduler).toHaveBeenCalledTimes(1);
+    const [reconcileOrder] = reconcileBeeperIngestion.mock.invocationCallOrder;
+    const [restartOrder] = restartBeeperScheduler.mock.invocationCallOrder;
+    expect(reconcileOrder).toBeLessThan(restartOrder);
+  });
 });
 
 // Fork issue #79's other half: an interval-only save (no `enabled` flip) used
@@ -1003,10 +1033,14 @@ describe('Settings routes — beeper interval change', () => {
     expect(restartBeeperScheduler).not.toHaveBeenCalled();
   });
 
-  // The `enabled`-flip branch already gets a fresh registration — and
-  // therefore the just-persisted interval — through `reconcileBeeperIngestion`,
-  // so restarting the scheduler too would just cancel and re-register a
-  // second time for nothing.
+  // With the scheduler not yet registered (`isBeeperSchedulerRegistered()`
+  // defaults to `false` in this file's mock — a fresh install / first
+  // enable), the `enabled`-flip branch's reconcile does the fresh
+  // registration itself and picks up the just-persisted interval, so
+  // restarting the scheduler too would just cancel and re-register a second
+  // time for nothing. When the scheduler IS already registered going in, the
+  // route restarts it explicitly — see the "already-registered scheduler"
+  // test under "beeper sync-toggle arming" above (fork issue #94).
   it('does not also restart the scheduler when enabled flips, even if the interval changed in the same save', async () => {
     store = { beeper: { enabled: false, intervalMinutes: 5 } };
 
