@@ -308,7 +308,7 @@ describe('instance features', () => {
     const { features } = await getInstanceFeatures();
     expect(Object.fromEntries(features.map((f) => [f.id, f.enabled]))).toEqual({
       post: true, datadog: true, jira: false, eidoverse: false, gsd: false, openclaw: false, health: true,
-      rigging: false, facetime: false, imessage: true, signal: true, beeper: false,
+      rigging: false, facetime: false, imessage: true, signal: true, x: true, 'stacker-news': true, beeper: false,
     });
   });
 
@@ -328,8 +328,12 @@ describe('instance features', () => {
     const { features, groups } = await getInstanceFeatures();
     expect(byId(features, 'imessage')).toMatchObject({ enabled: true, source: 'default' });
     expect(byId(features, 'signal')).toMatchObject({ enabled: true, source: 'default' });
+    expect(byId(features, 'x')).toMatchObject({ enabled: true, source: 'default' });
+    expect(byId(features, 'stacker-news')).toMatchObject({ enabled: true, source: 'default' });
     expect(await isInstanceFeatureEnabled('imessage')).toBe(true);
     expect(await isInstanceFeatureEnabled('signal')).toBe(true);
+    expect(await isInstanceFeatureEnabled('x')).toBe(true);
+    expect(await isInstanceFeatureEnabled('stacker-news')).toBe(true);
     // FaceTime Audio keeps answering to its own detector exactly as before
     // grouping existed — a group with no stored state never overrides it. This
     // suite doesn't mock voice/facetimeBridge.js, so the source depends on

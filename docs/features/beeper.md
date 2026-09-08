@@ -180,8 +180,8 @@ it disarms the sweep and the socket.
 
 ## The Comms feature group
 
-`beeper` is one of four features in the **Comms** group (`facetime`, `imessage`, `signal`,
-`beeper`), declared in `server/lib/instanceFeatureRegistry.js` as a plain `group: 'comms'` on the
+`beeper` is one of six features in the **Comms** group (`facetime`, `imessage`, `signal`, `x`,
+`stacker-news`, `beeper`), declared in `server/lib/instanceFeatureRegistry.js` as a plain `group: 'comms'` on the
 feature descriptor. Settings > Features renders the group toggle and each member's own
 tri-state override.
 
