@@ -608,9 +608,13 @@ Socket.IO events:
 | `beeper:invalidate` | server → Beeper subscribers | `{ kind, chatID, ids, seq, ts }` — ids and kinds only, never content. `kind: 'beeper-sweep'` (`chatID: null`) is the sweep's own progress frame, fork issue #80 |
 | `beeper:realtime` | server → Beeper subscribers | The transport liveness snapshot: `state`, `lastEventAt`, `lastPingAt`, `reconnectAttempts`, `appState`, `appStateActionable`, `authRejected` |
 
-Both surfaces publish as **generated** contract entries. `/api/beeper` appears in
-`server/lib/apiRouteCatalog.generated.json` (25 operations) and in `docs/API.md`'s route-domain
-index, and neither `server/lib/apiOperationContracts.js` nor
+Both surfaces publish as **generated** contract entries. The committed
+`apiRouteCatalog.generated.json` is gone: `server/lib/apiRouteGraph.js` now scans the mounted
+route graph in memory on the first `/api/api-docs/*` request, and `socketEventInventory.js` does
+the same for Socket.IO events, so `/api/beeper/*` and `beeper:*` are discovered from the mounted
+router and the emit sites rather than from a checked-in file — nothing to regenerate when a
+Beeper route is added. `/api/beeper` still appears in `docs/API.md`'s route-domain index, and
+neither `server/lib/apiOperationContracts.js` nor
 `server/lib/socketEventContracts.js` models any Beeper operation or event — so the catalog and
 spec endpoints listed in [API_TOOL_CONTRACT.md](../API_TOOL_CONTRACT.md) report every one of them
 with `contractStatus: "generated"` (path parameters and a default response, no richer modeled
